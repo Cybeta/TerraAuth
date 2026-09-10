@@ -17,21 +17,28 @@
 客户端包 → Phase 2 权威层
    ├─ Accept → Command → Phase 3 → Phase 4 → 下发
    └─ Reject → IMetrics.IncrementBlockedCheat
-             → IBanManager.ReportViolationAsync (达阈值→封禁)
+             → IBanManager.ReportViolationAsync (达阈值→封禁记录)
              → IAuditRepository.AppendAsync (落库)
+             → Phase 5 NetworkHost 处置 (达阈值→发包 2 踢出连接)
                   ↓
             运营复核 → 误判标记 → IMetrics.IncrementFalsePositives
 ```
 
 ## §3. 配置驱动
 
-`ServerConfig` 是所有阈值的唯一真相源（MaxWalkSpeed / MaxSingleDamage / MaxTileBreakPerSecond / MaxViolationsBeforeBan…）。`ConfigurationService` 用 `FileSystemWatcher` 热重载，权威子系统订阅 `OnChanged` 动态调整阈值，改阈值无需重启。
+`ServerConfig` 是所有阈值的唯一真相源（MaxWalkSpeed / MaxSingleDamage / MaxTileBreakPerSecond / MaxViolationsBeforeBan…）。`GameHost` 把限流与六个子系统的阈值全部显式映射注入（`RateLimits` / `PlayerLimits` / `MovementLimits` / `CombatLimits` / `InventoryLimits` / `WorldLimits`），**启动注入与热重载共用同一映射**（`AuthorityThresholds.From`），避免两处各写一份而漂移。
+
+`ConfigurationService` 用 `FileSystemWatcher` 重新加载并触发 `OnChanged`；`GameHost.OnConfigurationChanged` 随即调用 `AuthorityEnforcers.UpdateThresholds`，把新阈值推送给**已构造**的子系统 —— **改 `server.json` 无需重启即生效**。实现要点：阈值对象为不可变 record（引用类型），子系统以 `volatile` 字段持有，热更新时整体替换引用，故读取端无锁、无撕裂；更新瞬间正在执行的校验可能仍用旧值，属热重载的正常语义。
+
+集成测试覆盖两条路径：启动映射（`ConfigThresholds_AreApplied_ByBootstrap`）与运行时热重载（`ConfigHotReload_UpdatesThresholds_WithoutRestart`）。
 
 > ⚠️ 阈值过松=漏判，过紧=误杀（架构 §8.2 要求误判率<0.1%）。先用保守值再逐步收紧。
 
 ## §4. 封禁策略
 
 `BanManager` 滑动窗口累计违规：达 `MaxViolationsBeforeBan` → 自动封禁（默认 24h）。生产级 `IBanStore` 可选 Redis（多服共享 IP 黑名单）或 SQLite。
+
+同一阈值也驱动 **连接层即时处置**：`NetworkHost` 按 `ServerConfig`（`MaxViolationsBeforeBan` / `ViolationWindowMinutes`）维护每玩家滑动窗口，达阈值即调用 `ConnectionManager.KickAsync`（先下发包 2 告知原因，再关闭连接释放槽位）。封禁记录 + 踢出双管齐下，避免"只记录不处置"。
 
 ## §5. 验收清单
 
@@ -42,6 +49,8 @@
 - [x] 6.6 /metrics 端点可被 Prometheus 抓取（`MetricsHttpServer` + `ExportAsText`）
 - [x] 6.7 GameHost.RunAsync 启动三循环（网络 + 仿真 + 快照）
 - [x] 6.8 权威层拒绝同步触发 指标 + 审计 + 违规累计（`auditLogger.OnViolation`）
+- [x] 6.9 违规达阈值即时踢出在线连接（`NetworkHost` 滑动窗口 + `ConnectionManager.KickAsync` 发包 2 后关闭，真实 TCP 集成测试覆盖）
+- [x] 6.10 插件 API 的踢出 / 封禁真实生效（`ServerApi` 桥接 `ConnectionManager` + `IBanManager`；封禁身份经 `PlayerIdentity` 与审计链路统一，真实 TCP 集成测试覆盖）
 
 ## §6. P0 优先级
 
@@ -49,7 +58,7 @@
 2. ✅ 真实 IBanStore（`SqliteBanStore` 复用同一 `IDbExecutor`）
 3. ✅ PrometheusMetrics.ExportAsText + `HttpListener` /metrics 端点
 4. ✅ GameHost 注入真实实现（`Bootstrap` 组装 Phase 2/3/4/5 + 基础设施 + 扩展层）
-5. ⏳ Phase 2 子系统订阅配置热更新（当前 `OnConfigurationChanged` 仅打印日志占位）
+5. ✅ Phase 2 子系统订阅配置热更新（`OnConfigurationChanged` → `AuthorityEnforcers.UpdateThresholds`；阈值对象引用整体替换，运行时改 `server.json` 无需重启）
 
 ## §7. 与 Phase 7 衔接
 

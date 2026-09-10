@@ -10,7 +10,9 @@ using System.Text;
 using System.Threading.Tasks;
 using TerraAuth.Authority;       // IAuditLogger, AuditEvent
 using TerraAuth.Monitoring;      // IMetrics
+using TerraAuth.Net.Phase5;      // NetworkHost / ConnectionManager / ConnectionState
 using TerraAuth.Plugins;         // 插件适配器接口
+using TerraAuth.Security;        // IBanManager / PlayerIdentity
 using TerraAuth.Simulation;      // WorldState
 
 namespace TerraAuth.Plugins;
@@ -123,16 +125,40 @@ internal sealed class CoreEventStore : IEventStoreAdapter
 #endregion
 
 #region 服务端 API 实现（IServerApi）
-/// <summary>服务端 API 默认实现：桥接 GameHost 持有的核心服务。</summary>
+/// <summary>
+/// 服务端 API 默认实现：桥接 GameHost 持有的核心服务（连接管理 / 封禁 / 世界状态）。
+/// </summary>
+/// <remarks>
+/// 已实装：<see cref="KickPlayer"/> / <see cref="BanPlayer"/> / <see cref="GetPlayer"/> /
+/// <see cref="GetOnlinePlayers"/> / <see cref="GetServerInfo"/>。
+/// <br/>
+/// 尚未实装：<see cref="Broadcast"/> / <see cref="SendMessage"/> / <see cref="ExecuteCommand"/> ——
+/// 原版聊天走 NetTextModule（包 25 自 1.4 起弃用），需先实现文本包序列化才能下发，当前仅落审计。
+/// </remarks>
 public sealed class ServerApi : IServerApi
 {
     private readonly IAuditLogger _audit;
     private readonly Monitoring.IMetrics _metrics;
-    // TODO: 注入 NetworkHost / ConnectionManager / BanManager 实现真实操作
+    private readonly NetworkHost _network;
+    private readonly ConnectionManager _connections;
+    private readonly IBanManager _bans;
+    private readonly WorldState _world;
+    private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
 
-    public ServerApi(IAuditLogger audit, Monitoring.IMetrics metrics)
+    public ServerApi(
+        IAuditLogger audit,
+        Monitoring.IMetrics metrics,
+        NetworkHost network,
+        ConnectionManager connections,
+        IBanManager bans,
+        WorldState world)
     {
-        _audit = audit; _metrics = metrics;
+        _audit = audit;
+        _metrics = metrics;
+        _network = network;
+        _connections = connections;
+        _bans = bans;
+        _world = world;
     }
 
     public void Broadcast(string message, string color = "White")
@@ -143,23 +169,76 @@ public sealed class ServerApi : IServerApi
 
     public PlayerStateSnapshot? GetPlayer(int playerId)
     {
-        // TODO: 从 WorldState / ConnectionManager 读取真实状态
-        return null;
+        var conn = _connections.Get(playerId);
+        if (conn is null) return null;
+        return BuildSnapshot(playerId, conn.State == ConnectionState.Playing);
     }
 
     public IReadOnlyList<PlayerStateSnapshot> GetOnlinePlayers()
-        => Array.Empty<PlayerStateSnapshot>();
+    {
+        var list = new List<PlayerStateSnapshot>();
+        foreach (var conn in _connections.All())
+        {
+            if (conn.State != ConnectionState.Playing) continue;
+            list.Add(BuildSnapshot(conn.PlayerId, isConnected: true));
+        }
+        return list;
+    }
 
     public void KickPlayer(int playerId, string reason)
-        => _audit.Log(AuditEvent.Now(playerId, "server", "kick", reason));
+    {
+        // IServerApi 为同步接口（插件在 Hook 回调内调用），踢出是异步 I/O → 投递后不阻塞插件
+        _ = _connections.KickAsync(playerId, reason);
+        _audit.Log(AuditEvent.Now(playerId, "server", "kick", reason));
+    }
 
     public void BanPlayer(int playerId, TimeSpan? duration = null, string reason = "")
-        => _audit.Log(AuditEvent.Now(playerId, "security", "ban", reason, duration?.ToString() ?? "permanent"));
+    {
+        // 身份映射与审计链路一致（PlayerIdentity），否则"审计封了 A、写库封的是 B"
+        _ = _bans.BanAsync(PlayerIdentity.ToGuid(playerId), reason, duration);
+        // 封禁需立即生效：踢出在线连接，否则被封玩家仍可继续游戏
+        _ = _connections.KickAsync(playerId, string.IsNullOrEmpty(reason) ? "Banned" : reason);
+        _audit.Log(AuditEvent.Now(playerId, "security", "ban", reason, duration?.ToString() ?? "permanent"));
+    }
 
     public void ExecuteCommand(string command)
         => _audit.Log(AuditEvent.Now(0, "server", "command", command));
 
     public ServerInfoSnapshot GetServerInfo()
-        => new(0, 0, 0, TimeSpan.Zero, "");
+    {
+        int online = 0;
+        foreach (var conn in _connections.All())
+        {
+            if (conn.State == ConnectionState.Playing) online++;
+        }
+
+        return new ServerInfoSnapshot(
+            OnlinePlayers: online,
+            MaxPlayers: _connections.MaxConnections,
+            TotalTicks: _world.Tick,
+            Uptime: DateTimeOffset.UtcNow - _startedAt,
+            WorldName: _world.WorldName);
+    }
+
+    /// <summary>
+    /// 组装插件可见的玩家快照：名称取自包 4 记录的外观，HP / 坐标取自世界运行时状态。
+    /// 注意：当前法力值未在服务端跟踪（<see cref="WorldState"/> 只维护 HP），Mp / MaxMp 恒为 0。
+    /// </summary>
+    private PlayerStateSnapshot BuildSnapshot(int playerId, bool isConnected)
+    {
+        _network.TryGetPlayerName(playerId, out var name);
+        var runtime = _world.Players.TryGetValue(playerId, out var p) ? p : null;
+
+        return new PlayerStateSnapshot(
+            PlayerId: playerId,
+            Name: name,
+            Hp: runtime?.Hp ?? 0,
+            MaxHp: runtime?.HpMax ?? 0,
+            Mp: 0,
+            MaxMp: 0,
+            X: runtime?.Position.X ?? 0f,
+            Y: runtime?.Position.Y ?? 0f,
+            IsConnected: isConnected);
+    }
 }
 #endregion

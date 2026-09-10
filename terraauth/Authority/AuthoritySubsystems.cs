@@ -9,27 +9,29 @@ namespace TerraAuth.Authority;
 
 // ---------- 阈值配置 ----------
 // 由 ServerConfig 映射注入（架构 §4.5 唯一来源），使 Authority 层不反向依赖 Config 层。
+// 全部为不可变 record（引用类型）：热更新时由 AuthorityEnforcers.UpdateThresholds 整体替换实例，
+// 子系统以 volatile 字段持有 —— 读取端无锁、无撕裂，故此处不能用 record struct。
 
-public readonly record struct PlayerLimits(int MaxHp, int MaxMana)
+public sealed record PlayerLimits(int MaxHp, int MaxMana)
 {
     public static PlayerLimits Default => new(MaxHp: 500, MaxMana: 200);
 }
 
 /// <summary>移动校验阈值。</summary>
-public readonly record struct MovementLimits(float MaxSpeed, float TeleportTolerance, int MaxTeleportsPerSecond = 5)
+public sealed record MovementLimits(float MaxSpeed, float TeleportTolerance, int MaxTeleportsPerSecond = 5)
 {
     /// <summary>兜底默认值（与 ServerConfig 默认一致）。</summary>
     public static MovementLimits Default => new(MaxSpeed: 8.0f, TeleportTolerance: 4.0f, MaxTeleportsPerSecond: 5);
 }
 
 /// <summary>战斗校验阈值：单次伤害上限 + 统计窗口内的伤害总量上限。</summary>
-public readonly record struct CombatLimits(int MaxSingleDamage, int MaxDpsWindowSeconds, int MaxDps)
+public sealed record CombatLimits(int MaxSingleDamage, int MaxDpsWindowSeconds, int MaxDps)
 {
     public static CombatLimits Default => new(MaxSingleDamage: 30000, MaxDpsWindowSeconds: 5, MaxDps: 50000);
 }
 
 /// <summary>库存校验阈值。SscEnabled=true 时服务端持有唯一真相源。</summary>
-public readonly record struct InventoryLimits(bool SscEnabled, int MaxStackSize)
+public sealed record InventoryLimits(bool SscEnabled, int MaxStackSize)
 {
     /// <summary>Terraria 玩家背包槽位数（0..58，含装备/饰品/坐骑槽）。</summary>
     public const int MaxSlots = 59;
@@ -38,7 +40,7 @@ public readonly record struct InventoryLimits(bool SscEnabled, int MaxStackSize)
 }
 
 /// <summary>世界交互阈值：每秒挖砖/放砖上限。</summary>
-public readonly record struct WorldLimits(int MaxTileBreakPerSecond, int MaxTilePlacePerSecond)
+public sealed record WorldLimits(int MaxTileBreakPerSecond, int MaxTilePlacePerSecond)
 {
     public static WorldLimits Default => new(MaxTileBreakPerSecond: 60, MaxTilePlacePerSecond: 40);
 }
@@ -48,10 +50,13 @@ public readonly record struct WorldLimits(int MaxTileBreakPerSecond, int MaxTile
 internal sealed class PlayerAuthority : IPlayerAuthority
 {
     private readonly IAuditLogger _audit;
-    private readonly PlayerLimits _limits;
+    private volatile PlayerLimits _limits;
     private readonly ConcurrentDictionary<int, PlayerStats> _stats = new();
 
     public PlayerAuthority(IAuditLogger audit, PlayerLimits limits) => (_audit, _limits) = (audit, limits);
+
+    /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
+    internal void UpdateLimits(PlayerLimits limits) => _limits = limits;
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
     {
@@ -141,11 +146,14 @@ internal sealed class MovementAuthority : IMovementAuthority
 
     private readonly IPlayerAuthority _players;
     private readonly IAuditLogger _audit;
-    private readonly MovementLimits _limits;
+    private volatile MovementLimits _limits;
     private readonly ConcurrentDictionary<int, PlayerMotion> _motion = new();
 
     public MovementAuthority(IPlayerAuthority players, IAuditLogger audit, MovementLimits limits)
         => (_players, _audit, _limits) = (players, audit, limits);
+
+    /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
+    internal void UpdateLimits(MovementLimits limits) => _limits = limits;
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
     {
@@ -336,11 +344,14 @@ internal sealed class CombatAuthority : ICombatAuthority
 
     private readonly IPlayerAuthority _players;
     private readonly IAuditLogger _audit;
-    private readonly CombatLimits _limits;
+    private volatile CombatLimits _limits;
     private readonly ConcurrentDictionary<int, DamageWindow> _windows = new();
 
     public CombatAuthority(IPlayerAuthority players, IAuditLogger audit, CombatLimits limits)
         => (_players, _audit, _limits) = (players, audit, limits);
+
+    /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
+    internal void UpdateLimits(CombatLimits limits) => _limits = limits;
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
     {
@@ -413,10 +424,13 @@ internal sealed class InventoryAuthority : IInventoryAuthority
     private const int WorldHeightTiles = 2400;
 
     private readonly IAuditLogger _audit;
-    private readonly InventoryLimits _limits;
+    private volatile InventoryLimits _limits;
     private readonly ConcurrentDictionary<int, ConcurrentDictionary<int, SlotState>> _inventories = new();
 
     public InventoryAuthority(IAuditLogger audit, InventoryLimits limits) => (_audit, _limits) = (audit, limits);
+
+    /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
+    internal void UpdateLimits(InventoryLimits limits) => _limits = limits;
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands) => packet switch
     {
@@ -525,12 +539,15 @@ internal sealed class WorldAuthority : IWorldAuthority
 
     private readonly IPlayerAuthority _players;
     private readonly IAuditLogger _audit;
-    private readonly WorldLimits _limits;
+    private volatile WorldLimits _limits;
     private readonly WorldState _world;
     private readonly IInventoryAuthority _inv;
 
     public WorldAuthority(IPlayerAuthority players, IAuditLogger audit, WorldLimits limits, WorldState world, IInventoryAuthority inv)
         => (_players, _audit, _limits, _world, _inv) = (players, audit, limits, world, inv);
+
+    /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
+    internal void UpdateLimits(WorldLimits limits) => _limits = limits;
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands) => packet switch
     {
@@ -551,7 +568,10 @@ internal sealed class WorldAuthority : IWorldAuthority
 
         // 目标 tile 必须存在且为实心（Action=0 挖实心砖；2/3 挖墙；>=5 电线/斜坡类跳过实体检查）
         // brk.Action=0 → 实心砖；TileType=客户端声称的类型，服务端需对账
-        var tile = _world.Tiles[brk.X, brk.Y];
+        // 区块读锁内取一份图格副本：仿真线程可能正在改同一格（详见 SectionLocks）
+        Tile tile;
+        using (_world.Sections.EnterRead(brk.X, brk.Y, brk.X, brk.Y))
+            tile = _world.Tiles[brk.X, brk.Y];
         if (brk.Action == 0)
         {
             if (!tile.Active)
@@ -587,7 +607,10 @@ internal sealed class WorldAuthority : IWorldAuthority
                 new { place.TileType, Reason = "backpack missing item or not synced yet" });
 
         // 放置目标必须为空：已有 Active 砖 → 客户端正常流程不会发，CE 伪造直接拒
-        var tile = _world.Tiles[place.X, place.Y];
+        // 区块读锁内取一份图格副本（同上）
+        Tile tile;
+        using (_world.Sections.EnterRead(place.X, place.Y, place.X, place.Y))
+            tile = _world.Tiles[place.X, place.Y];
         if (tile.Active)
             return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y });
 
@@ -624,11 +647,14 @@ internal sealed class WorldAuthority : IWorldAuthority
 
 internal sealed class RateAuthority : IRateAuthority
 {
-    private readonly RateLimits _limits;
+    private volatile RateLimits _limits;
     private readonly IAuditLogger _audit;
     private readonly ConcurrentDictionary<int, PlayerRateState> _states = new();
 
     public RateAuthority(RateLimits limits, IAuditLogger audit) => (_limits, _audit) = (limits, audit);
+
+    /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
+    internal void UpdateLimits(RateLimits limits) => _limits = limits;
 
     public AuthorityResult Check(IPacketContext context, PacketId packetType)
     {

@@ -583,4 +583,81 @@ public class SnapshotTests
         Assert.True(strict.IsDeviationSignificant(1, reported, predicted, out _));
         Assert.False(loose.IsDeviationSignificant(1, reported, predicted, out _));
     }
+
+    [Fact]
+    public void Broadcaster_FullSnapshot_UsesPublishedView_NotLiveWorldState()
+    {
+        // 仿真线程的活动 WorldState：玩家 1 已移动到 (999,999)
+        var world = new WorldState();
+        world.Players[1] = new PlayerRuntime { Id = 1, Position = new Vector2(999f, 999f) };
+
+        // 已发布视图：tick 7 时玩家 1 在 (100,100) —— 广播线程只应看到这一份
+        var views = new StubViewProvider
+        {
+            View = WorldEntityView.Extract(SnapshotWorld(playerId: 1, x: 100f, y: 100f, tick: 7)),
+        };
+
+        var broadcaster = new SnapshotBroadcaster(
+            world,
+            new CommandQueue(),
+            new SnapshotConfig { ViewportRadius = 0f },
+            sender: null!,
+            encoder: new PacketEncoder(ProtocolVersion.Current),
+            views: views);
+
+        // store 为空 → 必然走全量回退路径
+        var frame = broadcaster.BuildFrameFor(1);
+
+        Assert.Equal(7u, frame.Tick); // tick 取自视图
+        var entity = Assert.Single(frame.Entities, e => e.Id == 1);
+        Assert.Equal(100f, entity.Position.X); // 视图值，而非活动的 999
+    }
+
+    [Fact]
+    public void Broadcaster_CullCenter_ComesFromPublishedView()
+    {
+        // 活动位置在原点；若裁剪中心误取活动状态，玩家自身也会被判为超视野
+        var world = new WorldState();
+        world.Players[1] = new PlayerRuntime { Id = 1, Position = new Vector2(0f, 0f) };
+
+        var views = new StubViewProvider
+        {
+            View = WorldEntityView.Extract(SnapshotWorld(playerId: 1, x: 1000f, y: 0f, tick: 7)),
+        };
+
+        var broadcaster = new SnapshotBroadcaster(
+            world,
+            new CommandQueue(),
+            new SnapshotConfig { ViewportRadius = 100f },
+            sender: null!,
+            encoder: new PacketEncoder(ProtocolVersion.Current),
+            views: views);
+
+        broadcaster.Enqueue(1, SnapshotFrame.Create(1, new[]
+        {
+            new EntityState(1, new Vector2(1000f, 0f), new Vector2(0, 0), EntityStateType.Active),
+            new EntityState(99, new Vector2(5000f, 0f), new Vector2(0, 0), EntityStateType.Active),
+        }, System.Array.Empty<RemovedEntity>()));
+
+        var frame = broadcaster.BuildFrameFor(1);
+
+        // 以视图中心 (1000,0) 裁剪：玩家自身保留，远处实体 99 → OutOfRange
+        Assert.Contains(frame.Entities, e => e.Id == 1);
+        Assert.Single(frame.Removed, r => r.Id == 99 && r.Reason == RemoveReason.OutOfRange);
+    }
+
+    /// <summary>构造仅含一个玩家的 WorldState（供视图提取）。</summary>
+    private static WorldState SnapshotWorld(int playerId, float x, float y, long tick)
+    {
+        var world = new WorldState { Tick = tick };
+        world.Players[playerId] = new PlayerRuntime { Id = playerId, Position = new Vector2(x, y) };
+        return world;
+    }
+
+    /// <summary>测试替身：手动控制"已发布实体视图"。</summary>
+    private sealed class StubViewProvider : IWorldViewProvider
+    {
+        public WorldEntityView View { get; set; } = WorldEntityView.Empty;
+        public WorldEntityView CurrentEntityView => View;
+    }
 }

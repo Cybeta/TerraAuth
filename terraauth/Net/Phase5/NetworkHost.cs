@@ -14,12 +14,23 @@ using TerraAuth.Simulation; // CommandQueue
 namespace TerraAuth.Net.Phase5;
 
 /// <summary>
+/// 违规处置阈值：滑动窗口内权威拒绝次数达 <see cref="MaxViolations"/> → 踢出该连接。
+/// 由组合根从 ServerConfig 映射注入，Net 层不反向依赖 Config 层（架构 §4.5 阈值唯一来源）。
+/// </summary>
+public readonly record struct ViolationKickLimits(int MaxViolations, int WindowSeconds)
+{
+    /// <summary>兜底默认值（与 ServerConfig 默认一致：10 次 / 60 分钟）。</summary>
+    public static ViolationKickLimits Default => new(MaxViolations: 10, WindowSeconds: 60 * 60);
+}
+
+/// <summary>
 /// 服务端网络主机。
 /// 职责：
 ///   1. TcpListener 接受新连接
 ///   2. 为每个连接创建 Connection + 运行读写循环
 ///   3. 入站包 → IInboundPipeline（Phase 2）→ CommandQueue（Phase 3）
 ///   4. 出站快照 → ISnapshotSender（Phase 4）
+///   5. 权威拒绝累计达阈值 → 踢出连接（处置闭环）
 /// </summary>
 public sealed class NetworkHost : IAsyncDisposable
 {
@@ -48,12 +59,34 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>诊断：权威层拒绝计数（PersistenceAuditLogger 只落库不打印，拒绝原因需在控制台可见）。</summary>
     private long _rejectCount;
 
+    /// <summary>违规处置阈值（滑动窗口 + 阈值 → 踢出）。</summary>
+    private readonly ViolationKickLimits _violationKick;
+
+    /// <summary>进程内违规窗口：PlayerId → 窗口起点 + 窗口内拒绝计数。</summary>
+    private readonly ConcurrentDictionary<int, ViolationWindow> _violations = new();
+
     private Task? _acceptLoop;
 
     public ISnapshotSender SnapshotSender { get; }
 
     /// <summary>实际监听端口（endpoint 端口传 0 时由 OS 分配）；<see cref="Start"/> 之后有效。</summary>
     public int BoundPort => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
+    /// <summary>
+    /// 查询玩家名（包 4 SyncPlayer 记录的外观）。未认证 / 未知返回 false。
+    /// 供插件 API（IServerApi）读取玩家信息用，避免暴露内部外观缓存。
+    /// </summary>
+    public bool TryGetPlayerName(int playerId, out string name)
+    {
+        if (_playerAppearances.TryGetValue(playerId, out var info) && !string.IsNullOrEmpty(info.Name))
+        {
+            name = info.Name;
+            return true;
+        }
+
+        name = "";
+        return false;
+    }
 
     public NetworkHost(
         IPEndPoint endpoint,
@@ -66,7 +99,8 @@ public sealed class NetworkHost : IAsyncDisposable
         WorkerPool workers,
         WorldState world,
         IReadOnlyCollection<string>? playerWhitelist = null,
-        IHookRegistry? hooks = null)
+        IHookRegistry? hooks = null,
+        ViolationKickLimits? violationKick = null)
     {
         _listener = new TcpListener(endpoint);
         _decoder = decoder;
@@ -79,6 +113,7 @@ public sealed class NetworkHost : IAsyncDisposable
         _world = world;
         _playerWhitelist = playerWhitelist;
         _hooks = hooks;
+        _violationKick = violationKick ?? ViolationKickLimits.Default;
 
         SnapshotSender = new ConnectionSnapshotSender(connections, encoder);
     }
@@ -154,6 +189,7 @@ public sealed class NetworkHost : IAsyncDisposable
     private void OnConnectionClosed(Connection connection)
     {
         _playerAppearances.TryRemove(connection.PlayerId, out var info);
+        _violations.TryRemove(connection.PlayerId, out _); // 断开即清违规窗口，避免 ID 复用串号
         var name = info?.Name ?? "";
 
         // 通知其他玩家该玩家已离线（包 14 置为未激活），否则原版客户端会残留幽灵玩家
@@ -223,9 +259,10 @@ public sealed class NetworkHost : IAsyncDisposable
 
             case AuthorityDecision.Correct:
                 // 服务端权威纠正（如 HP/MP snap back）→ 下发纠正包
+                // 包号取自纠正包自身（INetworkPacket.Type），避免新增纠正类型时下发错误包号
                 if (result.CorrectionPacket is not null)
                     await connection.SendEncodedAsync(
-                        PacketId.PlayerHealth, // TODO: 按包类型映射
+                        result.CorrectionPacket.Type,
                         result.CorrectionPacket,
                         ct).ConfigureAwait(false);
                 break;
@@ -237,9 +274,50 @@ public sealed class NetworkHost : IAsyncDisposable
                 var rejectNo = Interlocked.Increment(ref _rejectCount);
                 if (rejectNo <= 50 || rejectNo % 1000 == 0)
                     Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}");
-                // TODO: 严重违规累计 → KickAsync
+
+                // 处置：窗口内拒绝累计达阈值 → 踢出（先发包 2 说明原因，再关闭连接）
+                if (RecordViolation(connection.PlayerId))
+                {
+                    _violations.TryRemove(connection.PlayerId, out _);
+                    Console.WriteLine(
+                        $"[Authority] 玩家 #{connection.PlayerId} 违规累计达 " +
+                        $"{_violationKick.MaxViolations}/{_violationKick.WindowSeconds}s，踢出：{result.Reason}");
+                    await _connections.KickAsync(
+                        connection.PlayerId,
+                        $"Too many violations: {result.Reason}",
+                        ct).ConfigureAwait(false);
+                }
                 break;
         }
+    }
+
+    /// <summary>
+    /// 记录一次权威拒绝，返回 true 表示该玩家在窗口内已达阈值（调用方应立即处置）。
+    /// 窗口滚动：超出窗口则重置起点与计数；阈值触发后由调用方移除条目。
+    /// </summary>
+    private bool RecordViolation(int playerId)
+    {
+        var now = DateTime.UtcNow;
+        var window = _violations.GetOrAdd(playerId, _ => new ViolationWindow { StartUtc = now });
+
+        lock (window)
+        {
+            if ((now - window.StartUtc).TotalSeconds > _violationKick.WindowSeconds)
+            {
+                window.StartUtc = now;
+                window.Count = 0;
+            }
+
+            window.Count++;
+            return window.Count >= _violationKick.MaxViolations;
+        }
+    }
+
+    /// <summary>进程内违规窗口状态（每玩家一条，锁内更新）。</summary>
+    private sealed class ViolationWindow
+    {
+        public DateTime StartUtc;
+        public int Count;
     }
 
     /// <summary>

@@ -64,31 +64,21 @@ public sealed record SnapshotFrame(
     public static int NpcEntityId(int npcIndex) => -1 - npcIndex;
 
     /// <summary>
-    /// 从 <see cref="WorldState"/> 提取玩家与 NPC 实体，
-    /// 并按 <paramref name="previous"/> 做增量：只保留变化实体 + 消失实体列表，BaseTick = 上一帧。
+    /// 从 <see cref="WorldState"/> 提取玩家与 NPC 实体，并按 <paramref name="previous"/> 做增量。
+    /// 仅允许仿真线程调用（要求无并发写入）；跨线程请走 <see cref="WorldEntityView"/> 发布。
     /// </summary>
     public static SnapshotFrame BuildDelta(WorldState world, SnapshotFrame? previous)
+        => BuildDelta(WorldEntityView.Extract(world), previous);
+
+    /// <summary>
+    /// 基于已发布的不可变实体视图构建快照帧：只保留变化实体 + 消失实体列表，BaseTick = 上一帧。
+    /// 提取逻辑与 <see cref="WorldEntityView"/> 共用，保证快照内容与视图一致。
+    /// </summary>
+    public static SnapshotFrame BuildDelta(WorldEntityView view, SnapshotFrame? previous)
     {
-        var current = new List<EntityState>(world.Players.Count + world.Npcs.Count);
+        IReadOnlyList<EntityState> current = view.Entities;
 
-        foreach (var kvp in world.Players)
-        {
-            var p = kvp.Value;
-            current.Add(new EntityState(
-                kvp.Key, p.Position, p.Velocity,
-                p.Active ? EntityStateType.Active : EntityStateType.Hidden));
-        }
-
-        // NPC 无速度字段 → Velocity 恒为 0；静态 NPC 会在增量中被 SameState 判为未变化而省略
-        for (int i = 0; i < world.Npcs.Count; i++)
-        {
-            var npc = world.Npcs[i];
-            current.Add(new EntityState(
-                NpcEntityId(i), new Vector2(npc.X, npc.Y), new Vector2(0, 0),
-                EntityStateType.Active));
-        }
-
-        List<EntityState> entities;
+        IReadOnlyList<EntityState> entities;
         List<RemovedEntity> removed;
 
         if (previous is null)
@@ -103,14 +93,15 @@ public sealed record SnapshotFrame(
             foreach (var e in previous.Entities)
                 previousById[e.Id] = e;
 
-            entities = new List<EntityState>(current.Count);
+            var changed = new List<EntityState>(current.Count);
             var currentIds = new HashSet<int>(current.Count);
             foreach (var e in current)
             {
                 currentIds.Add(e.Id);
                 if (!previousById.TryGetValue(e.Id, out var old) || !SameState(old, e))
-                    entities.Add(e);
+                    changed.Add(e);
             }
+            entities = changed;
 
             removed = new List<RemovedEntity>();
             foreach (var e in previous.Entities)
@@ -119,7 +110,7 @@ public sealed record SnapshotFrame(
         }
 
         return Create(
-            tick: (uint)world.Tick,
+            tick: view.Tick,
             entities: entities,
             removed: removed,
             baseTick: previous?.Tick,

@@ -29,10 +29,20 @@ public sealed class HookedPipeline : IInboundPipeline
     private readonly IInboundPipeline _inner;
     private readonly IHookRegistry _hooks;
     private readonly ILogger _logger;
+    private readonly Func<int, string?>? _playerNameResolver;
 
-    public HookedPipeline(IInboundPipeline inner, IHookRegistry hooks, ILogger logger)
+    /// <param name="playerNameResolver">
+    /// 玩家名解析器（PlayerId → 名称）。传输层（NetworkHost）持有玩家名，故由组合根以延迟绑定的
+    /// 闭包注入，避免 Plugins 层反向依赖 Net 层；为 null 时 PlayerName 留空。
+    /// </param>
+    public HookedPipeline(
+        IInboundPipeline inner,
+        IHookRegistry hooks,
+        ILogger logger,
+        Func<int, string?>? playerNameResolver = null)
     {
         _inner = inner; _hooks = hooks; _logger = logger;
+        _playerNameResolver = playerNameResolver;
     }
 
     public Task<AuthorityResult> ProcessAsync(
@@ -56,26 +66,80 @@ public sealed class HookedPipeline : IInboundPipeline
         return _inner.ProcessAsync(packet, playerId, commands, ct);
     }
 
-    /// <summary>把网络包映射到对应 Hook 参数（扩展点：新增包类型在此注册）。</summary>
+    /// <summary>
+    /// 把网络包映射到对应 Hook 参数并**填充包数据**（扩展点：新增包类型在此注册）。
+    /// 填充规则：只填解码器**已提取**的字段；未解码字段保持默认值（各 HookArgs 类型上有说明）。
+    /// 注意：不填包数据会让插件基于恒为 0 的字段做判断（如 Damage&gt;上限），静默失效。
+    /// </summary>
     private HookArgs? BuildHookArgs(INetworkPacket packet, int playerId)
     {
         // 注意：packet.Type 为 PacketId 枚举（Protocol 层定义）
-        var type = packet.Type;
-        HookArgs? args = type switch
+        HookArgs? args = packet switch
         {
-            // 玩家移动
-            PacketId.PlayerPosition => new PlayerMovingArgs { PlayerId = playerId },
-            // 战斗
-            PacketId.NpcStrike => new NpcStrikeArgs { PlayerId = playerId },
-            PacketId.ProjectileNew => new ProjectileSpawnArgs { PlayerId = playerId },
-            // 物品
-            PacketId.ItemDrop or PacketId.Chest => new ItemDropArgs { PlayerId = playerId },
-            // 世界
-            PacketId.TilePlace => new TilePlaceArgs { PlayerId = playerId },
-            PacketId.TileBreak => new TileBreakArgs { PlayerId = playerId },
+            // 玩家移动（包 13）
+            PlayerControlsPacket mv => new PlayerMovingArgs
+            {
+                PlayerId = playerId,
+                ToX = mv.Position.X,
+                ToY = mv.Position.Y,
+                VelocityX = mv.Velocity.X,
+                VelocityY = mv.Velocity.Y,
+            },
+            // 战斗（包 28）
+            NpcStrikePacket strike => new NpcStrikeArgs
+            {
+                PlayerId = playerId,
+                NpcId = strike.NpcId,
+                Damage = strike.Damage,
+            },
+            // 抛射物（包 27）
+            ProjectileNewPacket proj => new ProjectileSpawnArgs
+            {
+                PlayerId = playerId,
+                ProjectileId = proj.ProjectileKey,
+                Type = proj.ProjectileType,
+                X = proj.Position.X,
+                Y = proj.Position.Y,
+                VelocityX = proj.Velocity.X,
+                VelocityY = proj.Velocity.Y,
+                Damage = proj.Damage,
+            },
+            // 物品（包 21 丢弃 / 包 31 开箱）
+            ItemDropPacket drop => new ItemDropArgs
+            {
+                PlayerId = playerId,
+                ItemId = drop.ItemId,
+                Stack = drop.Stack,
+                X = drop.Position.X,
+                Y = drop.Position.Y,
+            },
+            ChestPacket chest => new ItemDropArgs
+            {
+                PlayerId = playerId,
+                X = chest.X,
+                Y = chest.Y,
+            },
+            // 世界（包 79 / 17）
+            TilePlacePacket place => new TilePlaceArgs
+            {
+                PlayerId = playerId,
+                X = place.X,
+                Y = place.Y,
+                TileType = place.TileType,
+            },
+            TileBreakPacket brk => new TileBreakArgs
+            {
+                PlayerId = playerId,
+                X = brk.X,
+                Y = brk.Y,
+                TileType = brk.TileType,
+            },
             _ => null
         };
-        if (args != null) args.PlayerName = ""; // TODO: 从 ConnectionManager 读取
+
+        if (args is not null)
+            args.PlayerName = _playerNameResolver?.Invoke(playerId) ?? "";
+
         return args;
     }
 }

@@ -59,14 +59,36 @@ public sealed class ConnectionManager
         }
     }
 
-    /// <summary>踢出指定玩家。</summary>
-    public async Task KickAsync(int playerId, string reason)
+    /// <summary>
+    /// 踢出指定玩家：先下发包 2（Disconnect，携带原因，客户端据此提示并主动断开），再关闭连接释放槽位。
+    /// 关闭走 dispose 路径：读循环随 socket 释放退出，由 NetworkHost 触发 PlayerLeft 清理。
+    /// </summary>
+    public async Task KickAsync(int playerId, string reason, CancellationToken ct = default)
     {
         var conn = Get(playerId);
         if (conn is null) return;
 
-        // TODO: 先发 DisconnectPacket(reason)，再关闭
+        // 先置为断开：该玩家后续入站包不再进入权威管线
+        conn.State = ConnectionState.Disconnected;
+
+        try
+        {
+            // 等待包 2 真正写入 socket 后再关闭：投递到出站通道不等于已发出，
+            // 直接关闭会丢帧（客户端看不到踢出原因）
+            await conn.SendEncodedAndFlushedAsync(PacketId.Disconnect, DisconnectPacket.WithReason(reason), ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // 取消即直接关闭，不再等待落盘
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Net] 踢出玩家 #{playerId} 时下发包 2 失败: {ex.Message}");
+        }
+
         await RemoveAsync(playerId).ConfigureAwait(false);
+        Console.WriteLine($"[Net] 已踢出玩家 #{playerId}：{reason}");
     }
 
     /// <summary>广播到所有活跃连接（供快照下发）。</summary>

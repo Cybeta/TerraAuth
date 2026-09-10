@@ -21,6 +21,12 @@ public sealed class WorldState
     // ---- 图格 ----
     public TileMap Tiles { get; set; } = new(1, 1);
 
+    /// <summary>
+    /// 区块分区锁：仿真线程写图格 / 其他线程读图格（包 10 编码、权威校验）时使用。
+    /// 详见 <see cref="SectionLocks"/>。
+    /// </summary>
+    public SectionLocks Sections { get; } = new();
+
     public int MaxTilesX { get; set; } = 1;
     public int MaxTilesY { get; set; } = 1;
 

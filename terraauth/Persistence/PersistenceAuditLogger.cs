@@ -11,6 +11,7 @@ using System;
 using System.Threading.Tasks;
 using TerraAuth.Authority;
 using TerraAuth.Monitoring;
+using TerraAuth.Security;
 
 namespace TerraAuth.Persistence;
 
@@ -18,7 +19,6 @@ public sealed class PersistenceAuditLogger : IAuditLogger
 {
     private readonly IAuditRepository _audit;
     private readonly IMetrics? _metrics;
-    private static readonly Guid _hostId = Guid.Empty; // 服务端事件占位
 
     /// <summary>违规回调：GameHost 订阅后实现"拦截→封禁"闭环。</summary>
     public Action<Guid, string>? OnViolation { get; set; }
@@ -31,7 +31,7 @@ public sealed class PersistenceAuditLogger : IAuditLogger
         // 1. 落库（异步入队，不阻塞管线）
         _audit.AppendAsync(new AuditEntry(
             Timestamp: e.Timestamp.UtcDateTime,
-            PlayerId: GetPlayerGuid(e.PlayerId),
+            PlayerId: PlayerIdentity.ToGuid(e.PlayerId),
             EventType: e.Action,
             Detail: $"{e.Category}:{e.Reason} {(e.Details is null ? "" : System.Text.Json.JsonSerializer.Serialize(e.Details))}",
             IpAddress: null));
@@ -45,13 +45,8 @@ public sealed class PersistenceAuditLogger : IAuditLogger
 
         // 3. 触发违规累计（GameHost 订阅 → BanManager）
         if (e.Category is "authority" or "rate" or "security")
-            OnViolation?.Invoke(GetPlayerGuid(e.PlayerId), e.Reason);
+            OnViolation?.Invoke(PlayerIdentity.ToGuid(e.PlayerId), e.Reason);
     }
 
     public Task FlushAsync() => Task.CompletedTask;
-
-    // PlayerId 在 AuditEvent 是 int（连接槽位），AuditEntry 用 Guid；此处做映射
-    // 生产应维护 ConnectionId → Guid 表；此处简化用确定性哈希
-    private static Guid GetPlayerGuid(int playerId)
-        => playerId == 0 ? _hostId : new Guid(playerId, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte)playerId);
 }

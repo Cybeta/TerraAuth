@@ -6,9 +6,9 @@ namespace TerraAuth.Simulation;
 public partial class WorldSimulator
 {
     /// <summary>
-    /// 从当前 WorldState 产出强类型快照（供 SnapshotBroadcaster 下发）。
+    /// 基于本 tick 已提取的实体视图产出强类型快照（供 SnapshotBroadcaster 下发）。
     /// 使用上一个快照做增量 Diff（BaseTick + 真实 xxHash32 校验和）。
     /// </summary>
-    internal SnapshotFrame BuildSnapshot(SnapshotFrame? previous)
-        => SnapshotFrame.BuildDelta(_world, previous);
+    internal SnapshotFrame BuildSnapshot(WorldEntityView view, SnapshotFrame? previous)
+        => SnapshotFrame.BuildDelta(view, previous);
 }

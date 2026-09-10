@@ -902,6 +902,131 @@ public class TileSectionCodecTests
 
     // ---- 测试辅助 ----
 
+    /// <summary>
+    /// 确定性验证：持有区块写锁时，包 10 编码必须被阻塞 —— 证明编码路径确实经过区块读锁
+    /// （不依赖竞态时机，因此能真正判别"有没有加锁"）。
+    /// </summary>
+    [Fact]
+    public async Task TileSectionEncode_BlocksWhileWriterHoldsSectionLock()
+    {
+        const int W = 200, H = 150;
+        var world = new WorldState { MaxTilesX = W, MaxTilesY = H, Tiles = new TileMap(W, H) };
+
+        // 模拟"仿真线程正在写该区块"。持锁/编码都用**独立线程**：本测试要求线程及时被调度，
+        // Task.Run 在线程池饱和时会延迟数秒，导致假失败（实测已发生）。
+        using var writeHeld = new ManualResetEventSlim(false);
+        using var releaseWrite = new ManualResetEventSlim(false);
+        var holder = new Thread(() =>
+        {
+            world.Sections.EnterWrite(0, 0);
+            try
+            {
+                writeHeld.Set();
+                releaseWrite.Wait(TimeSpan.FromSeconds(10));
+            }
+            finally
+            {
+                world.Sections.ExitWrite(0, 0);
+            }
+        }) { IsBackground = true };
+        holder.Start();
+
+        Assert.True(writeHeld.Wait(TimeSpan.FromSeconds(10)), "写锁未取得");
+
+        var encodeDone = false;
+        Exception? encodeError = null;
+        var encode = new Thread(() =>
+        {
+            try { EncodeThenDecode(world, 0, 0, W, H, out _, out _); }
+            catch (Exception ex) { encodeError = ex; }
+            finally { encodeDone = true; }
+        }) { IsBackground = true };
+        encode.Start();
+
+        try
+        {
+            await Task.Delay(200);
+            Assert.False(encodeDone, $"编码未被区块读锁阻塞（{(encodeError is null ? "已完成" : encodeError.ToString())}）");
+        }
+        finally
+        {
+            releaseWrite.Set();
+        }
+
+        Assert.True(encode.Join(TimeSpan.FromSeconds(15)), "释放写锁后编码应完成");
+        Assert.Null(encodeError);
+        holder.Join(TimeSpan.FromSeconds(5));
+    }
+
+    /// <summary>
+    /// 并发不变量：仿真线程反复切换图格，编码线程同时编码包 10。
+    /// 解码出的每一格都必须是"某个合法状态"，绝不能出现撕裂组合
+    /// （例如 Active=true 配 Type=0 —— 编码器按 ref 逐字段读 ~20B 的 Tile，无锁时可能读到混合值）。
+    /// <para>注：本测试依赖竞态显现，属补充验证；确定性判别由上面的持锁阻塞测试承担。</para>
+    /// </summary>
+    [Fact]
+    public void TileSection_ConcurrentTileWrites_NeverEncodeTornTile()
+    {
+        const int W = 200, H = 150, Guard = 50;
+        var world = new WorldState { MaxTilesX = W, MaxTilesY = H, Tiles = new TileMap(W, H) };
+        var sections = world.Sections;
+        var stop = false;
+        long writes = 0;
+
+        // 仿真线程：在 (false,0) 与 (true,1) 两个合法状态间反复切换。
+        // 用独立线程（非线程池）：线程池饱和时 Task 可能一直不被调度，导致"写入线程未执行"的假失败。
+        var writer = new Thread(() =>
+        {
+            bool placed = false;
+            while (!Volatile.Read(ref stop))
+            {
+                sections.EnterWrite(Guard, Guard);
+                try
+                {
+                    ref var t = ref world.Tiles[Guard, Guard];
+                    placed = !placed;
+                    t.Active = placed;
+                    t.Type = placed ? (ushort)1 : (ushort)0;
+                    t.Wall = 0;
+                }
+                finally
+                {
+                    sections.ExitWrite(Guard, Guard);
+                }
+
+                Interlocked.Increment(ref writes);
+            }
+        }) { IsBackground = true };
+        writer.Start();
+
+        try
+        {
+            // 读线程（本线程）：并发编码 + 解码，校验每格都是合法组合
+            for (int round = 0; round < 12; round++)
+            {
+                var decoded = EncodeThenDecode(world, 0, 0, W, H, out _, out _);
+
+                for (int x = 0; x < W; x++)
+                {
+                    for (int y = 0; y < H; y++)
+                    {
+                        var t = decoded[x, y];
+                        bool legal = (t.Active && t.Type == 1) || (!t.Active && t.Type == 0);
+                        Assert.True(legal,
+                            $"第 {round} 轮 (x={x}, y={y}) 出现撕裂图格：Active={t.Active}, Type={t.Type}");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref stop, true);
+            writer.Join(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.True(Interlocked.Read(ref writes) > 0, "写入线程未执行");
+    }
+
     private static Tile[,] EncodeThenDecode(
         WorldState world, int xStart, int yStart, int width, int height,
         out int chestCount, out int signCount)

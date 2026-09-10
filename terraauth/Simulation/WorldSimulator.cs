@@ -2,11 +2,12 @@
 // 架构 §4.3：六阶段确定性 tick
 
 using System.Collections.Generic;
+using TerraAuth.Concurrency; // DoubleBufferedWorldState（无依赖的通用原语，同 Authority 层用法）
 using TerraAuth.Protocol;
 
 namespace TerraAuth.Simulation;
 
-public partial class WorldSimulator
+public partial class WorldSimulator : IWorldViewProvider
 {
     private readonly WorldState _world;
     private readonly CommandQueue _commands;
@@ -14,7 +15,13 @@ public partial class WorldSimulator
     private readonly SnapshotStore _snapshots;
     private readonly IRng _rng = new XoshiroRng(0x12345);
 
+    /// <summary>双缓冲发布：仿真线程写 / 快照线程读，读取端无需加锁。</summary>
+    private readonly DoubleBufferedWorldState<WorldEntityView> _entityViews = new();
+
     public WorldState State => _world;
+
+    /// <summary>最近一次 tick 发布的实体视图（快照线程读取，见 <see cref="IWorldViewProvider"/>）。</summary>
+    public WorldEntityView CurrentEntityView => _entityViews.Current ?? WorldEntityView.Empty;
 
     public WorldSimulator(
         WorldState world,
@@ -50,8 +57,11 @@ public partial class WorldSimulator
         SimulateWorld();
 
         // 6. Output：产出快照（Phase 4）
-        var snapshot = BuildSnapshot(_snapshots.LatestOrDefault);
-        _snapshots.Add(snapshot);
+        //    同时发布本 tick 的不可变实体视图 —— 快照线程据此构建/裁剪快照，
+        //    不再直接读正在被本线程改动的 WorldState（见 WorldEntityView）。
+        var view = WorldEntityView.Extract(_world);
+        _snapshots.Add(BuildSnapshot(view, _snapshots.LatestOrDefault));
+        _entityViews.Publish(view);
     }
 
     // ---------- 各阶段（扩展点，逐步填充） ----------

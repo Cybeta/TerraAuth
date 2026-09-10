@@ -1,5 +1,8 @@
 // TerraAuth — Phase 3 验收测试
 
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 using TerraAuth.Simulation;
 using Xunit;
 
@@ -7,6 +10,60 @@ namespace TerraAuth.Tests;
 
 public class SimulationTests
 {
+    /// <summary>
+    /// 区块分区锁：写锁持有期间，同区块的读锁必须被阻塞（图格写入与包 10 编码 / 权威校验互斥）。
+    /// 注意：ReaderWriterLockSlim 写锁具线程亲和性，故由后台线程持锁并在同一线程释放。
+    /// </summary>
+    [Fact]
+    public async Task SectionLocks_WriteLock_ExcludesReaderOnSameSection()
+    {
+        var locks = new SectionLocks();
+        using var writeHeld = new ManualResetEventSlim(false);
+        using var releaseWrite = new ManualResetEventSlim(false);
+
+        // 持锁/抢锁都用**独立线程**而非线程池：本测试需要"线程一定能及时被调度"，
+        // 而 Task.Run 在线程池饱和时会延迟数秒，导致假失败（实测已发生）。
+        var holder = new Thread(() =>
+        {
+            locks.EnterWrite(tileX: 10, tileY: 10);
+            try
+            {
+                writeHeld.Set();
+                releaseWrite.Wait(TimeSpan.FromSeconds(10));
+            }
+            finally
+            {
+                locks.ExitWrite(tileX: 10, tileY: 10);
+            }
+        }) { IsBackground = true };
+        holder.Start();
+
+        Assert.True(writeHeld.Wait(TimeSpan.FromSeconds(10)), "写锁未取得");
+
+        var readerEntered = false;
+        var reader = new Thread(() =>
+        {
+            using (locks.EnterRead(10, 10, 10, 10))
+                readerEntered = true;
+        }) { IsBackground = true };
+        reader.Start();
+
+        try
+        {
+            // 写锁持有 → 读者进不来
+            await Task.Delay(200);
+            Assert.False(readerEntered);
+        }
+        finally
+        {
+            releaseWrite.Set();
+        }
+
+        Assert.True(reader.Join(TimeSpan.FromSeconds(10)), "释放写锁后读者应获得读锁");
+        Assert.True(readerEntered);
+        holder.Join(TimeSpan.FromSeconds(5));
+    }
+
     [Fact]
     public void GameLoop_Steps_AtFixedTimestep()
     {

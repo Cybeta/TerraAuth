@@ -1,7 +1,7 @@
 # TerraAuth 项目结构文档（合并后）
 
 > 本文档描述 **8 个源码工程合并为单一工程** 之后的实际结构。
-> 分层保留在目录与命名空间层面，工程层面只剩「1 个主工程 + 1 个测试工程」。
+> 分层保留在目录与命名空间层面，工程层面只剩「1 个主工程 + 1 个测试工程 + 1 个示例插件工程」。
 
 ---
 
@@ -43,7 +43,7 @@
 
 ```
 terraauth/
-├── TerraAuth.sln                 # 解决方案（1 主工程 + 1 测试）
+├── TerraAuth.sln                 # 解决方案（1 主工程 + 1 测试 + 1 示例插件）
 ├── TerraAuth.csproj              # ★ 单一主工程（Exe / net8.0）
 ├── Program.cs                    # 可执行入口：参数解析 → GameHost.Bootstrap → RunAsync
 ├── GameHost.cs                   # ★ 组装根：初始化全部模块 + 仿真/网络/快照三循环
@@ -72,6 +72,7 @@ terraauth/
 │   ├── GameLoop.cs               #   固定步长循环
 │   ├── WorldSimulator.cs         #   六阶段 tick（partial）
 │   ├── WorldSimulator.Snapshot.cs#   快照桥接
+│   ├── WorldEntityView.cs        #   每 tick 不可变实体视图（仿真→快照跨线程发布）
 │   ├── CommandQueue.cs           #   命令模型
 │   ├── SnapshotStore.cs          #   快照环形存储
 │   ├── SnapshotFrame.cs          #   快照帧
@@ -81,6 +82,7 @@ terraauth/
 │       ├── Tile.cs               #     Tile / TileMap
 │       ├── TileIdSets.cs         #     瓦片 ID 集合（FrameImportant 等）
 │       ├── WorldState.cs         #     世界状态
+│       ├── SectionLocks.cs       #     区块分区锁（图格读写互斥）
 │       └── WorldFileReader.cs    #     .wld 解析器
 │
 ├── Net/                          # Phase 4/5 网络层 ── namespace TerraAuth.Net.Phase4 / Phase5
@@ -116,6 +118,7 @@ terraauth/
 ├── Security/                     # 封禁            ── namespace TerraAuth.Security
 │   ├── IBanManager.cs
 │   ├── BanManager.cs             #   滑动窗口封禁
+│   ├── PlayerIdentity.cs         #   连接槽位 ↔ 封禁 Guid 的统一映射
 │   └── SqliteBanStore.cs
 │
 ├── Plugins/                      # 插件系统         ── namespace TerraAuth.Plugins
@@ -191,24 +194,24 @@ TerraAuth                     ← 组合根（Program / GameHost）
 
 | 模块 | 状态 | 说明 / 待办 |
 |------|------|-------------|
-| `Protocol/` | 部分 | 已定义 `PacketId` 与 1/2/3/4/6/7/8/9/12/49/129 等包契约；其余 200+ 包未定义 |
+| `Protocol/` | 部分 | 已定义 33 个 `PacketId` 常量与对应包契约（握手链 + 权威白名单 + 快照包 15 等）；原版 200+ 包按需补充 |
 | `Authority/` | 已实现 | 六子系统 + `InboundPipeline` 阶段链 |
 | `Simulation/`（核心） | 已实现 | `GameLoop` / `CommandQueue` / `SnapshotStore` / `EventRecorder` / 确定性 RNG |
 | `Simulation/World/` | 部分 | `Tile`/`TileMap`、`TileIdSets`（含 `tileFrameImportant`）、`WorldState`、`.wld` 解析、包 10 `TileSection` 编码均已实现 |
-| `Simulation/WorldSimulator` | 部分 | 主循环 / 快照已实现；`SimulateAi/Physics/Combat/World` 为空 TODO |
+| `Simulation/WorldSimulator` | 已实现 | 六阶段 tick 全部落地：AI（城镇 NPC 确定性游走）/ 物理（重力 + 图格碰撞 + 边界钳制）/ 战斗（下落伤害结算）/ 世界（昼夜 + 月相推进）；为简化模型，非原版全量物理 |
 | `Net/Phase4` | 部分 | 快照广播框架 + `BuildDelta`（实体提取 / 增量 / `Removed` / xxHash32 校验和）+ `SubmitInputs` Command 生成 + `ShadowPredictor` 影子预测（输入重放/速度钳制/偏差阈值）+ 每玩家分桶（`BuildFrameFor`）+ 视野裁剪（`ViewportRadius`）已实现 |
 | `Net/Phase5`（协议） | 部分 | `Framing` / `Connection` / 握手链已实现 |
-| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 3/7/9/8/10/12/49/129/13/2；包 10 `TileSection`（Deflate + 位标志 + RLE + 尾部列表）、包 15 `Snapshot`（BaseTick/Tick/Checksum/实体/Removed）已实现 |
+| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 28 类出站包（握手链 3/7/9/8/10/12/49/129 + 2/4/5/13/14/16/17/21/27/28/31/32/35/36/50/65/73/79/117/118）；包 10 `TileSection`（Deflate + 位标志 + RLE + 尾部列表）、包 15 `Snapshot`（BaseTick/Tick/Checksum/实体/Removed）已实现 |
 | `Net/Phase5` `PacketDecoder` | 部分 | 已解析 28 个入站包（握手链 + 权威白名单 10 包 + 伤害/死亡/传送等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
-| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 仍用 `DefaultWorldInfo` 占位 |
+| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（先发包 2 再关闭） |
 | `Config/` | 已实现 | `ServerConfig` + `FileSystemWatcher` 热重载 |
 | `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用；真实 `SqliteImpl` 为骨架 |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `/metrics` |
-| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` |
-| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路；示例插件见 `Examples/TerraAuth.ExamplePlugins/` |
+| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射） |
+| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计）；示例插件见 `Examples/TerraAuth.ExamplePlugins/` |
 | `ModCompat/` | 部分 | 策略 / 检测框架已实现；TModLoader 握手与 ModNet 解析为 TODO |
-| `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 骨架待接入仿真 |
-| `Tests/` | 部分 | 7 组验收测试（118 用例通过）；包 10 / 包 15 编解码回归已补，`.wld` 解析测试待补 |
+| `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
+| `Tests/` | 部分 | 7 组验收测试（138 用例通过）；包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、Hook 参数填充包数据、配置阈值启动映射与热重载、实体视图发布、区块分区锁并发安全（真实 TCP）已补，`.wld` 解析测试待补 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 文档 | 对抗测试手册（M/P/R 清单），尚未执行 |
 
@@ -226,7 +229,7 @@ dotnet build TerraAuth.csproj -p:NoSqlite=true
 # 运行
 dotnet run --project TerraAuth.csproj -- --config server.json --port 7777
 
-# 测试（122 用例）
+# 测试（138 用例）
 dotnet test Tests/TerraAuth.Tests.csproj
 
 # 无 SDK 环境静态校验（大括号平衡 / ProjectReference 路径 / 接口实现 / TODO 统计）

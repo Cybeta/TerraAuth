@@ -6,9 +6,12 @@ using System.Net;
 using System.Net.Sockets;
 using TerraAuth.Authority;
 using TerraAuth.Concurrency;
+using TerraAuth.Monitoring;
 using TerraAuth.Net.Phase4;
 using TerraAuth.Net.Phase5;
+using TerraAuth.Plugins;
 using TerraAuth.Protocol;
+using TerraAuth.Security;
 using TerraAuth.Simulation;
 using Xunit;
 
@@ -220,6 +223,260 @@ public class EndToEndTests
         }
     }
 
+    [Fact]
+    public async Task KickAsync_SendsDisconnect_ThenClosesConnection()
+    {
+        // Arrange：真实 TCP 监听，握手至 Playing 后由服务端主动踢出
+        var world = new WorldState();
+        var commands = new CommandQueue();
+        var pipeline = new InboundPipeline(new IPipelineStage[]
+        {
+            new FrameStage(),
+            new TerminalStage(),
+        });
+
+        var decoder = new PacketDecoder();
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var protocol = new TerrariaProtocol();
+        var connections = new ConnectionManager();
+
+        using var workers = new WorkerPool(2);
+        var network = new NetworkHost(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            decoder, encoder, protocol, connections, pipeline,
+            commands, workers, world);
+        network.Start();
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, network.BoundPort);
+            var stream = client.GetStream();
+
+            await HandshakeAsync(stream, encoder, protocol, "Kickee");
+            Assert.True(await WaitUntilAsync(
+                    () => connections.Get(1)?.State == ConnectionState.Playing, TimeSpan.FromSeconds(5)),
+                "客户端未进入 Playing");
+
+            // Act：踢出玩家 #1
+            await connections.KickAsync(1, "test kick");
+
+            // Assert 1：客户端收到包 2（Disconnect），且携带踢出原因
+            var kick = await ReadPacketAsync(stream, decoder, PacketId.Disconnect, TimeSpan.FromSeconds(5));
+            Assert.NotNull(kick);
+            Assert.Equal("test kick", Assert.IsType<DisconnectPacket>(kick).Reason);
+
+            // Assert 2：连接已移除（容量槽位释放）
+            Assert.True(await WaitUntilAsync(() => connections.Get(1) is null, TimeSpan.FromSeconds(5)),
+                "踢出后连接未从管理器移除");
+        }
+        finally
+        {
+            await network.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ViolationEscalation_KicksPlayer_AfterThreshold()
+    {
+        // Arrange：入站管线一律拒绝 + 阈值 2 次 / 60s
+        var world = new WorldState();
+        var commands = new CommandQueue();
+        var decoder = new PacketDecoder();
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var protocol = new TerrariaProtocol();
+        var connections = new ConnectionManager();
+
+        using var workers = new WorkerPool(2);
+        var network = new NetworkHost(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            decoder, encoder, protocol, connections, new AlwaysRejectPipeline(),
+            commands, workers, world,
+            violationKick: new ViolationKickLimits(MaxViolations: 2, WindowSeconds: 60));
+        network.Start();
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, network.BoundPort);
+            var stream = client.GetStream();
+
+            await HandshakeAsync(stream, encoder, protocol, "Cheater");
+            Assert.True(await WaitUntilAsync(
+                    () => connections.Get(1)?.State == ConnectionState.Playing, TimeSpan.FromSeconds(5)),
+                "客户端未进入 Playing");
+
+            // Act：连发 2 个必然被权威层拒绝的包（阈值 = 2）
+            await SendPacketAsync(stream, encoder, PacketId.PlayerPosition,
+                new PlayerControlsPacket(1, new Vector2(0f, 0f)));
+            await SendPacketAsync(stream, encoder, PacketId.PlayerPosition,
+                new PlayerControlsPacket(1, new Vector2(0f, 0f)));
+
+            // Assert：违规累计达阈值 → 客户端收到包 2，连接被移除
+            var kick = await ReadPacketAsync(stream, decoder, PacketId.Disconnect, TimeSpan.FromSeconds(5));
+            Assert.NotNull(kick);
+            Assert.Contains("Too many violations", Assert.IsType<DisconnectPacket>(kick).Reason);
+            Assert.True(await WaitUntilAsync(() => connections.Get(1) is null, TimeSpan.FromSeconds(5)),
+                "达阈值后连接未从管理器移除");
+        }
+        finally
+        {
+            await network.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Correction_IsSent_WithItsOwnPacketType()
+    {
+        // Arrange：管线对任意包都返回"纠正"，纠正包为背包槽同步（包 5，非健康包 16）
+        var world = new WorldState();
+        var commands = new CommandQueue();
+        var decoder = new PacketDecoder();
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var protocol = new TerrariaProtocol();
+        var connections = new ConnectionManager();
+
+        var correction = new InventorySlotPacket(Slot: 3, ItemId: 42, Stack: 1) { PlayerId = 1 };
+        using var workers = new WorkerPool(2);
+        var network = new NetworkHost(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            decoder, encoder, protocol, connections, new AlwaysCorrectPipeline(correction),
+            commands, workers, world);
+        network.Start();
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, network.BoundPort);
+            var stream = client.GetStream();
+
+            await HandshakeAsync(stream, encoder, protocol, "Correctee");
+            Assert.True(await WaitUntilAsync(
+                    () => connections.Get(1)?.State == ConnectionState.Playing, TimeSpan.FromSeconds(5)),
+                "客户端未进入 Playing");
+
+            // Act：发任意包 → 管线返回 Correct
+            await SendPacketAsync(stream, encoder, PacketId.PlayerPosition,
+                new PlayerControlsPacket(1, new Vector2(0f, 0f)));
+
+            // Assert：纠正包按自身类型（包 5 SyncEquipment）下发，而不是硬编码的包 16
+            var corrected = await ReadPacketAsync(
+                stream, decoder, PacketId.InventorySlot, TimeSpan.FromSeconds(5));
+            Assert.NotNull(corrected);
+            var slot = Assert.IsType<InventorySlotPacket>(corrected);
+            Assert.Equal(3, slot.Slot);
+            Assert.Equal(42, slot.ItemId);
+        }
+        finally
+        {
+            await network.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ServerApi_KickAndBan_TakeEffectOnLiveConnection()
+    {
+        // Arrange：真实 TCP + 插件服务端 API（此前 KickPlayer / BanPlayer 仅写审计、不生效）
+        var world = new WorldState();
+        var commands = new CommandQueue();
+        var pipeline = new InboundPipeline(new IPipelineStage[]
+        {
+            new FrameStage(),
+            new TerminalStage(),
+        });
+
+        var decoder = new PacketDecoder();
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var protocol = new TerrariaProtocol();
+        var connections = new ConnectionManager();
+        var bans = new RecordingBanManager();
+
+        using var workers = new WorkerPool(2);
+        var network = new NetworkHost(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            decoder, encoder, protocol, connections, pipeline,
+            commands, workers, world);
+        network.Start();
+
+        var server = new ServerApi(
+            new NoOpAuditLogger(), new PrometheusMetrics(), network, connections, bans, world);
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, network.BoundPort);
+            var stream = client.GetStream();
+
+            await HandshakeAsync(stream, encoder, protocol, "Target");
+            Assert.True(await WaitUntilAsync(
+                    () => connections.Get(1)?.State == ConnectionState.Playing, TimeSpan.FromSeconds(5)),
+                "客户端未进入 Playing");
+
+            // Assert 0：插件能读到真实玩家信息（名称来自包 4）
+            var online = Assert.Single(server.GetOnlinePlayers());
+            Assert.Equal(1, online.PlayerId);
+            Assert.Equal("Target", online.Name);
+            Assert.True(online.IsConnected);
+
+            // Act 1：插件踢出玩家 → 客户端收到包 2，原因来自插件
+            server.KickPlayer(1, "plugin kick");
+            var kick = await ReadPacketAsync(stream, decoder, PacketId.Disconnect, TimeSpan.FromSeconds(5));
+            Assert.NotNull(kick);
+            Assert.Equal("plugin kick", Assert.IsType<DisconnectPacket>(kick).Reason);
+
+            // Act 2：插件封禁玩家 → 封禁身份须与审计链路一致（否则封禁写入的是另一个身份）
+            server.BanPlayer(1, TimeSpan.FromHours(2), "cheating");
+            Assert.Equal(PlayerIdentity.ToGuid(1), bans.LastPlayerId);
+            Assert.Equal("cheating", bans.LastReason);
+            Assert.Equal(TimeSpan.FromHours(2), bans.LastDuration);
+        }
+        finally
+        {
+            await network.DisposeAsync();
+        }
+    }
+
+    /// <summary>测试替身：记录最近一次封禁请求（验证 ServerApi 的参数与身份映射）。</summary>
+    private sealed class RecordingBanManager : IBanManager
+    {
+        public Guid LastPlayerId { get; private set; }
+        public string? LastReason { get; private set; }
+        public TimeSpan? LastDuration { get; private set; }
+
+        public Task<bool> ReportViolationAsync(Guid playerId, string reason) => Task.FromResult(false);
+
+        public Task<bool> IsBannedAsync(Guid playerId, string ipAddress) => Task.FromResult(false);
+
+        public Task BanAsync(Guid playerId, string reason, TimeSpan? duration)
+        {
+            LastPlayerId = playerId;
+            LastReason = reason;
+            LastDuration = duration;
+            return Task.CompletedTask;
+        }
+
+        public Task UnbanAsync(Guid playerId, string reason) => Task.CompletedTask;
+    }
+
+    /// <summary>测试替身：一律拒绝的入站管线（验证"违规累计 → 踢出"处置闭环）。</summary>
+    private sealed class AlwaysRejectPipeline : IInboundPipeline
+    {
+        public Task<AuthorityResult> ProcessAsync(
+            INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct = default)
+            => Task.FromResult(AuthorityResult.Reject("test_reject"));
+    }
+
+    /// <summary>测试替身：一律返回"纠正"的入站管线（验证纠正包按自身类型下发）。</summary>
+    private sealed class AlwaysCorrectPipeline : IInboundPipeline
+    {
+        private readonly INetworkPacket _correction;
+        public AlwaysCorrectPipeline(INetworkPacket correction) => _correction = correction;
+
+        public Task<AuthorityResult> ProcessAsync(
+            INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct = default)
+            => Task.FromResult(AuthorityResult.Correct(_correction, "test_correct"));
+    }
+
     // ---------- 测试辅助：真实 TCP 收发 ----------
 
     /// <summary>真实 TCP 完成握手至 Playing（包 1 → 4 → 6 → 8 → 12）。</summary>
@@ -349,6 +606,82 @@ public class EndToEndTests
         catch (OperationCanceledException)
         {
             return null;
+        }
+    }
+
+    [Fact]
+    public async Task ConfigThresholds_AreApplied_ByBootstrap()
+    {
+        // 验证"改 server.json 即生效"：先前仅 MovementLimits 接入配置，其余走代码默认值
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-cfg-{Guid.NewGuid():N}.db");
+        var configPath = Path.Combine(Path.GetTempPath(), $"terraauth-cfg-{Guid.NewGuid():N}.json");
+        var dbPathDefault = Path.Combine(Path.GetTempPath(), $"terraauth-cfg-{Guid.NewGuid():N}.db");
+        var configPathDefault = Path.Combine(Path.GetTempPath(), $"terraauth-cfg-{Guid.NewGuid():N}.json");
+
+        // 自定义配置：单次伤害上限压到 1
+        await File.WriteAllTextAsync(configPath, "{ \"MaxSingleDamage\": 1 }");
+
+        try
+        {
+            // Act 1：自定义阈值 → 500 点伤害必须被拒
+            using (var host = GameHost.Bootstrap(dbPath, configPath, metricsPort: 0, port: 0))
+            {
+                var rejected = await host.Pipeline.ProcessAsync(
+                    new NpcStrikePacket(1, 500), playerId: 1, new CommandQueue(), default);
+                Assert.Equal(AuthorityDecision.Reject, rejected.Decision);
+                Assert.Equal("damage_exceeded", rejected.Reason);
+            }
+
+            // Act 2：默认阈值（配置缺失 → Bootstrap 生成默认）→ 同一包放行，证明差异确实来自配置
+            using (var host = GameHost.Bootstrap(dbPathDefault, configPathDefault, metricsPort: 0, port: 0))
+            {
+                var accepted = await host.Pipeline.ProcessAsync(
+                    new NpcStrikePacket(1, 500), playerId: 1, new CommandQueue(), default);
+                Assert.Equal(AuthorityDecision.Accept, accepted.Decision);
+            }
+        }
+        finally
+        {
+            foreach (var path in new[] { dbPath, configPath, dbPathDefault, configPathDefault })
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ConfigHotReload_UpdatesThresholds_WithoutRestart()
+    {
+        // 验证运行中改配置 → 阈值立即生效（此前 OnConfigurationChanged 只打印日志，改配置等于没用）
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-hot-{Guid.NewGuid():N}.db");
+        var configPath = Path.Combine(Path.GetTempPath(), $"terraauth-hot-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, "{ \"MaxSingleDamage\": 30000 }");
+
+        try
+        {
+            using var host = GameHost.Bootstrap(dbPath, configPath, metricsPort: 0, port: 0);
+
+            // 改动前：500 点伤害放行
+            var before = await host.Pipeline.ProcessAsync(
+                new NpcStrikePacket(1, 500), playerId: 1, new CommandQueue(), default);
+            Assert.Equal(AuthorityDecision.Accept, before.Decision);
+
+            // 运行中收紧阈值 → 重载（等价于 FileSystemWatcher 检测到文件变更后调用 Reload）
+            await File.WriteAllTextAsync(configPath, "{ \"MaxSingleDamage\": 1 }");
+            host.Config.Reload();
+
+            // 改动后：同一包被拒，无需重启
+            var after = await host.Pipeline.ProcessAsync(
+                new NpcStrikePacket(1, 500), playerId: 1, new CommandQueue(), default);
+            Assert.Equal(AuthorityDecision.Reject, after.Decision);
+            Assert.Equal("damage_exceeded", after.Reason);
+        }
+        finally
+        {
+            foreach (var path in new[] { dbPath, configPath })
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
         }
     }
 

@@ -46,33 +46,43 @@ public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, by
     {
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
             return;
-        ref var tile = ref world.Tiles[X, Y];
-        // Action=0：挖实心砖 → Active=false，Type=0
-        // Action=2/3：挖墙 → Wall=0
-        // >=5：电线/斜坡类 → 清对应 flag
-        switch (Action)
+
+        // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
+        world.Sections.EnterWrite(X, Y);
+        try
         {
-            case 0:
-                tile.Active = false;
-                tile.Type = 0;
-                tile.Wall = 0;
-                break;
-            case 2: // 挖墙
-            case 3:
-                tile.Wall = 0;
-                break;
-            default: // 电线、斜坡、激活器等 → 清对应位
-                if (Action >= 5)
-                {
-                    if (Action == 5) tile.Wire = false;
-                    else if (Action == 6) tile.Wire2 = false;
-                    else if (Action == 7) tile.Wire3 = false;
-                    else if (Action == 8) tile.Wire4 = false;
-                    else if (Action == 9) tile.Slope = 0;
-                    else if (Action == 10) tile.HalfBrick = false;
-                    else if (Action == 11) tile.Actuator = false;
-                }
-                break;
+            ref var tile = ref world.Tiles[X, Y];
+            // Action=0：挖实心砖 → Active=false，Type=0
+            // Action=2/3：挖墙 → Wall=0
+            // >=5：电线/斜坡类 → 清对应 flag
+            switch (Action)
+            {
+                case 0:
+                    tile.Active = false;
+                    tile.Type = 0;
+                    tile.Wall = 0;
+                    break;
+                case 2: // 挖墙
+                case 3:
+                    tile.Wall = 0;
+                    break;
+                default: // 电线、斜坡、激活器等 → 清对应位
+                    if (Action >= 5)
+                    {
+                        if (Action == 5) tile.Wire = false;
+                        else if (Action == 6) tile.Wire2 = false;
+                        else if (Action == 7) tile.Wire3 = false;
+                        else if (Action == 8) tile.Wire4 = false;
+                        else if (Action == 9) tile.Slope = 0;
+                        else if (Action == 10) tile.HalfBrick = false;
+                        else if (Action == 11) tile.Actuator = false;
+                    }
+                    break;
+            }
+        }
+        finally
+        {
+            world.Sections.ExitWrite(X, Y);
         }
     }
 }
@@ -85,10 +95,20 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
     {
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
             return;
-        ref var tile = ref world.Tiles[X, Y];
-        tile.Active = true;
-        tile.Type = (ushort)TileType;
-        tile.Wall = 0;
+
+        // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
+        world.Sections.EnterWrite(X, Y);
+        try
+        {
+            ref var tile = ref world.Tiles[X, Y];
+            tile.Active = true;
+            tile.Type = (ushort)TileType;
+            tile.Wall = 0;
+        }
+        finally
+        {
+            world.Sections.ExitWrite(X, Y);
+        }
     }
 }
 

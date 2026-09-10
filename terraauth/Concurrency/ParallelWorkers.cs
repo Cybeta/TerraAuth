@@ -68,38 +68,26 @@ public sealed class WorkerPool : IDisposable
 #endregion
 
 #region 2. 双缓冲 WorldState：仿真写 / 快照读 分离
-/// <summary>双缓冲状态容器：避免快照序列化与仿真推进互相阻塞。</summary>
+/// <summary>仿真写 / 快照读 的状态发布器：读取端无锁、无撕裂。</summary>
 /// <remarks>
-/// 约定：
-///   Logic 线程：GetWriteState() 写，Swap() 交换
-///   Snapshot 线程：GetReadonlyState() 读（短暂持锁仅取引用）
+/// 契约：
+///   仿真线程：每帧构建**完整且不可变**的状态对象 → <see cref="Publish"/>
+///   快照线程：<see cref="Current"/> 取最近发布的引用（仅取引用，不读内容）
+/// <para>
+/// 为何不提供「就地填充 + Swap」：只有两块缓冲时，读数慢于写帧的读者（仿真 60Hz vs
+/// 快照 20Hz 必然发生）会读到正被覆写的缓冲，且一次覆写跨过整块缓冲 —— 不安全。
+/// 因此发布对象必须不可变；也正因不可变，无需再做「脏区块增量复制」（原 TODO 随契约取消）。
+/// </para>
 /// </remarks>
-public sealed class DoubleBufferedWorldState<T> where T : class, new()
+public sealed class DoubleBufferedWorldState<T> where T : class
 {
-    private T _front = new();  // 仿真线程写
-    private T _back = new();   // 快照线程读
-    private volatile int _flip = 0;
-    private readonly object _swapLock = new();
+    private T? _published;
 
-    /// <summary>仿真线程获取可写状态。</summary>
-    public T GetWriteState() => _flip == 0 ? _front : _back;
+    /// <summary>仿真线程：发布本帧的完整状态（原子替换引用）。</summary>
+    public void Publish(T state) => Volatile.Write(ref _published, state);
 
-    /// <summary>快照线程获取只读状态（短暂持锁取引用）。</summary>
-    public T GetReadonlyState()
-    {
-        lock (_swapLock) { return _flip == 0 ? _back : _front; }
-    }
-
-    /// <summary>交换前后缓冲（仿真线程在帧末调用）。</summary>
-    public void Swap()
-    {
-        lock (_swapLock)
-        {
-            _flip = 1 - _flip;
-            // TODO: 增量复制变更（仅复制脏区块，非全量）
-            // CopyChanges(_flip == 0 ? _back : _front, _flip == 0 ? _front : _back);
-        }
-    }
+    /// <summary>快照线程：取最近发布的状态；尚未发布过时返回 <c>null</c>。</summary>
+    public T? Current => Volatile.Read(ref _published);
 }
 #endregion
 

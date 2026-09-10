@@ -563,6 +563,10 @@ public sealed class PacketEncoder : IPacketEncoder
     /// </summary>
     private static void WriteTileSection(Stream output, TileSectionPacket section)
     {
+        // 先在区块读锁内把图格拷成快照，再压缩：拷贝是 memcpy 级，
+        // 避免把 Deflate 的耗时压进锁内阻塞仿真线程的图格写入（详见 SectionLocks）。
+        var tiles = SnapshotTiles(section);
+
         using var deflate = new DeflateStream(output, CompressionLevel.Optimal, leaveOpen: true);
         using var bw = new BinaryWriter(deflate, System.Text.Encoding.UTF8, leaveOpen: true);
 
@@ -571,15 +575,40 @@ public sealed class PacketEncoder : IPacketEncoder
         bw.Write((short)section.Width);
         bw.Write((short)section.Height);
 
-        CompressTileBlockInner(bw, section.World, section.XStart, section.YStart, section.Width, section.Height);
+        CompressTileBlockInner(
+            bw, tiles, section.World, section.XStart, section.YStart, section.Width, section.Height);
+    }
+
+    /// <summary>在区块读锁内拷贝图格矩形（拷贝的是值，释放锁后即可安全使用）。</summary>
+    private static Tile[] SnapshotTiles(TileSectionPacket section)
+    {
+        var world = section.World;
+        int width = section.Width;
+        int height = section.Height;
+        var snapshot = new Tile[width * height];
+
+        using (world.Sections.EnterRead(
+                   section.XStart, section.YStart,
+                   section.XStart + width - 1, section.YStart + height - 1))
+        {
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = 0; x < width; x++)
+                    snapshot[x * height + y] = world.Tiles[section.XStart + x, section.YStart + y];
+            }
+        }
+
+        return snapshot;
     }
 
     /// <summary>
     /// 逐图格编码区块（等价 <c>NetMessage.CompressTileBlock_Inner</c>）。
     /// 每格写入 [可选 b2][可选 b3][可选 b4][主标志 b][payload][可选 RLE 计数]，主标志决定后续字节存在性。
+    /// <paramref name="tiles"/> 为区块图格的快照（列优先，索引 = (x-xStart)*height + (y-yStart)）。
     /// </summary>
     private static void CompressTileBlockInner(
-        BinaryWriter writer, WorldState world, int xStart, int yStart, int width, int height)
+        BinaryWriter writer, Tile[] tiles, WorldState world,
+        int xStart, int yStart, int width, int height)
     {
         // 尾部宝箱 / 牌子按坐标索引（原版通过 Chest.FindChest / Sign.ReadSign 查找）
         var chestByPos = new Dictionary<(int X, int Y), Chest>(world.Chests.Count);
@@ -602,7 +631,7 @@ public sealed class PacketEncoder : IPacketEncoder
         {
             for (int x = xStart; x < xStart + width; x++)
             {
-                ref var tile = ref world.Tiles[x, y];
+                ref var tile = ref tiles[(x - xStart) * height + (y - yStart)];
 
                 if (hasPrev && IsSameAs(in tile, in prev) && TileIdSets.AllowsSaveCompressionBatching(tile.Type))
                 {

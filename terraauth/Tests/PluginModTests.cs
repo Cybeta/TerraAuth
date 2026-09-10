@@ -287,6 +287,82 @@ public class PluginModTests
         Assert.Equal(1, inner.Calls); // Allow：继续走内层管线
     }
 
+    /// <summary>
+    /// Hook 参数必须携带**包数据**：否则插件基于恒为 0 的字段判断会静默失效
+    /// （示例插件 AntiCheatLitePlugin 就靠 args.Damage &gt; 上限 来拦截）。
+    /// </summary>
+    [Fact]
+    public async Task HookedPipeline_PopulatesNpcStrikeArgs_FromPacket()
+    {
+        NpcStrikeArgs? seen = null;
+        var hooks = new HookRegistry(new TestLogger());
+        hooks.Register<NpcStrikeArgs>(new TestPlugin(), a => { seen = a; return HookResult.Allow(); });
+
+        var pipeline = new HookedPipeline(new FakePipeline(), hooks, new TestLogger());
+        await pipeline.ProcessAsync(new NpcStrikePacket(NpcId: 42, Damage: 777), playerId: 3, new CommandQueue());
+
+        Assert.NotNull(seen);
+        Assert.Equal(3, seen!.PlayerId);
+        Assert.Equal(42, seen.NpcId);
+        Assert.Equal(777, seen.Damage); // 旧实现恒为 0 → 上限类插件永远不拦
+    }
+
+    [Fact]
+    public async Task HookedPipeline_PopulatesTileArgs_FromPacket()
+    {
+        TilePlaceArgs? placed = null;
+        var hooks = new HookRegistry(new TestLogger());
+        hooks.Register<TilePlaceArgs>(new TestPlugin(), a => { placed = a; return HookResult.Allow(); });
+
+        var pipeline = new HookedPipeline(new FakePipeline(), hooks, new TestLogger());
+        await pipeline.ProcessAsync(
+            new TilePlacePacket(X: 1234, Y: 567, TileType: 30), playerId: 1, new CommandQueue());
+
+        Assert.NotNull(placed);
+        Assert.Equal(1234, placed!.X);
+        Assert.Equal(567, placed.Y);
+        Assert.Equal(30, placed.TileType);
+    }
+
+    [Fact]
+    public async Task HookedPipeline_PopulatesPlayerName_FromResolver()
+    {
+        NpcStrikeArgs? seen = null;
+        var hooks = new HookRegistry(new TestLogger());
+        hooks.Register<NpcStrikeArgs>(new TestPlugin(), a => { seen = a; return HookResult.Allow(); });
+
+        var pipeline = new HookedPipeline(
+            new FakePipeline(), hooks, new TestLogger(),
+            playerNameResolver: id => id == 7 ? "Alice" : null);
+
+        await pipeline.ProcessAsync(new NpcStrikePacket(1, 10), playerId: 7, new CommandQueue());
+        Assert.Equal("Alice", seen!.PlayerName);
+
+        // 解析不到时保持空串（不得抛异常）
+        await pipeline.ProcessAsync(new NpcStrikePacket(1, 10), playerId: 8, new CommandQueue());
+        Assert.Equal("", seen!.PlayerName);
+    }
+
+    [Fact]
+    public async Task HookedPipeline_DenyBasedOnRealDamage_ShortCircuits()
+    {
+        // 用示例插件的判据（Damage 超上限即拒）验证参数填充真的让插件生效
+        var hooks = new HookRegistry(new TestLogger());
+        hooks.Register<NpcStrikeArgs>(new TestPlugin(),
+            a => a.Damage > 10000 ? HookResult.Deny("damage exceeded") : HookResult.Allow());
+
+        var inner = new FakePipeline();
+        var pipeline = new HookedPipeline(inner, hooks, new TestLogger());
+
+        var over = await pipeline.ProcessAsync(new NpcStrikePacket(1, 99999), playerId: 1, new CommandQueue());
+        Assert.Equal(AuthorityDecision.Reject, over.Decision);
+        Assert.Equal(0, inner.Calls);
+
+        var normal = await pipeline.ProcessAsync(new NpcStrikePacket(1, 50), playerId: 1, new CommandQueue());
+        Assert.Equal(AuthorityDecision.Accept, normal.Decision);
+        Assert.Equal(1, inner.Calls);
+    }
+
     [Fact]
     public async Task HookedPipeline_UnmappedPacket_SkipsHookAndDelegates()
     {

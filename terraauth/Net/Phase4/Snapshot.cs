@@ -69,6 +69,12 @@ public sealed class SnapshotBroadcaster
     private uint _tick;
 
     /// <summary>
+    /// 仿真线程发布的实体视图。接上后，广播线程（独立于仿真线程）构建/裁剪快照时
+    /// **不再读活动 WorldState**，从而消除数据竞争；为 null 时回退直读（测试 / 独立场景）。
+    /// </summary>
+    private readonly IWorldViewProvider? _views;
+
+    /// <summary>
     /// 当前快照 tick：优先取共享 <see cref="SnapshotStore"/> 的最新帧（由仿真线程写入），
     /// 否则回退到 <see cref="Enqueue"/> 记录值（独立 store 的测试场景）。
     /// </summary>
@@ -81,13 +87,15 @@ public sealed class SnapshotBroadcaster
         ISnapshotSender sender,
         IPacketEncoder encoder,
         int maxParallelism = 0,
-        SnapshotStore? store = null)
+        SnapshotStore? store = null,
+        IWorldViewProvider? views = null)
     {
         _world = world;
         _commands = commands;
         _config = config;
         _sender = sender;
         _encoder = encoder;
+        _views = views;
         _predictor = new ShadowPredictor(config);
         // 共享仿真层 store 时，仿真每 tick 写入即成为可下发帧；未传入则自持（测试/独立场景）
         _store = store ?? new SnapshotStore();
@@ -141,9 +149,22 @@ public sealed class SnapshotBroadcaster
         // 历史窗口不足（裁剪 / 容量淘汰 / 从未确认的落后玩家）→ 回退真全量，
         // 否则会在错误基线上发残缺 delta，客户端将缺失未变化实体。
         if (!CanServeDeltaFrom(frames, baseTick))
-            return Cull(SnapshotFrame.BuildDelta(_world, previous: null), playerId);
+            return Cull(BuildFullFrame(), playerId);
 
         return Cull(MergeSince(frames, baseTick), playerId);
+    }
+
+    /// <summary>
+    /// 构建全量快照帧：优先取仿真线程发布的不可变实体视图（广播线程不读活动 WorldState）；
+    /// 未接入视图提供方时回退直读（测试 / 独立场景）。
+    /// </summary>
+    private SnapshotFrame BuildFullFrame()
+    {
+        var view = _views?.CurrentEntityView;
+        if (view is not null && !ReferenceEquals(view, WorldEntityView.Empty))
+            return SnapshotFrame.Create(view.Tick, view.Entities, Array.Empty<RemovedEntity>(), baseTick: 0);
+
+        return SnapshotFrame.BuildDelta(_world, previous: null);
     }
 
     /// <summary>
@@ -201,11 +222,10 @@ public sealed class SnapshotBroadcaster
     private SnapshotFrame Cull(SnapshotFrame frame, int playerId)
     {
         float radius = _config.ViewportRadius;
-        if (radius <= 0f || !_world.Players.TryGetValue(playerId, out var player))
+        if (radius <= 0f || !TryGetViewportCenter(playerId, out var center))
             return frame; // 关闭裁剪 / 玩家尚未进入世界 → 原样下发
 
         float radiusSquared = radius * radius;
-        var center = player.Position;
 
         var kept = new List<EntityState>(frame.Entities.Count);
         var removed = new List<RemovedEntity>(frame.Removed.Count + frame.Entities.Count);
@@ -228,6 +248,36 @@ public sealed class SnapshotBroadcaster
         }
 
         return SnapshotFrame.Create(frame.Tick, kept, removed, baseTick: frame.BaseTick);
+    }
+
+    /// <summary>
+    /// 取视野裁剪中心（玩家权威坐标）。优先用已发布的实体视图，广播线程因此不触活动 WorldState；
+    /// 未接入视图时回退直读（测试 / 独立场景）。
+    /// </summary>
+    private bool TryGetViewportCenter(int playerId, out Vector2 center)
+    {
+        var view = _views?.CurrentEntityView;
+        if (view is not null && !ReferenceEquals(view, WorldEntityView.Empty))
+        {
+            // 视图内查不到该玩家 → 不裁剪也不改读活动状态（该玩家尚无 tick 数据）
+            if (view.ById.TryGetValue(playerId, out var entity))
+            {
+                center = entity.Position;
+                return true;
+            }
+
+            center = default;
+            return false;
+        }
+
+        if (_world.Players.TryGetValue(playerId, out var player))
+        {
+            center = player.Position;
+            return true;
+        }
+
+        center = default;
+        return false;
     }
 
     private static bool InRange(Vector2 position, Vector2 center, float radiusSquared)

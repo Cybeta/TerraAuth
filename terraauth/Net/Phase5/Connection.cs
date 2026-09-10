@@ -22,8 +22,9 @@ public enum ConnectionState
 
 /// <summary>
 /// 出站消息（由 SnapshotBroadcaster / 控制逻辑投递）。
+/// <paramref name="Flushed"/> 非空时，写循环在真正写入 socket 后置位（供"先发包再断开"等待）。
 /// </summary>
-public sealed record OutboundFrame(PacketId Type, byte[] Bytes);
+public sealed record OutboundFrame(PacketId Type, byte[] Bytes, TaskCompletionSource? Flushed = null);
 
 /// <summary>
 /// 单个客户端连接。
@@ -43,6 +44,10 @@ public sealed class Connection : IAsyncDisposable
     private readonly IPacketEncoder _encoder;
     private readonly DecodeContext _decodeContext;
     private readonly WorkerPool _workers;
+
+    /// <summary>写循环退出信号：供"等待落盘"的调用方判断"已不可能落盘"，避免依赖固定超时。</summary>
+    private readonly TaskCompletionSource _writeLoopExited =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public int PlayerId { get; internal set; }
     public ConnectionState State { get; internal set; } = ConnectionState.Handshaking;
@@ -146,17 +151,28 @@ public sealed class Connection : IAsyncDisposable
 
     private async Task WriteLoopAsync(CancellationToken ct)
     {
-        await foreach (var frame in _outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+        try
         {
-            try
+            await foreach (var frame in _outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                await _stream.WriteAsync(frame.Bytes, ct).ConfigureAwait(false);
-                await _stream.FlushAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    await _stream.WriteAsync(frame.Bytes, ct).ConfigureAwait(false);
+                    await _stream.FlushAsync(ct).ConfigureAwait(false);
+                    frame.Flushed?.TrySetResult(); // 该帧已落盘
+                }
+                catch (IOException)
+                {
+                    frame.Flushed?.TrySetResult(); // 写失败也要唤醒等待方，避免其挂起
+                    break; // 断开
+                }
             }
-            catch (IOException)
-            {
-                break; // 断开
-            }
+        }
+        finally
+        {
+            // 写循环退出（正常关闭 / 断开 / 异常）：唤醒所有等待落盘的调用方，
+            // 使它们无需依赖"魔法超时"判断"已不可能落盘"
+            _writeLoopExited.TrySetResult();
         }
     }
 
@@ -170,10 +186,33 @@ public sealed class Connection : IAsyncDisposable
 
     /// <summary>编码并投递（供 SnapshotBroadcaster 使用）。</summary>
     public ValueTask SendEncodedAsync(PacketId type, INetworkPacket packet, CancellationToken ct)
+        => SendEncodedAsync(type, packet, ct, flushed: null);
+
+    /// <summary>
+    /// 编码投递并等待该帧**真正写入 socket**。
+    /// 用于「必须先发出某包再断开」的场景（如踢出发包 2）：投递到出站通道不等于已发出，
+    /// 立即关闭 socket 会丢掉尚未落盘的帧。
+    /// </summary>
+    /// <remarks>
+    /// 等待是**事件驱动**的：要么该帧落盘，要么写循环退出（此时已不可能再落盘）。
+    /// 不使用固定超时 —— 机器负载高时固定超时会误判为"发不出去"并丢掉包（实测已发生）。
+    /// </remarks>
+    public async Task SendEncodedAndFlushedAsync(PacketId type, INetworkPacket packet, CancellationToken ct)
+    {
+        var flushed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await SendEncodedAsync(type, packet, ct, flushed).ConfigureAwait(false);
+
+        var finished = await Task.WhenAny(flushed.Task, _writeLoopExited.Task).WaitAsync(ct).ConfigureAwait(false);
+        if (finished == flushed.Task)
+            await flushed.Task.ConfigureAwait(false); // 展开写入侧异常（若有）
+    }
+
+    private ValueTask SendEncodedAsync(
+        PacketId type, INetworkPacket packet, CancellationToken ct, TaskCompletionSource? flushed)
     {
         var writer = new ArrayBufferWriter<byte>();
         _encoder.Encode(writer, type, packet);
-        return SendAsync(new OutboundFrame(type, writer.WrittenSpan.ToArray()), ct);
+        return SendAsync(new OutboundFrame(type, writer.WrittenSpan.ToArray(), flushed), ct);
     }
 
     public async ValueTask DisposeAsync()

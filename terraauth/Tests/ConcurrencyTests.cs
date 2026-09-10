@@ -72,33 +72,28 @@ public class ConcurrencyTests
     // 2. DoubleBufferedWorldState：读写分离（P2）
     // ========================================================================
     [Fact]
-    public void DoubleBuffer_GetWrite_GetRead_AreDifferentReferences()
+    public void DoubleBuffer_Current_IsNull_BeforeFirstPublish()
     {
         var buf = new DoubleBufferedWorldState<State>();
-        var write1 = buf.GetWriteState();
-        var write2 = buf.GetWriteState();
-        Assert.Same(write1, write2); // 写端始终返回同一 front
-
-        var readBefore = buf.GetReadonlyState();
-        Assert.NotSame(write1, readBefore); // 读写是不同缓冲
-
-        buf.Swap();
-        var readAfter = buf.GetReadonlyState();
-        Assert.Same(write1, readAfter); // Swap 后读端切换到原 front（即刚写入的缓冲）
+        Assert.Null(buf.Current); // 尚未发布 → 读取端拿到 null（调用方回退空视图）
     }
 
     [Fact]
-    public void DoubleBuffer_Swap_TogglesRoles()
+    public void DoubleBuffer_Publish_ReplacesCurrent_WithoutTouchingPrevious()
     {
         var buf = new DoubleBufferedWorldState<State>();
-        var front = buf.GetWriteState();
-        var back = buf.GetReadonlyState();
 
-        buf.Swap();
+        var first = new State { X = 1, Y = 1 };
+        buf.Publish(first);
+        Assert.Same(first, buf.Current);
 
-        // Swap 后：原来的 front 变成可读，原来的 back 变成可写
-        Assert.Same(front, buf.GetReadonlyState());
-        Assert.Same(back, buf.GetWriteState());
+        var second = new State { X = 2, Y = 2 };
+        buf.Publish(second);
+        Assert.Same(second, buf.Current);
+
+        // 关键：先前发布的对象不被改动 —— 慢读者可能仍持有其引用
+        Assert.Equal(1, first.X);
+        Assert.Equal(1, first.Y);
     }
 
     // ========================================================================

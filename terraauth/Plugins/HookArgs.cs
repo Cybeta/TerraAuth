@@ -31,6 +31,12 @@ public sealed class PlayerLeftArgs : HookArgs
 
 #region 玩家属性（对接 PlayerAuthority）
 /// <summary>玩家移动（可取消 / 可修改位置速度）。触发于 MovementAuthorityStage。</summary>
+/// <remarks>
+/// 已填充：<see cref="ToX"/> / <see cref="ToY"/> / <see cref="VelocityX"/> / <see cref="VelocityY"/>
+/// （取自包 13 客户端上报值；速度仅在该包携带时非 0）。
+/// 未填充（保持默认值）：<see cref="FromX"/> / <see cref="FromY"/>（触发点早于权威层，拿不到上一位置）、
+/// <see cref="IsFlying"/> / <see cref="IsUsingHook"/>（控制位语义未解析）。
+/// </remarks>
 public sealed class PlayerMovingArgs : HookArgs
 {
     public float FromX { get; set; }
@@ -69,6 +75,11 @@ public sealed class ItemPickupArgs : HookArgs
     public int Prefix { get; set; }
 }
 /// <summary>物品丢弃（可取消）。</summary>
+/// <remarks>
+/// 已填充：包 21（丢弃）填 <see cref="ItemId"/> / <see cref="Stack"/> / <see cref="X"/> / <see cref="Y"/>；
+/// 包 31（请求开箱）当前也映射到本类型，仅填 <see cref="X"/> / <see cref="Y"/>（箱子图格坐标），
+/// 此时 <see cref="ItemId"/> / <see cref="Stack"/> 为 0。
+/// </remarks>
 public sealed class ItemDropArgs : HookArgs
 {
     public int ItemId { get; set; }
@@ -80,6 +91,11 @@ public sealed class ItemDropArgs : HookArgs
 
 #region 战斗（对接 CombatAuthority）
 /// <summary>NPC 被攻击（可取消 / 可修改伤害）。触发于 CombatAuthorityStage。</summary>
+/// <remarks>
+/// 已填充：<see cref="NpcId"/> / <see cref="Damage"/>（取自包 28 解码结果）。
+/// 未填充（保持默认值）：<see cref="NpcType"/> / <see cref="Knockback"/> / <see cref="Direction"/> /
+/// <see cref="Critical"/> / <see cref="WeaponItemId"/> —— 解码器尚未提取这些字段。
+/// </remarks>
 public sealed class NpcStrikeArgs : HookArgs
 {
     public int NpcId { get; set; }
@@ -91,6 +107,11 @@ public sealed class NpcStrikeArgs : HookArgs
     public int WeaponItemId { get; set; }
 }
 /// <summary>抛射物生成（可取消 / 可修改）。</summary>
+/// <remarks>
+/// 已填充：<see cref="ProjectileId"/>（实体 key）/ <see cref="Type"/> / <see cref="X"/> / <see cref="Y"/> /
+/// <see cref="VelocityX"/> / <see cref="VelocityY"/> / <see cref="Damage"/>。
+/// 未填充（保持默认值）：<see cref="OwnerId"/> —— 包 27 未携带所有者信息（服务端应以发送者为准）。
+/// </remarks>
 public sealed class ProjectileSpawnArgs : HookArgs
 {
     public int ProjectileId { get; set; }

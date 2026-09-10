@@ -52,6 +52,9 @@ public sealed class GameHost : IDisposable
     private readonly MetricsHttpServer? _metricsServer;
     private readonly IAsyncDisposable? _pipelineDisposable;
 
+    /// <summary>权威子系统聚合：配置热重载时用于推送新阈值。</summary>
+    private readonly AuthorityEnforcers _enforcers;
+
     // ★ 已填充：注入真实实现（含扩展层）
     public GameHost(
         IConfigurationService config,
@@ -70,6 +73,7 @@ public sealed class GameHost : IDisposable
         ICustomPacketHandler customPackets,
         ParallelConfig parallel,
         WorkerPool workers,
+        AuthorityEnforcers enforcers,
         IAsyncDisposable? pipelineDisposable = null)
     {
         Config = config;
@@ -90,6 +94,7 @@ public sealed class GameHost : IDisposable
         CustomPackets = customPackets;
         Parallel = parallel;
         Workers = workers;
+        _enforcers = enforcers;
         _pipelineDisposable = pipelineDisposable;
 
         // 配置热更新 → 动态调整阈值（如 MaxWalkSpeed / MaxSingleDamage）
@@ -128,11 +133,16 @@ public sealed class GameHost : IDisposable
         var commands = new CommandQueue();
         var recorder = new EventRecorder();
         var snapshots = new SnapshotStore();
-        var rate = new RateLimits();
         var auditLogger = new PersistenceAuditLogger(db, metrics);
-        // 移动权威阈值取自 ServerConfig（架构 §4.5 唯一来源）；用飞行上限覆盖步行/冲刺，降低误判
-        var enforcers = new AuthorityEnforcers(rate, auditLogger, world,
-            new MovementLimits(config.Current.MaxFlightSpeed, config.Current.TeleportTolerance));
+
+        // 权威阈值统一取自 ServerConfig（架构 §4.5 唯一来源）：限流 + 六个子系统全部显式映射，
+        // 杜绝"改了 server.json 却不生效"——先前仅 MovementLimits 接入，其余走代码默认值，
+        // 而默认值恰与 ServerConfig 默认值相同（除挖砖上限），问题被完全掩盖。
+        // 移动限速用飞行上限覆盖步行/冲刺，降低误判。
+        var thresholds = AuthorityThresholds.From(config.Current);
+        var enforcers = new AuthorityEnforcers(thresholds.Rate, auditLogger, world,
+            thresholds.Movement, thresholds.Player, thresholds.Combat,
+            thresholds.Inventory, thresholds.World);
 
         // 管线阶段顺序（越早拒绝成本越低）
         var pipeline = new InboundPipeline(new IPipelineStage[]
@@ -165,25 +175,17 @@ public sealed class GameHost : IDisposable
 
         // 4. 权威管线分片装饰（P2：按玩家分片并行，同玩家保序）+ 叠加 Hook 触发
         var shardedPipeline = new ShardedInboundPipeline(pipeline, parallelConfig.ShardCount);
-        var hookedPipeline = new HookedPipeline(shardedPipeline, hooks, logger);
+        // 玩家名解析用延迟绑定：HookedPipeline 必须先于 NetworkHost 构造（NetworkHost 依赖它），
+        // 故以闭包捕获局部变量；实际调用发生在运行期，届时 networkForNames 已赋值。
+        NetworkHost? networkForNames = null;
+        var hookedPipeline = new HookedPipeline(shardedPipeline, hooks, logger,
+            playerNameResolver: id =>
+                networkForNames is not null && networkForNames.TryGetPlayerName(id, out var n) ? n : null);
 
-        // 5. 插件上下文 + 加载器
-        var pluginContext = new PluginContext(
-            hooks: hooks,
-            logger: logger,
-            configuration: new CoreConfiguration(config),
-            metrics: new CoreMetrics(metrics),
-            server: new ServerApi(auditLogger, metrics),
-            eventStore: new CoreEventStore(auditLogger));
-        var pluginLoader = new PluginLoader(
-            pluginDirectory: System.IO.Path.Combine(System.AppContext.BaseDirectory, "plugins"),
-            logger: logger,
-            context: pluginContext);
-
-        // 6. 仿真层（Phase 3）
+        // 5. 仿真层（Phase 3）
         var simulator = new WorldSimulator(world, commands, recorder, snapshots);
 
-        // 7. 网络层（Phase 5）——先建，以便把 SnapshotSender 注入快照广播
+        // 6. 网络层（Phase 5）——先建，以便把 SnapshotSender 注入快照广播
         var protocol = new TerrariaProtocol();
         var connections = new ConnectionManager(config.Current.MaxConnections);
         var decoder = new PacketDecoder();
@@ -191,7 +193,25 @@ public sealed class GameHost : IDisposable
         var network = new NetworkHost(
             new IPEndPoint(IPAddress.Any, port),
             decoder, encoder, protocol, connections, hookedPipeline, commands, workers, world,
-            config.Current.PlayerWhitelist, hooks);
+            config.Current.PlayerWhitelist, hooks,
+            new ViolationKickLimits(
+                config.Current.MaxViolationsBeforeBan,
+                config.Current.ViolationWindowMinutes * 60));
+        networkForNames = network; // HookedPipeline 的玩家名解析延迟绑定到此
+
+        // 7. 插件上下文 + 加载器
+        // 必须在网络层之后：ServerApi 需要连接管理（踢出/在线查询）与封禁管理器才能真实生效
+        var pluginContext = new PluginContext(
+            hooks: hooks,
+            logger: logger,
+            configuration: new CoreConfiguration(config),
+            metrics: new CoreMetrics(metrics),
+            server: new ServerApi(auditLogger, metrics, network, connections, bans, world),
+            eventStore: new CoreEventStore(auditLogger));
+        var pluginLoader = new PluginLoader(
+            pluginDirectory: System.IO.Path.Combine(System.AppContext.BaseDirectory, "plugins"),
+            logger: logger,
+            context: pluginContext);
 
         // 8. 快照广播（Phase 4）——ServerConfig → SnapshotConfig 的映射属组合根职责
         var snapshotConfig = new SnapshotConfig
@@ -203,11 +223,13 @@ public sealed class GameHost : IDisposable
         var broadcaster = new SnapshotBroadcaster(
             world, commands, snapshotConfig, network.SnapshotSender, encoder,
             maxParallelism: parallelConfig.BackgroundThreads,
-            store: snapshots); // 与仿真层共享同一 store：仿真每 tick 写入即成为可下发帧
+            store: snapshots,      // 与仿真层共享同一 store：仿真每 tick 写入即成为可下发帧
+            views: simulator);     // 广播线程只读仿真发布的实体视图，不触活动 WorldState
 
         var host = new GameHost(
             config, db, db, metrics, bans, network, hookedPipeline, simulator, broadcaster, metricsServer,
-            hooks, pluginLoader, modDetector, customPackets, parallelConfig, workers, shardedPipeline);
+            hooks, pluginLoader, modDetector, customPackets, parallelConfig, workers, enforcers,
+            shardedPipeline);
 
         // 订阅审计：权威层 Reject → Metrics + Ban 累计（架构 §4.5 数据流）
         auditLogger.OnViolation += (playerId, reason) =>
@@ -269,14 +291,17 @@ public sealed class GameHost : IDisposable
     }
 
     // ========================================================================
-    // 配置热更新 → 权威子系统（IConfigurationObserver 模式）
+    // 配置热更新 → 权威子系统
     // ========================================================================
     private void OnConfigurationChanged(ServerConfig cfg)
     {
-        // 把阈值推送给权威子系统（如运行时收紧 MaxWalkSpeed）
-        // 各 Authority 持有 ServerConfig 引用即可自动读到新值（Current 是引用类型）
-        Metrics.SetAuthorityOverhead(0); // placeholder：触发一次采样
-        Console.WriteLine($"[Config] 热重载：MaxWalkSpeed={cfg.MaxWalkSpeed}, MaxSingleDamage={cfg.MaxSingleDamage}");
+        // 把全部新阈值推送给已构造的权威子系统：子系统以引用整体替换阈值，无需重启即生效
+        var t = AuthorityThresholds.From(cfg);
+        _enforcers.UpdateThresholds(t.Rate, t.Player, t.Movement, t.Combat, t.Inventory, t.World);
+
+        Console.WriteLine(
+            $"[Config] 热重载已生效：MaxSingleDamage={cfg.MaxSingleDamage}, " +
+            $"MaxTileBreakPerSecond={cfg.MaxTileBreakPerSecond}, MaxPlayerHp={cfg.MaxPlayerHp}");
     }
 
     public void Dispose()
@@ -301,5 +326,34 @@ public sealed class GameHost : IDisposable
             new ServerConfig(), new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
         File.WriteAllText(path, json);
         return path;
+    }
+
+    /// <summary>
+    /// ServerConfig → 权威阈值集合。启动注入与热重载共用同一映射，保证阈值来源唯一（架构 §4.5），
+    /// 避免两处各写一份导致"启动值与热更新值不一致"。
+    /// </summary>
+    private readonly record struct AuthorityThresholds(
+        RateLimits Rate,
+        PlayerLimits Player,
+        MovementLimits Movement,
+        CombatLimits Combat,
+        InventoryLimits Inventory,
+        WorldLimits World)
+    {
+        public static AuthorityThresholds From(ServerConfig c) => new(
+            Rate: new RateLimits
+            {
+                MaxPacketsPerSecond = c.MaxPacketsPerSecond,
+                MaxTileBreakPerSecond = c.MaxTileBreakPerSecond,
+                MaxTilePlacePerSecond = c.MaxTilePlacePerSecond,
+                MaxProjectilesPerSecond = c.MaxProjectilesPerSecond,
+                MaxChatPerMinute = c.MaxChatPerMinute,
+            },
+            Player: new PlayerLimits(c.MaxPlayerHp, c.MaxPlayerMana),
+            // 移动限速用飞行上限覆盖步行/冲刺，降低误判
+            Movement: new MovementLimits(c.MaxFlightSpeed, c.TeleportTolerance),
+            Combat: new CombatLimits(c.MaxSingleDamage, c.MaxDpsWindowSeconds, c.MaxDps),
+            Inventory: new InventoryLimits(c.SscEnabled, c.MaxStackSize),
+            World: new WorldLimits(c.MaxTileBreakPerSecond, c.MaxTilePlacePerSecond));
     }
 }

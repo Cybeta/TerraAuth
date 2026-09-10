@@ -11,6 +11,10 @@ public record ServerConfig
     public int SnapshotRateHz { get; init; } = 20;
     public float ViewportRadius { get; init; } = 2000f;   // 快照视野半径（像素）；0 = 不裁剪
 
+    // ---- 玩家属性权威 (Phase 2 IPlayerAuthority) ----
+    public int MaxPlayerHp { get; init; } = 500;           // 玩家生命上限（客户端不得抬高，超出即纠正）
+    public int MaxPlayerMana { get; init; } = 200;         // 玩家法力上限
+
     // ---- 移动权威 (Phase 2 IMovementAuthority) ----
     public float MaxWalkSpeed { get; init; } = 3.6f;      // 单位/秒，对应 terraria 基础移速
     public float MaxFlightSpeed { get; init; } = 8.0f;
@@ -28,13 +32,17 @@ public record ServerConfig
     public int MaxTilePlacePerSecond { get; init; } = 40;  // 每秒放砖上限
     public int MaxProjectilesPerSecond { get; init; } = 30;
 
+    // ---- 限流权威 (Phase 2 IRateAuthority) ----
+    public int MaxPacketsPerSecond { get; init; } = 120;   // 单玩家每秒上行包总量上限
+    public int MaxChatPerMinute { get; init; } = 30;       // 单玩家每分钟聊天上限
+
     // ---- 库存权威 (Phase 2 IInventoryAuthority) ----
     public bool SscEnabled { get; init; } = true;          // Server Side Characters
     public int MaxStackSize { get; init; } = 999;          // 单格最大堆叠
 
-    // ---- 封禁 (Phase 6 IBanManager) ----
-    public int MaxViolationsBeforeBan { get; init; } = 10; // 累计违规达此值自动封禁
-    public int ViolationWindowMinutes { get; init; } = 60; // 违规时间窗口（滑动）
+    // ---- 封禁 / 违规处置 (Phase 6 IBanManager + Phase 5 连接处置) ----
+    public int MaxViolationsBeforeBan { get; init; } = 10; // 窗口内累计违规达此值 → 封禁记录 + 踢出连接
+    public int ViolationWindowMinutes { get; init; } = 60; // 违规时间窗口（滑动，分钟）
 
     // ---- 连接认证 (Phase 5) ----
     /// <summary>玩家名白名单（包 4 SyncPlayer）；为空表示不限制。</summary>

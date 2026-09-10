@@ -3,7 +3,9 @@
 > **目标**：在不修改原版 Terraria 客户端的前提下，用重写的服务端实现服务端权威（Server Authority），
 > 将"CE 改内存"类作弊做到**架构性失效**（L4 天花板，详见 [`architecture.md`](architecture.md)）。
 >
-> **当前状态**：Phase 1-7 骨架 + Phase 6 完整实装 + **插件系统 / Mod 兼容层 / 多线程优化**（已整合）；
+> **当前状态**：Phase 1-7 骨架 + Phase 6 完整实装 + **插件系统 / Mod 兼容层 / 多线程优化**（已整合）
+> + **Tile（挖 / 放方块）服务端权威全链路**（解码 → 权威校验 → Command → 仿真 → 增量广播 → SSC 背包扣减）
+> + **违规处置闭环**（权威拒绝累计达阈值 → 发包 2 踢出连接）；
 > 原版 Terraria 客户端已实测连接成功（协议协商 → 进入世界）。
 
 ---
@@ -14,7 +16,7 @@
 terraauth/
 ├── architecture.md          # 架构文档（分层、模块、协议映射、验收 KPI）
 ├── PROJECT_STRUCTURE.md     # 合并后项目结构文档（目录树 / 工程配置 / 模块状态）
-├── TerraAuth.sln            # 解决方案（1 主工程 + 1 测试）
+├── TerraAuth.sln            # 解决方案（1 主工程 + 1 测试 + 1 示例插件）
 ├── TerraAuth.csproj         # ★ 单一工程：收拢全部分层源码（Protocol/Authority/Simulation/Net/...）
 ├── GameHost.cs              # ★ 组装根：Bootstrap() 一键初始化全部模块
 ├── Program.cs               # 可执行入口（--config / --db / --port / --metrics-port）
@@ -38,6 +40,8 @@ terraauth/
 ├── ModCompat/                # ★ Mod 兼容层（需求 2：Mod 服务器支持）
 ├── Concurrency/              # ★ 多线程优化（多 CPU 线程）
 │
+├── Examples/                 # ★ 示例插件工程（WelcomePlugin / AntiCheatLitePlugin）
+│   └── TerraAuth.ExamplePlugins/
 ├── Tests/                    # ★ 验收测试（xUnit，7 组覆盖全链路）
 │   └── TerraAuth.Tests.csproj
 ├── Phase6-Infrastructure/    # 基础设施层设计文档（实现落在 Config/Persistence/Monitoring/Security）
@@ -53,6 +57,7 @@ TerraAuth.csproj（单工程 / 单程序集，OutputType=Exe）
         · Concurrency · Config / Persistence / Monitoring / Security
 
 TerraAuth.Tests ──▶ TerraAuth.csproj（同程序集，经 InternalsVisibleTo 访问 internal）
+TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=false，构建后 DLL 复制到服务端 plugins/）
 ```
 
 ### 模块实现状态
@@ -61,24 +66,24 @@ TerraAuth.Tests ──▶ TerraAuth.csproj（同程序集，经 InternalsVisible
 
 | 模块 | 状态 | 说明 / 待办 |
 |------|------|-------------|
-| `Protocol/` | 部分 | 已定义 `PacketId` 与 1/2/3/4/6/7/8/9/12/49/129 等包契约；其余 200+ 包未定义 |
+| `Protocol/` | 部分 | 已定义 33 个 `PacketId` 常量与对应包契约（握手链 + 权威白名单 + 快照包 15 等）；原版 200+ 包按需补充 |
 | `Authority/` | 已实现 | 六子系统（Inventory/Movement/Combat/Player/World/Rate）+ `InboundPipeline` 阶段链 |
 | `Simulation/`（核心） | 已实现 | `GameLoop` 固定步长 / `CommandQueue` / `SnapshotStore` / `EventRecorder` / 确定性 RNG |
 | `Simulation/World/` | 部分 | `Tile`/`TileMap`、`TileIdSets`（含 `tileFrameImportant`）、`WorldState`、`.wld` 解析器、包 10 `TileSection` 编码均已实现 |
-| `Simulation/WorldSimulator` | 部分 | 主循环 / 快照已实现；`SimulateAi/Physics/Combat/World` 为空 TODO |
+| `Simulation/WorldSimulator` | 已实现 | 六阶段 tick 全部落地：AI（城镇 NPC 确定性游走）/ 物理（重力 + 图格碰撞 + 边界钳制）/ 战斗（下落伤害结算）/ 世界（昼夜 + 月相推进）；为简化模型，非原版全量物理 |
 | `Net/Phase4` | 部分 | 快照广播框架 + `BuildDelta`（实体提取 / 增量 / `Removed` / xxHash32 校验和）+ `SubmitInputs` Command 生成 + `ShadowPredictor` 影子预测（输入重放/速度钳制/偏差阈值）+ 每玩家分桶（`BuildFrameFor`）+ 视野裁剪（`ViewportRadius`）已实现 |
 | `Net/Phase5`（协议） | 部分 | `Framing` / `Connection` / 握手链（1→3、6→7、8→9/10/49、12→129）已实现 |
-| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 3/7/9/8/10/12/49/129/13/2；包 10 `TileSection`（Deflate + 位标志 + RLE + 尾部列表）、包 15 `Snapshot`（BaseTick/Tick/Checksum/实体/Removed）已实现 |
+| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 28 类出站包（握手链 3/7/9/8/10/12/49/129 + 2/4/5/13/14/16/17/21/27/28/31/32/35/36/50/65/73/79/117/118）；包 10 `TileSection`（Deflate + 位标志 + RLE + 尾部列表）、包 15 `Snapshot`（BaseTick/Tick/Checksum/实体/Removed）已实现 |
 | `Net/Phase5` `PacketDecoder` | 部分 | 已解析 28 个入站包（握手链 + 权威白名单 10 包 + 伤害/死亡/传送等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
-| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 仍用 `DefaultWorldInfo` 占位 |
-| `Config/` | 已实现 | `ServerConfig` + `FileSystemWatcher` 热重载 |
+| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**等待包 2 真正落盘后**再关闭，事件驱动等待、无固定超时） |
+| `Config/` | 已实现 | `ServerConfig`（反作弊阈值唯一来源）+ `FileSystemWatcher` 热重载，阈值热更新直接推送至已构造的权威子系统（无需重启） |
 | `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用（默认路径：`TerraAuth.csproj` 未定义 `USE_SQLITE`）；真实 `SqliteImpl` 为骨架（SQL 省略） |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `HttpListener` `/metrics` |
-| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` |
-| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路 |
+| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射） |
+| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据，插件可按 Damage / 方块坐标等真实值决策）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计） |
 | `ModCompat/` | 部分 | 策略 / 检测框架已实现；TModLoader 握手与 ModNet 解析为 TODO |
-| `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 骨架待接入仿真 |
-| `Tests/` | 部分 | 7 组验收测试（122 用例通过）；真实 TCP 往返集成测试（包 13 → 快照包 15 / 双客户端包 13 转发）、包 10 / 包 15 编解码回归已补，`.wld` 解析测试待补 |
+| `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
+| `Tests/` | 部分 | 7 组验收测试（138 用例通过）；真实 TCP 往返集成测试（包 13 → 快照包 15 / 双客户端包 13 转发 / 踢出下发包 2 / 违规阈值触发踢出 / 纠正包按自身类型下发 / 插件 API 踢出与封禁）、配置阈值启动映射与热重载、实体视图发布（快照线程不读活动 WorldState）、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试已补，`.wld` 解析测试待补 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 文档 | 对抗测试手册（M/P/R 清单），尚未执行 |
 
@@ -93,8 +98,8 @@ TerraAuth.Tests ──▶ TerraAuth.csproj（同程序集，经 InternalsVisible
 | `Plugins/HookArgs.cs` | 全部 Hook 参数类型（Player/Combat/World/Server/Economy） |
 | `Plugins/HookRegistry.cs` | 线程安全注册表、优先级排序、Deny 短路、Modified 传递 |
 | `Plugins/PluginLoader.cs` | DLL 反射加载、依赖拓扑排序、热重载 |
-| `Plugins/HookIntegration.cs` | `HookedPipeline` 装饰器 —— 权威管线插入 Hook 的接入点 |
-| `CoreAdapter.cs`（根目录） | 核心类型 ↔ 插件接口桥接 |
+| `Plugins/HookIntegration.cs` | `HookedPipeline` 装饰器 —— 权威管线插入 Hook 的接入点；**Hook 参数已填充包数据**（NpcId/Damage、方块坐标、抛射物、物品）与玩家名 |
+| `CoreAdapter.cs`（根目录） | 核心类型 ↔ 插件接口桥接；`ServerApi` 实装踢出 / 封禁 / 在线玩家查询 / 服务器信息 |
 | `Plugins/README.md` | **插件开发指南**（Hook 列表 / 示例 / 生命周期 / 最佳实践） |
 | `Tests/PluginModTests.cs` | Hook 注册/触发/Deny/Modify/卸载 验证 |
 
@@ -130,11 +135,12 @@ TerraAuth.Tests ──▶ TerraAuth.csproj（同程序集，经 InternalsVisible
 |------|------|
 | `Concurrency/ParallelConfig.cs` | `ParallelConfig` / `AtomicCounter` / `MpscQueue` / 读写锁原语 |
 | `Concurrency/ParallelWorkers.cs` | `WorkerPool` / `DoubleBufferedWorldState` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` |
+| `Simulation/WorldEntityView.cs` | 每 tick 不可变实体视图（仿真线程发布 → 快照线程只读） |
 | `Concurrency/README.md` | **并行优化分析**（并行边界 / 线程模型 / 收益预估 / 风险 / 执行优先级） |
 | `Tests/ConcurrencyTests.cs` | 各并行组件 + 确定性校验 |
 
-**已接入**：`GameHost` 实例化 `WorkerPool` + `ParallelConfig`；`HookedPipeline → ShardedInboundPipeline → InboundPipeline`（按玩家分片并行、同玩家保序）；`ParallelSnapshotBroadcaster` 接入 `SnapshotBroadcaster`；插件 Hook 触发通过 `HookRegistry`（线程安全）。
-**待推进（P3+）**：把 `DoubleBufferedWorldState` 替换 `WorldSimulator` 状态引用。
+**已接入**：`GameHost` 实例化 `WorkerPool` + `ParallelConfig`；`HookedPipeline → ShardedInboundPipeline → InboundPipeline`（按玩家分片并行、同玩家保序）；`ParallelSnapshotBroadcaster` 接入 `SnapshotBroadcaster`；插件 Hook 触发通过 `HookRegistry`（线程安全）；`DoubleBufferedWorldState` 接入 `WorldSimulator` → `SnapshotBroadcaster`（快照线程只读已发布视图，不再触碰活动 `WorldState`）；`SectionLocks` 区块分区锁接入图格读写（仿真写 vs 包 10 编码/权威校验读）。
+**P4 进展**：已实装「区块分区锁」；「并行区块仿真」暂缓（`MaxConnections=64` 使收益场景不成立、仿真非瓶颈、且并行前须先做每实体确定性 RNG 流）—— 详见 [`Concurrency/README.md`](Concurrency/README.md) §六。
 
 ---
 
@@ -179,9 +185,9 @@ python3 verify.py
 | **P0** | ✅ 持久化异步化（`SqlitePersistence` 审计走无界 `Channel` + 批量落盘） | 中 | 低 |
 | **P1** | ✅ 插件系统联调（`Examples/TerraAuth.ExamplePlugins` 示例插件 + `HookedPipeline` 端到端链路） | 中 | 低 |
 | **P2** | ✅ 权威校验分片（`ShardedInboundPipeline` 接入管线，按玩家分片并行、同玩家保序） | 高 | 中 |
-| **P2** | 双缓冲 WorldState | 高 | 中 |
+| **P2** | ✅ 双缓冲 WorldState（发布不可变实体视图，快照线程不再读活动 WorldState） | 高 | 中 |
 | **P2** | Mod 握手实装（TModLoader Mod 列表解析） | 中 | 中 |
-| **P4** | 空间分区世界仿真 | 极高 | 高 |
+| **P4** | 空间分区世界仿真（区块分区锁 ✅ 已实装 / 并行区块仿真暂缓，见 `Concurrency/README.md` §六） | 极高 | 高 |
 
 每个 Phase 结束须跑 **`Tests/` 验收测试** + **`Phase7-RedTeam/` 对抗清单**，详见各模块 README。
 
