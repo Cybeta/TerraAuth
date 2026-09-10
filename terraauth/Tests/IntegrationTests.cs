@@ -28,7 +28,7 @@ public class EndToEndTests
 
         var rate = new RateLimits();
         var audit = new NoOpAuditLogger();
-        var enforcers = new AuthorityEnforcers(rate, audit);
+        var enforcers = new AuthorityEnforcers(rate, audit, new WorldState());
         var pipeline = new InboundPipeline(new IPipelineStage[]
         {
             new FrameStage(),
@@ -67,7 +67,7 @@ public class EndToEndTests
 
         var rate = new RateLimits();
         var audit = new NoOpAuditLogger();
-        var enforcers = new AuthorityEnforcers(rate, audit);
+        var enforcers = new AuthorityEnforcers(rate, audit, new WorldState());
         var pipeline = new InboundPipeline(new IPipelineStage[]
         {
             new FrameStage(),
@@ -151,7 +151,7 @@ public class EndToEndTests
 
         var rate = new RateLimits();
         var audit = new NoOpAuditLogger();
-        var enforcers = new AuthorityEnforcers(rate, audit);
+        var enforcers = new AuthorityEnforcers(rate, audit, new WorldState());
         var pipeline = new InboundPipeline(new IPipelineStage[]
         {
             new FrameStage(),

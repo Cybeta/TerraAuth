@@ -131,7 +131,7 @@ public sealed class GameHost : IDisposable
         var rate = new RateLimits();
         var auditLogger = new PersistenceAuditLogger(db, metrics);
         // 移动权威阈值取自 ServerConfig（架构 §4.5 唯一来源）；用飞行上限覆盖步行/冲刺，降低误判
-        var enforcers = new AuthorityEnforcers(rate, auditLogger,
+        var enforcers = new AuthorityEnforcers(rate, auditLogger, world,
             new MovementLimits(config.Current.MaxFlightSpeed, config.Current.TeleportTolerance));
 
         // 管线阶段顺序（越早拒绝成本越低）

@@ -38,6 +38,60 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     }
 }
 
+/// <summary>挖砖命令：世界权威接受 TileBreak(17) 后生成，由仿真在目标 tick 应用到 WorldState.Tiles。</summary>
+public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, byte Action, int TileType)
+    : Command(Tick, PlayerId, "tile_break")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
+            return;
+        ref var tile = ref world.Tiles[X, Y];
+        // Action=0：挖实心砖 → Active=false，Type=0
+        // Action=2/3：挖墙 → Wall=0
+        // >=5：电线/斜坡类 → 清对应 flag
+        switch (Action)
+        {
+            case 0:
+                tile.Active = false;
+                tile.Type = 0;
+                tile.Wall = 0;
+                break;
+            case 2: // 挖墙
+            case 3:
+                tile.Wall = 0;
+                break;
+            default: // 电线、斜坡、激活器等 → 清对应位
+                if (Action >= 5)
+                {
+                    if (Action == 5) tile.Wire = false;
+                    else if (Action == 6) tile.Wire2 = false;
+                    else if (Action == 7) tile.Wire3 = false;
+                    else if (Action == 8) tile.Wire4 = false;
+                    else if (Action == 9) tile.Slope = 0;
+                    else if (Action == 10) tile.HalfBrick = false;
+                    else if (Action == 11) tile.Actuator = false;
+                }
+                break;
+        }
+    }
+}
+
+/// <summary>放砖命令：世界权威接受 TilePlace(79) 后生成，由仿真在目标 tick 应用到 WorldState.Tiles。</summary>
+public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, int TileType, int Style)
+    : Command(Tick, PlayerId, "tile_place")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
+            return;
+        ref var tile = ref world.Tiles[X, Y];
+        tile.Active = true;
+        tile.Type = (ushort)TileType;
+        tile.Wall = 0;
+    }
+}
+
 /// <summary>命令队列：按 tick 分组、线程安全、稳定排序。</summary>
 public sealed class CommandQueue
 {

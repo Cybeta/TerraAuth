@@ -489,16 +489,18 @@ internal sealed class InventoryAuthority : IInventoryAuthority
 
 internal sealed class WorldAuthority : IWorldAuthority
 {
-    // Terraria 大型世界尺寸（tile 数）
-    private const int WorldWidthTiles = 8400;
-    private const int WorldHeightTiles = 2400;
+    // Terraria 原版玩家可挖半径（像素）。tile 坐标到玩家像素坐标的直线距离，
+    // 超过此值客户端也无法操作，但 CE 可以发任意坐标。
+    private const int DigReachPx = 160;
+    private const int PlaceReachPx = 180;
 
     private readonly IPlayerAuthority _players;
     private readonly IAuditLogger _audit;
     private readonly WorldLimits _limits;
+    private readonly WorldState _world;
 
-    public WorldAuthority(IPlayerAuthority players, IAuditLogger audit, WorldLimits limits)
-        => (_players, _audit, _limits) = (players, audit, limits);
+    public WorldAuthority(IPlayerAuthority players, IAuditLogger audit, WorldLimits limits, WorldState world)
+        => (_players, _audit, _limits, _world) = (players, audit, limits, world);
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands) => packet switch
     {
@@ -509,17 +511,49 @@ internal sealed class WorldAuthority : IWorldAuthority
 
     private AuthorityResult ValidateBreak(TileBreakPacket brk, int playerId)
     {
-        if (!CanPlayerModifyTile(playerId, brk.X, brk.Y))
+        // 越界检查：坐标必须落在世界尺寸内
+        if (!IsInWorld(brk.X, brk.Y))
             return Deny(playerId, "tile_rejected", "out_of_bounds", new { brk.X, brk.Y });
+
+        // 玩家可达距离：CE 伪造远距离坐标 → 直接拒绝
+        if (!IsWithinReach(playerId, brk.X, brk.Y, DigReachPx))
+            return Deny(playerId, "tile_rejected", "out_of_reach", new { brk.X, brk.Y });
+
+        // 目标 tile 必须存在且为实心（Action=0 挖实心砖；2/3 挖墙；>=5 电线/斜坡类跳过实体检查）
+        // brk.Action=0 → 实心砖；TileType=客户端声称的类型，服务端需对账
+        var tile = _world.Tiles[brk.X, brk.Y];
+        if (brk.Action == 0)
+        {
+            if (!tile.Active)
+                return Deny(playerId, "tile_rejected", "tile_not_found", new { brk.X, brk.Y });
+            // 类型对账：客户端声称挖 TileType，服务端实际是 tile.Type，不一致视为篡改
+            if (brk.TileType >= 0 && brk.TileType != tile.Type)
+                return Deny(playerId, "tile_rejected", "tile_type_mismatch",
+                    new { Client = brk.TileType, Server = tile.Type });
+        }
+
         return AuthorityResult.Accept(brk);
     }
 
     private AuthorityResult ValidatePlace(TilePlacePacket place, int playerId)
     {
-        if (!CanPlayerModifyTile(playerId, place.X, place.Y))
+        // 越界检查
+        if (!IsInWorld(place.X, place.Y))
             return Deny(playerId, "tile_rejected", "out_of_bounds", new { place.X, place.Y });
-        if (place.TileType < 0)
-            return Deny(playerId, "tile_rejected", "invalid_tile", new { place.TileType });
+
+        // 玩家可达距离
+        if (!IsWithinReach(playerId, place.X, place.Y, PlaceReachPx))
+            return Deny(playerId, "tile_rejected", "out_of_reach", new { place.X, place.Y });
+
+        // tile 类型合法性：Terraria 有效砖类型 0..556（1.4.5.8），负数或超上限拒
+        if (place.TileType < 0 || place.TileType > 556)
+            return Deny(playerId, "tile_rejected", "invalid_tile_type", new { place.TileType });
+
+        // 放置目标必须为空：已有 Active 砖 → 客户端正常流程不会发，CE 伪造直接拒
+        var tile = _world.Tiles[place.X, place.Y];
+        if (tile.Active)
+            return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y });
+
         return AuthorityResult.Accept(place);
     }
 
@@ -529,9 +563,22 @@ internal sealed class WorldAuthority : IWorldAuthority
         return AuthorityResult.Reject(reason);
     }
 
-    /// <summary>坐标落在世界范围内才允许修改。更细的权限（领地/管理员）由世界状态层叠加。</summary>
-    public bool CanPlayerModifyTile(int playerId, int x, int y)
-        => x >= 0 && x < WorldWidthTiles && y >= 0 && y < WorldHeightTiles;
+    private bool IsInWorld(int x, int y)
+        => x >= 0 && x < _world.MaxTilesX && y >= 0 && y < _world.MaxTilesY;
+
+    private bool IsWithinReach(int playerId, int tileX, int tileY, int reachPx)
+    {
+        if (!_world.Players.TryGetValue(playerId, out var player))
+            return false; // 玩家未在权威状态 → 不允许操作
+        var tileCenterX = tileX * 16 + 8;
+        var tileCenterY = tileY * 16 + 8;
+        var dx = player.Position.X - tileCenterX;
+        var dy = player.Position.Y - tileCenterY;
+        return dx * dx + dy * dy <= reachPx * reachPx;
+    }
+
+    /// <summary>公开接口：坐标落在世界范围内。</summary>
+    public bool CanPlayerModifyTile(int playerId, int x, int y) => IsInWorld(x, y);
 
     public int GetTileBreakThreshold(int playerId) => _limits.MaxTileBreakPerSecond;
 }

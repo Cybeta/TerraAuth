@@ -177,6 +177,10 @@ public sealed class TerminalStage : IPipelineStage
             => new MoveCommand(context.Tick, context.PlayerId, teleport.Position),
         // 内部简化的位置包（权威层纠偏等内部构造，非线格式）
         PlayerPositionPacket pos => new MoveCommand(context.Tick, context.PlayerId, pos.Position),
+        // 包 17 TileManipulation → 挖砖指令（Action=0 实心砖，2/3 墙，>=5 电线/斜坡类）
+        TileBreakPacket brk => new TileBreakCommand(context.Tick, context.PlayerId, brk.X, brk.Y, brk.Action, brk.TileType),
+        // 包 79 PlaceObject → 放砖指令
+        TilePlacePacket place => new TilePlaceCommand(context.Tick, context.PlayerId, place.X, place.Y, place.TileType, place.Style),
         _ => null,
     };
 }

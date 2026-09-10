@@ -17,24 +17,25 @@ public sealed class AuthorityEnforcers
     public AuthorityEnforcers(
         RateLimits rate,
         IAuditLogger audit,
+        WorldState world,
         MovementLimits? movementLimits = null,
         PlayerLimits? playerLimits = null,
         CombatLimits? combatLimits = null,
         InventoryLimits? inventoryLimits = null,
-        WorldLimits? worldLimits = null)
+        WorldLimits? worldLimitsOpt = null)
     {
         // 依赖关系：World/Combat/Movement 依赖 Player（权限/上限），其余独立
         var movement = movementLimits ?? MovementLimits.Default;
         var player = playerLimits ?? PlayerLimits.Default;
         var combat = combatLimits ?? CombatLimits.Default;
         var inventory = inventoryLimits ?? InventoryLimits.Default;
-        var world = worldLimits ?? WorldLimits.Default;
+        var worldLimits = worldLimitsOpt ?? WorldLimits.Default;
 
         Player = new PlayerAuthority(audit, player);
         Movement = new MovementAuthority(Player, audit, movement);
         Combat = new CombatAuthority(Player, audit, combat);
         Inventory = new InventoryAuthority(audit, inventory);
-        World = new WorldAuthority(Player, audit, world);
+        World = new WorldAuthority(Player, audit, worldLimits, world);
         Rate = new RateAuthority(rate, audit);
     }
 }

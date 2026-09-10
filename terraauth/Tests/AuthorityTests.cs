@@ -14,7 +14,7 @@ public class AuthorityTests
     {
         var audit = new NoOpAuditLogger();
         var rate = new RateLimits();
-        var enforcers = new AuthorityEnforcers(rate, audit);
+        var enforcers = new AuthorityEnforcers(rate, audit, new WorldState());
         var pipeline = new InboundPipeline(new IPipelineStage[]
         {
             new FrameStage(),
@@ -50,7 +50,7 @@ public class AuthorityTests
     public void MovementAuthority_Accepts_NormalMove_Rejects_Teleport()
     {
         var enforcers = new AuthorityEnforcers(
-            new RateLimits(), new NoOpAuditLogger(),
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
             new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f));
         var move = enforcers.Movement;
         var commands = new CommandQueue();
@@ -73,7 +73,7 @@ public class AuthorityTests
     public void MovementAuthority_Rejected_Teleport_DoesNot_Pollute_Baseline()
     {
         var enforcers = new AuthorityEnforcers(
-            new RateLimits(), new NoOpAuditLogger(),
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
             new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f));
         var move = enforcers.Movement;
         var commands = new CommandQueue();
@@ -90,7 +90,7 @@ public class AuthorityTests
     public void MovementAuthority_Validates_PlayerControls_Packet13()
     {
         var enforcers = new AuthorityEnforcers(
-            new RateLimits(), new NoOpAuditLogger(),
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
             new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f));
         var move = enforcers.Movement;
         var commands = new CommandQueue();
@@ -117,7 +117,7 @@ public class AuthorityTests
     public void MovementAuthority_Accepts_NormalFrameStep_NotOnly_TinyMove()
     {
         var enforcers = new AuthorityEnforcers(
-            new RateLimits(), new NoOpAuditLogger(),
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
             new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f));
         var move = enforcers.Movement;
         var commands = new CommandQueue();
@@ -135,7 +135,7 @@ public class AuthorityTests
     public void MovementAuthority_SharedBaseline_Across_Packet13_And_InternalPosition()
     {
         var enforcers = new AuthorityEnforcers(
-            new RateLimits(), new NoOpAuditLogger(),
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
             new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f));
         var move = enforcers.Movement;
         var commands = new CommandQueue();
@@ -155,7 +155,7 @@ public class AuthorityTests
     [Fact]
     public void MovementAuthority_TeleportEntity_Rejects_OutOfBounds_And_InvalidTarget()
     {
-        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger());
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), new WorldState());
         var move = enforcers.Movement;
         var commands = new CommandQueue();
 
@@ -181,7 +181,7 @@ public class AuthorityTests
     public void MovementAuthority_TeleportEntity_Moves_Baseline_So_Next_Position_Accepted()
     {
         var enforcers = new AuthorityEnforcers(
-            new RateLimits(), new NoOpAuditLogger(),
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
             new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f));
         var move = enforcers.Movement;
         var commands = new CommandQueue();
@@ -202,7 +202,7 @@ public class AuthorityTests
     public void MovementAuthority_Teleport_Rejects_Rate_Exceeded()
     {
         var enforcers = new AuthorityEnforcers(
-            new RateLimits(), new NoOpAuditLogger(),
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
             new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f, MaxTeleportsPerSecond: 2));
         var move = enforcers.Movement;
         var commands = new CommandQueue();
@@ -221,7 +221,7 @@ public class AuthorityTests
     [Fact]
     public void MovementAuthority_RequestTeleportation_Rejects_Invalid_Kind()
     {
-        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger());
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), new WorldState());
         var move = enforcers.Movement;
         var commands = new CommandQueue();
 
@@ -236,7 +236,7 @@ public class AuthorityTests
     {
         var audit = new NoOpAuditLogger();
         var rate = new RateLimits();
-        var enforcers = new AuthorityEnforcers(rate, audit);
+        var enforcers = new AuthorityEnforcers(rate, audit, new WorldState());
 
         var order = new List<int>();
         var pipeline = new InboundPipeline(new IPipelineStage[]
