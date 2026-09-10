@@ -1,0 +1,9 @@
+# Build
+bin/
+obj/
+*.user
+.vs/
+.idea/
+
+# Logs
+*.log

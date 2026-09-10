@@ -1,0 +1,128 @@
+// TerraAuth — P2: 权威校验分片接入管线
+// 把单包 IInboundPipeline 契约桥接到 ShardedAuthorityProcessor 的批量 API：
+//   - 入站包按 PlayerId % shardCount 分片
+//   - 同一玩家串行（保持包序与 Command 入队顺序），不同玩家并行
+// 每个 ProcessAsync 调用挂一个 TaskCompletionSource，由分片批量处理完成后回填结果。
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using TerraAuth.Concurrency;
+using TerraAuth.Protocol;
+using TerraAuth.Simulation;
+
+namespace TerraAuth.Authority;
+
+/// <summary>分片入站管线装饰器：包装原始管线，按玩家分片并行执行权威校验。</summary>
+/// <remarks>
+/// 设计取舍：
+///   - 单调度协程按到达顺序批量取出待处理包，交给 <see cref="ShardedAuthorityProcessor{TInput,TOutput}"/>；
+///   - 处理器内部按分片并行、片内串行，因此同玩家包序被保持（Command 入队顺序可重现）；
+///   - 批量等待全部完成后再取下一批，跨批次的到达顺序同样保持。
+/// 权威阶段为同步 CPU 工作（<see cref="InboundPipeline"/> 的 Task 同步完成），
+/// 处理器用 Task.Run 把每包投递到线程池以获得真正的跨分片并行。
+/// </remarks>
+public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
+{
+    private readonly ShardedAuthorityProcessor<InboundWork, AuthorityResult> _processor;
+    private readonly Channel<InboundWork> _queue;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly Task _dispatcher;
+    private readonly int _maxBatchSize;
+
+    public ShardedInboundPipeline(IInboundPipeline inner, int shardCount, int maxBatchSize = 64)
+    {
+        ArgumentNullException.ThrowIfNull(inner);
+        _maxBatchSize = Math.Max(1, maxBatchSize);
+        _processor = new ShardedAuthorityProcessor<InboundWork, AuthorityResult>(
+            shardCount,
+            (_, work) => inner.ProcessAsync(work.Packet, work.PlayerId, work.Commands, work.Ct)
+                .GetAwaiter().GetResult());
+        _queue = Channel.CreateUnbounded<InboundWork>(new UnboundedChannelOptions { SingleReader = true });
+        _dispatcher = Task.Run(() => DispatchLoopAsync(_cts.Token));
+    }
+
+    public Task<AuthorityResult> ProcessAsync(
+        INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct = default)
+    {
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled<AuthorityResult>(ct);
+
+        var completion = new TaskCompletionSource<AuthorityResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_queue.Writer.TryWrite(new InboundWork(packet, playerId, commands, ct, completion)))
+            completion.TrySetException(new ObjectDisposedException(nameof(ShardedInboundPipeline)));
+        return completion.Task;
+    }
+
+    /// <summary>单调度协程：按到达顺序批量取出，交给分片处理器，再把结果回填到各自的 TCS。</summary>
+    private async Task DispatchLoopAsync(CancellationToken ct)
+    {
+        var batch = new List<InboundWork>(_maxBatchSize);
+        var inputs = new List<(int PlayerId, InboundWork Input)>(_maxBatchSize);
+        try
+        {
+            await foreach (var first in _queue.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                batch.Clear();
+                inputs.Clear();
+                batch.Add(first);
+                while (batch.Count < _maxBatchSize && _queue.Reader.TryRead(out var more))
+                    batch.Add(more);
+
+                foreach (var work in batch)
+                    inputs.Add((work.PlayerId, work));
+
+                IReadOnlyList<AuthorityResult> results;
+                try
+                {
+                    results = await _processor.ProcessBatchAsync(inputs).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    foreach (var work in batch)
+                        work.Completion.TrySetException(ex);
+                    continue;
+                }
+
+                // ProcessBatchAsync 保序返回 → 按下标回填，保证每个调用方拿到自己的结果
+                for (var i = 0; i < batch.Count; i++)
+                    batch[i].Completion.TrySetResult(results[i]);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 停机
+        }
+        finally
+        {
+            // 停机时唤醒所有仍等待的调用方，避免悬挂
+            while (_queue.Reader.TryRead(out var pending))
+                pending.Completion.TrySetCanceled();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _queue.Writer.TryComplete();
+        try
+        {
+            await _dispatcher.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // 停机期间忽略异常
+        }
+        _cts.Cancel();
+        _cts.Dispose();
+    }
+
+    private sealed record InboundWork(
+        INetworkPacket Packet,
+        int PlayerId,
+        CommandQueue Commands,
+        CancellationToken Ct,
+        TaskCompletionSource<AuthorityResult> Completion);
+}

@@ -1,0 +1,111 @@
+// TerraAuth — Phase 2: 权威层接口
+// 架构 §4.2：决策模型 + 管线契约
+
+using TerraAuth.Protocol;
+using TerraAuth.Simulation;
+
+namespace TerraAuth.Authority;
+
+/// <summary>权威决策结果。</summary>
+public enum AuthorityDecision
+{
+    /// <summary>接受，生成 Command 入队。</summary>
+    Accept,
+
+    /// <summary>拒绝（明确告知，调试用）。</summary>
+    Reject,
+
+    /// <summary>拒绝（静默，避免泄露服务端状态）。</summary>
+    RejectSilent,
+
+    /// <summary>纠正：服务端权威值覆盖客户端，需下发纠正包。</summary>
+    Correct,
+}
+
+/// <summary>权威处理结果。</summary>
+public sealed record AuthorityResult(
+    AuthorityDecision Decision,
+    INetworkPacket? Packet,
+    Command? Command = null,
+    INetworkPacket? CorrectionPacket = null,
+    string? Reason = null)
+{
+    public static AuthorityResult Accept(INetworkPacket? packet, Command? command = null)
+        => new(AuthorityDecision.Accept, packet, command);
+
+    public static AuthorityResult Reject(string reason)
+        => new(AuthorityDecision.Reject, null, Reason: reason);
+
+    public static AuthorityResult RejectSilent()
+        => new(AuthorityDecision.RejectSilent, null);
+
+    public static AuthorityResult Correct(INetworkPacket correction, string reason)
+        => new(AuthorityDecision.Correct, null, CorrectionPacket: correction, Reason: reason);
+}
+
+/// <summary>包处理上下文。</summary>
+public interface IPacketContext
+{
+    int PlayerId { get; }
+    long Tick { get; }
+    DateTimeOffset ReceivedAt { get; }
+}
+
+/// <summary>入站管线契约（架构 §3.2）。</summary>
+public interface IInboundPipeline
+{
+    Task<AuthorityResult> ProcessAsync(
+        INetworkPacket packet,
+        int playerId,
+        CommandQueue commands,
+        CancellationToken ct = default);
+}
+
+// ---------- 六个权威子系统接口 ----------
+
+public interface IPlayerAuthority
+{
+    AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
+    int GetMaxHp(int playerId);
+    int GetMaxMana(int playerId);
+}
+
+public interface IMovementAuthority
+{
+    AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
+    float GetMaxSpeedFor(int playerId);
+}
+
+public interface ICombatAuthority
+{
+    AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
+    int ComputeDamage(int playerId, int targetId);
+}
+
+public interface IInventoryAuthority
+{
+    AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
+    bool IsValidItem(int itemId);
+    int GetStackCount(int playerId, int slot);
+    void ApplyAuthorizedChange(int playerId, int slot, int delta);
+}
+
+public interface IWorldAuthority
+{
+    AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
+    bool CanPlayerModifyTile(int playerId, int x, int y);
+    int GetTileBreakThreshold(int playerId);
+}
+
+public interface IRateAuthority
+{
+    AuthorityResult Check(IPacketContext context, PacketId packetType);
+}
+
+/// <summary>事件存储（事件溯源）。</summary>
+public interface IEventStore
+{
+    void Append(GameEvent e);
+    IReadOnlyList<GameEvent> Since(long tick);
+    void CompactBefore(long tick);
+}

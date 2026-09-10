@@ -1,0 +1,23 @@
+# ========== TerraAuth 项目根目录 .gitignore ==========
+# 位于 项目根，管理 terraauth 源码 + .vscode 配置
+# 独立的 terraauth/.gitignore 保留，本文件做根目录补充
+
+# ---- Terraria 二进制目录（只读，数百 .xnb/.dll/.exe，不可提交） ----
+Terraria/
+
+# ---- .NET 构建产物 ----
+terraauth/bin/
+terraauth/obj/
+*.user
+.vs/
+.idea/
+
+# ---- 运行时数据 ----
+terraauth/*.db
+terraauth/*.log
+
+# ---- 编辑器/系统 ----
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

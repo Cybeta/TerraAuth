@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>TerraAuth</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 单工程：显式 glob 收拢所有分层源码，排除 Tests/（独立测试工程）与构建产物 -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <!-- 全部分层源码（目录结构保持不变：Protocol/Authority/Simulation/Net/...） -->
+  <ItemGroup>
+    <Compile Include="**\*.cs" Exclude="Tests\**;Examples\**;bin\**;obj\**" />
+  </ItemGroup>
+
+  <!-- 生产依赖：SQLite（可 -p:NoSqlite=true 降级到内嵌 LiteDb）+ 网络分帧 -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" Condition="'$(NoSqlite)' != 'true'" />
+    <PackageReference Include="System.IO.Pipelines" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- 验收测试需访问 internal（GameLoop.StepOne / ShadowPredictor 等） -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="TerraAuth.Tests" />
+  </ItemGroup>
+
+</Project>
