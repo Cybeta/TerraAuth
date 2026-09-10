@@ -214,6 +214,11 @@ public sealed class NetworkHost : IAsyncDisposable
                 // 包 13：转发给其他玩家（原版客户端会忽略 TerraAuth 专用快照包 15，玩家间可见性依赖包 13）
                 if (packet is PlayerControlsPacket controls)
                     await BroadcastControlsAsync(connection, controls, ct).ConfigureAwait(false);
+                // 包 17 / 79：挖砖/放砖权威通过 → 广播给其他玩家，原版客户端会自动更新 tile 显示
+                else if (packet is TileBreakPacket brk)
+                    await _connections.BroadcastExceptAsync(connection.PlayerId, PacketId.TileBreak, brk, ct).ConfigureAwait(false);
+                else if (packet is TilePlacePacket place)
+                    await _connections.BroadcastExceptAsync(connection.PlayerId, PacketId.TilePlace, place, ct).ConfigureAwait(false);
                 break;
 
             case AuthorityDecision.Correct:
