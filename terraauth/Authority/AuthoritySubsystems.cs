@@ -472,6 +472,16 @@ internal sealed class InventoryAuthority : IInventoryAuthority
     public int GetStackCount(int playerId, int slot)
         => _inventories.TryGetValue(playerId, out var inv) && inv.TryGetValue(slot, out var s) ? s.Stack : 0;
 
+    public bool HasItem(int playerId, int itemId)
+    {
+        if (!_inventories.TryGetValue(playerId, out var inv)) return false;
+        // 遍历所有槽位找 itemId 匹配且 stack > 0
+        foreach (var kv in inv)
+            if (kv.Value.ItemId == itemId && kv.Value.Stack > 0)
+                return true;
+        return false;
+    }
+
     public void ApplyAuthorizedChange(int playerId, int slot, int delta)
     {
         if (slot < 0 || slot >= InventoryLimits.MaxSlots) return;
@@ -498,9 +508,10 @@ internal sealed class WorldAuthority : IWorldAuthority
     private readonly IAuditLogger _audit;
     private readonly WorldLimits _limits;
     private readonly WorldState _world;
+    private readonly IInventoryAuthority _inv;
 
-    public WorldAuthority(IPlayerAuthority players, IAuditLogger audit, WorldLimits limits, WorldState world)
-        => (_players, _audit, _limits, _world) = (players, audit, limits, world);
+    public WorldAuthority(IPlayerAuthority players, IAuditLogger audit, WorldLimits limits, WorldState world, IInventoryAuthority inv)
+        => (_players, _audit, _limits, _world, _inv) = (players, audit, limits, world, inv);
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands) => packet switch
     {
@@ -548,6 +559,14 @@ internal sealed class WorldAuthority : IWorldAuthority
         // tile 类型合法性：Terraria 有效砖类型 0..556（1.4.5.8），负数或超上限拒
         if (place.TileType < 0 || place.TileType > 556)
             return Deny(playerId, "tile_rejected", "invalid_tile_type", new { place.TileType });
+
+        // 背包物品校验：Terraria tile/item 同 ID，放砖需背包至少有 1 个对应物品。
+        // 客户端正常流程会自动扣 stack；CE 空放（背包无此物品）或放非背包物品 → 拒绝。
+        // 如果 InventoryAuthority 尚未收到 InventorySlotPacket（玩家没同步过背包），
+        // _inventories 里查不到 playerId → HasItem 返回 false → 拒绝。这种情况需要客户端先同步背包。
+        if (!_inv.HasItem(playerId, place.TileType))
+            return Deny(playerId, "tile_rejected", "item_not_in_inventory",
+                new { place.TileType, Reason = "backpack missing item or not synced yet" });
 
         // 放置目标必须为空：已有 Active 砖 → 客户端正常流程不会发，CE 伪造直接拒
         var tile = _world.Tiles[place.X, place.Y];

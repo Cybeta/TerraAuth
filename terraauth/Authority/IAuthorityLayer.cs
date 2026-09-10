@@ -88,6 +88,8 @@ public interface IInventoryAuthority
     bool IsValidItem(int itemId);
     int GetStackCount(int playerId, int slot);
     void ApplyAuthorizedChange(int playerId, int slot, int delta);
+    /// <summary>检查玩家背包（含装备槽）中是否至少有 1 个指定物品。用于 TilePlace 等需要消耗物品的操作。</summary>
+    bool HasItem(int playerId, int itemId);
 }
 
 public interface IWorldAuthority

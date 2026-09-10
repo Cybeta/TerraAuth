@@ -35,7 +35,7 @@ public sealed class AuthorityEnforcers
         Movement = new MovementAuthority(Player, audit, movement);
         Combat = new CombatAuthority(Player, audit, combat);
         Inventory = new InventoryAuthority(audit, inventory);
-        World = new WorldAuthority(Player, audit, worldLimits, world);
+        World = new WorldAuthority(Player, audit, worldLimits, world, Inventory);
         Rate = new RateAuthority(rate, audit);
     }
 }
