@@ -117,12 +117,15 @@ public static class WorldGenerator
         world.Npcs.Add(new WorldNpc
         {
             Type = GuideNpcType,
+            NetId = GuideNpcType,
             GivenName = "Guide",
             X = (guideTileX + 0.5f) * 16f,
             Y = (spawnGroundY - 2) * 16f,
             IsTownNpc = true,
             HomeTileX = guideTileX,
             HomeTileY = spawnGroundY,
+            Life = 250,
+            LifeMax = 250,
         });
 
         return world;

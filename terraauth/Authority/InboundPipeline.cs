@@ -181,6 +181,8 @@ public sealed class TerminalStage : IPipelineStage
         TileBreakPacket brk => new TileBreakCommand(context.Tick, context.PlayerId, brk.X, brk.Y, brk.Action, brk.TileType),
         // 包 79 PlaceObject → 放砖指令
         TilePlacePacket place => new TilePlaceCommand(context.Tick, context.PlayerId, place.X, place.Y, place.TileType, place.Style),
+        // 包 28 DamageNPC → NPC 受击指令（服务端扣血，生命归零即死亡）
+        NpcStrikePacket strike => new NpcStrikeCommand(context.Tick, context.PlayerId, strike.NpcId, strike.Damage),
         _ => null,
     };
 }

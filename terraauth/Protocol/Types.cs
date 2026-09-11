@@ -434,6 +434,8 @@ public sealed record NpcUpdatePacket(
     Vector2 Velocity,
     ushort Target,
     short NetId,
+    int Life = 100,
+    int LifeMax = 100,
     bool DirectionPositive = true,
     bool DirectionYPositive = true,
     bool SpriteDirectionPositive = true) : INetworkPacket

@@ -112,6 +112,32 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
     }
 }
 
+/// <summary>NPC 受击命令：包 28 权威通过后生成，由仿真扣减 NPC 生命（生命归零即死亡）。</summary>
+public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, int Damage)
+    : Command(Tick, PlayerId, "npc_strike")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        lock (world.NpcsLock)
+        {
+            if (NpcIndex < 0 || NpcIndex >= world.Npcs.Count)
+                return;
+
+            var npc = world.Npcs[NpcIndex];
+            if (!npc.Active)
+                return;
+
+            npc.Life -= Damage;
+            if (npc.Life <= 0)
+            {
+                npc.Life = 0;
+                npc.Active = false; // 由世界同步下发 life=0，客户端据此移除
+                npc.DeadTick = Tick;
+            }
+        }
+    }
+}
+
 /// <summary>命令队列：按 tick 分组、线程安全、稳定排序。</summary>
 public sealed class CommandQueue
 {

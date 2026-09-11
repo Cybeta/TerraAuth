@@ -298,21 +298,32 @@ public sealed class GameHost : IDisposable
         await Network.BroadcastAsync(PacketId.Time,
             new TimePacket(world.DayTime, (int)world.Time, SunModY: 0, MoonModY: 0), ct).ConfigureAwait(false);
 
-        // NPC 索引上限 199（原版 Main.npc[200]）；位置为像素坐标，速度暂以 0 下发（客户端自行插值）
+        // NPC 索引上限 199（原版 Main.npc[200]）
         // 视口裁剪：只发给视野半径内的玩家，避免把全世界 NPC 推给所有人
         var radius = Math.Max(1, Config.Current.ViewportRadius);
         var radiusSq = (float)radius * radius;
 
-        for (var i = 0; i < world.Npcs.Count && i <= byte.MaxValue; i++)
+        // 先在锁内取一致快照（仿真线程会增删 NPC），再在锁外逐个下发（不在持锁期间做 I/O）
+        WorldNpc[] npcs;
+        lock (world.NpcsLock)
         {
-            var npc = world.Npcs[i];
+            npcs = world.Npcs.Count <= byte.MaxValue + 1
+                ? world.Npcs.ToArray()
+                : world.Npcs.GetRange(0, byte.MaxValue + 1).ToArray();
+        }
+
+        for (var i = 0; i < npcs.Length; i++)
+        {
+            var npc = npcs[i];
             var packet = new NpcUpdatePacket(
                 Index: (byte)i,
-                Generation: 0,
+                Generation: npc.Generation,
                 Position: new Vector2(npc.X, npc.Y),
-                Velocity: new Vector2(0f, 0f),
+                Velocity: new Vector2(npc.VelocityX, npc.VelocityY),
                 Target: 0,
-                NetId: (short)npc.Type);
+                NetId: npc.NetId == 0 ? (short)npc.Type : npc.NetId,
+                Life: npc.Active ? npc.Life : 0,   // 已死亡 → life=0，客户端据此移除
+                LifeMax: Math.Max(1, npc.LifeMax));
 
             await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet,
                 playerId => IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq), ct).ConfigureAwait(false);

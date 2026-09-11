@@ -113,6 +113,9 @@ public sealed class WorldState
     public List<Sign> Signs { get; } = new();
     public List<WorldNpc> Npcs { get; } = new();
 
+    /// <summary>NPC 列表的跨线程保护：仿真线程负责增删，世界同步线程负责遍历下发。</summary>
+    public object NpcsLock { get; } = new();
+
     /// <summary>按包 7 布局构造 <see cref="WorldInfoPacket"/>。</summary>
     public WorldInfoPacket ToWorldInfoPacket()
     {
@@ -460,4 +463,24 @@ public sealed class WorldNpc
     public bool Homeless;
     public int HomeTileX;
     public int HomeTileY;
+
+    // ---- 运行时（网络同步 / 战斗）----
+
+    /// <summary>网络 ID（客户端据此 <c>SetDefaults</c> 生成对应 NPC）；默认与 <see cref="Type"/> 相同。</summary>
+    public short NetId;
+
+    /// <summary>生成代数（包 23 用于校验命中的目标未过期）。</summary>
+    public byte Generation;
+
+    public int Life = 100;
+    public int LifeMax = 100;
+
+    public float VelocityX;
+    public float VelocityY;
+
+    /// <summary>是否存活；false 时同步 <c>life=0</c> 让客户端移除。</summary>
+    public bool Active = true;
+
+    /// <summary>死亡发生的 tick（用于延后清理，确保 life=0 已下发到客户端）。</summary>
+    public long DeadTick;
 }

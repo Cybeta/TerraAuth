@@ -650,6 +650,41 @@ public class VanillaFeatureTests
         Assert.Equal((short)22, npc.NetId); // NPCID.Guide
     }
 
+    [Fact]
+    public async Task Vanilla_Enemy_Spawns_Then_Dies_From_Strike()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+
+        // 玩家必须先在世界里（刷怪以在线玩家附近为目标）
+        await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+
+        // 推进仿真直到刷出敌怪
+        var spawned = await TickUntilAsync(server, () => world.Npcs.Any(n => !n.IsTownNpc),
+            TimeSpan.FromSeconds(20));
+        Assert.True(spawned, "未在超时内刷出敌怪");
+
+        WorldNpc slime;
+        lock (world.NpcsLock) slime = world.Npcs.First(n => !n.IsTownNpc);
+        Assert.Equal((short)1, slime.NetId); // NPCID.BlueSlime
+
+        // 客户端应能收到该敌怪（netID=1）
+        await server.Host.BroadcastWorldStateAsync();
+        var got = await s.ReadUntilAsync(p => p is NpcUpdatePacket { NetId: 1 }, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p is NpcUpdatePacket { NetId: 1 });
+
+        // 包 28 击杀（史莱姆 25 血）→ 服务端扣血并置为死亡
+        int index;
+        lock (world.NpcsLock) index = world.Npcs.IndexOf(slime);
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 25));
+
+        Assert.True(await TickUntilAsync(server, () => !slime.Active, TimeSpan.FromSeconds(5)),
+            "NPC 受击后未被击杀");
+        Assert.Equal(0, slime.Life);
+    }
+
     // ========================================================================
     // 十、聊天（包 82 = LoadNetModule → NetTextModule，模块号 1）
     // 布局来源：原版 NetTextModule / NetworkInitializer（模块号） / ChatMessage

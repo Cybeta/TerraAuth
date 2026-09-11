@@ -322,14 +322,29 @@ public sealed class PacketEncoder : IPacketEncoder
         WriteVector2(bw, npc.Velocity);
         bw.Write(npc.Target);           // UInt16 target
 
-        byte bitsA = 0x80;              // bit7=1：生命为满 → 省略生命段
+        var lifeFull = npc.Life >= npc.LifeMax;
+        byte bitsA = 0;
         if (npc.DirectionPositive) bitsA |= 0x01;
         if (npc.DirectionYPositive) bitsA |= 0x02;
         if (npc.SpriteDirectionPositive) bitsA |= 0x40;
+        if (lifeFull) bitsA |= 0x80;    // bit7=1：生命为满 → 省略生命段
         bw.Write(bitsA);
         bw.Write((byte)0);              // BitsByte B：无玩家数缩放 / 非雕像 / 无难度覆盖 / 非需同步生成
 
         bw.Write(npc.NetId);            // Int16 netID（客户端据此 SetDefaults 生成 NPC）
+
+        if (lifeFull) return;
+
+        // 生命段：Byte 宽度标记（1=sbyte / 2=short / 4=int）+ 对应宽度的生命值。
+        // 生命为 0 表示该 NPC 已死亡，客户端据此移除。
+        byte width = npc.LifeMax > 32767 ? (byte)4 : npc.LifeMax > 127 ? (byte)2 : (byte)1;
+        bw.Write(width);
+        switch (width)
+        {
+            case 2: bw.Write((short)npc.Life); break;
+            case 4: bw.Write(npc.Life); break;
+            default: bw.Write((sbyte)npc.Life); break;
+        }
     }
 
     /// <summary>
