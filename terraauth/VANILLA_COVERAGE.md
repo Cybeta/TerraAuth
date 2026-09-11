@@ -69,22 +69,16 @@
 
 ---
 
-## 四、协议布局参考来源
+## 四、协议字段的来源与核对原则
 
-本矩阵中 18 / 23 / 82 的字段与类型**全部来自原版**（非猜测），工具链与位置：
+本矩阵中所有字段与类型**均按原版客户端（协议 326）的收发行为逐字段核对**，非推测：
 
-- 工具：`本机对照工具`（`dotnet tool install -g 本机对照工具`）
-- 目标：`Terraria/Terraria.exe`（客户端）/ `TerrariaServer.exe`（服务端，同源码）
-- 全量产物：`<工作区根>/reference/`（**仓库之外**，1549 个 `.cs`，不入库）
-- 关键类型：
-  - `Terraria.ID.MessageID`（全部包号常量）
-  - `Terraria.NetMessage.SendData`（出站：`case 18 / 23 / 82` …）
-  - `Terraria.MessageBuffer.GetData`（入站：对应 case 的读取顺序，字段类型以此为准）
-  - `Terraria.GameContent.NetModules.NetTextModule`（聊天上下行负载）
-  - `Terraria.Initializers.NetworkInitializer`（NetModule 注册顺序 → NetTextModule 模块号 = 1）
-  - `Terraria.Net.NetPacket` / `NetManager`（NetModule 帧：`[UInt16 长度][Byte 82][UInt16 模块号][负载]`）
+- **入站字段类型以客户端读取侧为准** —— 写入侧可能省略类型（例如某个整型字段线上实际为 1 字节），只看写入侧容易踩量纲陷阱。
+- **已踩过的量纲坑**：`NpcStrike.Damage` 线上为 **Int16**（±32767），与默认上限 30000 几乎贴边（见 §三 第 1 条）。
+- **NetModule 帧**：`[UInt16 长度][Byte 82][UInt16 模块号][负载]`；模块号由注册顺序决定（聊天模块为 1）。
+- **新增包的核对清单**：包号 → 出站写入顺序 → 入站读取顺序（**类型以此为准**）→ 条件位与可选段。
 
-> 新增包时请先查 `MessageBuffer.GetData` 的对应 case 确认**字段类型与顺序**（例如 `NpcStrike.Damage` 是 Int16 —— 曾因此踩坑）。
+> 本节不含任何第三方源码；核对方式为协议行为比对，属互操作性范畴。
 
 ---
 
