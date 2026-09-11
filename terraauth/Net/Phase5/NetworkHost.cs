@@ -361,6 +361,11 @@ public sealed class NetworkHost : IAsyncDisposable
                     sender.PlayerId, PacketId.ProjectileNew, proj, ct).ConfigureAwait(false);
                 break;
 
+            case ProjectileDestroyPacket destroy:    // 29 弹幕销毁（不中继会导致他人视角弹幕永不消失）
+                await _connections.BroadcastExceptAsync(
+                    sender.PlayerId, PacketId.ProjectileDestroy, destroy, ct).ConfigureAwait(false);
+                break;
+
             case ItemDropPacket drop:                // 21 世界掉落物
                 await _connections.BroadcastExceptAsync(
                     sender.PlayerId, PacketId.ItemDrop, drop, ct).ConfigureAwait(false);
@@ -401,6 +406,19 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>向所有 Playing 连接广播一个包（供世界状态同步 / 聊天使用）。</summary>
     public Task BroadcastAsync(PacketId type, INetworkPacket packet, CancellationToken ct = default)
         => _connections.BroadcastAsync(type, packet, ct);
+
+    /// <summary>
+    /// 只发给满足条件的玩家（用于按视口裁剪的世界同步，避免把全世界 NPC / 掉落物推给所有人）。
+    /// </summary>
+    public async Task BroadcastWhereAsync(
+        PacketId type, INetworkPacket packet, Func<int, bool> shouldSend, CancellationToken ct = default)
+    {
+        foreach (var conn in _connections.All())
+        {
+            if (conn.State != ConnectionState.Playing || !shouldSend(conn.PlayerId)) continue;
+            await conn.SendEncodedAsync(type, packet, ct).ConfigureAwait(false);
+        }
+    }
 
     /// <summary>
     /// 广播一条聊天（包 82 / NetTextModule 下行形态：作者 = 服务端）。

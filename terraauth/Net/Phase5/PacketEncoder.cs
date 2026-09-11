@@ -256,6 +256,12 @@ public sealed class PacketEncoder : IPacketEncoder
                     bw.Write((byte)(death.Pvp ? 0x01 : 0));
                     break;
 
+                case ProjectileDestroyPacket destroy:
+                    // KillProjectile（包 29）：Int32 弹幕键 + Vector2 位置
+                    bw.Write(destroy.ProjectileKey);
+                    WriteVector2(bw, destroy.Position);
+                    break;
+
                 case TimePacket time:
                     // Time（包 18）：Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY
                     bw.Write((byte)(time.DayTime ? 1 : 0));

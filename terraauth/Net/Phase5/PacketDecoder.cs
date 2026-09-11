@@ -90,6 +90,7 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.PlayerDeathV2     => DecodePlayerDeathV2(reader),
             PacketId.ProjectileNew     => DecodeProjectileNew(reader),
             PacketId.Chest             => DecodeChest(reader),
+            PacketId.ProjectileDestroy => DecodeProjectileDestroy(reader),
             PacketId.Time              => DecodeTime(reader),
             PacketId.NpcUpdate         => DecodeNpcUpdate(reader),
             PacketId.NetModule         => DecodeNetText(reader, context, payload),
@@ -105,6 +106,10 @@ public sealed class PacketDecoder : IPacketDecoder
     }
 
     // ---------- 时间 / NPC / 聊天（包 18 / 23 / 82） ----------
+
+    /// <summary>KillProjectile（包 29）：Int32 弹幕键 + Vector2 位置。</summary>
+    private static ProjectileDestroyPacket DecodeProjectileDestroy(BinaryReader r)
+        => new(r.ReadInt32(), new Vector2(r.ReadSingle(), r.ReadSingle()));
 
     /// <summary>Time（包 18）：Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY。</summary>
     private static TimePacket DecodeTime(BinaryReader r)

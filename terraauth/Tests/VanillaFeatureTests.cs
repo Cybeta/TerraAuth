@@ -558,6 +558,22 @@ public class VanillaFeatureTests
     }
 
     [Fact]
+    public async Task Vanilla_ProjectileDestroy_Is_Relayed()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        await a.SendAsync(PacketId.ProjectileNew,
+            new ProjectileNewPacket(9, new Vector2(320f, 460f), new Vector2(1f, 0f), 1));
+        await a.SendAsync(PacketId.ProjectileDestroy, new ProjectileDestroyPacket(9, new Vector2(400f, 460f)));
+
+        var got = await b.ReadUntilAsync(p => p is ProjectileDestroyPacket, TimeSpan.FromSeconds(5));
+        var destroy = Assert.Single(got.OfType<ProjectileDestroyPacket>());
+        Assert.Equal(9, destroy.ProjectileKey);
+    }
+
+    [Fact]
     public async Task Vanilla_ItemDrop_Is_Relayed_To_OtherPlayers()
     {
         using var server = VanillaServer.Start();

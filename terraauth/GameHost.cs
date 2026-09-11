@@ -299,19 +299,33 @@ public sealed class GameHost : IDisposable
             new TimePacket(world.DayTime, (int)world.Time, SunModY: 0, MoonModY: 0), ct).ConfigureAwait(false);
 
         // NPC 索引上限 199（原版 Main.npc[200]）；位置为像素坐标，速度暂以 0 下发（客户端自行插值）
+        // 视口裁剪：只发给视野半径内的玩家，避免把全世界 NPC 推给所有人
+        var radius = Math.Max(1, Config.Current.ViewportRadius);
+        var radiusSq = (float)radius * radius;
+
         for (var i = 0; i < world.Npcs.Count && i <= byte.MaxValue; i++)
         {
             var npc = world.Npcs[i];
-            await Network.BroadcastAsync(PacketId.NpcUpdate,
-                new NpcUpdatePacket(
-                    Index: (byte)i,
-                    Generation: 0,
-                    Position: new Vector2(npc.X, npc.Y),
-                    Velocity: new Vector2(0f, 0f),
-                    Target: 0,
-                    NetId: (short)npc.Type),
-                ct).ConfigureAwait(false);
+            var packet = new NpcUpdatePacket(
+                Index: (byte)i,
+                Generation: 0,
+                Position: new Vector2(npc.X, npc.Y),
+                Velocity: new Vector2(0f, 0f),
+                Target: 0,
+                NetId: (short)npc.Type);
+
+            await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet,
+                playerId => IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq), ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>玩家当前位置是否落在 (x, y) 的视口半径内。</summary>
+    private static bool IsPlayerWithin(WorldState world, int playerId, float x, float y, float radiusSq)
+    {
+        if (!world.Players.TryGetValue(playerId, out var player)) return true; // 位置未知 → 不裁剪，避免 NPC 不可见
+        var dx = player.Position.X - x;
+        var dy = player.Position.Y - y;
+        return dx * dx + dy * dy <= radiusSq;
     }
 
     /// <summary>等待关闭信号后再停止网络宿主（避免启动即停机）。</summary>

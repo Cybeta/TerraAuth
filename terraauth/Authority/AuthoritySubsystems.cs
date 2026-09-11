@@ -694,6 +694,12 @@ internal sealed class RateAuthority : IRateAuthority
                     if (!state.Chat.TryConsume(now, _limits.MaxChatPerMinute, TimeSpan.FromMinutes(1)))
                         return Deny(context, packetType, "chat_rate_exceeded", _limits.MaxChatPerMinute);
                     break;
+
+                // 聊天（包 82 NetTextModule）：与已弃用的包 25 共用同一聊天令牌桶
+                case PacketId.NetModule:
+                    if (!state.Chat.TryConsume(now, _limits.MaxChatPerMinute, TimeSpan.FromMinutes(1)))
+                        return Deny(context, packetType, "chat_rate_exceeded", _limits.MaxChatPerMinute);
+                    break;
             }
         }
 

@@ -395,6 +395,16 @@ public sealed record InventorySlotPacket(int Slot, int ItemId, int Stack) : INet
 }
 
 /// <summary>
+/// 弹幕销毁包（KillProjectile，包 29，双向）。
+/// 布局权威：<c>NetMessage.SendData</c> case 29 / <c>MessageBuffer.GetData</c> case 29：
+/// <c>Int32 弹幕键 + Vector2 位置</c>。服务端权威：仅弹幕归属者可销毁。
+/// </summary>
+public sealed record ProjectileDestroyPacket(int ProjectileKey, Vector2 Position) : INetworkPacket
+{
+    public PacketId Type => PacketId.ProjectileDestroy;
+}
+
+/// <summary>
 /// 世界时间包（Time，包 18，服务端 → 客户端）。
 /// 布局权威：<c>NetMessage.SendData</c> case 18 / <c>MessageBuffer.GetData</c> case 18：
 /// <c>Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY</c>。
