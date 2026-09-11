@@ -261,13 +261,20 @@ public sealed class TModLoaderCompat
     private readonly ILogger _logger;
     private readonly ICustomPacketHandler _packets;
 
-    // TModLoader 自定义包 ID 区间（参考 tModLoader 协议）
+    /// <summary>自定义包转发回调（由组合根注入 NetworkHost 的单播发送）；null 表示未装配发送通道。</summary>
+    private readonly Func<int, int, int, byte[], Task>? _forward;
+
+    // TModLoader 自定义包 ID 区间（ModPacket 使用 250 号消息 ID）
     private const int PACKET_START = 250;
     private const int PACKET_END = 255;
 
-    public TModLoaderCompat(IModDetector detector, ILogger logger, ICustomPacketHandler packets)
+    public TModLoaderCompat(
+        IModDetector detector,
+        ILogger logger,
+        ICustomPacketHandler packets,
+        Func<int, int, int, byte[], Task>? forward = null)
     {
-        _detector = detector; _logger = logger; _packets = packets;
+        _detector = detector; _logger = logger; _packets = packets; _forward = forward;
         _packets.RegisterPacketRange(PACKET_START, PACKET_END, "tModLoader");
     }
 
@@ -288,22 +295,71 @@ public sealed class TModLoaderCompat
         return Task.FromResult(new HandshakeResult { Success = true, Capabilities = caps });
     }
 
-    /// <summary>转发 Mod 包给目标玩家。</summary>
-    public Task ForwardModPacketAsync(int fromPlayerId, int toPlayerId, int packetId, byte[] data)
+    /// <summary>转发 Mod 包给目标玩家（仅放行已注册区间，其余丢弃并告警）。</summary>
+    public async Task ForwardModPacketAsync(int fromPlayerId, int toPlayerId, int packetId, byte[] data)
     {
         if (!_packets.IsPacketAllowed(packetId, "tModLoader"))
         {
             _logger.Warn("Blocked unauthorized mod packet {PacketId} from player {PlayerId}", packetId, fromPlayerId);
-            return Task.CompletedTask;
+            return;
         }
-        // TODO: 通过 NetworkHost 发送给 toPlayerId
-        return Task.CompletedTask;
+
+        if (_forward is null)
+        {
+            _logger.Debug("Mod packet {PacketId} accepted but no forward channel configured", packetId);
+            return;
+        }
+
+        await _forward(fromPlayerId, toPlayerId, packetId, data).ConfigureAwait(false);
     }
 
-    private static IReadOnlyList<Plugins.LoadedMod> ParseModList(byte[] data)
+    /// <summary>
+    /// 解析 Mod 列表载荷：Int32 数量 + 数量 ×（7-bit 长度前缀 + UTF-8 名称）。
+    /// 该布局对应 ModPacket 中「Mod 名称清单」段；载荷不含版本 / 哈希，
+    /// 故解析出的 Mod 版本为空串 —— 白名单中带 MinVersion/MaxVersion 的条目无法据此校验。
+    /// 载荷截断 / 数量异常时返回已解析部分（不抛异常，避免握手崩溃）。
+    /// </summary>
+    internal static IReadOnlyList<Plugins.LoadedMod> ParseModList(byte[] data)
     {
-        // TODO: 解析 tModLoader ModNet 序列化格式
-        return Array.Empty<Plugins.LoadedMod>();
+        var mods = new List<Plugins.LoadedMod>();
+        if (data is null || data.Length < sizeof(int)) return mods;
+
+        using var ms = new MemoryStream(data, writable: false);
+        using var reader = new BinaryReader(ms, System.Text.Encoding.UTF8);
+        try
+        {
+            int count = reader.ReadInt32();
+            if (count <= 0 || count > 4096) return Array.Empty<Plugins.LoadedMod>();
+
+            for (int i = 0; i < count; i++)
+            {
+                var name = ReadPrefixedString(reader);
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                mods.Add(new Plugins.LoadedMod(name, Version: "", Author: "", IsClientSideOnly: false, RequiresServerSide: false));
+            }
+        }
+        catch (EndOfStreamException)
+        {
+            // 载荷截断：保留已解析部分
+        }
+        return mods;
+    }
+
+    /// <summary>读取 7-bit 变长长度前缀 + UTF-8 字符串（与 .NET BinaryReader.ReadString 线格式一致）。</summary>
+    private static string ReadPrefixedString(BinaryReader reader)
+    {
+        int len = 0, shift = 0;
+        while (true)
+        {
+            byte b = reader.ReadByte();
+            len |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) break;
+            shift += 7;
+            if (shift > 28) throw new FormatException("非法 7-bit 长度前缀");
+        }
+        var bytes = reader.ReadBytes(len);
+        if (bytes.Length < len) throw new EndOfStreamException("Mod 名称载荷截断");
+        return System.Text.Encoding.UTF8.GetString(bytes);
     }
 
     public sealed class HandshakeResult

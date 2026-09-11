@@ -22,6 +22,8 @@ public interface IAuditRepository
 {
     Task AppendAsync(AuditEntry entry);
     Task<IReadOnlyList<AuditEntry>> QueryByPlayerAsync(Guid playerId, DateTime since);
+    /// <summary>按时间倒序取最近 <paramref name="limit"/> 条审计（供插件事件查询）。</summary>
+    Task<IReadOnlyList<AuditEntry>> QueryRecentAsync(int limit);
 }
 
 public record PlayerData(Guid Id, string Name, byte[] InventoryBlob, int MaxHp, int MaxMp);

@@ -15,4 +15,12 @@ public static class PlayerIdentity
     /// <summary>连接槽位 PlayerId → 稳定 Guid（PlayerId 为 0 表示服务端自身，返回 <see cref="HostId"/>）。</summary>
     public static Guid ToGuid(int playerId)
         => playerId == 0 ? HostId : new Guid(playerId, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte)playerId);
+
+    /// <summary>稳定 Guid → 连接槽位 PlayerId（与 <see cref="ToGuid"/> 互逆；<see cref="HostId"/> 返回 0）。</summary>
+    public static int ToPlayerId(Guid id)
+    {
+        if (id == HostId) return 0;
+        var bytes = id.ToByteArray();
+        return BitConverter.ToInt32(bytes, 0);
+    }
 }

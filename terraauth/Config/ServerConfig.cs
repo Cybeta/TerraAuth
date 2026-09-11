@@ -1,6 +1,8 @@
 // Phase 6 - 服务端配置定义
 // 反作弊阈值的唯一来源（架构 §4.5）
 
+using TerraAuth.ModCompat;
+
 namespace TerraAuth.Config;
 
 public record ServerConfig
@@ -35,6 +37,7 @@ public record ServerConfig
     // ---- 限流权威 (Phase 2 IRateAuthority) ----
     public int MaxPacketsPerSecond { get; init; } = 120;   // 单玩家每秒上行包总量上限
     public int MaxChatPerMinute { get; init; } = 30;       // 单玩家每分钟聊天上限
+    public int MaxLiquidPerSecond { get; init; } = 60;     // 单玩家每秒液体编辑帧上限（包 82 模块 0）
 
     // ---- 库存权威 (Phase 2 IInventoryAuthority) ----
     public bool SscEnabled { get; init; } = true;          // Server Side Characters
@@ -47,6 +50,13 @@ public record ServerConfig
     // ---- 连接认证 (Phase 5) ----
     /// <summary>玩家名白名单（包 4 SyncPlayer）；为空表示不限制。</summary>
     public string[] PlayerWhitelist { get; init; } = System.Array.Empty<string>();
+
+    // ---- Mod 兼容层 (需求 2) ----
+    /// <summary>
+    /// Mod 策略（server.json 的 ModPolicy 节）。默认 VanillaOnly = 仅允许原版客户端；
+    /// Mode 支持字符串枚举（"VanillaOnly" / "Whitelist" / "Blacklist" / "AllowAll"）。
+    /// </summary>
+    public ModPolicy ModPolicy { get; init; } = new();
 
     // ---- 监控 (Phase 6 IMetrics) ----
     public bool MetricsEnabled { get; init; } = true;

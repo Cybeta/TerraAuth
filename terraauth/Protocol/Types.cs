@@ -152,6 +152,19 @@ public sealed record ItemDropPacket(int ItemId, int Stack) : INetworkPacket
 }
 
 /// <summary>
+/// 物品拾取包（SyncItemOwner，包 22，上行）。
+/// 布局：Int16 世界物品槽位 + Byte 归属玩家。
+/// 服务端权威：槽位对应的掉落物必须真实存在、存活且在拾取半径内；拾取由服务端结算并移除世界实体。
+/// </summary>
+public sealed record ItemPickupPacket(int ItemSlotIndex) : INetworkPacket
+{
+    public PacketId Type => PacketId.ItemPickup;
+
+    /// <summary>归属玩家（上行解码时填充；服务端以连接身份覆盖，防止代他人拾取）。</summary>
+    public int PlayerId { get; init; }
+}
+
+/// <summary>
 /// 抛射物生成 / 同步包（ProjectileNew，包 27，双向；原版 SyncProjectile）。
 /// 布局：Int32 抛射物键（ProjectileKey）+ Vector2 位置 + Vector2 速度 + Int16 类型
 ///   + BitsByte 标志1（bit0=ai[0]、bit1=ai[1]、bit2=标志2存在、bit3=banner、bit4=damage、
@@ -196,10 +209,35 @@ public sealed record SyncChestItemPacket(int ChestIndex, int ItemSlot, int Stack
     public PacketId Type => PacketId.SyncChestItem;
 }
 
+/// <summary>
+/// 玩家当前打开的箱子索引（SyncPlayerChestIndex，包 34，服务端 → 客户端）。
+/// 布局：Byte 玩家 + Int16 箱子索引（-1 表示关闭）。
+/// </summary>
+public sealed record PlayerChestIndexPacket(byte PlayerId, short ChestIndex) : INetworkPacket
+{
+    public PacketId Type => PacketId.SyncPlayerChestIndex;
+}
+
 /// <summary>治疗 / 回血事件包（PlayerHeal，包 35）：Byte 玩家 + Int16 治疗量。</summary>
 public sealed record PlayerHealPacket(int PlayerId, int Amount) : INetworkPacket
 {
     public PacketId Type => PacketId.PlayerHeal;
+}
+
+/// <summary>单格液体变更（NetLiquid 条目，6 字节）。</summary>
+public readonly record struct LiquidChange(int X, int Y, byte Amount, byte Type);
+
+/// <summary>
+/// 液体同步帧（包 82 = LoadNetModule → 模块 0 NetLiquidModule）。
+/// 布局：UInt16 模块号(0) + UInt16 条目数 + 条目 ×（Int16 X + Int16 Y + Byte 液体量 + Byte 液体类型）。
+/// 服务端权威：服务端下发自身仿真的液体变化；客户端上报浇灌 / 清液作为意图，经权威校验后落盘。
+/// </summary>
+public sealed record LiquidModulePacket(IReadOnlyList<LiquidChange> Changes) : INetworkPacket
+{
+    public PacketId Type => PacketId.NetModule;
+
+    /// <summary>true = 客户端上报（上行）；false = 服务端下发（下行）。</summary>
+    public bool IsClientMessage { get; init; }
 }
 
 /// <summary>

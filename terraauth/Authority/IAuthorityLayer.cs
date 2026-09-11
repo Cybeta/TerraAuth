@@ -86,12 +86,16 @@ public interface IInventoryAuthority
 {
     AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
     bool IsValidItem(int itemId);
+    /// <summary>单格最大堆叠（阈值唯一来源在 ServerConfig）。</summary>
+    int MaxStackSize { get; }
     int GetStackCount(int playerId, int slot);
     void ApplyAuthorizedChange(int playerId, int slot, int delta);
     /// <summary>检查玩家背包（含装备槽）中是否至少有 1 个指定物品。用于 TilePlace 等需要消耗物品的操作。</summary>
     bool HasItem(int playerId, int itemId);
     /// <summary>消耗玩家背包中 1 个指定物品：找到第一个匹配槽位 stack-1，stack 归零则置 ItemId=0。返回 false 表示背包中无此物品。</summary>
     bool ConsumeItem(int playerId, int itemId);
+    /// <summary>把物品加入服务端权威背包（优先并入同物品未满堆叠，其次占用空槽）。返回 false 表示背包已满。</summary>
+    bool TryAddItem(int playerId, int itemId, int stack);
 }
 
 public interface IWorldAuthority
@@ -103,7 +107,8 @@ public interface IWorldAuthority
 
 public interface IRateAuthority
 {
-    AuthorityResult Check(IPacketContext context, PacketId packetType);
+    /// <summary>按包类型 / 内容执行限流（需要包内容区分包 82 的不同模块）。</summary>
+    AuthorityResult Check(IPacketContext context, INetworkPacket packet);
 }
 
 /// <summary>事件存储（事件溯源）。</summary>

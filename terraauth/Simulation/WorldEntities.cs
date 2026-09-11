@@ -23,6 +23,15 @@ public sealed class WorldItemEntity
     /// <summary>拾取归属玩家（-1 = 无归属）。</summary>
     public int OwnedBy = -1;
 
+    /// <summary>失效是否已下发给客户端（由世界同步线程置位，避免重复发包）。</summary>
+    public bool RemovalNotified;
+
+    /// <summary>
+    /// 是否为已知物品：由客户端上报生成的掉落物为 <c>true</c>（玩家自己已看到），
+    /// 服务端主动生成的（如 Boss 掉落）为 <c>false</c>，需由世界同步补发包 21。
+    /// </summary>
+    public bool NewNotified = true;
+
     /// <summary>失效发生的 tick（用于延后清理）。</summary>
     public long DeadTick;
 }

@@ -60,9 +60,17 @@ internal sealed class PlayerAuthority : IPlayerAuthority
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
     {
-        if (packet is not PlayerHealthPacket hp)
-            return AuthorityResult.Accept(packet);
+        return packet switch
+        {
+            PlayerHealthPacket hp => ValidateHealth(hp, playerId),
+            PlayerHurtV2Packet hurt => ValidateHurt(hurt, playerId),
+            PlayerDeathV2Packet death => ValidateDeath(death, playerId),
+            _ => AuthorityResult.Accept(packet),
+        };
+    }
 
+    private AuthorityResult ValidateHealth(PlayerHealthPacket hp, int playerId)
+    {
         // 基础合法性：负血量 / 非正上限直接拒绝
         if (hp.Hp < 0 || hp.MaxHp <= 0)
         {
@@ -97,8 +105,35 @@ internal sealed class PlayerAuthority : IPlayerAuthority
             // 客户端可下调上限（卸装备），但不得高于服务端记录
             state.Hp = hp.Hp;
             state.MaxHp = hp.MaxHp;
-            return AuthorityResult.Accept(packet);
+            return AuthorityResult.Accept(hp);
         }
+    }
+
+    /// <summary>
+    /// 玩家受伤（包 117）：伤害只允许为非负值，实际扣血由仿真层结算（DamagePlayerCommand）。
+    /// 负伤害等价于治疗（CE 改血的方向之一），直接拒绝。
+    /// </summary>
+    private AuthorityResult ValidateHurt(PlayerHurtV2Packet hurt, int playerId)
+    {
+        if (hurt.Damage < 0)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "hurt_rejected", "invalid_damage",
+                new { hurt.Damage }));
+            return AuthorityResult.Reject("invalid_damage");
+        }
+        return AuthorityResult.Accept(hurt);
+    }
+
+    /// <summary>玩家死亡（包 118）：伤害非负即可，死亡状态由仿真层结算。</summary>
+    private AuthorityResult ValidateDeath(PlayerDeathV2Packet death, int playerId)
+    {
+        if (death.Damage < 0)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "death_rejected", "invalid_damage",
+                new { death.Damage }));
+            return AuthorityResult.Reject("invalid_damage");
+        }
+        return AuthorityResult.Accept(death);
     }
 
     public int GetMaxHp(int playerId) => _stats.TryGetValue(playerId, out var s) ? s.MaxHp : _limits.MaxHp;
@@ -425,10 +460,6 @@ internal sealed class InventoryAuthority : IInventoryAuthority
     /// <summary>Terraria 物品表规模上限（1.4 约 5000+，留余量）。</summary>
     private const int MaxItemId = 6000;
 
-    /// <summary>世界图格宽高（与 TileAuthority 保持一致）。</summary>
-    private const int WorldWidthTiles = 8400;
-    private const int WorldHeightTiles = 2400;
-
     private readonly IAuditLogger _audit;
     private volatile InventoryLimits _limits;
     private readonly ConcurrentDictionary<int, ConcurrentDictionary<int, SlotState>> _inventories = new();
@@ -441,10 +472,11 @@ internal sealed class InventoryAuthority : IInventoryAuthority
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands) => packet switch
     {
         ItemDropPacket drop => ValidateDrop(drop, playerId),
-        ChestPacket chest => ValidateChest(chest, playerId),
         InventorySlotPacket slot => ValidateSlot(slot, playerId),
-        _ => AuthorityResult.Accept(packet),
+        _ => AuthorityResult.Accept(packet),   // 箱子（31/32）由 WorldAuthority 校验（需世界数据）
     };
+
+    public int MaxStackSize => _limits.MaxStackSize;
 
     private AuthorityResult ValidateDrop(ItemDropPacket drop, int playerId)
     {
@@ -453,13 +485,6 @@ internal sealed class InventoryAuthority : IInventoryAuthority
         if (drop.Stack <= 0 || drop.Stack > _limits.MaxStackSize)
             return Deny(playerId, "drop_rejected", "invalid_stack", new { drop.Stack, Max = _limits.MaxStackSize });
         return AuthorityResult.Accept(drop);
-    }
-
-    private AuthorityResult ValidateChest(ChestPacket chest, int playerId)
-    {
-        if (chest.X < 0 || chest.X >= WorldWidthTiles || chest.Y < 0 || chest.Y >= WorldHeightTiles)
-            return Deny(playerId, "chest_rejected", "out_of_bounds", new { chest.X, chest.Y });
-        return AuthorityResult.Accept(chest);
     }
 
     private AuthorityResult ValidateSlot(InventorySlotPacket slot, int playerId)
@@ -521,6 +546,37 @@ internal sealed class InventoryAuthority : IInventoryAuthority
         return false;
     }
 
+    public bool TryAddItem(int playerId, int itemId, int stack)
+    {
+        if (!IsValidItem(itemId) || stack <= 0) return false;
+
+        var inv = _inventories.GetOrAdd(playerId, _ => new ConcurrentDictionary<int, SlotState>());
+        lock (inv)
+        {
+            // 1) 优先并入同物品未满堆叠
+            foreach (var kv in inv)
+            {
+                if (kv.Value.ItemId == itemId && kv.Value.Stack > 0 && kv.Value.Stack < _limits.MaxStackSize)
+                {
+                    var add = Math.Min(stack, _limits.MaxStackSize - kv.Value.Stack);
+                    inv[kv.Key] = new SlotState(itemId, kv.Value.Stack + add);
+                    return true;
+                }
+            }
+
+            // 2) 占用空槽：客户端已上报过的空槽，或尚未上报的槽位（SSC 下均按空处理）
+            for (int slot = 0; slot < InventoryLimits.MaxSlots; slot++)
+            {
+                if (!inv.TryGetValue(slot, out var cur) || cur.Stack == 0)
+                {
+                    inv[slot] = new SlotState(itemId, Math.Min(stack, _limits.MaxStackSize));
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     public void ApplyAuthorizedChange(int playerId, int slot, int delta)
     {
         if (slot < 0 || slot >= InventoryLimits.MaxSlots) return;
@@ -559,8 +615,141 @@ internal sealed class WorldAuthority : IWorldAuthority
     {
         TileBreakPacket brk => ValidateBreak(brk, playerId),
         TilePlacePacket place => ValidatePlace(place, playerId),
+        ItemPickupPacket pickup => ValidatePickup(pickup, playerId),
+        ChestPacket chest => ValidateChestOpen(chest, playerId),
+        SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId),
+        LiquidModulePacket liquid => ValidateLiquid(liquid, playerId),
         _ => AuthorityResult.Accept(packet),
     };
+
+    /// <summary>箱子交互最大距离（像素）。</summary>
+    private const int ChestReachPx = 160;
+
+    /// <summary>液体编辑最大距离（像素）。</summary>
+    private const int LiquidReachPx = 160;
+
+    /// <summary>单个液体帧允许的最大变更条目数（防超大帧）。</summary>
+    private const int MaxLiquidChangesPerPacket = 128;
+
+    /// <summary>
+    /// 客户端液体编辑（包 82 模块 0）：逐条校验坐标越界 / 液体类型 / 玩家距离；
+    /// 全部通过才接受（失败整帧拒绝，避免部分生效导致的状态漂移）。
+    /// </summary>
+    private AuthorityResult ValidateLiquid(LiquidModulePacket liquid, int playerId)
+    {
+        // 服务端下发形态不会进入入站管线；此处仅处理客户端上行
+        if (!liquid.IsClientMessage || liquid.Changes.Count == 0)
+            return AuthorityResult.Accept(liquid);
+
+        if (liquid.Changes.Count > MaxLiquidChangesPerPacket)
+            return Deny(playerId, "liquid_rejected", "too_many_changes",
+                new { liquid.Changes.Count, Max = MaxLiquidChangesPerPacket });
+
+        PlayerRuntime? player;
+        lock (_world.PlayersLock)
+            _world.Players.TryGetValue(playerId, out player);
+        if (player is null || !player.Active || player.Dead)
+            return Deny(playerId, "liquid_rejected", "player_not_active", new { playerId });
+
+        foreach (var change in liquid.Changes)
+        {
+            if (!IsInWorld(change.X, change.Y))
+                return Deny(playerId, "liquid_rejected", "out_of_bounds", new { change.X, change.Y });
+
+            if (change.Type > 3)
+                return Deny(playerId, "liquid_rejected", "invalid_liquid_type", new { change.Type });
+
+            if (!IsWithinReach(playerId, change.X, change.Y, LiquidReachPx))
+                return Deny(playerId, "liquid_rejected", "out_of_reach", new { change.X, change.Y });
+        }
+
+        return AuthorityResult.Accept(liquid);
+    }
+
+    /// <summary>
+    /// 打开箱子（包 31）：坐标必须落在世界内、存在箱子、且玩家在交互距离内。
+    /// 通过后由网络层把服务端持有的箱子内容逐槽下发（包 32）。
+    /// </summary>
+    private AuthorityResult ValidateChestOpen(ChestPacket chest, int playerId)
+    {
+        if (!IsInWorld(chest.X, chest.Y))
+            return Deny(playerId, "chest_rejected", "out_of_bounds", new { chest.X, chest.Y });
+
+        if (!IsWithinReach(playerId, chest.X, chest.Y, ChestReachPx))
+            return Deny(playerId, "chest_rejected", "out_of_reach", new { chest.X, chest.Y });
+
+        lock (_world.ChestsLock)
+        {
+            if (_world.FindChestAt(chest.X, chest.Y) is null)
+                return Deny(playerId, "chest_rejected", "chest_not_found", new { chest.X, chest.Y });
+        }
+
+        return AuthorityResult.Accept(chest);
+    }
+
+    /// <summary>
+    /// 箱子内物品写入（包 32）：箱子索引 / 槽位 / 堆叠 / 物品合法性 + 玩家在交互距离内。
+    /// 通过后由 <see cref="SyncChestItemCommand"/> 落盘到服务端箱子（服务端持有唯一真相）。
+    /// </summary>
+    private AuthorityResult ValidateChestItem(SyncChestItemPacket item, int playerId)
+    {
+        if (item.Stack < 0 || item.Stack > _inv.MaxStackSize)
+            return Deny(playerId, "chest_rejected", "invalid_stack",
+                new { item.Stack, Max = _inv.MaxStackSize });
+
+        // 空槽（Stack==0）允许任意物品 ID（用于清空），非空槽必须是已知物品
+        if (item.Stack > 0 && !_inv.IsValidItem(item.ItemType))
+            return Deny(playerId, "chest_rejected", "unknown_item", new { item.ItemType });
+
+        Chest? chest;
+        lock (_world.ChestsLock)
+            chest = _world.FindChestByIndex(item.ChestIndex);
+        if (chest is null)
+            return Deny(playerId, "chest_rejected", "chest_not_found", new { item.ChestIndex });
+
+        if (item.ItemSlot < 0 || item.ItemSlot >= chest.Items.Length)
+            return Deny(playerId, "chest_rejected", "invalid_slot", new { item.ItemSlot });
+
+        if (!IsWithinReach(playerId, chest.X, chest.Y, ChestReachPx))
+            return Deny(playerId, "chest_rejected", "out_of_reach", new { item.ChestIndex });
+
+        return AuthorityResult.Accept(item);
+    }
+
+    /// <summary>玩家拾取掉落物的最大距离（像素）。原版拾取盒约 1 格 + 玩家半宽，此处放宽到 4 格。</summary>
+    private const int PickupReachPx = 64;
+
+    /// <summary>
+    /// 掉落物拾取（包 22）：槽位必须对应真实存活的世界掉落物、玩家在线且在拾取半径内，
+    /// 入库成功后才允许移除世界实体（背包已满则拒绝，世界实体保留）。
+    /// </summary>
+    private AuthorityResult ValidatePickup(ItemPickupPacket pickup, int playerId)
+    {
+        PlayerRuntime? player;
+        lock (_world.PlayersLock)
+            _world.Players.TryGetValue(playerId, out player);
+        if (player is null || !player.Active || player.Dead)
+            return Deny(playerId, "pickup_rejected", "player_not_active", new { playerId });
+
+        WorldItemEntity? item;
+        lock (_world.ItemsLock)
+            item = _world.Items.FirstOrDefault(i => i.Slot == pickup.ItemSlotIndex && i.Active);
+        if (item is null)
+            return Deny(playerId, "pickup_rejected", "item_not_found", new { pickup.ItemSlotIndex });
+
+        // 拾取半径：CE 远程拾取 → 拒绝
+        var dx = player.Position.X - item.Position.X;
+        var dy = player.Position.Y - item.Position.Y;
+        if (dx * dx + dy * dy > (float)PickupReachPx * PickupReachPx)
+            return Deny(playerId, "pickup_rejected", "out_of_reach", new { pickup.ItemSlotIndex });
+
+        // 服务端权威背包入库（SSC）：入不了（背包满）则拒绝，且不移除世界实体
+        if (!_inv.TryAddItem(playerId, item.ItemId, item.Stack))
+            return Deny(playerId, "pickup_rejected", "inventory_full",
+                new { item.ItemId, item.Stack });
+
+        return AuthorityResult.Accept(pickup);
+    }
 
     private AuthorityResult ValidateBreak(TileBreakPacket brk, int playerId)
     {
@@ -662,7 +851,7 @@ internal sealed class RateAuthority : IRateAuthority
     /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
     internal void UpdateLimits(RateLimits limits) => _limits = limits;
 
-    public AuthorityResult Check(IPacketContext context, PacketId packetType)
+    public AuthorityResult Check(IPacketContext context, INetworkPacket packet)
     {
         var state = _states.GetOrAdd(context.PlayerId, _ => new PlayerRateState());
         var now = context.ReceivedAt == default ? DateTimeOffset.UtcNow : context.ReceivedAt;
@@ -671,34 +860,36 @@ internal sealed class RateAuthority : IRateAuthority
         {
             // 全局包速率：packet flood / DoS 防护
             if (!state.Global.TryConsume(now, _limits.MaxPacketsPerSecond, TimeSpan.FromSeconds(1)))
-                return Deny(context, packetType, "packet_rate_exceeded", _limits.MaxPacketsPerSecond);
+                return Deny(context, packet.Type, "packet_rate_exceeded", _limits.MaxPacketsPerSecond);
 
-            switch (packetType)
+            switch (packet)
             {
-                case PacketId.TileBreak:
+                case TileBreakPacket:
                     if (!state.TileBreak.TryConsume(now, _limits.MaxTileBreakPerSecond, TimeSpan.FromSeconds(1)))
-                        return Deny(context, packetType, "tile_break_rate_exceeded", _limits.MaxTileBreakPerSecond);
+                        return Deny(context, packet.Type, "tile_break_rate_exceeded", _limits.MaxTileBreakPerSecond);
                     break;
 
-                case PacketId.TilePlace:
+                case TilePlacePacket:
                     if (!state.TilePlace.TryConsume(now, _limits.MaxTilePlacePerSecond, TimeSpan.FromSeconds(1)))
-                        return Deny(context, packetType, "tile_place_rate_exceeded", _limits.MaxTilePlacePerSecond);
+                        return Deny(context, packet.Type, "tile_place_rate_exceeded", _limits.MaxTilePlacePerSecond);
                     break;
 
-                case PacketId.ProjectileNew:
+                case ProjectileNewPacket:
                     if (!state.Projectile.TryConsume(now, _limits.MaxProjectilesPerSecond, TimeSpan.FromSeconds(1)))
-                        return Deny(context, packetType, "projectile_rate_exceeded", _limits.MaxProjectilesPerSecond);
+                        return Deny(context, packet.Type, "projectile_rate_exceeded", _limits.MaxProjectilesPerSecond);
                     break;
 
-                case PacketId.ChatText:
+                // 聊天：包 82 的 NetTextModule（含已弃用的包 25）共用同一聊天令牌桶
+                case NetTextPacket { IsClientMessage: true }:
+                case UnknownPacket { Type: PacketId.ChatText }:
                     if (!state.Chat.TryConsume(now, _limits.MaxChatPerMinute, TimeSpan.FromMinutes(1)))
-                        return Deny(context, packetType, "chat_rate_exceeded", _limits.MaxChatPerMinute);
+                        return Deny(context, packet.Type, "chat_rate_exceeded", _limits.MaxChatPerMinute);
                     break;
 
-                // 聊天（包 82 NetTextModule）：与已弃用的包 25 共用同一聊天令牌桶
-                case PacketId.NetModule:
-                    if (!state.Chat.TryConsume(now, _limits.MaxChatPerMinute, TimeSpan.FromMinutes(1)))
-                        return Deny(context, packetType, "chat_rate_exceeded", _limits.MaxChatPerMinute);
+                // 液体：包 82 的 NetLiquidModule，独立令牌桶（不占用聊天额度）
+                case LiquidModulePacket:
+                    if (!state.Liquid.TryConsume(now, _limits.MaxLiquidPerSecond, TimeSpan.FromSeconds(1)))
+                        return Deny(context, packet.Type, "liquid_rate_exceeded", _limits.MaxLiquidPerSecond);
                     break;
             }
         }
@@ -741,5 +932,6 @@ internal sealed class RateAuthority : IRateAuthority
         public WindowCounter TilePlace;
         public WindowCounter Projectile;
         public WindowCounter Chat;
+        public WindowCounter Liquid;
     }
 }

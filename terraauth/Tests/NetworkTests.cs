@@ -344,6 +344,34 @@ public class AuthorityPacketCodecTests
     }
 
     [Fact]
+    public void Encode_Decode_PlayerChestIndex_RoundTrips()
+    {
+        var p = RoundTrip<PlayerChestIndexPacket>(PacketId.SyncPlayerChestIndex,
+            new PlayerChestIndexPacket(PlayerId: 3, ChestIndex: 12));
+        Assert.Equal(3, p.PlayerId);
+        Assert.Equal(12, p.ChestIndex);
+    }
+
+    [Fact]
+    public void Encode_Decode_LiquidModule_RoundTrips()
+    {
+        var original = new LiquidModulePacket(new[]
+        {
+            new LiquidChange(2100, 300, 200, 0),
+            new LiquidChange(2101, 300, 0, 0),
+            new LiquidChange(2102, 301, 128, 1),
+        });
+
+        var p = RoundTrip<LiquidModulePacket>(PacketId.NetModule, original);
+
+        Assert.Equal(3, p.Changes.Count);
+        Assert.Equal(new LiquidChange(2100, 300, 200, 0), p.Changes[0]);
+        Assert.Equal(new LiquidChange(2101, 300, 0, 0), p.Changes[1]);
+        Assert.Equal(new LiquidChange(2102, 301, 128, 1), p.Changes[2]);
+        Assert.True(p.IsClientMessage); // RoundTrip 用入站上下文解码 → 视为客户端上行
+    }
+
+    [Fact]
     public void Encode_Decode_SyncPlayerZone_RoundTrips()
     {
         var original = new SyncPlayerZonePacket(PlayerId: 1, Zone1: 1, Zone2: 2, Zone3: 3, Zone4: 4, Zone5: 5, TownNpcs: 6);

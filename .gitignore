@@ -1,5 +1,5 @@
 # ========== TerraAuth 项目根目录 .gitignore ==========
-# 位于 项目根，管理 terraauth 源码 + .vscode 配置
+# 管理 terraauth 源码 + .vscode 配置
 # 独立的 terraauth/.gitignore 保留，本文件做根目录补充
 
 # ---- Terraria 二进制目录（只读，数百 .xnb/.dll/.exe，不可提交） ----
@@ -22,7 +22,7 @@ Thumbs.db
 *.swp
 *.tmp
 
-# ---- 原版相关：一律放仓库外，禁止入库（用户规则） ----
+# ---- 本地素材 / 第三方产物：一律放仓库外，禁止入库 ----
 decompiled/
 decompiled-*.zip
 *.bundle

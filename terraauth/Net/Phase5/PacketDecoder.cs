@@ -80,7 +80,9 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.TileBreak         => DecodeTileBreak(reader),
             PacketId.TilePlace         => DecodeTilePlace(reader),
             PacketId.ItemDrop          => DecodeSyncItem(reader),
+            PacketId.ItemPickup        => DecodeItemPickup(reader),
             PacketId.SyncChestItem     => DecodeSyncChestItem(reader),
+            PacketId.SyncPlayerChestIndex => DecodePlayerChestIndex(reader),
             PacketId.PlayerHeal        => DecodePlayerHeal(reader),
             PacketId.SyncPlayerZone    => DecodeSyncPlayerZone(reader),
             PacketId.PlayerBuffs       => DecodePlayerBuffs(reader),
@@ -93,7 +95,7 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.ProjectileDestroy => DecodeProjectileDestroy(reader),
             PacketId.Time              => DecodeTime(reader),
             PacketId.NpcUpdate         => DecodeNpcUpdate(reader),
-            PacketId.NetModule         => DecodeNetText(reader, context, payload),
+            PacketId.NetModule         => DecodeNetModule(reader, context, payload),
             PacketId.Disconnect        => payload.Length == 0
                 ? DisconnectPacket.Instance
                 : DecodeDisconnect(reader),
@@ -147,11 +149,29 @@ public sealed class PacketDecoder : IPacketDecoder
         return new NpcUpdatePacket(index, generation, position, velocity, target, netId);
     }
 
-    /// <summary>NetTextModule（包 82）：按方向解上行（命令名 + 文本）或下行（作者 + 文本 + 颜色）。</summary>
-    private static INetworkPacket DecodeNetText(BinaryReader r, DecodeContext context, ReadOnlySpan<byte> payload)
+    /// <summary>
+    /// NetModule（包 82）：按模块号分派。
+    ///   模块 0 = NetLiquidModule（液体变更）；模块 1 = NetTextModule（聊天）。
+    /// 未建模模块统一透传为 <see cref="UnknownPacket"/>。
+    /// </summary>
+    private static INetworkPacket DecodeNetModule(BinaryReader r, DecodeContext context, ReadOnlySpan<byte> payload)
     {
-        const ushort netTextModuleId = 1; // NetLiquidModule=0 → NetTextModule=1
-        if (r.ReadUInt16() != netTextModuleId)
+        const ushort netLiquidModuleId = 0; // NetLiquidModule
+        const ushort netTextModuleId = 1;   // NetLiquidModule=0 → NetTextModule=1
+
+        var moduleId = r.ReadUInt16();
+
+        if (moduleId == netLiquidModuleId)
+        {
+            // 液体：UInt16 条目数 + 条目 ×（Int16 X + Int16 Y + Byte 液体量 + Byte 液体类型）
+            int count = r.ReadUInt16();
+            var changes = new List<LiquidChange>(count);
+            for (int i = 0; i < count; i++)
+                changes.Add(new LiquidChange(r.ReadInt16(), r.ReadInt16(), r.ReadByte(), r.ReadByte()));
+            return new LiquidModulePacket(changes) { IsClientMessage = !context.ServerToClient };
+        }
+
+        if (moduleId != netTextModuleId)
             return new UnknownPacket(PacketId.NetModule, payload.ToArray()); // 其他模块不解析，原样透传
 
         if (context.ServerToClient)
@@ -482,6 +502,14 @@ public sealed class PacketDecoder : IPacketDecoder
         };
     }
 
+    private INetworkPacket DecodeItemPickup(BinaryReader r)
+    {
+        // SyncItemOwner（包 22）：Int16 世界物品槽位 + Byte 归属玩家
+        var itemSlot = r.ReadInt16();
+        var playerId = r.ReadByte();
+        return new ItemPickupPacket(itemSlot) { PlayerId = playerId };
+    }
+
     private INetworkPacket DecodeSyncChestItem(BinaryReader r)
     {
         // SyncChestItem（包 32）：Int16 chestIndex + Byte slot + Int16 stack + Byte prefix + Int16 type
@@ -491,6 +519,14 @@ public sealed class PacketDecoder : IPacketDecoder
         var prefix = r.ReadByte();
         var itemType = r.ReadInt16();
         return new SyncChestItemPacket(chestIndex, itemSlot, stack, prefix, itemType);
+    }
+
+    private INetworkPacket DecodePlayerChestIndex(BinaryReader r)
+    {
+        // SyncPlayerChestIndex（包 34）：Byte playerId + Int16 chestIndex
+        var playerId = r.ReadByte();
+        var chestIndex = r.ReadInt16();
+        return new PlayerChestIndexPacket(playerId, chestIndex);
     }
 
     private INetworkPacket DecodePlayerHeal(BinaryReader r)

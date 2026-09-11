@@ -659,7 +659,7 @@ public static class WorldFileReader
                     if ((b & 0x10) == 0x10) tile.FullbrightWall = true;
                 }
 
-                int run = (b4 & 0xC0) >> 6 switch
+                int run = ((b4 & 0xC0) >> 6) switch
                 {
                     0 => 0,
                     1 => reader.ReadByte(),

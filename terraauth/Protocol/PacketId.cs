@@ -31,6 +31,7 @@ public enum PacketId : byte
     TileBreak           = 17,   // 原版 TileManipulation：破块 / 改块
     Time                = 18,   // 原版 Time：世界时间（Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY）
     ItemDrop            = 21,   // 原版 SyncItem
+    ItemPickup          = 22,   // 原版 SyncItemOwner：物品拾取（Int16 物品槽位 + Byte 归属玩家）
     NpcUpdate           = 23,   // 原版 SyncNPC：NPC 生成 / 更新（条件位 + 可选 ai / 生命段）
     ChatText            = 25,   // 原版 Unused25（已弃用，1.4 起聊天走 NetTextModule）
     ProjectileNew       = 27,   // 原版 SyncProjectile
@@ -38,6 +39,7 @@ public enum PacketId : byte
     ProjectileDestroy   = 29,   // 原版 KillProjectile：弹幕销毁（Int32 弹幕键 + Vector2 位置）
     Chest               = 31,   // 原版 RequestChestOpen
     SyncChestItem       = 32,   // 原版 SyncChestItem：箱子内物品同步
+    SyncPlayerChestIndex = 34,  // 原版 SyncPlayerChestIndex：告知玩家当前打开的箱子索引（Byte 玩家 + Int16 箱子）
     PlayerHeal          = 35,   // 原版 PlayerHeal：治疗 / 回血事件
     SyncPlayerZone      = 36,   // 原版 SyncPlayerZone：生物群系 / 城镇 NPC 状态
     InitialSpawn        = 49,   // 原版 InitialSpawn：无 payload

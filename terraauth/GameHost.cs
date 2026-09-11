@@ -44,6 +44,10 @@ public sealed class GameHost : IDisposable
     public IModDetector ModDetector { get; }
     /// <summary>自定义包处理器：Mod 自定义网络包 ID 区间管理。</summary>
     public ICustomPacketHandler CustomPackets { get; }
+    /// <summary>TModLoader 兼容层：Mod 列表解析 + 自定义包转发。</summary>
+    public TModLoaderCompat TModLoader { get; }
+    /// <summary>服务端命令子系统：内置命令 + 插件注册的命令。</summary>
+    public CommandService Commands { get; }
     /// <summary>并行配置：线程池大小、Chunk 大小等。</summary>
     public ParallelConfig Parallel { get; }
     /// <summary>Worker 池：网络 I/O 与解码并行。</summary>
@@ -72,9 +76,11 @@ public sealed class GameHost : IDisposable
         PluginLoader pluginLoader,
         IModDetector modDetector,
         ICustomPacketHandler customPackets,
+        TModLoaderCompat tmodLoader,
         ParallelConfig parallel,
         WorkerPool workers,
         AuthorityEnforcers enforcers,
+        CommandService commands,
         IAsyncDisposable? pipelineDisposable = null)
     {
         Config = config;
@@ -93,6 +99,8 @@ public sealed class GameHost : IDisposable
         Plugins = pluginLoader;
         ModDetector = modDetector;
         CustomPackets = customPackets;
+        TModLoader = tmodLoader;
+        Commands = commands;
         Parallel = parallel;
         Workers = workers;
         _enforcers = enforcers;
@@ -169,8 +177,8 @@ public sealed class GameHost : IDisposable
         var hooks = new HookRegistry(logger);
 
         // 3. Mod 兼容层（需求 2：Mod 服务器支持）
-        // ModPolicy 不属于 ServerConfig（配置文件当前仅含阈值），默认仅允许原版客户端
-        var modPolicy = new ModPolicy { Mode = ModPolicyMode.VanillaOnly };
+        // ModPolicy 取自 server.json 的 ModPolicy 节（未配置时默认 VanillaOnly = 仅原版客户端）
+        var modPolicy = config.Current.ModPolicy;
         var modDetector = new ModDetector(modPolicy, logger);
         var customPackets = new CustomPacketHandler(logger);
 
@@ -200,15 +208,27 @@ public sealed class GameHost : IDisposable
                 config.Current.ViolationWindowMinutes * 60));
         networkForNames = network; // HookedPipeline 的玩家名解析延迟绑定到此
 
+        // 6.5 TModLoader 兼容层：Mod 列表解析 + 自定义包转发
+        // 转发通道绑定到网络层单播发送（包号 250-255 原样透传，其余被 CustomPackets 拦截）
+        var tmodLoader = new TModLoaderCompat(
+            modDetector, logger, customPackets,
+            forward: (_, toPlayerId, packetId, data) =>
+                network.SendRawAsync(toPlayerId, (PacketId)packetId, data));
+
         // 7. 插件上下文 + 加载器
         // 必须在网络层之后：ServerApi 需要连接管理（踢出/在线查询）与封禁管理器才能真实生效
+        // 命令子系统：内置 say / who / kick / help；插件可经 IServerApi.ExecuteCommand 调用
+        var commandService = new CommandService();
+        var serverApi = new ServerApi(auditLogger, metrics, network, connections, bans, world, commandService);
+        RegisterBuiltinCommands(commandService, serverApi);
+
         var pluginContext = new PluginContext(
             hooks: hooks,
             logger: logger,
             configuration: new CoreConfiguration(config),
             metrics: new CoreMetrics(metrics),
-            server: new ServerApi(auditLogger, metrics, network, connections, bans, world),
-            eventStore: new CoreEventStore(auditLogger));
+            server: serverApi,
+            eventStore: new CoreEventStore(db));
         var pluginLoader = new PluginLoader(
             pluginDirectory: System.IO.Path.Combine(System.AppContext.BaseDirectory, "plugins"),
             logger: logger,
@@ -229,8 +249,8 @@ public sealed class GameHost : IDisposable
 
         var host = new GameHost(
             config, db, db, metrics, bans, network, hookedPipeline, simulator, broadcaster, metricsServer,
-            hooks, pluginLoader, modDetector, customPackets, parallelConfig, workers, enforcers,
-            shardedPipeline);
+            hooks, pluginLoader, modDetector, customPackets, tmodLoader, parallelConfig, workers, enforcers,
+            commandService, shardedPipeline);
 
         // 订阅审计：权威层 Reject → Metrics + Ban 累计（架构 §4.5 数据流）
         auditLogger.OnViolation += (playerId, reason) =>
@@ -269,6 +289,14 @@ public sealed class GameHost : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 await Broadcaster.FlushAsync(ct);
+                // 液体变化随快照频率（20Hz）下发：1Hz 的液体流动观感过差（按视口裁剪）
+                await FlushLiquidAsync(ct).ConfigureAwait(false);
+                // 服务端驱动的图格变更（电路翻转执行器等）同样按快照频率推送
+                await FlushTileUpdatesAsync(ct).ConfigureAwait(false);
+                // 服务端判定的玩家受击（接触 / 下落伤害）→ 包 117 + 包 16
+                await FlushPlayerHurtAsync(ct).ConfigureAwait(false);
+                // 服务端主动生成的掉落物（Boss 掉落等）→ 包 21
+                await FlushNewItemsAsync(ct).ConfigureAwait(false);
                 await Task.Delay(1000 / Math.Max(1, Config.Current.SnapshotRateHz), ct);
             }
         }, ct);
@@ -287,6 +315,172 @@ public sealed class GameHost : IDisposable
         await Task.WhenAll(simTask, netTask, snapTask, worldSyncTask).ConfigureAwait(false);
     }
 
+    /// <summary>单批液体同步的最大条目数。</summary>
+    private const int MaxLiquidChangesPerBatch = 512;
+
+    /// <summary>图格边长（像素）。</summary>
+    private const float TileSizePx = 16f;
+
+    /// <summary>
+    /// 批量下发服务端仿真的液体变化（包 82 模块 0），**按视口裁剪**：
+    /// 每个玩家只收到其视野半径内的变更；无变更的玩家不下发。由快照循环按快照频率调用。
+    /// </summary>
+    public async Task FlushLiquidAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var cells = world.DrainLiquidSync(MaxLiquidChangesPerBatch);
+        if (cells.Count == 0) return;
+
+        // 先采样一次当前液体状态（随后按玩家裁剪，避免每个玩家重复读图格）
+        var changes = new List<LiquidChange>(cells.Count);
+        foreach (var (x, y) in cells)
+        {
+            Tile tile;
+            using (world.Sections.EnterRead(x, y, x, y))
+                tile = world.Tiles[x, y];
+            changes.Add(new LiquidChange(x, y, tile.Liquid, tile.LiquidType));
+        }
+
+        var radius = Math.Max(1, Config.Current.ViewportRadius);
+        var radiusSq = (float)radius * radius;
+
+        await Network.BroadcastPerPlayerAsync(playerId =>
+        {
+            var subset = new List<LiquidChange>();
+            foreach (var change in changes)
+            {
+                float px = (change.X + 0.5f) * TileSizePx;
+                float py = (change.Y + 0.5f) * TileSizePx;
+                if (IsPlayerWithin(world, playerId, px, py, radiusSq)) subset.Add(change);
+            }
+            return subset.Count == 0 ? null : new LiquidModulePacket(subset);
+        }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>单批受击通知上限。</summary>
+    private const int MaxHurtNotifiesPerFlush = 64;
+
+    /// <summary>
+    /// 下发服务端判定的玩家受击：包 117（受击表现，广播给所有玩家）+
+    /// 包 16（权威生命，单发给受击者，客户端据此更新血条）。由快照循环按快照频率调用。
+    /// </summary>
+    public async Task FlushPlayerHurtAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var hurts = world.DrainPlayerHurt(MaxHurtNotifiesPerFlush);
+        if (hurts.Count == 0) return;
+
+        foreach (var (playerId, damage) in hurts)
+        {
+            await Network.BroadcastAsync(PacketId.PlayerHurtV2,
+                new PlayerHurtV2Packet(playerId, damage), ct).ConfigureAwait(false);
+
+            PlayerRuntime? player;
+            lock (world.PlayersLock)
+                world.Players.TryGetValue(playerId, out player);
+
+            if (player is not null)
+            {
+                await Network.SendToPlayerAsync(playerId, PacketId.PlayerHealth,
+                    new PlayerHealthPacket(playerId, player.Hp, player.HpMax), ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 下发服务端主动生成的掉落物（如 Boss 掉落）：包 21（含服务端分配的槽位 / 位置 / 速度 / 堆叠），按视口裁剪。
+    /// 客户端上报生成的掉落物由客户端自行广播，不在此列（<c>NewNotified</c> 默认 true）。由快照循环调用。
+    /// </summary>
+    public async Task FlushNewItemsAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+
+        WorldItemEntity[] fresh;
+        lock (world.ItemsLock)
+        {
+            fresh = world.Items.Where(i => i.Active && !i.NewNotified).ToArray();
+            foreach (var item in fresh) item.NewNotified = true;
+        }
+
+        if (fresh.Length == 0) return;
+
+        var radius = Math.Max(1, Config.Current.ViewportRadius);
+        var radiusSq = (float)radius * radius;
+
+        foreach (var item in fresh)
+        {
+            await Network.BroadcastWhereAsync(PacketId.ItemDrop,
+                new ItemDropPacket(item.ItemId, item.Stack)
+                {
+                    ItemSlotIndex = item.Slot,
+                    Position = item.Position,
+                    Velocity = item.Velocity,
+                    Prefix = item.Prefix,
+                },
+                playerId => IsPlayerWithin(world, playerId, item.Position.X, item.Position.Y, radiusSq),
+                ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>单次推送的图格数上限。</summary>
+    private const int MaxTileUpdatesPerFlush = 256;
+
+    /// <summary>单次推送的矩形区块数上限（其余重新排队，下次 flush 继续）。</summary>
+    private const int MaxTileUpdateRectsPerFlush = 64;
+
+    /// <summary>
+    /// 推送服务端驱动的图格变更（如电路翻转执行器）：把待推送图格按行合并为连续矩形，
+    /// 以包 10（TileSection）小矩形下发给**视口内**的玩家。由快照循环按快照频率调用。
+    /// </summary>
+    public async Task FlushTileUpdatesAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var cells = world.DrainTileUpdates(MaxTileUpdatesPerFlush);
+        if (cells.Count == 0) return;
+
+        // 先把待推送图格按行合并为「宽 × 1」矩形
+        var rects = new List<(int X, int Y, int Width)>();
+        foreach (var row in cells.GroupBy(c => c.Y))
+        {
+            var xs = row.Select(c => c.X).Distinct().OrderBy(x => x).ToArray();
+            int start = xs[0];
+            int prev = xs[0];
+
+            for (int i = 1; i < xs.Length; i++)
+            {
+                if (xs[i] == prev + 1) { prev = xs[i]; continue; }
+                rects.Add((start, row.Key, prev - start + 1));
+                start = prev = xs[i];
+            }
+            rects.Add((start, row.Key, prev - start + 1));
+        }
+
+        var radius = Math.Max(1, Config.Current.ViewportRadius);
+        var radiusSq = (float)radius * radius;
+
+        for (int i = 0; i < rects.Count; i++)
+        {
+            var (x, y, width) = rects[i];
+
+            // 超出本次上限 → 重新排队，保证不丢更新
+            if (i >= MaxTileUpdateRectsPerFlush)
+            {
+                for (int cx = x; cx < x + width; cx++)
+                    world.MarkTileChanged(cx, y);
+                continue;
+            }
+
+            float centerX = (x + width / 2f) * TileSizePx;
+            float centerY = (y + 0.5f) * TileSizePx;
+
+            await Network.BroadcastWhereAsync(
+                PacketId.TileSendSection,
+                new TileSectionPacket(world, x, y, width, 1),
+                playerId => IsPlayerWithin(world, playerId, centerX, centerY, radiusSq),
+                ct).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>
     /// 把世界时间与 NPC 状态同步给所有在线玩家（包 18 / 23）。
     /// 布局依据：原版客户端（协议 326）包 18 / 包 23 的字段顺序。
@@ -294,6 +488,14 @@ public sealed class GameHost : IDisposable
     public async Task BroadcastWorldStateAsync(CancellationToken ct = default)
     {
         var world = Simulator.State;
+
+        // 世界进度 / 事件变化（Boss 击杀、入侵起止、昼夜切换）→ 重新下发包 7（WorldData）
+        if (world.ProgressDirty)
+        {
+            world.ProgressDirty = false;
+            await Network.BroadcastAsync(PacketId.WorldInfo,
+                world.ToWorldInfoPacket(), ct).ConfigureAwait(false);
+        }
 
         await Network.BroadcastAsync(PacketId.Time,
             new TimePacket(world.DayTime, (int)world.Time, SunModY: 0, MoonModY: 0), ct).ConfigureAwait(false);
@@ -341,6 +543,50 @@ public sealed class GameHost : IDisposable
         {
             await Network.BroadcastAsync(PacketId.ProjectileDestroy,
                 new ProjectileDestroyPacket(p.Key, p.Position), ct).ConfigureAwait(false);
+        }
+
+        // 玩家死亡 / 复活：服务端结算后由本线程补发权威包（118 死亡 / 12+16 复活）
+        PlayerRuntime[] players;
+        lock (world.PlayersLock)
+            players = world.Players.Values.ToArray();
+
+        foreach (var p in players)
+        {
+            if (p.Dead && !p.DeathNotified)
+            {
+                p.DeathNotified = true;
+                await Network.BroadcastAsync(PacketId.PlayerDeathV2,
+                    new PlayerDeathV2Packet(p.Id, 0), ct).ConfigureAwait(false);
+            }
+            else if (!p.Dead && !p.RespawnNotified)
+            {
+                p.RespawnNotified = true;
+                // 复活点由服务端权威划定（世界出生点），并下发满血
+                await Network.BroadcastAsync(PacketId.PlayerSpawn,
+                    new PlayerSpawnPacket((byte)p.Id, (short)world.SpawnTileX, (short)world.SpawnTileY,
+                        0, 0, 0, 0, 0), ct).ConfigureAwait(false);
+                await Network.BroadcastAsync(PacketId.PlayerHealth,
+                    new PlayerHealthPacket(p.Id, p.Hp, p.HpMax), ct).ConfigureAwait(false);
+            }
+        }
+
+        // 掉落物被拾取 / 失效：服务端补发包 21（stack=0）通知客户端移除
+        WorldItemEntity[] removedItems;
+        lock (world.ItemsLock)
+        {
+            removedItems = world.Items.Where(i => !i.Active && !i.RemovalNotified).ToArray();
+            foreach (var i in removedItems) i.RemovalNotified = true;
+        }
+
+        foreach (var item in removedItems)
+        {
+            await Network.BroadcastAsync(PacketId.ItemDrop,
+                new ItemDropPacket(item.ItemId, 0)
+                {
+                    ItemSlotIndex = item.Slot,
+                    Position = item.Position,
+                    Velocity = new Vector2(0, 0),
+                }, ct).ConfigureAwait(false);
         }
     }
 
@@ -401,9 +647,41 @@ public sealed class GameHost : IDisposable
     private static string CreateDefaultConfig(string path)
     {
         var json = System.Text.Json.JsonSerializer.Serialize(
-            new ServerConfig(), new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            new ServerConfig(), ConfigurationService.JsonOptions);
         File.WriteAllText(path, json);
         return path;
+    }
+
+    /// <summary>注册内置命令（say / who / kick / help）；插件可另注册自己的命令。</summary>
+    private static void RegisterBuiltinCommands(CommandService commands, ServerApi server)
+    {
+        commands.Register("say", "广播一条消息：say <text>", (_, args) =>
+        {
+            if (args.Length == 0) return CommandResult.Fail("用法：say <text>");
+            server.Broadcast(string.Join(' ', args));
+            return CommandResult.Ok("已广播");
+        });
+
+        commands.Register("who", "列出在线玩家", (_, _) =>
+        {
+            var players = server.GetOnlinePlayers();
+            return CommandResult.Ok(players.Count == 0
+                ? "当前无在线玩家"
+                : string.Join(", ", players.Select(p => $"#{p.PlayerId} {p.Name}")));
+        });
+
+        commands.Register("kick", "踢出玩家：kick <playerId> [reason]", (_, args) =>
+        {
+            if (args.Length == 0 || !int.TryParse(args[0], out var playerId))
+                return CommandResult.Fail("用法：kick <playerId> [reason]");
+
+            var reason = args.Length > 1 ? string.Join(' ', args[1..]) : "Kicked by command";
+            server.KickPlayer(playerId, reason);
+            return CommandResult.Ok($"已踢出 #{playerId}");
+        });
+
+        commands.Register("help", "列出全部命令", (_, _) =>
+            CommandResult.Ok(string.Join("\n", commands.Commands.Select(c => $"{c.Name} - {c.Help}"))));
     }
 
     /// <summary>
@@ -426,6 +704,7 @@ public sealed class GameHost : IDisposable
                 MaxTilePlacePerSecond = c.MaxTilePlacePerSecond,
                 MaxProjectilesPerSecond = c.MaxProjectilesPerSecond,
                 MaxChatPerMinute = c.MaxChatPerMinute,
+                MaxLiquidPerSecond = c.MaxLiquidPerSecond,
             },
             Player: new PlayerLimits(c.MaxPlayerHp, c.MaxPlayerMana),
             // 移动限速用飞行上限覆盖步行/冲刺，降低误判

@@ -16,6 +16,7 @@ public sealed class RateLimits
     public int MaxTilePlacePerSecond { get; init; } = 40;
     public int MaxProjectilesPerSecond { get; init; } = 60;
     public int MaxChatPerMinute { get; init; } = 30;
+    public int MaxLiquidPerSecond { get; init; } = 60;
 }
 
 // ---------- 包上下文 ----------
@@ -48,7 +49,12 @@ public sealed class ConnectionStateStage : IPipelineStage
     public Task<AuthorityResult> ExecuteAsync(INetworkPacket packet, IPacketContext context,
         Func<INetworkPacket, Task<AuthorityResult>> next, CancellationToken ct)
     {
-        // TODO: 校验 context.PlayerId 已认证
+        // 「仅 Playing 连接的包会进入管线」由网络层保证（NetworkHost.HandleConnectionStateAsync：
+        // 握手包就地消费、非 Playing 的包直接丢弃）。此处只做权威层自身的兜底防御：
+        // 未分配 PlayerId（≤0）的上下文一律静默丢弃，避免无身份包进入后续子系统。
+        if (context.PlayerId <= 0)
+            return Task.FromResult(AuthorityResult.RejectSilent());
+
         return next(packet);
     }
 }
@@ -62,7 +68,7 @@ public sealed class RateLimitStage : IPipelineStage
     public async Task<AuthorityResult> ExecuteAsync(INetworkPacket packet, IPacketContext context,
         Func<INetworkPacket, Task<AuthorityResult>> next, CancellationToken ct)
     {
-        var result = _rate.Check(context, packet.Type);
+        var result = _rate.Check(context, packet);
         if (result.Decision == AuthorityDecision.Reject)
             return result;
         return await next(packet).ConfigureAwait(false);
@@ -177,7 +183,10 @@ public sealed class TerminalStage : IPipelineStage
             => new MoveCommand(context.Tick, context.PlayerId, teleport.Position),
         // 内部简化的位置包（权威层纠偏等内部构造，非线格式）
         PlayerPositionPacket pos => new MoveCommand(context.Tick, context.PlayerId, pos.Position),
-        // 包 17 TileManipulation → 挖砖指令（Action=0 实心砖，2/3 墙，>=5 电线/斜坡类）
+        // 包 17 TileManipulation（action 19 = Actuate）→ 电路触发（服务端沿电线传播并翻转执行器）
+        TileBreakPacket { Action: 19 } actuate =>
+            new ActuateCommand(context.Tick, context.PlayerId, actuate.X, actuate.Y),
+        // 包 17 TileManipulation → 挖砖 / 改砖指令（action 语义见 TileBreakCommand.Apply）
         TileBreakPacket brk => new TileBreakCommand(context.Tick, context.PlayerId, brk.X, brk.Y, brk.Action, brk.TileType),
         // 包 79 PlaceObject → 放砖指令
         TilePlacePacket place => new TilePlaceCommand(context.Tick, context.PlayerId, place.X, place.Y, place.TileType, place.Style),
@@ -186,6 +195,20 @@ public sealed class TerminalStage : IPipelineStage
         // 包 21 SyncItem → 掉落物生成（服务端分配槽位）
         ItemDropPacket drop => new SpawnItemCommand(context.Tick, context.PlayerId,
             drop.ItemId, drop.Stack, drop.Position, drop.Velocity, drop.Prefix),
+        // 包 22 SyncItemOwner → 物品拾取（服务端移除世界实体并入库）
+        ItemPickupPacket pickup => new PickupItemCommand(context.Tick, context.PlayerId, pickup.ItemSlotIndex),
+        // 包 32 SyncChestItem → 箱子内物品写入（服务端持有箱子内容唯一真相）
+        SyncChestItemPacket chestItem => new SyncChestItemCommand(context.Tick, context.PlayerId,
+            chestItem.ChestIndex, chestItem.ItemSlot, chestItem.Stack, chestItem.Prefix, chestItem.ItemType),
+        // 包 82 模块 0（NetLiquid）→ 客户端液体编辑（服务端权威落盘并触发流动）
+        LiquidModulePacket { IsClientMessage: true } liquid =>
+            new LiquidEditCommand(context.Tick, context.PlayerId, liquid.Changes),
+        // 包 117 PlayerHurtV2 → 服务端生命扣减（负伤害已在权威层拒绝）
+        PlayerHurtV2Packet hurt => new DamagePlayerCommand(context.Tick, context.PlayerId, hurt.Damage),
+        // 包 118 PlayerDeathV2 → 服务端死亡结算
+        PlayerDeathV2Packet => new KillPlayerCommand(context.Tick, context.PlayerId),
+        // 包 12 PlayerSpawn（Playing 阶段）→ 复活请求（服务端划定复活点）
+        PlayerSpawnPacket => new RespawnCommand(context.Tick, context.PlayerId),
         // 包 27 SyncProjectile → 弹幕生成 / 更新（服务端登记生命周期）
         ProjectileNewPacket proj => new SpawnProjectileCommand(context.Tick, context.PlayerId,
             proj.ProjectileKey, proj.ProjectileType, proj.Position, proj.Velocity, proj.Damage),

@@ -7,6 +7,8 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using TerraAuth.Authority;
+using TerraAuth.Config;
+using TerraAuth.Net.Phase5;
 using TerraAuth.Plugins;
 using TerraAuth.ModCompat;
 using TerraAuth.Protocol;
@@ -238,6 +240,143 @@ public class PluginModTests
     }
 
     // ========================================================================
+    // 3b. TModLoader 握手：Mod 列表解析 + 自定义包转发
+    // ========================================================================
+    [Fact]
+    public async Task TModLoader_Handshake_Parses_Mod_List_And_Validates()
+    {
+        var detector = new ModDetector(new ModPolicy { Mode = ModPolicyMode.Whitelist, BlockOnUnlistedMod = true,
+            AllowedMods = new[] { new ModEntry { Name = "MagicStorage" } } }, new TestLogger());
+        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()));
+
+        var modList = BuildModListPayload("MagicStorage", "RecipeBrowser");
+        var request = new ConnectionRequest { ClientVersion = "tModLoader v2024.1", ProtocolVersion = 326 };
+
+        var result = await compat.HandleHandshakeAsync(request, modList);
+
+        // 解析出两个 Mod，未在白名单的 RecipeBrowser 触发拒绝
+        Assert.False(result.Success);
+        Assert.Contains("RecipeBrowser", result.RejectReason);
+    }
+
+    [Fact]
+    public async Task TModLoader_Handshake_AllowAll_Accepts_And_Parses_Mods()
+    {
+        var detector = new ModDetector(new ModPolicy { Mode = ModPolicyMode.AllowAll }, new TestLogger());
+        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()));
+
+        var result = await compat.HandleHandshakeAsync(
+            new ConnectionRequest { ClientVersion = "tModLoader v2024.1", ProtocolVersion = 326 },
+            BuildModListPayload("MagicStorage", "RecipeBrowser"));
+
+        Assert.True(result.Success);
+        Assert.NotNull(result.Capabilities);
+        Assert.Equal(2, result.Capabilities!.Mods.Count);
+        Assert.Equal("MagicStorage", result.Capabilities.Mods[0].Name);
+    }
+
+    [Fact]
+    public async Task TModLoader_ParseModList_Tolerates_Truncated_Payload()
+    {
+        var detector = new ModDetector(new ModPolicy { Mode = ModPolicyMode.AllowAll }, new TestLogger());
+        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()));
+
+        var payload = BuildModListPayload("MagicStorage", "RecipeBrowser");
+        var truncated = payload[..(payload.Length - 3)]; // 截断最后一个名字
+
+        var result = await compat.HandleHandshakeAsync(
+            new ConnectionRequest { ClientVersion = "tModLoader v2024.1", ProtocolVersion = 326 }, truncated);
+
+        Assert.True(result.Success);
+        Assert.Single(result.Capabilities!.Mods); // 只解析出完整的第一个
+    }
+
+    [Fact]
+    public async Task TModLoader_ForwardModPacket_Uses_Injected_Channel_And_Range_Check()
+    {
+        var sent = new List<(int From, int To, int PacketId)>();
+        var compat = new TModLoaderCompat(
+            new ModDetector(new ModPolicy(), new TestLogger()), new TestLogger(), new CustomPacketHandler(new TestLogger()),
+            forward: (from, to, id, _) => { sent.Add((from, to, id)); return Task.CompletedTask; });
+
+        await compat.ForwardModPacketAsync(1, 2, 250, new byte[] { 0x01 }); // 区间内 → 转发
+        await compat.ForwardModPacketAsync(1, 2, 200, new byte[] { 0x01 }); // 区间外 → 丢弃
+
+        var single = Assert.Single(sent);
+        Assert.Equal((1, 2, 250), single);
+    }
+
+    /// <summary>构造 Mod 名称清单载荷：Int32 数量 + 数量 ×（7-bit 长度前缀 + UTF-8 名称）。</summary>
+    private static byte[] BuildModListPayload(params string[] names)
+    {
+        using var ms = new MemoryStream();
+        using (var bw = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            bw.Write(names.Length);
+            foreach (var n in names) PacketEncoder.WritePrefixedString(bw, n);
+        }
+        return ms.ToArray();
+    }
+
+    // ========================================================================
+    // 3c. ModPolicy 从 server.json 读取并注入组合根
+    // ========================================================================
+    [Fact]
+    public void ServerConfig_Deserializes_ModPolicy_With_StringEnum()
+    {
+        const string json = """
+            {
+              "ModPolicy": {
+                "Mode": "Whitelist",
+                "BlockOnUnlistedMod": true,
+                "AllowedMods": [ { "Name": "MagicStorage", "MinVersion": "1.0" } ],
+                "BlockedMods": [ { "Name": "CheatMod" } ]
+              }
+            }
+            """;
+
+        var cfg = System.Text.Json.JsonSerializer.Deserialize<ServerConfig>(json, ConfigurationService.JsonOptions)!;
+
+        Assert.Equal(ModPolicyMode.Whitelist, cfg.ModPolicy.Mode);
+        Assert.True(cfg.ModPolicy.BlockOnUnlistedMod);
+        Assert.Equal("MagicStorage", cfg.ModPolicy.AllowedMods[0].Name);
+        Assert.Equal("CheatMod", cfg.ModPolicy.BlockedMods[0].Name);
+    }
+
+    [Fact]
+    public void Bootstrap_Applies_ModPolicy_From_Config_And_Wires_TModLoader()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-mod-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var configPath = Path.Combine(dir, "server.json");
+        File.WriteAllText(configPath, """
+            { "ModPolicy": { "Mode": "Whitelist", "BlockOnUnlistedMod": true,
+              "AllowedMods": [ { "Name": "MagicStorage" } ] } }
+            """);
+
+        try
+        {
+            using var host = GameHost.Bootstrap(Path.Combine(dir, "state.db"), configPath, metricsPort: 0, port: 0);
+
+            // 组合根装配：TModLoader 兼容层存在，250-255 自定义包区间已注册
+            Assert.NotNull(host.TModLoader);
+            Assert.True(host.CustomPackets.IsPacketAllowed(250, "tModLoader"));
+
+            // 策略来自 server.json：未列出的 Mod 被拒
+            var caps = new ClientCapabilities
+            {
+                Type = ClientType.TModLoader,
+                Mods = new[] { new LoadedMod("CheatMod", "1.0", "", false, false) },
+            };
+            Assert.False(host.ModDetector.Validate(caps).IsAllowed);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* 临时目录清理失败可忽略 */ }
+        }
+    }
+
+    // ========================================================================
     // 4. HookedPipeline：插件 Deny 短路权威管线（集成点）
     // ========================================================================
     [Fact]
@@ -400,6 +539,49 @@ public class PluginModTests
         {
             Calls++;
             return Task.FromResult(AuthorityResult.Accept(packet));
+        }
+    }
+
+    [Fact]
+    public void CommandService_Registers_Parses_And_Dispatches()
+    {
+        var commands = new CommandService();
+        commands.Register("echo", "回显参数", (playerId, args) => CommandResult.Ok($"{playerId}:{string.Join('|', args)}"));
+
+        Assert.True(commands.Execute(7, "ECHO a b").Success);          // 命令名不区分大小写
+        Assert.Equal("7:a|b", commands.Execute(7, "echo a b").Output);  // 参数按空格切分
+        Assert.False(commands.Execute(1, "nope").Success);              // 未注册 → 失败
+        Assert.False(commands.Execute(1, "  ").Success);                // 空命令 → 失败
+
+        commands.Register("boom", "抛异常", (_, _) => throw new InvalidOperationException("x"));
+        Assert.False(commands.Execute(1, "boom").Success);              // 处理器异常被捕获
+    }
+
+    [Fact]
+    public void Bootstrap_Registers_Builtin_Commands()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-cmd-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var host = GameHost.Bootstrap(Path.Combine(dir, "state.db"),
+                Path.Combine(dir, "server.json"), metricsPort: 0, port: 0);
+
+            var names = host.Commands.Commands.Select(c => c.Name).ToHashSet();
+            Assert.Contains("say", names);
+            Assert.Contains("who", names);
+            Assert.Contains("kick", names);
+            Assert.Contains("help", names);
+
+            var help = host.Commands.Execute(0, "help");
+            Assert.True(help.Success);
+            Assert.Contains("say", help.Output);
+
+            Assert.False(host.Commands.Execute(0, "no-such-command").Success);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* 清理失败可忽略 */ }
         }
     }
 

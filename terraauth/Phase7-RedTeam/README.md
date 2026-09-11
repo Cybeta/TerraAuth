@@ -2,6 +2,25 @@
 
 > 配套 `architecture.md` §8 验收章节。每个 Phase 结束后**必须**跑一遍本清单。
 
+## 零、自动化现状（服务端可自动化部分）
+
+下列清单项已落为可执行测试，其余项（需 CE 改内存或真实客户端交互）仍为手工实验：
+
+| 清单项 | 自动化测试 | 覆盖点 |
+|--------|-----------|--------|
+| P1 | `AntiCheat_DpsWindow_RejectsBurst` | 单次在 `MaxSingleDamage` 内、窗口累计超 `MaxDps` → `dps_exceeded` |
+| P2 | `Vanilla_Movement_Overspeed_Is_Rejected_And_Corrected`（既有） | 超速 → `speed_exceeded` + 位置纠正 |
+| P3 | `AntiCheat_IllegalItemStack_IsRejected` / `AntiCheat_ChestItem_WithUnknownItem_Is_Rejected` | 非法堆叠 `invalid_stack`；未知物品 `unknown_item` |
+| P4 | `AntiCheat_UnidentifiedPlayer_IsSilentlyDropped` / `AntiCheat_Replayed_Malicious_Movement_DoesNotAdvance_Authority` | 无身份包丢弃；恶意包重放不推进权威 |
+| P5 / M6 | `AntiCheat_PacketFlood_IsRateLimited_AndEventuallyKicked` | 洪水 → 限流 → 违规累计达阈值踢出（包 2 + 关闭） |
+| M1 | `Vanilla_Health_Above_ServerMax_Gets_Correction`（既有） | 血量超上限被纠正 |
+| M3 | `Vanilla_Place_Without_Item_Is_Rejected`（既有） | 无物品放砖被拒 |
+| M4 | 同 P2 | 速度上限 |
+| M9 | `Vanilla_ItemPickup_*`（既有） | 拾取按世界真实实体对账 |
+| 健壮性 | `Vanilla_ChaoticSection_Is_Split_Without_Breaking_Login` | 超帧上限区块拆分后登录仍完成 |
+
+> 说明：P4 的「nonce/tick 去重」目前**未实现**（协议无 nonce），当前保证的是「重放不会推进权威状态」而非「包被去重」。
+
 ## 一、测试矩阵
 
 ### M 组：内存修改类（CE 直改）— 目标阻断率 ≥ 99%

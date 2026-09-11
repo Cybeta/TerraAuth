@@ -31,6 +31,7 @@ internal interface IDbExecutor
     /// <summary>批量写入审计（单事务，减少 fsync 次数）。</summary>
     void AppendAuditBatch(IReadOnlyList<AuditEntry> batch);
     IReadOnlyList<AuditEntry> QueryAudit(Guid playerId, DateTime since);
+    IReadOnlyList<AuditEntry> QueryRecentAudit(int limit);
 
     // ---- 封禁（IBanStore 复用同一 DB）----
     void SaveBan(BanRecord record);
@@ -87,6 +88,9 @@ public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IDi
 
     public Task<IReadOnlyList<AuditEntry>> QueryByPlayerAsync(Guid playerId, DateTime since)
         => Task.Run(() => _db.QueryAudit(playerId, since));
+
+    public Task<IReadOnlyList<AuditEntry>> QueryRecentAsync(int limit)
+        => Task.Run(() => _db.QueryRecentAudit(limit));
 
     // ========================================================================
     // 后台批量落盘
@@ -177,6 +181,15 @@ internal sealed class LiteDbPersistence : IDbExecutor
     {
         if (!_audit.TryGetValue(playerId, out var list)) return Array.Empty<AuditEntry>();
         lock (list) return list.Where(e => e.Timestamp >= since).OrderByDescending(e => e.Timestamp).ToList();
+    }
+
+    public IReadOnlyList<AuditEntry> QueryRecentAudit(int limit)
+    {
+        var all = new List<AuditEntry>();
+        foreach (var kv in _audit)
+            lock (kv.Value) all.AddRange(kv.Value);
+
+        return all.OrderByDescending(e => e.Timestamp).Take(Math.Max(0, limit)).ToList();
     }
 
     // ---- 封禁（内存 + JSON 持久化）----
@@ -408,6 +421,30 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
             """;
         cmd.Parameters.AddWithValue("$pid", playerId.ToString());
         cmd.Parameters.AddWithValue("$since", Iso(since));
+
+        var list = new List<AuditEntry>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            list.Add(new AuditEntry(
+                ParseIso(r.GetString(0)),
+                Guid.Parse(r.GetString(1)),
+                r.GetString(2),
+                r.GetString(3),
+                r.IsDBNull(4) ? null : r.GetString(4)));
+        }
+        return list;
+    }
+
+    public IReadOnlyList<AuditEntry> QueryRecentAudit(int limit)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT Timestamp, PlayerId, EventType, Detail, IpAddress FROM AuditLogs
+            ORDER BY Timestamp DESC LIMIT $limit;
+            """;
+        cmd.Parameters.AddWithValue("$limit", Math.Max(0, limit));
 
         var list = new List<AuditEntry>();
         using var r = cmd.ExecuteReader();

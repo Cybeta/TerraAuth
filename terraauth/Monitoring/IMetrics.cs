@@ -21,4 +21,6 @@ public interface IMetrics
     // ---- 仪表盘 ----
     void SetConnectedPlayers(int count);
     void SetAuthorityOverhead(double milliseconds); // 权威层额外开销
+    /// <summary>通用仪表盘：插件可自定义指标名（含可选标签）。</summary>
+    void SetGauge(string name, double value, params (string, string)[] labels);
 }

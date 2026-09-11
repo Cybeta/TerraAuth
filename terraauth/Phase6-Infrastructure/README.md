@@ -45,7 +45,7 @@
 - [x] 6.1 违规达阈值自动封禁（测试通过）
 - [x] 6.3 配置热重载触发 OnChanged
 - [x] 6.4 真实 `SqliteImpl` 填充（玩家存档 + 审计 + 封禁落库）：默认后端为 SQLite（csproj 定义 `USE_SQLITE`）；`-p:NoSqlite=true` 降级到内嵌 `LiteDbPersistence`（三类数据同样落盘）。均有「重启后读回」测试覆盖
-- [x] 6.5 审计可按玩家查询（`IAuditRepository.QueryByPlayerAsync` → 后台批量落盘）
+- [x] 6.5 审计可按玩家查询（`IAuditRepository.QueryByPlayerAsync` → 后台批量落盘）；另提供 `QueryRecentAsync`（按时间倒序取最近 N 条，SQLite / 内嵌后端均实现），并由 `CoreEventStore.QueryAsync` 适配为插件可见事件流
 - [x] 6.6 /metrics 端点可被 Prometheus 抓取（`MetricsHttpServer` + `ExportAsText`）
 - [x] 6.7 GameHost.RunAsync 启动三循环（网络 + 仿真 + 快照）
 - [x] 6.8 权威层拒绝同步触发 指标 + 审计 + 违规累计（`auditLogger.OnViolation`）

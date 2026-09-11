@@ -192,6 +192,12 @@ public sealed class PacketEncoder : IPacketEncoder
                     WriteSyncItem(bw, item);
                     break;
 
+                case ItemPickupPacket pickup:
+                    // SyncItemOwner（包 22）：Int16 世界物品槽位 + Byte 归属玩家
+                    bw.Write((short)pickup.ItemSlotIndex);
+                    bw.Write((byte)pickup.PlayerId);
+                    break;
+
                 case SyncChestItemPacket chestItem:
                     // SyncChestItem（包 32）：Int16 ChestIndex + Byte Slot + Int16 Stack + Byte Prefix + Int16 Type
                     bw.Write((short)chestItem.ChestIndex);
@@ -199,6 +205,12 @@ public sealed class PacketEncoder : IPacketEncoder
                     bw.Write((short)chestItem.Stack);
                     bw.Write(chestItem.Prefix);
                     bw.Write((short)chestItem.ItemType);
+                    break;
+
+                case PlayerChestIndexPacket chestIndex:
+                    // SyncPlayerChestIndex（包 34）：Byte PlayerId + Int16 ChestIndex
+                    bw.Write(chestIndex.PlayerId);
+                    bw.Write(chestIndex.ChestIndex);
                     break;
 
                 case PlayerHealPacket heal:
@@ -276,6 +288,20 @@ public sealed class PacketEncoder : IPacketEncoder
 
                 case NetTextPacket netText:
                     WriteNetText(bw, netText);
+                    break;
+
+                case LiquidModulePacket liquid:
+                    // NetLiquidModule（模块 0）：UInt16 模块号 + UInt16 条目数
+                    //   + 条目 ×（Int16 X + Int16 Y + Byte 液体量 + Byte 液体类型）
+                    bw.Write((ushort)0);
+                    bw.Write((ushort)liquid.Changes.Count);
+                    foreach (var c in liquid.Changes)
+                    {
+                        bw.Write((short)c.X);
+                        bw.Write((short)c.Y);
+                        bw.Write(c.Amount);
+                        bw.Write(c.Type);
+                    }
                     break;
 
                 case DisconnectPacket disconnect:

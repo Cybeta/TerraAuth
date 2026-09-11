@@ -23,6 +23,55 @@ public partial class WorldSimulator : IWorldViewProvider
     /// <summary>最近一次 tick 发布的实体视图（快照线程读取，见 <see cref="IWorldViewProvider"/>）。</summary>
     public WorldEntityView CurrentEntityView => _entityViews.Current ?? WorldEntityView.Empty;
 
+    // ---------- 服务端事件 / Boss 控制（运维 / 插件 / 测试入口） ----------
+
+    /// <summary>开始血月（持续到次日黎明；由世界同步下发包 7 告知客户端）。</summary>
+    public void StartBloodMoon()
+    {
+        _world.BloodMoon = true;
+        _world.ProgressDirty = true;
+    }
+
+    /// <summary>开始日食（持续到当天结束）。</summary>
+    public void StartEclipse()
+    {
+        _world.Eclipse = true;
+        _world.ProgressDirty = true;
+    }
+
+    /// <summary>开始入侵：<paramref name="type"/> 为入侵类型（0 = 无），<paramref name="size"/> 为待刷新配额。</summary>
+    public void StartInvasion(int type, int size)
+    {
+        _world.InvasionType = type;
+        _world.InvasionSize = Math.Max(0, size);
+        _world.InvasionSizeStart = Math.Max(0, size);
+        _world.ProgressDirty = true;
+    }
+
+    /// <summary>在指定位置生成一只 Boss（生命上限取自简化表）并返回该 NPC。</summary>
+    public WorldNpc SpawnBoss(int npcType, float x, float y)
+    {
+        int life = BossLife.TryGetValue(npcType, out var hp) ? hp : 1000;
+
+        var boss = new WorldNpc
+        {
+            Type = npcType,
+            NetId = (short)npcType,
+            X = x,
+            Y = y,
+            IsTownNpc = false,
+            IsBoss = true,
+            Life = life,
+            LifeMax = life,
+            Active = true,
+            Generation = (byte)(_rng.NextUInt32() & 0xFF),
+        };
+
+        lock (_world.NpcsLock) _world.Npcs.Add(boss);
+        _world.ProgressDirty = true;
+        return boss;
+    }
+
     public WorldSimulator(
         WorldState world,
         CommandQueue commands,
@@ -58,6 +107,9 @@ public partial class WorldSimulator : IWorldViewProvider
 
         // 5.5 世界实体：掉落物重力落地 / 弹幕运动与生命周期
         SimulateEntities();
+
+        // 5.6 液体：按脏格集合推进简化流动（下落优先，受阻后向两侧均衡）
+        SimulateLiquids();
 
         // 6. Output：产出快照（Phase 4）
         //    同时发布本 tick 的不可变实体视图 —— 快照线程据此构建/裁剪快照，
@@ -108,6 +160,24 @@ public partial class WorldSimulator : IWorldViewProvider
     private const short BlueSlimeType = 1;
     private const int BlueSlimeLife = 25;
 
+    /// <summary>眼魔（Boss，原版 NPC 类型 ID 4）。</summary>
+    private const short EyeOfCthulhuType = 4;
+
+    /// <summary>哥布林苦工（入侵怪，原版 NPC 类型 ID 26）与其生命值。</summary>
+    private const short GoblinPeonType = 26;
+    private const int GoblinPeonLife = 60;
+
+    /// <summary>Boss 飞行速度（像素 / tick）。</summary>
+    private const float BossSpeed = 2f;
+
+    /// <summary>Boss 类型 → 生命上限（简化表；未收录类型按 1000 处理）。</summary>
+    private static readonly Dictionary<int, int> BossLife = new()
+    {
+        [4] = 2800,   // Eye of Cthulhu
+        [35] = 4400,  // Skeletron
+        [50] = 2000,  // King Slime
+    };
+
     /// <summary>
     /// 阶段 5.5：世界实体（服务端权威）。
     /// 掉落物：重力 + 图格落地；弹幕：直线积分 + 生存期耗尽即失效。
@@ -146,6 +216,27 @@ public partial class WorldSimulator : IWorldViewProvider
                 if (!p.Active) continue;
 
                 p.Position = new Vector2(p.Position.X + p.Velocity.X, p.Position.Y + p.Velocity.Y);
+
+                // 命中判定（服务端权威）：弹幕与敌怪距离在命中半径内 → 结算伤害并销毁弹幕。
+                // 客户端上报的命中不再被信任；服务端自行判定，避免"空气命中"与免伤。
+                var hit = FindHitEnemy(p);
+                if (hit is not null)
+                {
+                    int damage = Math.Max(1, p.Damage);
+                    hit.Life -= damage;
+                    if (hit.Life <= 0)
+                    {
+                        hit.Life = 0;
+                        hit.Active = false;
+                        hit.DeadTick = _world.Tick;
+                        _world.NotifyNpcKilled(hit.Type, hit.X, hit.Y); // Boss 击杀 → 世界进度 + 掉落
+                    }
+                    p.Active = false;
+                    p.DeadTick = _world.Tick;
+                    _recorder.Record(new GameEvent(_world.Tick, p.Owner, "projectile_hit", damage));
+                    continue;
+                }
+
                 if (--p.TimeLeft <= 0)
                 {
                     p.Active = false;
@@ -153,6 +244,209 @@ public partial class WorldSimulator : IWorldViewProvider
                 }
             }
         }
+    }
+
+    /// <summary>命中半径（像素）：弹幕中心与敌怪中心距离小于该值即判定命中。</summary>
+    private const float ProjectileHitRadius = 32f;
+
+    /// <summary>每 tick 处理的液体格数上限（限制大范围流动对 tick 的占用）。</summary>
+    private const int MaxLiquidStepsPerTick = 2000;
+
+    /// <summary>
+    /// 阶段 5.6：液体简化仿真（服务端权威）。
+    /// 只处理「脏格」集合（编辑 / 上次流动波及的格子），避免全图扫描：
+    ///   1) 优先向下方流动（下方非实心且液体类型兼容）；
+    ///   2) 下方受阻时，向两侧液面更低处均衡（每 tick 每侧最多 1 单位）。
+    /// 与可玩性无关的原版压力模型不同，属简化模型；但液体量与类型均由服务端持有并同步。
+    /// </summary>
+    private void SimulateLiquids()
+    {
+        var cells = _world.TakeLiquidDirty(MaxLiquidStepsPerTick);
+        if (cells.Count == 0) return;
+
+        foreach (var (x, y) in cells)
+            SimulateLiquidCell(x, y);
+    }
+
+    /// <summary>混合反应所需的最小异种液体量（原版规则为 24 单位）。</summary>
+    private const int LiquidMergeThreshold = 24;
+
+    /// <summary>
+    /// 液体混合反应（按原版客户端行为核对，简化模型）：
+    /// 本格液体与相邻（左右 / 上 / 下）异种液体接触，异种量累计 ≥ 24 → 消耗异种液体、清空本格并生成混合图格。
+    /// 图格 ID 已核对：水 + 岩浆 → 黑曜石 56、水 + 蜂蜜 → 蜂蜜块 229、岩浆 + 蜂蜜 → 松脆蜂蜜块 230、微光 → 微光块 659。
+    /// 简化点：仅在本格为空时生成（原版还允许覆盖可被黑曜石破坏的图格），且生成位置取本格。
+    /// </summary>
+    private bool TryLiquidMerge(int x, int y)
+    {
+        var self = ReadTile(x, y);
+        if (self.Liquid <= 0 || self.Active) return false;
+
+        byte otherType = 0;
+        int otherAmount = ConsumeOtherLiquid(x - 1, y, self.LiquidType, ref otherType)
+                        + ConsumeOtherLiquid(x + 1, y, self.LiquidType, ref otherType)
+                        + ConsumeOtherLiquid(x, y - 1, self.LiquidType, ref otherType)
+                        + ConsumeOtherLiquid(x, y + 1, self.LiquidType, ref otherType);
+
+        if (otherAmount < LiquidMergeThreshold) return false;
+
+        int mergeTile = MergeTileFor(self.LiquidType, otherType);
+        if (mergeTile < 0) return false;
+
+        self.Active = true;
+        self.Type = (ushort)mergeTile;
+        self.Liquid = 0;
+        self.LiquidType = 0;
+        WriteTile(x, y, in self);
+
+        _world.MarkLiquidChanged(x, y);
+        _world.MarkTileChanged(x, y); // 新方块推送客户端（包 10 小矩形）
+        _recorder.Record(new GameEvent(_world.Tick, 0, "liquid_merge", mergeTile));
+        return true;
+    }
+
+    /// <summary>消耗一格与 <paramref name="myType"/> 不同的液体并返回其数量；同时记录异种类型。</summary>
+    private int ConsumeOtherLiquid(int x, int y, byte myType, ref byte otherType)
+    {
+        if (x < 0 || x >= _world.MaxTilesX || y < 0 || y >= _world.MaxTilesY) return 0;
+
+        var tile = ReadTile(x, y);
+        if (tile.Liquid == 0 || tile.LiquidType == myType) return 0;
+
+        int amount = tile.Liquid;
+        otherType = tile.LiquidType;
+        tile.Liquid = 0;
+        WriteTile(x, y, in tile);
+        _world.MarkLiquidChanged(x, y);
+        return amount;
+    }
+
+    /// <summary>两种液体混合产出的图格 ID（按原版客户端行为核对）；-1 表示无反应。</summary>
+    private static int MergeTileFor(byte selfType, byte otherType) => (selfType, otherType) switch
+    {
+        (0, 1) or (1, 0) => 56,   // 水 + 岩浆 → 黑曜石
+        (0, 2) or (2, 0) => 229,  // 水 + 蜂蜜 → 蜂蜜块
+        (1, 2) or (2, 1) => 230,  // 岩浆 + 蜂蜜 → 松脆蜂蜜块
+        (3, _) or (_, 3) => 659,  // 微光 + 任意 → 微光块
+        _ => -1,
+    };
+
+    private void SimulateLiquidCell(int x, int y)
+    {
+        if (x < 0 || x >= _world.MaxTilesX || y < 0 || y >= _world.MaxTilesY) return;
+
+        // 0) 混合反应：异种液体接触且累计 ≥ 24 单位 → 生成混合图格
+        if (TryLiquidMerge(x, y)) return;
+
+        var tile = ReadTile(x, y);
+        if (tile.Liquid < 2) return;
+
+        int amount = tile.Liquid;
+        byte type = tile.LiquidType;
+
+        // 1) 优先下落
+        int belowY = y + 1;
+        if (belowY < _world.MaxTilesY)
+        {
+            var below = ReadTile(x, belowY);
+            if (!IsLiquidBlocking(in below) && (below.Liquid == 0 || below.LiquidType == type))
+            {
+                int move = Math.Min(amount, 255 - below.Liquid);
+                if (move > 0)
+                {
+                    below.Liquid = (byte)(below.Liquid + move);
+                    below.LiquidType = type;
+                    WriteTile(x, belowY, in below);
+                    _world.MarkLiquidChanged(x, belowY);
+
+                    WriteLiquid(x, y, amount - move, type);
+                    return; // 下落过程中不做水平扩散
+                }
+            }
+        }
+
+        // 2) 下方受阻 → 向两侧低位均衡
+        for (int dir = -1; dir <= 1 && amount >= 2; dir += 2)
+        {
+            int nx = x + dir;
+            if (nx < 0 || nx >= _world.MaxTilesX) continue;
+
+            var side = ReadTile(nx, y);
+            if (IsLiquidBlocking(in side)) continue;
+            if (side.Liquid != 0 && side.LiquidType != type) continue;
+            if (side.Liquid + 1 >= amount) continue; // 只向液面明显更低的一侧扩散
+
+            side.Liquid++;
+            side.LiquidType = type;
+            WriteTile(nx, y, in side);
+            _world.MarkLiquidChanged(nx, y);
+            amount--;
+        }
+
+        if (amount != tile.Liquid)
+            WriteLiquid(x, y, amount, type);
+    }
+
+    /// <summary>读取单格图格（区块读锁内取副本）。</summary>
+    private Tile ReadTile(int x, int y)
+    {
+        using (_world.Sections.EnterRead(x, y, x, y))
+            return _world.Tiles[x, y];
+    }
+
+    /// <summary>写入单格图格（区块写锁内）。</summary>
+    private void WriteTile(int x, int y, in Tile tile)
+    {
+        _world.Sections.EnterWrite(x, y);
+        try
+        {
+            _world.Tiles[x, y] = tile;
+        }
+        finally
+        {
+            _world.Sections.ExitWrite(x, y);
+        }
+    }
+
+    /// <summary>写入单格液体量 / 类型并标记为「已变化」（触发继续仿真 + 下发）。</summary>
+    private void WriteLiquid(int x, int y, int amount, byte type)
+    {
+        byte clamped = (byte)Math.Clamp(amount, 0, 255);
+
+        _world.Sections.EnterWrite(x, y);
+        try
+        {
+            ref var tile = ref _world.Tiles[x, y];
+            tile.Liquid = clamped;
+            tile.LiquidType = clamped == 0 ? (byte)0 : type;
+        }
+        finally
+        {
+            _world.Sections.ExitWrite(x, y);
+        }
+
+        _world.MarkLiquidChanged(x, y);
+    }
+
+    /// <summary>该格是否阻挡液体（实心方块；已通电 / 未通电的执行器方块按通电状态判定）。</summary>
+    private static bool IsLiquidBlocking(in Tile tile)
+        => tile.Active && TileIdSets.IsTileSolid(tile.Type) && !tile.InActive;
+
+    /// <summary>查找被弹幕命中的存活敌怪（不含城镇 NPC）。</summary>
+    private WorldNpc? FindHitEnemy(ProjectileEntity p)
+    {
+        float radiusSq = ProjectileHitRadius * ProjectileHitRadius;
+        lock (_world.NpcsLock)
+        {
+            foreach (var npc in _world.Npcs)
+            {
+                if (!npc.Active || npc.IsTownNpc) continue;
+                float dx = npc.X - p.Position.X;
+                float dy = npc.Y - p.Position.Y;
+                if (dx * dx + dy * dy <= radiusSq) return npc;
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -189,25 +483,87 @@ public partial class WorldSimulator : IWorldViewProvider
                     continue;
                 }
 
-                SimulateEnemyStep(npc);
+                if (npc.IsBoss)
+                    SimulateBossStep(npc);
+                else
+                    SimulateEnemyStep(npc);
             }
         }
     }
 
-    /// <summary>确定性刷怪：在随机在线玩家附近的地表生成一只史莱姆。</summary>
+    /// <summary>Boss 一帧：朝最近玩家飞行追击（简化为直线移动，不做专属 AI 阶段）。</summary>
+    private void SimulateBossStep(WorldNpc npc)
+    {
+        var target = NearestPlayer(npc.X, npc.Y);
+        if (target is null)
+        {
+            npc.VelocityX = 0f;
+            npc.VelocityY = 0f;
+            return;
+        }
+
+        float dx = target.Position.X - npc.X;
+        float dy = target.Position.Y - npc.Y;
+        float len = MathF.Sqrt(dx * dx + dy * dy);
+        if (len > 1f)
+        {
+            npc.VelocityX = dx / len * BossSpeed;
+            npc.VelocityY = dy / len * BossSpeed;
+        }
+
+        npc.X += npc.VelocityX;
+        npc.Y += npc.VelocityY;
+    }
+
+    /// <summary>随机挑选一名在线且未死亡的玩家（无则返回 null）。</summary>
+    private PlayerRuntime? PickPlayer()
+    {
+        var candidates = new List<PlayerRuntime>(_world.Players.Count);
+        foreach (var p in _world.Players.Values)
+            if (p.Active && !p.Dead) candidates.Add(p);
+
+        return candidates.Count == 0
+            ? null
+            : candidates[(int)(_rng.NextUInt32() % (uint)candidates.Count)];
+    }
+
+    /// <summary>是否存在存活的 Boss。</summary>
+    private bool AnyBossAlive()
+    {
+        foreach (var n in _world.Npcs)
+            if (n.Active && n.IsBoss) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// 确定性刷怪：入侵期内优先刷新入侵怪（消耗入侵配额）；夜晚且未击败 Boss 时小概率刷新 Boss；
+    /// 否则在随机在线玩家附近的地表生成一只史莱姆。
+    /// </summary>
     private void TrySpawnEnemy()
     {
+        if (_world.InvasionType != 0 && _world.InvasionSize > 0 && TrySpawnInvasionEnemy())
+            return;
+
+        // 简化 Boss 触发条件：夜晚 + 未击败眼魔 + 无存活 Boss + 低概率
+        if (!_world.DayTime && !_world.Progress.DownedBoss1 && !AnyBossAlive()
+            && _rng.NextUInt32() % 120 == 0)
+        {
+            var bossTarget = PickPlayer();
+            if (bossTarget is not null)
+            {
+                SpawnBoss(EyeOfCthulhuType, bossTarget.Position.X, bossTarget.Position.Y - 8f * TileSize);
+                return;
+            }
+        }
+
         int enemies = 0;
         foreach (var n in _world.Npcs)
             if (n.Active && !n.IsTownNpc) enemies++;
         if (enemies >= MaxEnemies) return;
 
-        var candidates = new List<PlayerRuntime>(_world.Players.Count);
-        foreach (var p in _world.Players.Values)
-            if (p.Active) candidates.Add(p);
-        if (candidates.Count == 0) return;
+        var target = PickPlayer();
+        if (target is null) return;
 
-        var target = candidates[(int)(_rng.NextUInt32() % (uint)candidates.Count)];
         int spawnTileX = (int)(target.Position.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
         if (spawnTileX < 1 || spawnTileX >= _world.MaxTilesX - 1) return;
 
@@ -231,6 +587,44 @@ public partial class WorldSimulator : IWorldViewProvider
             });
             return;
         }
+    }
+
+    /// <summary>刷新一只入侵怪（哥布林）并消耗 1 个入侵配额；配额归零则结束入侵。</summary>
+    private bool TrySpawnInvasionEnemy()
+    {
+        var target = PickPlayer();
+        if (target is null) return false;
+
+        int spawnTileX = (int)(target.Position.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
+        if (spawnTileX < 1 || spawnTileX >= _world.MaxTilesX - 1) return false;
+
+        for (int y = 1; y < _world.MaxTilesY - 1; y++)
+        {
+            ref var tile = ref _world.Tiles[spawnTileX, y];
+            if (!tile.Active || !TileIdSets.IsTileSolid(tile.Type)) continue;
+
+            _world.Npcs.Add(new WorldNpc
+            {
+                Type = GoblinPeonType,
+                NetId = GoblinPeonType,
+                X = (spawnTileX + 0.5f) * TileSize,
+                Y = (y - 1) * TileSize,
+                IsTownNpc = false,
+                Life = GoblinPeonLife,
+                LifeMax = GoblinPeonLife,
+                Active = true,
+                Generation = (byte)(_rng.NextUInt32() & 0xFF),
+            });
+
+            if (--_world.InvasionSize <= 0)
+            {
+                _world.InvasionSize = 0;
+                _world.InvasionType = 0;
+                _world.ProgressDirty = true; // 入侵结束 → 包 7 重新下发
+            }
+            return true;
+        }
+        return false;
     }
 
     /// <summary>敌怪一帧：朝最近玩家水平移动 + 重力 + 图格落地。</summary>
@@ -266,7 +660,7 @@ public partial class WorldSimulator : IWorldViewProvider
         var bestSq = float.MaxValue;
         foreach (var p in _world.Players.Values)
         {
-            if (!p.Active) continue;
+            if (!p.Active || p.Dead) continue;
             var dx = p.Position.X - x;
             var dy = p.Position.Y - y;
             var d = dx * dx + dy * dy;
@@ -284,7 +678,7 @@ public partial class WorldSimulator : IWorldViewProvider
     {
         foreach (var player in _world.Players.Values)
         {
-            if (!player.Active)
+            if (!player.Active || player.Dead)
                 continue;
 
             // 重力积分（终端速度封顶）
@@ -325,51 +719,135 @@ public partial class WorldSimulator : IWorldViewProvider
         }
     }
 
-    /// <summary>阶段 4：战斗结算（服务端权威）。当前结算下落伤害。</summary>
+    /// <summary>接触半径（像素）：玩家碰撞盒中心与敌怪中心距离小于该值即判定接触。</summary>
+    private const float ContactRadius = 32f;
+
+    /// <summary>玩家受击后的免伤帧（tick，60 ≈ 1 秒）。</summary>
+    private const int HurtImmunityTicks = 60;
+
+    /// <summary>
+    /// 阶段 4：战斗结算（服务端权威）。下落伤害 + 敌怪 / Boss 接触伤害。
+    /// 接触伤害由服务端判定并结算（客户端上报的受击仅作参考），避免「漏报伤害避免死亡」。
+    /// </summary>
     private void SimulateCombat()
     {
         foreach (var player in _world.Players.Values)
         {
-            if (!player.Active)
+            if (!player.Active || player.Dead)
                 continue;
 
-            // 仅在落地（垂直速度归零）时结算，且下落距离超过阈值
+            // 4.1 下落伤害：仅在落地（垂直速度归零）时结算，且下落距离超过阈值
             if (player.Velocity.Y == 0f)
             {
                 if (player.FallDistance > FallDamageThreshold)
                 {
                     int damage = (int)((player.FallDistance - FallDamageThreshold) / TileSize);
                     if (damage > 0)
-                    {
-                        player.Hp = Math.Max(0, player.Hp - damage);
-                        if (player.Hp == 0)
-                            player.Active = false;
-
-                        _recorder.Record(new GameEvent(
-                            _world.Tick, player.Id, "fall_damage", damage));
-                    }
+                        ApplyPlayerDamage(player, damage, "fall_damage");
                 }
 
                 player.FallDistance = 0f;
             }
+
+            if (player.Dead) continue;
+
+            // 4.2 接触伤害：受免伤帧约束
+            if (player.HurtCooldown > 0)
+            {
+                player.HurtCooldown--;
+                continue;
+            }
+
+            int contact = FindContactDamage(player);
+            if (contact > 0)
+                ApplyPlayerDamage(player, contact, "contact_damage");
         }
     }
 
-    /// <summary>阶段 5：世界推进。时间 / 昼夜 / 月相。</summary>
+    /// <summary>敌怪 / Boss 接触伤害表（简化：按类型固定值，未收录按普通敌怪计）。</summary>
+    private static int ContactDamageOf(int npcType) => npcType switch
+    {
+        26 => 12,   // Goblin Peon
+        4 => 20,    // Eye of Cthulhu
+        35 => 30,   // Skeletron
+        50 => 20,   // King Slime
+        _ => 7,     // 史莱姆等普通敌怪
+    };
+
+    /// <summary>查找与玩家接触的敌怪伤害（取接触者中的最大值）；无接触返回 0。</summary>
+    private int FindContactDamage(PlayerRuntime player)
+    {
+        float px = player.Position.X;
+        float py = player.Position.Y + PlayerHalfHeight; // 玩家碰撞盒中心（Position 为头顶）
+        float radiusSq = ContactRadius * ContactRadius;
+        int best = 0;
+
+        lock (_world.NpcsLock)
+        {
+            foreach (var npc in _world.Npcs)
+            {
+                if (!npc.Active || npc.IsTownNpc) continue;
+
+                float dx = npc.X - px;
+                float dy = npc.Y - py;
+                if (dx * dx + dy * dy > radiusSq) continue;
+
+                best = Math.Max(best, ContactDamageOf(npc.Type));
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// 服务端结算玩家伤害：扣血 → 必要时置死亡态 → 登记受击通知（包 117 表现 + 包 16 权威血量）。
+    /// 这是玩家生命的唯一权威入口（客户端上报的包 117 只做非负校验，不直接改血）。
+    /// </summary>
+    private void ApplyPlayerDamage(PlayerRuntime player, int damage, string kind)
+    {
+        if (damage <= 0 || player.Dead) return;
+
+        player.Hp = Math.Max(0, player.Hp - damage);
+        player.HurtCooldown = HurtImmunityTicks;
+        player.FallDistance = 0f;
+
+        if (player.Hp == 0)
+        {
+            // 死亡：置死亡态而非离线态（Active 表示在线），等待复活命令复位
+            player.Dead = true;
+            player.DeathNotified = false;
+            player.Velocity = new Vector2(0, 0);
+        }
+
+        _world.MarkPlayerHurt(player.Id, damage);
+        _recorder.Record(new GameEvent(_world.Tick, player.Id, kind, damage));
+    }
+
+    /// <summary>阶段 5：世界推进。时间 / 昼夜 / 月相 / 简化事件（血月 · 日食）。</summary>
     private void SimulateWorld()
     {
         // 原版每 tick 推进 1 个时间单位（60Hz 下一天 15 分钟）
         _world.Time += 1.0;
 
         double length = _world.DayTime ? DayLength : NightLength;
-        if (_world.Time >= length)
-        {
-            _world.Time -= length;
-            _world.DayTime = !_world.DayTime;
+        if (_world.Time < length) return;
 
-            // 天亮时推进月相
-            if (_world.DayTime)
-                _world.MoonPhase = (_world.MoonPhase + 1) % 8;
+        _world.Time -= length;
+        _world.DayTime = !_world.DayTime;
+        _world.ProgressDirty = true; // 昼夜切换 → 包 7 重新下发
+
+        if (_world.DayTime)
+        {
+            // 天亮：推进月相、结束血月、按概率开始日食
+            _world.MoonPhase = (_world.MoonPhase + 1) % 8;
+            _world.BloodMoon = false;
+            _world.Eclipse = _rng.NextUInt32() % 20 == 0;
+        }
+        else
+        {
+            // 入夜：结束日食、按概率开始血月
+            _world.Eclipse = false;
+            _world.BloodMoon = _rng.NextUInt32() % 9 == 0;
         }
     }
 }

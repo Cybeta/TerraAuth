@@ -651,6 +651,77 @@ public class EndToEndTests
     }
 
     [Fact]
+    public async Task Config_Rejects_MaxSingleDamage_Above_Int16()
+    {
+        // 包 28 的伤害线格式为 Int16：上限超过 32767 将永不触发 → 启动即拒绝并给出明确提示
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-dmg-{Guid.NewGuid():N}.db");
+        var configPath = Path.Combine(Path.GetTempPath(), $"terraauth-dmg-{Guid.NewGuid():N}.json");
+        await File.WriteAllTextAsync(configPath, "{ \"MaxSingleDamage\": 40000 }");
+
+        try
+        {
+            var ex = Assert.Throws<System.IO.InvalidDataException>(
+                () => GameHost.Bootstrap(dbPath, configPath, metricsPort: 0, port: 0));
+            Assert.Contains("Int16", ex.Message);
+        }
+        finally
+        {
+            foreach (var path in new[] { dbPath, configPath })
+                if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void Metrics_SetGauge_IsExportedInPrometheusText()
+    {
+        using var metrics = new Monitoring.PrometheusMetrics();
+        metrics.SetGauge("terraauth_test_gauge", 1.5, ("plugin", "demo"));
+
+        var text = metrics.ExportAsText();
+        Assert.Contains("terraauth_test_gauge{plugin=\"demo\"} 1.5", text);
+    }
+
+    [Fact]
+    public async Task EventStore_Query_Returns_RecentAudit()
+    {
+        static async Task<List<T>> CollectAsync<T>(IAsyncEnumerable<T> source)
+        {
+            var list = new List<T>();
+            await foreach (var item in source) list.Add(item);
+            return list;
+        }
+
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-ev-{Guid.NewGuid():N}.db");
+        try
+        {
+            using var db = new Persistence.SqlitePersistence(dbPath);
+            await db.AppendAsync(new Persistence.AuditEntry(
+                DateTime.UtcNow, Security.PlayerIdentity.ToGuid(1),
+                "position_rejected", "authority:speed_exceeded {\"dt\":10}", null));
+
+            var store = new Plugins.CoreEventStore(db);
+
+            // 审计是异步批量落盘（250ms 一轮），轮询等待可见
+            var events = new List<Plugins.EventRecord>();
+            for (int i = 0; i < 30 && events.Count == 0; i++)
+            {
+                await Task.Delay(100);
+                events = await CollectAsync(store.QueryAsync(playerId: 1));
+            }
+
+            var single = Assert.Single(events);
+            Assert.Equal(1, single.PlayerId);
+            Assert.Equal("authority", single.Category);
+            Assert.Equal("position_rejected", single.Action);
+            Assert.Equal("speed_exceeded", single.Reason);
+        }
+        finally
+        {
+            if (File.Exists(dbPath)) File.Delete(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task ConfigHotReload_UpdatesThresholds_WithoutRestart()
     {
         // 验证运行中改配置 → 阈值立即生效（此前 OnConfigurationChanged 只打印日志，改配置等于没用）

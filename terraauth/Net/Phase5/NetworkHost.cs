@@ -255,6 +255,10 @@ public sealed class NetworkHost : IAsyncDisposable
                 }
                 else
                 {
+                    // 打开箱子（包 31）权威通过 → 把服务端持有的箱子内容逐槽下发（包 34 + 32）
+                    if (packet is ChestPacket chestOpen)
+                        await SendChestContentsAsync(connection, chestOpen, ct).ConfigureAwait(false);
+
                     // 权威通过 → 转发给其他玩家：原版客户端依赖这些原版包渲染他人状态
                     // （TerraAuth 专用快照包 15 会被原版客户端忽略，故玩家间可见性必须靠原版包）
                     await RelayToOthersAsync(packet, connection, ct).ConfigureAwait(false);
@@ -376,10 +380,8 @@ public sealed class NetworkHost : IAsyncDisposable
                     hurt with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
                 break;
 
-            case PlayerDeathV2Packet death:          // 118 死亡
-                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerDeathV2,
-                    death with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
-                break;
+            // 注：118 死亡不在此中继 —— 死亡已由服务端结算（KillPlayerCommand），
+            // 统一由世界同步线程按下发（避免同一次死亡发出两遍 118）。
 
             case PlayerHealPacket heal:              // 35 治疗
                 await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerHeal,
@@ -403,6 +405,38 @@ public sealed class NetworkHost : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 打开箱子（包 31）权威通过后，把服务端持有的箱子内容逐槽下发：
+    /// 先发包 34 告知玩家当前箱子索引，再对每个槽位发包 32（空槽 stack=0）。
+    /// </summary>
+    private async Task SendChestContentsAsync(Connection connection, ChestPacket request, CancellationToken ct)
+    {
+        int index;
+        ChestItem[] items;
+        lock (_world.ChestsLock)
+        {
+            var chest = _world.FindChestAt(request.X, request.Y);
+            if (chest is null) return;
+
+            index = chest.Index;
+            items = (ChestItem[])chest.Items.Clone();
+        }
+
+        await connection.SendEncodedAsync(
+            PacketId.SyncPlayerChestIndex,
+            new PlayerChestIndexPacket((byte)connection.PlayerId, (short)index),
+            ct).ConfigureAwait(false);
+
+        for (int slot = 0; slot < items.Length; slot++)
+        {
+            var item = items[slot];
+            await connection.SendEncodedAsync(
+                PacketId.SyncChestItem,
+                new SyncChestItemPacket(index, slot, item.Stack, item.Prefix, item.Type),
+                ct).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>向所有 Playing 连接广播一个包（供世界状态同步 / 聊天使用）。</summary>
     public Task BroadcastAsync(PacketId type, INetworkPacket packet, CancellationToken ct = default)
         => _connections.BroadcastAsync(type, packet, ct);
@@ -417,6 +451,33 @@ public sealed class NetworkHost : IAsyncDisposable
         {
             if (conn.State != ConnectionState.Playing || !shouldSend(conn.PlayerId)) continue;
             await conn.SendEncodedAsync(type, packet, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>向单个 Playing 玩家发送一个包（玩家不存在 / 未进入 Playing 时忽略）。</summary>
+    public async Task SendToPlayerAsync(int playerId, PacketId type, INetworkPacket packet, CancellationToken ct = default)
+    {
+        var conn = _connections.Get(playerId);
+        if (conn is null || conn.State != ConnectionState.Playing) return;
+
+        await conn.SendEncodedAsync(type, packet, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 按玩家定制内容的广播：<paramref name="packetFactory"/> 返回 null 表示跳过该玩家。
+    /// 用于「每个玩家需要收到不同子集」的下发（如按视口裁剪的液体变更）。
+    /// </summary>
+    public async Task BroadcastPerPlayerAsync(
+        Func<int, INetworkPacket?> packetFactory, CancellationToken ct = default)
+    {
+        foreach (var conn in _connections.All())
+        {
+            if (conn.State != ConnectionState.Playing) continue;
+
+            var packet = packetFactory(conn.PlayerId);
+            if (packet is null) continue;
+
+            await conn.SendEncodedAsync(packet.Type, packet, ct).ConfigureAwait(false);
         }
     }
 
@@ -436,6 +497,18 @@ public sealed class NetworkHost : IAsyncDisposable
 
         await conn.SendEncodedAsync(PacketId.NetModule,
             new NetTextPacket(text) { AuthorId = byte.MaxValue, Color = ParseColor(color) }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 向单个玩家发送一个未结构化包（Mod 自定义包转发用）：包号按 <see cref="PacketId"/> 原样写出，
+    /// 载荷原样透传，客户端按自定义包 ID 区间处理。
+    /// </summary>
+    public async Task SendRawAsync(int playerId, PacketId type, byte[] payload, CancellationToken ct = default)
+    {
+        var conn = _connections.Get(playerId);
+        if (conn is null || conn.State != ConnectionState.Playing) return;
+
+        await conn.SendEncodedAsync(type, new UnknownPacket(type, payload), ct).ConfigureAwait(false);
     }
 
     /// <summary>拼「名字: 文本」聊天行（服务端下行不带作者解析，需自行带名）。</summary>
@@ -556,16 +629,46 @@ public sealed class NetworkHost : IAsyncDisposable
             int width = Math.Min(200, _world.MaxTilesX - xStart);
             int height = Math.Min(150, _world.MaxTilesY - yStart);
 
-            await connection.SendEncodedAsync(
-                PacketId.TileSendSection,
-                new TileSectionPacket(_world, xStart, yStart, width, height),
-                ct).ConfigureAwait(false);
+            await SendTileSectionAsync(connection, xStart, yStart, width, height, ct).ConfigureAwait(false);
         }
 
         await connection.SendEncodedAsync(
             PacketId.InitialSpawn,
             new InitialSpawnPacket(),
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 发送一个图格区块；若编码后超过帧上限（UInt16 65535），沿较长轴二分拆分后分别发送（递归）。
+    /// 原版对「压缩不划算的区块」有降级路径；此处用拆分替代，避免高熵区块
+    /// 直接抛 <see cref="InvalidOperationException"/> 中断登录 / 出生点下载。
+    /// </summary>
+    private async Task SendTileSectionAsync(
+        Connection connection, int xStart, int yStart, int width, int height, CancellationToken ct)
+    {
+        try
+        {
+            await connection.SendEncodedAsync(
+                PacketId.TileSendSection,
+                new TileSectionPacket(_world, xStart, yStart, width, height),
+                ct).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException) when (width > 1 || height > 1)
+        {
+            // 帧过大且仍可拆分 → 优先切分较长轴
+            if (width >= height)
+            {
+                int half = width / 2;
+                await SendTileSectionAsync(connection, xStart, yStart, half, height, ct).ConfigureAwait(false);
+                await SendTileSectionAsync(connection, xStart + half, yStart, width - half, height, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                int half = height / 2;
+                await SendTileSectionAsync(connection, xStart, yStart, width, half, ct).ConfigureAwait(false);
+                await SendTileSectionAsync(connection, xStart, yStart + half, width, height - half, ct).ConfigureAwait(false);
+            }
+        }
     }
 
     /// <summary>包 12：客户端完成出生 → 进入 Playing，回包 129（FinishedConnecting），并主动下发玩家状态。</summary>

@@ -105,21 +105,58 @@ internal sealed class CoreMetrics : IMetricsAdapter
     public CoreMetrics(Monitoring.IMetrics metrics) => _metrics = metrics;
     public void Counter(string name, string help, params (string, string)[] labels)
         => _metrics.IncrementBlockedCheat(name); // 映射到现有计数器
-    public void Gauge(string name, double value, params (string, string)[] labels) { /* TODO: 暴露 SetGauge */ }
+    public void Gauge(string name, double value, params (string, string)[] labels)
+        => _metrics.SetGauge(name, value, labels);
     public void Histogram(string name, double value, params (string, string)[] labels)
         => _metrics.ObservePacketProcessingTime(value);
 }
 
-/// <summary>桥接核心事件存储（复用 IAuditLogger）。</summary>
+/// <summary>桥接核心事件存储：把持久化层的审计日志适配为插件可见的只读事件流。</summary>
 internal sealed class CoreEventStore : IEventStoreAdapter
 {
-    private readonly IAuditLogger _audit;
-    public CoreEventStore(IAuditLogger audit) => _audit = audit;
+    private readonly Persistence.IAuditRepository _repo;
+
+    /// <summary>按玩家查询时的回溯窗口。</summary>
+    private static readonly TimeSpan Lookback = TimeSpan.FromDays(30);
+
+    public CoreEventStore(Persistence.IAuditRepository repo) => _repo = repo;
+
     public async IAsyncEnumerable<EventRecord> QueryAsync(int? playerId = null, string? category = null, int limit = 100)
     {
-        // TODO: 从持久化层按条件查询（此处为占位）
-        await Task.CompletedTask;
-        yield break;
+        // 有玩家维度 → 走按玩家查询（int PlayerId ↔ 稳定 Guid 由 PlayerIdentity 互转）；
+        // 否则取最近 N 条。两条路径都按时间倒序。
+        IReadOnlyList<Persistence.AuditEntry> entries = playerId is int pid
+            ? await _repo.QueryByPlayerAsync(
+                PlayerIdentity.ToGuid(pid), DateTime.UtcNow - Lookback).ConfigureAwait(false)
+            : await _repo.QueryRecentAsync(Math.Max(1, limit)).ConfigureAwait(false);
+
+        int emitted = 0;
+        foreach (var entry in entries)
+        {
+            var (cat, reason) = SplitDetail(entry.Detail);
+            if (category is not null && !string.Equals(cat, category, StringComparison.Ordinal)) continue;
+
+            yield return new EventRecord(
+                new DateTimeOffset(DateTime.SpecifyKind(entry.Timestamp, DateTimeKind.Utc)),
+                PlayerIdentity.ToPlayerId(entry.PlayerId),
+                cat,
+                entry.EventType,
+                reason);
+
+            if (++emitted >= limit) yield break;
+        }
+    }
+
+    /// <summary>拆分持久化 Detail（形如 <c>category:reason {json}</c>）为分类与原因。</summary>
+    private static (string Category, string Reason) SplitDetail(string detail)
+    {
+        int colon = detail.IndexOf(':');
+        if (colon <= 0) return ("", detail);
+
+        var category = detail[..colon];
+        var rest = detail[(colon + 1)..];
+        int space = rest.IndexOf(' ');
+        return (category, space > 0 ? rest[..space] : rest);
     }
 }
 #endregion
@@ -133,7 +170,8 @@ internal sealed class CoreEventStore : IEventStoreAdapter
 /// <see cref="GetOnlinePlayers"/> / <see cref="GetServerInfo"/> / <see cref="Broadcast"/> / <see cref="SendMessage"/>
 /// （后两者经 <c>NetworkHost.BroadcastChatAsync</c> 下发包 82 / NetTextModule，并同时落审计）。
 /// <br/>
-/// 尚未实装：<see cref="ExecuteCommand"/> —— 需要命令子系统，当前仅落审计。
+/// <see cref="ExecuteCommand"/>：由组合根注入的 <see cref="CommandService"/> 分发（内置 say / who / kick / help）；
+/// 未注入时仅落审计（降级语义）。
 /// </remarks>
 public sealed class ServerApi : IServerApi
 {
@@ -143,6 +181,7 @@ public sealed class ServerApi : IServerApi
     private readonly ConnectionManager _connections;
     private readonly IBanManager _bans;
     private readonly WorldState _world;
+    private readonly CommandService? _commands;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
 
     public ServerApi(
@@ -151,7 +190,8 @@ public sealed class ServerApi : IServerApi
         NetworkHost network,
         ConnectionManager connections,
         IBanManager bans,
-        WorldState world)
+        WorldState world,
+        CommandService? commands = null)
     {
         _audit = audit;
         _metrics = metrics;
@@ -159,6 +199,7 @@ public sealed class ServerApi : IServerApi
         _connections = connections;
         _bans = bans;
         _world = world;
+        _commands = commands;
     }
 
     public void Broadcast(string message, string color = "White")
@@ -209,7 +250,13 @@ public sealed class ServerApi : IServerApi
     }
 
     public void ExecuteCommand(string command)
-        => _audit.Log(AuditEvent.Now(0, "server", "command", command));
+    {
+        // 命令子系统（组合根注入）：分发到已注册命令；未注入时仅落审计（保持旧的降级语义）
+        var result = _commands?.Execute(playerId: 0, command);
+        _audit.Log(AuditEvent.Now(0, "server", "command",
+            result is null ? "no_command_service" : (result.Success ? result.Output : $"failed: {result.Output}"),
+            command));
+    }
 
     public ServerInfoSnapshot GetServerInfo()
     {

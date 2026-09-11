@@ -53,6 +53,19 @@ public sealed class PrometheusMetrics : IMetrics, IDisposable
     public void SetAuthorityOverhead(double milliseconds)
         => _gauges.AddOrUpdate("terraauth_authority_overhead_ms", milliseconds, (_, _) => milliseconds);
 
+    public void SetGauge(string name, double value, params (string, string)[] labels)
+    {
+        if (labels.Length == 0)
+        {
+            _gauges.AddOrUpdate(name, value, (_, _) => value);
+            return;
+        }
+
+        var labelText = string.Join(",", labels.Select(l => $"{l.Item1}=\"{EscapeLabel(l.Item2)}\""));
+        var key = $"{name}{{{labelText}}}";
+        _gauges.AddOrUpdate(key, value, (_, _) => value);
+    }
+
     // ========================================================================
     // 供 /metrics HTTP 端点导出
     // ========================================================================

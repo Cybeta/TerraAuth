@@ -61,20 +61,27 @@ public class ClientCapabilities
 | `Blacklist` | 仅封禁黑名单中的 Mod |
 | `AllowAll` | 放行所有，仅记录 |
 
-> ⚠️ 当前 `GameHost.Bootstrap` 尚未从 `server.json` 读取 `ModPolicy` 节（`ServerConfig` 仅含阈值与 `PlayerWhitelist`），默认使用 `VanillaOnly`。上述 JSON 结构与 `ModPolicy` 类型对齐，启用白/黑名单需先扩展配置加载 + 组合根注入。
+> ✅ `GameHost.Bootstrap` 会从 `server.json` 的 `ModPolicy` 节读取策略（未配置时为默认 `VanillaOnly`）；
+> `Mode` 支持字符串枚举写法（`"Whitelist"` 等）。启用白 / 黑名单无需改代码，改配置即可。
 
 ## 服务端接入
 
 `GameHost.Bootstrap()` 已完成以下装配（见 `GameHost.cs`）：
 
 ```csharp
-// ModPolicy 不属于 ServerConfig（配置文件当前仅含阈值），默认仅允许原版客户端
-var modPolicy = new ModPolicy { Mode = ModPolicyMode.VanillaOnly };
+// ModPolicy 取自 server.json（未配置 → 默认 VanillaOnly = 仅允许原版客户端）
+var modPolicy = config.Current.ModPolicy;
 var modDetector = new ModDetector(modPolicy, logger);
 var customPackets = new CustomPacketHandler(logger);
+
+// TModLoader 兼容层：Mod 列表解析 + 自定义包转发（转发通道绑定网络层单播发送）
+var tmodLoader = new TModLoaderCompat(
+    modDetector, logger, customPackets,
+    forward: (_, toPlayerId, packetId, data) =>
+        network.SendRawAsync(toPlayerId, (PacketId)packetId, data));
 ```
 
-> `TModLoaderCompat`（握手 + Mod 列表解析 + 包转发）已定义于 `ModPolicy.cs`，但尚未在 `Bootstrap` 中装配；其 `ParseModList` / `ForwardModPacketAsync` 仍为 TODO。
+`GameHost` 通过 `ModDetector` / `CustomPackets` / `TModLoader` 暴露上述组件，供插件与运维查询。
 
 在连接处理中调用：
 

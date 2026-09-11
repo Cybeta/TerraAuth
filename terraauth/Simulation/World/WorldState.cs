@@ -18,6 +18,12 @@ public sealed class WorldState
     /// <summary>玩家运行时状态（服务端权威唯一真相）。</summary>
     public Dictionary<int, PlayerRuntime> Players { get; } = new();
 
+    /// <summary>
+    /// 玩家表的跨线程保护：仿真线程可能新增玩家（首个移动包），
+    /// 网络线程（世界同步 / 死亡广播）需枚举其当前值，加锁避免枚举期结构变更异常。
+    /// </summary>
+    public object PlayersLock { get; } = new();
+
     // ---- 图格 ----
     public TileMap Tiles { get; set; } = new(1, 1);
 
@@ -86,6 +92,83 @@ public sealed class WorldState
     // ---- 进度 / 世界种子 ----
     public WorldProgress Progress { get; } = new();
 
+    /// <summary>
+    /// 进度（Boss 击杀 / 事件开始结束）发生变化 → 需要重新下发包 7（WorldData）。
+    /// 由仿真线程置位、世界同步线程清除，均为单字节读写，故用 volatile。
+    /// </summary>
+    public volatile bool ProgressDirty;
+
+    /// <summary>
+    /// 记录 Boss 击杀进度 + 掉落（服务端权威）。未收录的 NPC 类型不做处理。
+    /// 进度位映射与 NPC 类型 ID 均按**原版客户端行为**逐项核对（协议字段比对，不含第三方源码）。
+    /// 由仿真线程调用（NPC 死亡处）。
+    /// </summary>
+    public void NotifyNpcKilled(int npcType, float x = 0f, float y = 0f)
+    {
+        switch (npcType)
+        {
+            case 4: Progress.DownedBoss1 = true; break;                  // Eye of Cthulhu
+            case 13 or 14 or 15 or 266: Progress.DownedBoss2 = true; break; // Eater of Worlds（含分段）
+            case 35: Progress.DownedBoss3 = true; break;                 // Skeletron
+            case 50: Progress.DownedSlimeKing = true; break;             // King Slime
+            case 222: Progress.DownedQueenBee = true; break;             // Queen Bee
+            case 245: Progress.DownedGolemBoss = true; break;            // Golem
+            case 262: Progress.DownedPlantBoss = true; break;            // Plantera
+            case 370: Progress.DownedFishron = true; break;              // Duke Fishron
+            case 439: Progress.DownedAncientCultist = true; break;       // Lunatic Cultist
+            case 398: Progress.DownedMoonlord = true; break;             // Moon Lord
+            case 134: Progress.DownedMechBoss1 = true; Progress.DownedMechBossAny = true; break; // The Destroyer
+            case 125 or 126: Progress.DownedMechBoss2 = true; Progress.DownedMechBossAny = true; break; // The Twins
+            case 127: Progress.DownedMechBoss3 = true; Progress.DownedMechBossAny = true; break; // Skeletron Prime
+            case 109: Progress.DownedClown = true; break;                // Clown
+            default: return;
+        }
+
+        DropBossLoot(npcType, x, y);
+        ProgressDirty = true;
+    }
+
+    /// <summary>
+    /// Boss 掉落表（**简化模型**：物品 ID 按原版 <c>ItemID</c> 核对，数量为简化值）。
+    /// 未收录的 Boss 不掉落 —— 原版掉落规则在掉落数据库中，此处不逐条复刻。
+    /// </summary>
+    private static readonly Dictionary<int, (int ItemId, int Stack)> BossLoot = new()
+    {
+        [4] = (56, 30),      // Eye of Cthulhu → Demonite Ore
+        [13] = (56, 30),     // Eater of Worlds → Demonite Ore
+        [50] = (23, 50),     // King Slime → Gel
+        [222] = (2431, 10),  // Queen Bee → Bee Wax
+    };
+
+    /// <summary>世界掉落物槽位上限（与原版 <c>Main.item[400]</c> 一致）。</summary>
+    private const int MaxItemSlots = 400;
+
+    /// <summary>服务端主动生成掉落物（Boss 掉落）：标记待下发，由世界同步补发包 21。</summary>
+    private void DropBossLoot(int npcType, float x, float y)
+    {
+        if (!BossLoot.TryGetValue(npcType, out var loot)) return;
+
+        lock (ItemsLock)
+        {
+            if (Items.Count >= MaxItemSlots) return;
+
+            int slot = 0;
+            while (Items.Any(i => i.Slot == slot)) slot++;
+
+            Items.Add(new WorldItemEntity
+            {
+                Slot = slot,
+                ItemId = loot.ItemId,
+                Stack = loot.Stack,
+                Position = new Vector2(x, y),
+                Velocity = new Vector2(0f, 0f),
+                Prefix = 0,
+                OwnedBy = -1,
+                NewNotified = false, // 服务端生成 → 客户端尚不知情，需补发包 21
+            });
+        }
+    }
+
     // ---- 入侵 / 沙尘暴 / 冷却 ----
     public int InvasionDelay { get; set; }
     public int InvasionSize { get; set; }
@@ -113,8 +196,162 @@ public sealed class WorldState
     public List<Sign> Signs { get; } = new();
     public List<WorldNpc> Npcs { get; } = new();
 
+    /// <summary>
+    /// 箱子列表的跨线程保护：仿真线程按命令写入箱内物品，权威校验 / 网络线程读取内容。
+    /// </summary>
+    public object ChestsLock { get; } = new();
+
+    /// <summary>按图格坐标查找箱子（不存在返回 null）。调用方需持 <see cref="ChestsLock"/>。</summary>
+    public Chest? FindChestAt(int x, int y)
+    {
+        foreach (var chest in Chests)
+            if (chest.X == x && chest.Y == y) return chest;
+        return null;
+    }
+
+    /// <summary>按索引查找箱子（越界 / 不存在返回 null）。调用方需持 <see cref="ChestsLock"/>。</summary>
+    public Chest? FindChestByIndex(int index)
+        => index >= 0 && index < Chests.Count ? Chests[index] : null;
+
     /// <summary>NPC 列表的跨线程保护：仿真线程负责增删，世界同步线程负责遍历下发。</summary>
     public object NpcsLock { get; } = new();
+
+    // ---- 液体仿真 / 同步（服务端权威）----
+
+    /// <summary>液体待处理集合的跨线程保护：命令 / 权威校验标记，仿真线程消费。</summary>
+    public object LiquidsLock { get; } = new();
+
+    /// <summary>坐标打包步长：大于最大世界宽度（8400），保证 (x, y) 打包唯一。</summary>
+    private const int CoordPackStride = 16384;
+
+    private readonly HashSet<int> _liquidDirty = new();
+    private readonly List<(int X, int Y)> _liquidPendingSync = new();
+
+    /// <summary>待下发客户端的液体变更上限（防止液体洪水撑爆发送队列）。</summary>
+    private const int MaxPendingLiquidSync = 16384;
+
+    /// <summary>标记一格液体需要仿真（不触发下发）。</summary>
+    public void MarkLiquidDirty(int x, int y)
+    {
+        lock (LiquidsLock) _liquidDirty.Add(y * CoordPackStride + x);
+    }
+
+    /// <summary>标记一格液体已变化：既需要继续仿真，也需要下发客户端。</summary>
+    public void MarkLiquidChanged(int x, int y)
+    {
+        lock (LiquidsLock)
+        {
+            _liquidDirty.Add(y * CoordPackStride + x);
+            if (_liquidPendingSync.Count < MaxPendingLiquidSync)
+                _liquidPendingSync.Add((x, y));
+        }
+    }
+
+    /// <summary>取出至多 <paramref name="max"/> 格待仿真液体（并从待处理集合移除）。</summary>
+    public List<(int X, int Y)> TakeLiquidDirty(int max)
+    {
+        lock (LiquidsLock)
+        {
+            var result = new List<(int X, int Y)>(Math.Min(max, _liquidDirty.Count));
+            if (_liquidDirty.Count == 0) return result;
+
+            foreach (var packed in _liquidDirty)
+            {
+                result.Add((packed % CoordPackStride, packed / CoordPackStride));
+                if (result.Count >= max) break;
+            }
+
+            foreach (var (x, y) in result) _liquidDirty.Remove(y * CoordPackStride + x);
+            return result;
+        }
+    }
+
+    /// <summary>取出至多 <paramref name="max"/> 条待下发的液体变更。</summary>
+    public List<(int X, int Y)> DrainLiquidSync(int max)
+    {
+        lock (LiquidsLock)
+        {
+            if (_liquidPendingSync.Count == 0) return new List<(int X, int Y)>();
+
+            int take = Math.Min(max, _liquidPendingSync.Count);
+            var result = _liquidPendingSync.GetRange(0, take);
+            _liquidPendingSync.RemoveRange(0, take);
+            return result;
+        }
+    }
+
+    // ---- 图格变更推送（服务端驱动的图格修改，如电路翻转执行器）----
+
+    /// <summary>待推送图格集合的跨线程保护。</summary>
+    public object TileUpdatesLock { get; } = new();
+
+    private readonly HashSet<int> _pendingTileUpdates = new();
+
+    /// <summary>待推送图格上限（防止大范围改动撑爆发送队列）。</summary>
+    private const int MaxPendingTileUpdates = 8192;
+
+    /// <summary>标记一格图格已由服务端修改，需要推送客户端（小矩形包 10 区块）。</summary>
+    public void MarkTileChanged(int x, int y)
+    {
+        lock (TileUpdatesLock)
+        {
+            if (_pendingTileUpdates.Count < MaxPendingTileUpdates)
+                _pendingTileUpdates.Add(y * CoordPackStride + x);
+        }
+    }
+
+    /// <summary>取出至多 <paramref name="max"/> 格待推送图格（并从待推送集合移除）。</summary>
+    public List<(int X, int Y)> DrainTileUpdates(int max)
+    {
+        lock (TileUpdatesLock)
+        {
+            if (_pendingTileUpdates.Count == 0) return new List<(int X, int Y)>();
+
+            var result = new List<(int X, int Y)>(Math.Min(max, _pendingTileUpdates.Count));
+            foreach (var packed in _pendingTileUpdates)
+            {
+                result.Add((packed % CoordPackStride, packed / CoordPackStride));
+                if (result.Count >= max) break;
+            }
+
+            foreach (var (x, y) in result) _pendingTileUpdates.Remove(y * CoordPackStride + x);
+            return result;
+        }
+    }
+
+    // ---- 服务端判定的玩家受击通知（包 117 / 16 下发）----
+
+    /// <summary>待下发受击通知的跨线程保护：仿真线程入队，网络线程消费。</summary>
+    public object PlayerHurtLock { get; } = new();
+
+    private readonly List<(int PlayerId, int Damage)> _pendingPlayerHurt = new();
+
+    /// <summary>待下发受击通知上限（防止极端情况下无界增长）。</summary>
+    private const int MaxPendingPlayerHurt = 1024;
+
+    /// <summary>登记一次「服务端判定」的玩家受击（供网络层发包 117 表现 + 包 16 权威血量）。</summary>
+    public void MarkPlayerHurt(int playerId, int damage)
+    {
+        lock (PlayerHurtLock)
+        {
+            if (_pendingPlayerHurt.Count < MaxPendingPlayerHurt)
+                _pendingPlayerHurt.Add((playerId, damage));
+        }
+    }
+
+    /// <summary>取出至多 <paramref name="max"/> 条待下发受击通知。</summary>
+    public List<(int PlayerId, int Damage)> DrainPlayerHurt(int max)
+    {
+        lock (PlayerHurtLock)
+        {
+            if (_pendingPlayerHurt.Count == 0) return new List<(int, int)>();
+
+            int take = Math.Min(max, _pendingPlayerHurt.Count);
+            var result = _pendingPlayerHurt.GetRange(0, take);
+            _pendingPlayerHurt.RemoveRange(0, take);
+            return result;
+        }
+    }
 
     // ---- 掉落物 / 弹幕（服务端权威实体）----
 
@@ -319,11 +556,23 @@ public sealed class PlayerRuntime
     /// <summary>每 tick 速度（像素 / tick）。</summary>
     public Vector2 Velocity;
 
-    /// <summary>是否在线：断线 / 死亡后置 false，不再参与仿真与快照。</summary>
+    /// <summary>是否在线：断线后置 false，不再参与仿真与快照。</summary>
     public bool Active = true;
 
     public int Hp = 100;
     public int HpMax = 100;
+
+    /// <summary>是否处于死亡状态：死亡后不再参与物理 / 战斗，直到复活命令复位。</summary>
+    public bool Dead;
+
+    /// <summary>死亡是否已广播（包 118），由世界同步线程置位，避免重复下发。</summary>
+    public bool DeathNotified;
+
+    /// <summary>复活是否已广播（包 12 / 16），由世界同步线程置位。</summary>
+    public bool RespawnNotified = true;
+
+    /// <summary>受击免伤帧剩余 tick：&gt;0 时不再结算接触伤害（约 1 秒）。</summary>
+    public int HurtCooldown;
 
     /// <summary>连续下落距离（像素），落地时用于结算下落伤害。</summary>
     public float FallDistance;
@@ -494,6 +743,9 @@ public sealed class WorldNpc
 
     /// <summary>是否存活；false 时同步 <c>life=0</c> 让客户端移除。</summary>
     public bool Active = true;
+
+    /// <summary>是否为 Boss（服务端权威：击杀后记录世界进度，AI 为简化追击）。</summary>
+    public bool IsBoss;
 
     /// <summary>死亡发生的 tick（用于延后清理，确保 life=0 已下发到客户端）。</summary>
     public long DeadTick;
