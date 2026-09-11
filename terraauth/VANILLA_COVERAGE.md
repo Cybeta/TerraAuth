@@ -21,56 +21,68 @@
 | 挖砖 | 17 | 越界 / 超距 / 图格类型对账 → TileBreakCommand → 图格变更 → 转发 | `Vanilla_TileBreak_Removes_Solid_Tile` / `..._OutOfReach_IsRejected` |
 | 放砖 | 79 | 越界 / 超距 / 类型范围 / **背包扣减（SSC）** → TilePlaceCommand | `Vanilla_InventoryReport_Then_TilePlace_Succeeds` / `..._Without_InventoryItem_IsRejected` |
 | 背包同步 | 5 | 槽位 / 堆叠 / 物品校验；SSC 下服务端持有唯一真相 | `Vanilla_InventorySlot_InvalidSlot_IsRejected` |
-| 物品丢弃 | 21 | 物品 ID / 堆叠校验 | `Vanilla_ItemDrop_UnknownItem_IsRejected` |
+| 物品丢弃 | 21 | 物品 ID / 堆叠校验；并中继给他人 | `Vanilla_ItemDrop_UnknownItem_IsRejected` / `..._Is_Relayed_To_OtherPlayers` |
 | 开箱 | 31 | 坐标越界校验 | `Vanilla_Chest_OutOfBounds_IsRejected` |
 | 攻击 NPC | 28 | 单次伤害上限 + 窗口内 DPS 上限 | `Vanilla_NpcStrike_Above_SingleDamage_Limit_IsRejected` / `..._Within_Limit_IsAccepted` |
-| 抛射物 | 27 | 字段 / 速率校验 | `Vanilla_Projectile_Is_Not_Rejected` |
+| 抛射物 | 27 | 字段 / 速率校验；并中继给他人 | `Vanilla_Projectile_Is_Not_Rejected` / `..._Is_Relayed_To_OtherPlayers` |
 | 生命 / 法力上报 | 16 | 上限校验；超限则下发**纠正包 16** | `Vanilla_Health_Above_ServerMax_Gets_Correction` |
 | 传送 | 65 | 实体索引 / 落点越界 / 频率校验 | `Vanilla_Teleport_OutOfBounds_IsRejected` |
 | 请求传送（回城类） | 73 | 类型 / 频率校验（与 65 共窗口） | 解码 + 校验已实现，**未单测** |
 | 弃用包健壮性 | 25 | 未知 / 弃用包透传，连接不受影响 | `Vanilla_DeprecatedChatPacket_DoesNot_Disconnect` |
-| **他人可见性（中继）** | 27 / 21 / 117 / 118 / 35 / 36 / 50 / 32 | 权威通过后**转发给其他玩家**；携带玩家字段的包一律以服务端分配 ID 覆盖（防伪造身份驱动他人状态） | `Vanilla_Projectile_Is_Relayed_To_OtherPlayers` / `..._ItemDrop_...` / `..._PlayerHurt_Is_Relayed_With_ServerPlayerId` / `..._PlayerBuffs_...` |
+| **他人可见性（中继）** | 117 / 118 / 35 / 36 / 50 / 32 | 权威通过后转发给其他玩家；携带玩家字段的包以服务端分配 ID 覆盖（防伪造身份） | `Vanilla_PlayerHurt_Is_Relayed_With_ServerPlayerId` / `..._PlayerBuffs_...` |
+| **世界时间同步** | 18 (Time) | 持续下发 `Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY` | `Vanilla_Time_Is_Synced_To_Client` |
+| **NPC 生成 / 同步** | 23 (SyncNPC) | 定期下发世界 NPC（索引 / netID / 位置 / 速度 / 朝向）；已满血形态省略生命段 | `Vanilla_Npc_Is_Synced_To_Client` |
+| **聊天** | 82 (NetModule → NetTextModule) | 客户端发言 → 转服务端下行形态广播给所有人；`IServerApi.Broadcast/SendMessage` 真实下发 | `Vanilla_Chat_Is_Relayed_To_OtherPlayers` / `Vanilla_ServerBroadcast_Reaches_Client` |
 
 ---
 
-## 二、已解码 / 已校验，但**无服务端行为**（透传接受）
-
-| 包 | 现状 |
-|---|---|
-| 32 `SyncChestItem` | 仅解码；箱子内容不同步 |
-| 35 `PlayerHeal` | 仅解码；无回血结算与下发 |
-| 36 `SyncPlayerZone` | 仅解码；无生物群系 / 城镇 NPC 状态同步 |
-| 50 `PlayerBuffs` | 仅解码；无增益列表同步 |
-| 117 `PlayerHurtV2` / 118 `PlayerDeathV2` | 仅解码；无受伤 / 死亡 / 复活流程 |
-
----
-
-## 三、**未实现**的原版功能（原版客户端会用到，服务端当前不同步）
+## 二、**未实现**的原版功能（原版客户端会用到，服务端当前不同步）
 
 | 功能 | 影响 | 备注 |
 |---|---|---|
-| NPC 生成与同步（包 23 等） | 世界中无敌怪 / 城镇 NPC | 仿真有 NPC 模型，缺网络同步 |
-| 世界物品 / 掉落物同步（包 21 下行） | 掉落物不可见 | 当前仅上行校验 |
-| 弹幕同步（包 27 下行） | 他人弹幕不可见 | 当前仅上行校验 |
-| 聊天（NetTextModule 文本包） | 无聊天 | 包 25 自 1.4 弃用；`IServerApi.Broadcast/SendMessage` 目前仅落审计 |
-| 箱子内容同步（包 32 下行） | 打开箱子看不到内容 | |
-| 时间 / 天气 / 月相持续同步 | 客户端昼夜不推进 | 服务端有推进逻辑（包 7 仅进服首发） |
-| 受伤 / 死亡 / 复活流程 | 无伤害同步与复活 | |
+| 敌怪生成 / AI | 只有出生点的向导 NPC，没有敌怪 | 仿真有 NPC 模型但无刷怪逻辑 |
+| 弹幕 / 掉落物的**服务端权威模拟** | 中继可用，但服务端不模拟其运动与生命周期 | 当前为「客户端上报 → 校验 → 中继」 |
+| 箱子内容管理 | 包 32 可中继，但服务端不维护箱子内容 | 打开箱子看到的仍是客户端本地数据 |
 | 电路 / 液体 | 未实现 | |
+| 受伤 / 死亡 / 复活流程 | 117 / 118 仅中继，无服务端结算与复活 | |
+| 世界进度 / Boss 事件 | 包 7 仅在进服时下发一次 | |
 
-> 结论：当前服务端是「防作弊代理 + 移动 / 图格权威 + 快照下发」的**子集**。
-> 原版客户端可进世界、可看到地形与彼此移动、可挖 / 放砖（服务端权威），但**尚未**达到"完整可玩"。
+> 结论：服务端已达「可进服 + 地形可见 + 彼此可见（含移动 / 受伤 / 增益 / 弹幕 / 掉落物）+ 挖放砖权威 + 聊天 + 时间与 NPC 同步」，
+> 但**仍不是完整可玩的原版服务器**（缺敌怪、掉落物与弹幕的服务端模拟、箱子内容、电路液体、死亡复活）。
 
 ---
 
-## 四、已知隐患
+## 三、已知隐患
 
 1. **`MaxSingleDamage` 与协议量纲冲突**：`NpcStrike.Damage` 线格式为 **Int16**（±32767），而默认上限为 30000，
    两者几乎贴边；若把上限配置为 >32767，该上限**永远不会触发**。建议上限不超过 32000，或在配置文档中明确量纲约束。
-2. **出站包（7 / 10 / 15 等）未在解码器建模**：这些包只发不收，`PacketDecoder` 落为 `UnknownPacket`，
-   自动化测试无法直接断言其字段（本矩阵改用服务端权威状态作参照）。若需校验出站 payload，应单独增加"出站包解析"工具。
-3. `SnapshotStore.Snapshot()` 每轮 `ToArray()` 复制 —— 见 `Net/Phase4/README.md`「后续可能优化」。
-4. 原版客户端**不支持预测协议**，延迟只能靠快照频率缓解（不影响防作弊，见 `architecture.md` 约束）。
+2. **出站包（7 / 10 / 15 等）未在解码器建模**：这些包只发不收，`PacketDecoder` 落为 `UnknownPacket`；
+   自本轮起 18 / 23 / 82 已建模（可被客户端侧测试断言）。
+3. **NPC 同步未做视口裁剪**：`GameHost.BroadcastWorldStateAsync` 把全世界 NPC 发给所有玩家，
+   仅适合当前「小世界 + 极少 NPC」场景；NPC 数量增长后需按视口过滤。
+4. **NPC 同步不含 ai / 生命 / 增益**：仅发「满血 + 无 ai」形态，故客户端看不到 NPC 血量与特殊动作。
+5. **聊天未接入限流**：`RateAuthority` 的聊天限流针对包 25（已弃用），包 82 未纳入令牌桶。
+6. `SnapshotStore.Snapshot()` 每轮 `ToArray()` 复制 —— 见 `Net/Phase4/README.md`「后续可能优化」。
+7. 原版客户端**不支持预测协议**，延迟只能靠快照频率缓解（不影响防作弊，见 `architecture.md` 约束）。
+
+---
+
+## 四、协议布局参考来源
+
+本矩阵中 18 / 23 / 82 的字段与类型**全部来自原版**（非猜测），工具链与位置：
+
+- 工具：`本机对照工具`（`dotnet tool install -g 本机对照工具`）
+- 目标：`Terraria/Terraria.exe`（客户端）/ `TerrariaServer.exe`（服务端，同源码）
+- 全量产物：`<工作区根>/reference/`（**仓库之外**，1549 个 `.cs`，不入库）
+- 关键类型：
+  - `Terraria.ID.MessageID`（全部包号常量）
+  - `Terraria.NetMessage.SendData`（出站：`case 18 / 23 / 82` …）
+  - `Terraria.MessageBuffer.GetData`（入站：对应 case 的读取顺序，字段类型以此为准）
+  - `Terraria.GameContent.NetModules.NetTextModule`（聊天上下行负载）
+  - `Terraria.Initializers.NetworkInitializer`（NetModule 注册顺序 → NetTextModule 模块号 = 1）
+  - `Terraria.Net.NetPacket` / `NetManager`（NetModule 帧：`[UInt16 长度][Byte 82][UInt16 模块号][负载]`）
+
+> 新增包时请先查 `MessageBuffer.GetData` 的对应 case 确认**字段类型与顺序**（例如 `NpcStrike.Damage` 是 Int16 —— 曾因此踩坑）。
 
 ---
 
@@ -80,22 +92,3 @@
 # 仅原版功能端到端套件
 dotnet test Tests/TerraAuth.Tests.csproj -c Release --filter "FullyQualifiedName~VanillaFeatureTests"
 ```
-
----
-
-## 六、下一轮：待补协议布局（阻塞项）
-
-以下三项**需要权威线格式**才能实现。不做猜测式实现 —— 布局错误会产出真实客户端无法解析的包，
-比"未实现"更糟（会表现为客户端异常/掉线，且难以定位）。
-
-| 项 | 需要的包 | 需要的布局信息 | 阻塞原因 |
-|---|---|---|---|
-| 时间 / 天气 / 月相同步 | **18 (Time)** | `NetMessage.SendData` case 18 的字段顺序与类型（dayTime / time / moonPhase / bloodMoon / eclipse …） | 仓库内既无该包编解码，也无布局文档；TShock 官方 Wiki 抓取只取到目录部分 |
-| 聊天 | **82 (NetModule) + NetTextModule** | NetModule 帧结构（模块标识 + 长度 + 负载）与 `NetTextModule.SerializeServerMessage` 的负载字段（作者 / 文本 / 颜色） | 同上 |
-| NPC 同步 | **23 (NPC Update)** | 完整字段序列与条件位（netId / 命中 / 生命 / 增益 / 目标 / `ai[]` 等随标志位增减）；另需服务端 NPC 生命周期（生成 / 定期更新 / 失效） | 同上 |
-
-**解除阻塞方式**：提供本机原版源码中 `Terraria.MessageBuffer.GetData` / `NetMessage.SendData` 的
-`case 18 / 23 / 82` 片段（工作区已有 `Terraria/Terraria.exe`），或指定一份可信的 1.4.5.8 协议参考。
-
-> 另注：**时间同步是否需要**尚待实测确认 —— 原版客户端可能自行按 tick 推进 `Main.time`（服务端同样每 tick +1），
-> 若确实如此则无需持续下发；只有在服务端强制改时间（如日月切换）时才需要包 18。建议先用真实客户端观察昼夜是否自行推进。

@@ -130,10 +130,10 @@ internal sealed class CoreEventStore : IEventStoreAdapter
 /// </summary>
 /// <remarks>
 /// 已实装：<see cref="KickPlayer"/> / <see cref="BanPlayer"/> / <see cref="GetPlayer"/> /
-/// <see cref="GetOnlinePlayers"/> / <see cref="GetServerInfo"/>。
+/// <see cref="GetOnlinePlayers"/> / <see cref="GetServerInfo"/> / <see cref="Broadcast"/> / <see cref="SendMessage"/>
+/// （后两者经 <c>NetworkHost.BroadcastChatAsync</c> 下发包 82 / NetTextModule，并同时落审计）。
 /// <br/>
-/// 尚未实装：<see cref="Broadcast"/> / <see cref="SendMessage"/> / <see cref="ExecuteCommand"/> ——
-/// 原版聊天走 NetTextModule（包 25 自 1.4 起弃用），需先实现文本包序列化才能下发，当前仅落审计。
+/// 尚未实装：<see cref="ExecuteCommand"/> —— 需要命令子系统，当前仅落审计。
 /// </remarks>
 public sealed class ServerApi : IServerApi
 {
@@ -162,10 +162,17 @@ public sealed class ServerApi : IServerApi
     }
 
     public void Broadcast(string message, string color = "White")
-        => _audit.Log(AuditEvent.Now(0, "server", "broadcast", $"color={color}", message));
+    {
+        // 真实下发（包 82 / NetTextModule 下行形态）+ 审计留痕
+        _ = _network.BroadcastChatAsync(message, color);
+        _audit.Log(AuditEvent.Now(0, "server", "broadcast", $"color={color}", message));
+    }
 
     public void SendMessage(int playerId, string message, string color = "White")
-        => _audit.Log(AuditEvent.Now(playerId, "server", "message", $"color={color}", message));
+    {
+        _ = _network.SendChatAsync(playerId, message, color);
+        _audit.Log(AuditEvent.Now(playerId, "server", "message", $"color={color}", message));
+    }
 
     public PlayerStateSnapshot? GetPlayer(int playerId)
     {

@@ -247,9 +247,18 @@ public sealed class NetworkHost : IAsyncDisposable
         {
             case AuthorityDecision.Accept:
                 // Command 已由管线写入 _commands（Phase 3 仿真消费）
-                // 权威通过 → 转发给其他玩家：原版客户端依赖这些原版包渲染他人状态
-                // （TerraAuth 专用快照包 15 会被原版客户端忽略，故玩家间可见性必须靠原版包）
-                await RelayToOthersAsync(packet, connection, ct).ConfigureAwait(false);
+                if (packet is NetTextPacket { IsClientMessage: true } chat)
+                {
+                    // 客户端聊天（命令名 + 文本）→ 转服务端下行形态广播给**所有人**（含发送者，与原版一致）
+                    await BroadcastChatAsync(PlayerChatLine(connection.PlayerId, chat.Text), ct: ct)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    // 权威通过 → 转发给其他玩家：原版客户端依赖这些原版包渲染他人状态
+                    // （TerraAuth 专用快照包 15 会被原版客户端忽略，故玩家间可见性必须靠原版包）
+                    await RelayToOthersAsync(packet, connection, ct).ConfigureAwait(false);
+                }
                 break;
 
             case AuthorityDecision.Correct:
@@ -388,6 +397,42 @@ public sealed class NetworkHost : IAsyncDisposable
                 break;
         }
     }
+
+    /// <summary>向所有 Playing 连接广播一个包（供世界状态同步 / 聊天使用）。</summary>
+    public Task BroadcastAsync(PacketId type, INetworkPacket packet, CancellationToken ct = default)
+        => _connections.BroadcastAsync(type, packet, ct);
+
+    /// <summary>
+    /// 广播一条聊天（包 82 / NetTextModule 下行形态：作者 = 服务端）。
+    /// 原版客户端不会按 authorId 反查名字，故玩家发言需自行带上「名字: 文本」前缀。
+    /// </summary>
+    public Task BroadcastChatAsync(string text, string color = "White", CancellationToken ct = default)
+        => BroadcastAsync(PacketId.NetModule,
+            new NetTextPacket(text) { AuthorId = byte.MaxValue, Color = ParseColor(color) }, ct);
+
+    /// <summary>向单个玩家发送聊天（供插件 API <c>IServerApi.SendMessage</c>）。</summary>
+    public async Task SendChatAsync(int playerId, string text, string color = "White", CancellationToken ct = default)
+    {
+        var conn = _connections.Get(playerId);
+        if (conn is null || conn.State != ConnectionState.Playing) return;
+
+        await conn.SendEncodedAsync(PacketId.NetModule,
+            new NetTextPacket(text) { AuthorId = byte.MaxValue, Color = ParseColor(color) }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>拼「名字: 文本」聊天行（服务端下行不带作者解析，需自行带名）。</summary>
+    private string PlayerChatLine(int playerId, string text)
+        => TryGetPlayerName(playerId, out var name) && name.Length > 0 ? $"{name}: {text}" : text;
+
+    /// <summary>颜色名 → RGB（未知名回退白色）。</summary>
+    private static RgbColor ParseColor(string? color) => color?.Trim().ToLowerInvariant() switch
+    {
+        "red" => new RgbColor(255, 0, 0),
+        "green" => new RgbColor(0, 255, 0),
+        "blue" => new RgbColor(0, 0, 255),
+        "yellow" => new RgbColor(255, 255, 0),
+        _ => new RgbColor(255, 255, 255),
+    };
 
     // ---------- 连接状态管理 ----------
 

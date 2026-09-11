@@ -31,6 +31,9 @@ public static class WorldGenerator
     private const int BaseSurfaceY = 360;
     private const int RockLayerY = 720;
 
+    /// <summary>向导 NPC 的类型 ID（权威：原版 <c>Terraria.ID.NPCID.Guide</c>）。</summary>
+    private const short GuideNpcType = 22;
+
     /// <summary>出生点周围压平的半宽（图格），保证稳定出生。</summary>
     private const int SpawnFlatRadius = 8;
 
@@ -108,6 +111,19 @@ public static class WorldGenerator
         world.SpawnTileY = spawnGroundY;
         world.WorldSurface = BaseSurfaceY;
         world.RockLayer = RockLayerY;
+
+        // 4. 出生点旁放置一名城镇 NPC（向导），使 NPC 同步（包 23）具备可观测对象
+        int guideTileX = spawnX + 2;
+        world.Npcs.Add(new WorldNpc
+        {
+            Type = GuideNpcType,
+            GivenName = "Guide",
+            X = (guideTileX + 0.5f) * 16f,
+            Y = (spawnGroundY - 2) * 16f,
+            IsTownNpc = true,
+            HomeTileX = guideTileX,
+            HomeTileY = spawnGroundY,
+        });
 
         return world;
     }

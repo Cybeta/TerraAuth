@@ -36,6 +36,8 @@ TerraAuth 的目标是在**协议层**把关键状态收回服务端，提供可
 - ✅ Tile（挖 / 放方块）服务端权威全链路：校验 → Command → 仿真 → 增量广播 → SSC 背包扣减
 - ✅ 违规处置闭环：窗口内权威拒绝累计达阈值 → 下发包 2 后踢出连接
 - ✅ 持久化落盘：玩家存档 / 审计 / 封禁写入 SQLite，重启后仍在（封禁不再重启即失效）
+- ✅ 世界同步与聊天：时间（包 18）/ NPC（包 23）定期下发；聊天（包 82 NetTextModule）可收发，`IServerApi.Broadcast/SendMessage` 真实生效
+- ✅ 他人可见性：移动 / 挖放砖 / 受伤 / 增益 / 弹幕 / 掉落物按原版包中继（带玩家字段的包以服务端 ID 覆盖）
 
 ## 快速启动
 
@@ -84,7 +86,7 @@ terraauth/
 ├─ Plugins/             # 插件系统（Hook / 加载器 / 管线装饰）
 ├─ ModCompat/           # Mod 兼容层（策略 / 检测 / 自定义包）
 ├─ Concurrency/         # 并行优化（Worker 池 / 分片 / 快照并行）
-├─ Tests/               # xUnit 验收测试（164 用例）
+├─ Tests/               # xUnit 验收测试（168 用例）
 └─ server.json          # 阈值配置
 ```
 

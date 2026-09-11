@@ -256,6 +256,22 @@ public sealed class PacketEncoder : IPacketEncoder
                     bw.Write((byte)(death.Pvp ? 0x01 : 0));
                     break;
 
+                case TimePacket time:
+                    // Time（包 18）：Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY
+                    bw.Write((byte)(time.DayTime ? 1 : 0));
+                    bw.Write(time.Time);
+                    bw.Write(time.SunModY);
+                    bw.Write(time.MoonModY);
+                    break;
+
+                case NpcUpdatePacket npc:
+                    WriteNpcUpdate(bw, npc);
+                    break;
+
+                case NetTextPacket netText:
+                    WriteNetText(bw, netText);
+                    break;
+
                 case DisconnectPacket disconnect:
                     // Kick：NetworkText（mode=0 字面量 + 7-bit 长度前缀字符串）
                     if (disconnect.Reason is not null)
@@ -283,6 +299,55 @@ public sealed class PacketEncoder : IPacketEncoder
     {
         bw.Write(v.X);
         bw.Write(v.Y);
+    }
+
+    /// <summary>NetTextModule 的模块号（权威：NetworkInitializer 注册顺序，NetLiquidModule=0 → NetTextModule=1）。</summary>
+    private const ushort NetTextModuleId = 1;
+
+    /// <summary>
+    /// NPC 生成 / 更新（包 23）：只写「满血 + 无 ai + 非雕像 / 无难度覆盖」的最小形态。
+    /// bitsA.bit7 置位 → 客户端跳过生命段，故无需服务端维护 NPC 生命。
+    /// </summary>
+    private static void WriteNpcUpdate(BinaryWriter bw, NpcUpdatePacket npc)
+    {
+        bw.Write(npc.Index);            // Byte 索引（0..199）
+        bw.Write(npc.Generation);       // Byte generation
+        WriteVector2(bw, npc.Position);
+        WriteVector2(bw, npc.Velocity);
+        bw.Write(npc.Target);           // UInt16 target
+
+        byte bitsA = 0x80;              // bit7=1：生命为满 → 省略生命段
+        if (npc.DirectionPositive) bitsA |= 0x01;
+        if (npc.DirectionYPositive) bitsA |= 0x02;
+        if (npc.SpriteDirectionPositive) bitsA |= 0x40;
+        bw.Write(bitsA);
+        bw.Write((byte)0);              // BitsByte B：无玩家数缩放 / 非雕像 / 无难度覆盖 / 非需同步生成
+
+        bw.Write(npc.NetId);            // Int16 netID（客户端据此 SetDefaults 生成 NPC）
+    }
+
+    /// <summary>
+    /// 聊天（包 82 = LoadNetModule → NetTextModule）。
+    /// 下行：UInt16 模块号 + Byte 作者 + Byte 模式(0=Literal) + String 文本 + RGB；
+    /// 上行：UInt16 模块号 + String 命令名 + String 文本。
+    /// </summary>
+    private static void WriteNetText(BinaryWriter bw, NetTextPacket netText)
+    {
+        bw.Write(NetTextModuleId);
+
+        if (netText.IsClientMessage)
+        {
+            WritePrefixedString(bw, netText.CommandName);
+            WritePrefixedString(bw, netText.Text);
+            return;
+        }
+
+        bw.Write(netText.AuthorId);
+        bw.Write((byte)0);              // NetworkText 模式：0 = Literal
+        WritePrefixedString(bw, netText.Text);
+        bw.Write(netText.Color.R);
+        bw.Write(netText.Color.G);
+        bw.Write(netText.Color.B);
     }
 
     /// <summary>

@@ -393,3 +393,63 @@ public sealed record InventorySlotPacket(int Slot, int ItemId, int Stack) : INet
     /// <summary>是否收藏（BitsByte bit0）。</summary>
     public bool Favorited { get; init; }
 }
+
+/// <summary>
+/// 世界时间包（Time，包 18，服务端 → 客户端）。
+/// 布局权威：<c>NetMessage.SendData</c> case 18 / <c>MessageBuffer.GetData</c> case 18：
+/// <c>Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY</c>。
+/// </summary>
+public sealed record TimePacket(bool DayTime, int Time, short SunModY, short MoonModY) : INetworkPacket
+{
+    public PacketId Type => PacketId.Time;
+}
+
+/// <summary>
+/// NPC 生成 / 更新包（SyncNPC，包 23，服务端 → 客户端）。
+/// 布局权威：<c>NetMessage.SendData</c> case 23 / <c>MessageBuffer.GetData</c> case 23：
+/// <c>Byte 索引 + Byte generation + Vector2 位置 + Vector2 速度 + UInt16 target
+/// + BitsByte A + BitsByte B + [各 ai 单精度] + Int16 netID + [可选段]</c>。
+/// <para>BitsByte A：bit0 朝向 &gt;0、bit1 竖直朝向 &gt;0、bit2..5 第 i 个 ai 是否存在、
+/// bit6 spriteDirection &gt;0、bit7 生命是否为满（置位则**省略生命段**）。</para>
+/// <para>BitsByte B：bit0 玩家数缩放、bit1 雕像生成、bit2 难度覆盖、bit3 需同步生成。</para>
+/// </summary>
+/// <remarks>
+/// TerraAuth 只发「满血 + 无 ai + 非雕像 / 无难度覆盖 / 不可捕捉」的最小形态：
+/// bitsA.bit7 恒置位以省略生命段，因此服务端无需维护 NPC 生命即可让客户端正确生成该 NPC。
+/// </remarks>
+public sealed record NpcUpdatePacket(
+    byte Index,
+    byte Generation,
+    Vector2 Position,
+    Vector2 Velocity,
+    ushort Target,
+    short NetId,
+    bool DirectionPositive = true,
+    bool DirectionYPositive = true,
+    bool SpriteDirectionPositive = true) : INetworkPacket
+{
+    public PacketId Type => PacketId.NpcUpdate;
+}
+
+/// <summary>
+/// 聊天包（LoadNetModule → NetTextModule，包 82）。
+/// 模块号权威：<c>Terraria.Initializers.NetworkInitializer</c> 的注册顺序（NetLiquidModule=0，**NetTextModule=1**）。
+/// <para>服务端 → 客户端负载：<c>UInt16 模块号 + Byte authorId + Byte 模式(0=Literal) + String 文本 + RGB</c>；</para>
+/// <para>客户端 → 服务端负载：<c>UInt16 模块号 + String 命令名（普通说话为空串）+ String 文本</c>。</para>
+/// </summary>
+public sealed record NetTextPacket(string Text) : INetworkPacket
+{
+    public PacketId Type => PacketId.NetModule;
+
+    /// <summary>true = 客户端上行形态；false = 服务端下行形态。</summary>
+    public bool IsClientMessage { get; init; }
+
+    /// <summary>上行：命令名（普通发言为空串）。</summary>
+    public string CommandName { get; init; } = "";
+
+    /// <summary>下行：作者玩家 Id（<see cref="byte.MaxValue"/> 表示服务端 / 系统消息）。</summary>
+    public byte AuthorId { get; init; } = byte.MaxValue;
+
+    /// <summary>下行：颜色。</summary>
+    public RgbColor Color { get; init; } = new RgbColor(255, 255, 255);
+}

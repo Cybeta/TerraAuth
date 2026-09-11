@@ -30,7 +30,9 @@ public enum PacketId : byte
     Snapshot            = 15,   // TerraAuth 专用快照帧（原版 MessageBuffer case 15 为显式 no-op，客户端会忽略，安全复用）
     PlayerHealth        = 16,   // 原版 PlayerLifeMana
     TileBreak           = 17,   // 原版 TileManipulation：破块 / 改块
+    Time                = 18,   // 原版 Time：世界时间（Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY）
     ItemDrop            = 21,   // 原版 SyncItem
+    NpcUpdate           = 23,   // 原版 SyncNPC：NPC 生成 / 更新（条件位 + 可选 ai / 生命段）
     ChatText            = 25,   // 原版 Unused25（已弃用，1.4 起聊天走 NetTextModule）
     ProjectileNew       = 27,   // 原版 SyncProjectile
     NpcStrike           = 28,   // 原版 DamageNPC
@@ -43,6 +45,7 @@ public enum PacketId : byte
     TeleportEntity      = 65,   // 原版 TeleportEntity：玩家 / NPC / 玩家间传送（含确认）
     RequestTeleportationByServer = 73, // 原版 RequestTeleportationByServer：回城药水 / 海螺等
     TilePlace           = 79,   // 原版 PlaceObject
+    NetModule           = 82,   // 原版 LoadNetModule：模块帧（UInt16 moduleId + 模块负载；聊天走 NetTextModule）
     PlayerHurtV2        = 117,  // 原版 PlayerHurtV2：玩家受击（含死亡原因）
     PlayerDeathV2       = 118,  // 原版 PlayerDeathV2：玩家死亡（含死亡原因）
     FinishedConnecting  = 129,  // 原版 FinishedConnectingToServer：无 payload

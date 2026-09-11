@@ -148,7 +148,8 @@ public class VanillaFeatureTests
                         if (!Framing.TryReadFrame(ref buffer, out var type, out var payload)) break;
                         _pending.RemoveRange(0, _pending.Count - (int)buffer.Length);
 
-                        var pkt = Decoder.Decode(type, payload.ToArray(), new DecodeContext());
+                        var pkt = Decoder.Decode(type, payload.ToArray(),
+                            new DecodeContext { ServerToClient = true }); // 本会话是客户端，收到的都是下行包
                         got.Add(pkt);
                         if (match(pkt)) return got;
                     }
@@ -599,5 +600,74 @@ public class VanillaFeatureTests
         var buffs = Assert.Single(got.OfType<PlayerBuffsPacket>());
         Assert.Equal(1, buffs.PlayerId);
         Assert.Equal(new[] { 1, 2 }, buffs.BuffTypes);
+    }
+
+    // ========================================================================
+    // 九、世界状态同步（包 18 时间 / 包 23 NPC）
+    // 布局来源：原版 Terraria.exe 的 NetMessage.SendData case 18 / case 23
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_Time_Is_Synced_To_Client()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+
+        await server.Host.BroadcastWorldStateAsync();
+
+        var got = await s.ReadUntilAsync(p => p is TimePacket, TimeSpan.FromSeconds(5));
+        var time = Assert.Single(got.OfType<TimePacket>());
+        Assert.True(time.DayTime, "世界生成时为白天");
+        Assert.InRange(time.Time, 0, 54000);
+    }
+
+    [Fact]
+    public async Task Vanilla_Npc_Is_Synced_To_Client()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+
+        await server.Host.BroadcastWorldStateAsync();
+
+        var got = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromSeconds(5));
+        var npc = Assert.Single(got.OfType<NpcUpdatePacket>());
+        Assert.Equal((short)22, npc.NetId); // NPCID.Guide
+    }
+
+    // ========================================================================
+    // 十、聊天（包 82 = LoadNetModule → NetTextModule，模块号 1）
+    // 布局来源：原版 NetTextModule / NetworkInitializer（模块号） / ChatMessage
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_Chat_Is_Relayed_To_Other_Players()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        // 上行形态：命令名为空串（普通发言）
+        await a.SendAsync(PacketId.NetModule, new NetTextPacket("hello") { IsClientMessage = true });
+
+        // 下行形态：作者 = 服务端（255），文本由服务端拼「名字: 」
+        var got = await b.ReadUntilAsync(p => p is NetTextPacket, TimeSpan.FromSeconds(5));
+        var chat = Assert.Single(got.OfType<NetTextPacket>());
+        Assert.Equal("Alice: hello", chat.Text);
+        Assert.Equal(byte.MaxValue, chat.AuthorId);
+    }
+
+    [Fact]
+    public async Task Vanilla_ServerBroadcast_Reaches_Client()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+
+        // IServerApi.Broadcast 走同一下发路径（包 82 下行形态）
+        await server.Host.Network.BroadcastChatAsync("Server restarting soon", "Yellow");
+
+        var got = await s.ReadUntilAsync(p => p is NetTextPacket, TimeSpan.FromSeconds(5));
+        var chat = Assert.Single(got.OfType<NetTextPacket>());
+        Assert.Equal("Server restarting soon", chat.Text);
+        Assert.Equal(new RgbColor(255, 255, 0), chat.Color);
     }
 }

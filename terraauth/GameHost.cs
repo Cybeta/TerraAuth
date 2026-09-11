@@ -16,6 +16,7 @@ using TerraAuth.Net.Phase5;
 using TerraAuth.Plugins;
 using TerraAuth.ModCompat;
 using TerraAuth.Concurrency;
+using TerraAuth.Protocol; // Vector2 / PacketId
 
 namespace TerraAuth;
 
@@ -272,7 +273,45 @@ public sealed class GameHost : IDisposable
             }
         }, ct);
 
-        await Task.WhenAll(simTask, netTask, snapTask).ConfigureAwait(false);
+        // 4. 世界状态同步循环：时间（包 18）与 NPC（包 23）定期下发
+        //    1Hz 足够：客户端自身按 tick 推进时间，这里只做周期性对账；NPC 位置变化平缓
+        var worldSyncTask = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await BroadcastWorldStateAsync(ct).ConfigureAwait(false);
+                await Task.Delay(1000, ct).ConfigureAwait(false);
+            }
+        }, ct);
+
+        await Task.WhenAll(simTask, netTask, snapTask, worldSyncTask).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 把世界时间与 NPC 状态同步给所有在线玩家（包 18 / 23）。
+    /// 布局权威：原版 <c>NetMessage.SendData</c> case 18 / case 23。
+    /// </summary>
+    public async Task BroadcastWorldStateAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+
+        await Network.BroadcastAsync(PacketId.Time,
+            new TimePacket(world.DayTime, (int)world.Time, SunModY: 0, MoonModY: 0), ct).ConfigureAwait(false);
+
+        // NPC 索引上限 199（原版 Main.npc[200]）；位置为像素坐标，速度暂以 0 下发（客户端自行插值）
+        for (var i = 0; i < world.Npcs.Count && i <= byte.MaxValue; i++)
+        {
+            var npc = world.Npcs[i];
+            await Network.BroadcastAsync(PacketId.NpcUpdate,
+                new NpcUpdatePacket(
+                    Index: (byte)i,
+                    Generation: 0,
+                    Position: new Vector2(npc.X, npc.Y),
+                    Velocity: new Vector2(0f, 0f),
+                    Target: 0,
+                    NetId: (short)npc.Type),
+                ct).ConfigureAwait(false);
+        }
     }
 
     /// <summary>等待关闭信号后再停止网络宿主（避免启动即停机）。</summary>

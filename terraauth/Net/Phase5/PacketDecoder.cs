@@ -15,6 +15,12 @@ namespace TerraAuth.Net.Phase5;
 public sealed class DecodeContext
 {
     public ProtocolVersion Version { get; init; } = ProtocolVersion.Current;
+
+    /// <summary>
+    /// 解码方向：true 表示解「服务端 → 客户端」形态。仅包 82（NetTextModule）上下行负载不同，需据此区分。
+    /// 入站（服务端解客户端）保持默认 false。
+    /// </summary>
+    public bool ServerToClient { get; init; }
 }
 
 /// <summary>
@@ -84,6 +90,9 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.PlayerDeathV2     => DecodePlayerDeathV2(reader),
             PacketId.ProjectileNew     => DecodeProjectileNew(reader),
             PacketId.Chest             => DecodeChest(reader),
+            PacketId.Time              => DecodeTime(reader),
+            PacketId.NpcUpdate         => DecodeNpcUpdate(reader),
+            PacketId.NetModule         => DecodeNetText(reader, context, payload),
             PacketId.Disconnect        => payload.Length == 0
                 ? DisconnectPacket.Instance
                 : DecodeDisconnect(reader),
@@ -93,6 +102,65 @@ public sealed class PacketDecoder : IPacketDecoder
             // 如需结构化某包，参考本地原版 MessageBuffer.GetData 对应 case 的 read 实现。
             _ => new UnknownPacket(type, payload.ToArray()),
         };
+    }
+
+    // ---------- 时间 / NPC / 聊天（包 18 / 23 / 82） ----------
+
+    /// <summary>Time（包 18）：Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY。</summary>
+    private static TimePacket DecodeTime(BinaryReader r)
+        => new(DayTime: r.ReadByte() == 1, Time: r.ReadInt32(), SunModY: r.ReadInt16(), MoonModY: r.ReadInt16());
+
+    /// <summary>
+    /// SyncNPC（包 23）：按条件位读取 ai / 玩家数 / 难度 / 生命等可选段。
+    /// 本解码器只取「索引 / generation / 位置 / 速度 / 目标 / netID」等核心字段，其余段读到即跳过。
+    /// </summary>
+    private static NpcUpdatePacket DecodeNpcUpdate(BinaryReader r)
+    {
+        var index = r.ReadByte();
+        var generation = r.ReadByte();
+        var position = new Vector2(r.ReadSingle(), r.ReadSingle());
+        var velocity = new Vector2(r.ReadSingle(), r.ReadSingle());
+        var target = r.ReadUInt16();
+
+        var bitsA = r.ReadByte();
+        var bitsB = r.ReadByte();
+
+        for (var i = 0; i < 4; i++)
+        {
+            if ((bitsA & (1 << (i + 2))) != 0) r.ReadSingle(); // 各 ai 存在时才写入
+        }
+
+        var netId = r.ReadInt16();
+
+        if ((bitsB & 0x01) != 0) r.ReadByte();      // 玩家数缩放
+        if ((bitsB & 0x04) != 0) r.ReadSingle();    // 难度覆盖
+        if ((bitsA & 0x80) == 0)                    // 非满血 → 有生命段
+        {
+            _ = r.ReadByte() switch { 2 => (int)r.ReadInt16(), 4 => r.ReadInt32(), _ => (int)r.ReadSByte() };
+        }
+
+        return new NpcUpdatePacket(index, generation, position, velocity, target, netId);
+    }
+
+    /// <summary>NetTextModule（包 82）：按方向解上行（命令名 + 文本）或下行（作者 + 文本 + 颜色）。</summary>
+    private static INetworkPacket DecodeNetText(BinaryReader r, DecodeContext context, ReadOnlySpan<byte> payload)
+    {
+        const ushort netTextModuleId = 1; // NetLiquidModule=0 → NetTextModule=1
+        if (r.ReadUInt16() != netTextModuleId)
+            return new UnknownPacket(PacketId.NetModule, payload.ToArray()); // 其他模块不解析，原样透传
+
+        if (context.ServerToClient)
+        {
+            var authorId = r.ReadByte();
+            _ = r.ReadByte();                       // NetworkText 模式（本实现仅处理 Literal）
+            var text = r.ReadString();
+            var color = new RgbColor(r.ReadByte(), r.ReadByte(), r.ReadByte());
+            return new NetTextPacket(text) { AuthorId = authorId, Color = color };
+        }
+
+        var commandName = r.ReadString();
+        var message = r.ReadString();
+        return new NetTextPacket(message) { IsClientMessage = true, CommandName = commandName };
     }
 
     public bool TryDecodeFrame(
