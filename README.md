@@ -21,6 +21,7 @@ TerraAuth 的目标是在**协议层**把关键状态收回服务端，提供可
 | 扩展 | 插件系统 / Mod 兼容层 / 多线程优化 | ✅ 已整合（Hook 触发写时复制 · 每包零分配） |
 
 > 更细的模块状态与待办：见 [`terraauth/README.md`](terraauth/README.md) §模块实现状态；
+> **原版功能覆盖现状（哪些已实现 / 未实现）**：见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)；
 > 未实施的优化 / 补全项：见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 
 图例：✅ 完成 / ◐ 部分实现 / ⏳ 未实施
@@ -83,7 +84,7 @@ terraauth/
 ├─ Plugins/             # 插件系统（Hook / 加载器 / 管线装饰）
 ├─ ModCompat/           # Mod 兼容层（策略 / 检测 / 自定义包）
 ├─ Concurrency/         # 并行优化（Worker 池 / 分片 / 快照并行）
-├─ Tests/               # xUnit 验收测试（141 用例）
+├─ Tests/               # xUnit 验收测试（160 用例）
 └─ server.json          # 阈值配置
 ```
 

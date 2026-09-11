@@ -24,6 +24,7 @@
     <Compile Include="IntegrationTests.cs" />
     <Compile Include="PluginModTests.cs" />
     <Compile Include="ConcurrencyTests.cs" />
+    <Compile Include="VanillaFeatureTests.cs" />
   </ItemGroup>
 
   <!-- 被测项目引用：全部分层已合并为根目录单一工程 -->
