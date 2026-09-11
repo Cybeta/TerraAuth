@@ -12,8 +12,8 @@ public sealed class BanManager : IBanManager
     private readonly IBanStore _store;
     private readonly IConfigurationService _config;
     private readonly IAuditRepository _audit;
-    // 进程内违规计数：PlayerId -> 有序时间戳列表
-    private readonly ConcurrentDictionary<Guid, List<DateTime>> _violations = new();
+    // 进程内违规计数：PlayerId -> 有序时间戳列表（附带 .NET 9+ 轻量锁）
+    private readonly ConcurrentDictionary<Guid, ViolationWindow> _violations = new();
 
     public BanManager(IBanStore store, IConfigurationService config, IAuditRepository audit)
     {
@@ -28,9 +28,10 @@ public sealed class BanManager : IBanManager
         var threshold = _config.Current.MaxViolationsBeforeBan;
         var now = DateTime.UtcNow;
 
-        var list = _violations.GetOrAdd(playerId, _ => new List<DateTime>());
-        lock (list)
+        var state = _violations.GetOrAdd(playerId, _ => new ViolationWindow());
+        lock (state.Gate)
         {
+            var list = state.Times;
             // 移除窗口外的旧记录（滑动窗口）
             list.RemoveAll(t => (now - t).TotalMinutes > window);
             list.Add(now);
@@ -60,5 +61,12 @@ public sealed class BanManager : IBanManager
     {
         await _store.RemoveAsync(playerId);
         await _audit.AppendAsync(new AuditEntry(DateTime.UtcNow, playerId, "unban", reason, null));
+    }
+
+    /// <summary>单玩家的违规时间戳窗口（锁与数据同置，替代对 List 实例加锁）。</summary>
+    private sealed class ViolationWindow
+    {
+        public readonly Lock Gate = new();
+        public readonly List<DateTime> Times = new();
     }
 }

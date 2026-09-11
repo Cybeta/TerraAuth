@@ -1,11 +1,14 @@
 // TerraAuth — Hook 注册表
 // 线程安全：支持并行触发（对接 Concurrency 模块的 WorkerPool）
 // 优先级：数字越小越先执行；Deny 短路；Modified 传递修改后数据
+// 并发策略：注册 / 注销罕见 → 写端加锁重建**不可变快照数组**（写时复制）；
+//          触发在每包热路径上 → 读取端 Volatile.Read 取快照，零锁、零分配。
 
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;      // Lock / Volatile
 using System.Threading.Tasks;
 
 namespace TerraAuth.Plugins;
@@ -20,13 +23,17 @@ public interface IHookRegistry
     void UnregisterPlugin(IPlugin plugin);
     /// <summary>是否存在某类 Hook 的订阅者（用于核心层提前短路判断）。</summary>
     bool HasSubscribers<TArgs>() where TArgs : HookArgs;
+    /// <summary>
+    /// 按运行期 <see cref="HookArgs"/> 类型查询订阅者。供核心层在**构造 HookArgs 之前**做零分配短路。
+    /// </summary>
+    bool HasSubscribers(Type argsType);
 }
 
 /// <summary>Hook 注册表默认实现。</summary>
 public sealed class HookRegistry : IHookRegistry
 {
-    // Type = HookArgs 的具体类型；List 按 Priority 排序
-    private readonly ConcurrentDictionary<Type, List<HookEntry>> _hooks = new();
+    // Type = HookArgs 的具体类型；Snapshot 为按 Priority 排序的不可变数组
+    private readonly ConcurrentDictionary<Type, HookEntryList> _hooks = new();
     private readonly ILogger _logger;
 
     public HookRegistry(ILogger logger) => _logger = logger;
@@ -43,13 +50,18 @@ public sealed class HookRegistry : IHookRegistry
         Add(typeof(TArgs), entry);
     }
 
+    /// <summary>新增订阅者：复制当前快照 + 排序后原子发布（写时复制，读端不受影响）。</summary>
     private void Add(Type type, HookEntry entry)
     {
-        var list = _hooks.GetOrAdd(type, _ => new List<HookEntry>());
-        lock (list) // 按 Type 加锁，保证排序稳定
+        var list = _hooks.GetOrAdd(type, _ => new HookEntryList());
+        lock (list.Gate) // 仅写端串行；读端（Trigger）不加锁
         {
-            list.Add(entry);
-            list.Sort((a, b) => a.Plugin.Priority.CompareTo(b.Plugin.Priority));
+            var current = list.Snapshot;
+            var next = new HookEntry[current.Length + 1];
+            current.CopyTo(next, 0);
+            next[^1] = entry;
+            Array.Sort(next, static (a, b) => a.Plugin.Priority.CompareTo(b.Plugin.Priority));
+            Volatile.Write(ref list.Snapshot, next);
         }
     }
 
@@ -60,9 +72,8 @@ public sealed class HookRegistry : IHookRegistry
         // 此时 typeof(TArgs) 恒为 HookArgs，会漏掉具体注册项（HookedPipeline 即此场景）。
         if (args is null) return HookResult.Allow();
         if (!_hooks.TryGetValue(args.GetType(), out var entries)) return HookResult.Allow();
-        // 快照列表避免执行期间持锁（插件可能耗时）
-        List<HookEntry> snapshot;
-        lock (entries) { snapshot = entries.ToList(); }
+        // 读取不可变快照：零锁、零分配（插件可能耗时，更不能持锁执行）
+        var snapshot = Volatile.Read(ref entries.Snapshot);
         foreach (var entry in snapshot)
         {
             try
@@ -93,8 +104,7 @@ public sealed class HookRegistry : IHookRegistry
     {
         if (args is null) return HookResult.Allow();
         if (!_hooks.TryGetValue(args.GetType(), out var entries)) return HookResult.Allow();
-        List<HookEntry> snapshot;
-        lock (entries) { snapshot = entries.ToList(); }
+        var snapshot = Volatile.Read(ref entries.Snapshot);
         foreach (var entry in snapshot)
         {
             try
@@ -118,16 +128,37 @@ public sealed class HookRegistry : IHookRegistry
         return HookResult.Allow();
     }
 
+    /// <summary>注销插件的全部订阅：命中才重建快照（写时复制，读端不受影响）。</summary>
     public void UnregisterPlugin(IPlugin plugin)
     {
         foreach (var kvp in _hooks)
         {
-            lock (kvp.Value) { kvp.Value.RemoveAll(e => e.Plugin == plugin); }
+            var list = kvp.Value;
+            lock (list.Gate)
+            {
+                var current = list.Snapshot;
+                var kept = Array.FindAll(current, e => e.Plugin != plugin);
+                if (kept.Length != current.Length)
+                    Volatile.Write(ref list.Snapshot, kept);
+            }
         }
     }
 
     public bool HasSubscribers<TArgs>() where TArgs : HookArgs
-        => _hooks.ContainsKey(typeof(TArgs));
+        => HasSubscribers(typeof(TArgs));
+
+    public bool HasSubscribers(Type argsType)
+        => _hooks.TryGetValue(argsType, out var list) && Volatile.Read(ref list.Snapshot).Length > 0;
+
+    /// <summary>
+    /// 某类 Hook 的订阅者容器：<see cref="Snapshot"/> 为按优先级排序的不可变数组。
+    /// 写端（注册 / 注销）持 <see cref="Lock"/> 重建并原子替换；读端（触发）仅 Volatile.Read。
+    /// </summary>
+    private sealed class HookEntryList
+    {
+        public readonly Lock Gate = new();
+        public HookEntry[] Snapshot = Array.Empty<HookEntry>();
+    }
 
     private sealed record HookEntry(
         IPlugin Plugin,

@@ -300,7 +300,7 @@ public sealed class NetworkHost : IAsyncDisposable
         var now = DateTime.UtcNow;
         var window = _violations.GetOrAdd(playerId, _ => new ViolationWindow { StartUtc = now });
 
-        lock (window)
+        lock (window.Gate)
         {
             if ((now - window.StartUtc).TotalSeconds > _violationKick.WindowSeconds)
             {
@@ -316,6 +316,8 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>进程内违规窗口状态（每玩家一条，锁内更新）。</summary>
     private sealed class ViolationWindow
     {
+        /// <summary>每窗口独占的轻量锁（.NET 9+ Lock，替代 Monitor 对象锁）。</summary>
+        public readonly Lock Gate = new();
         public DateTime StartUtc;
         public int Count;
     }

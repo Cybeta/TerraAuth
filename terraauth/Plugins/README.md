@@ -61,7 +61,7 @@ public class WelcomePlugin : PluginBase
 
 ```bash
 dotnet build -c Release
-cp bin/Release/net8.0/MyPlugin.dll <server>/plugins/
+cp bin/Release/net10.0/MyPlugin.dll <server>/plugins/
 ```
 
 服务端启动时自动加载（详见 `GameHost.Bootstrap`）。

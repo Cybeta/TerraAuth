@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <OutputType>Exe</OutputType>
     <RootNamespace>TerraAuth</RootNamespace>
     <Nullable>enable</Nullable>
@@ -15,10 +15,10 @@
     <Compile Include="**\*.cs" Exclude="Tests\**;Examples\**;bin\**;obj\**" />
   </ItemGroup>
 
-  <!-- 生产依赖：SQLite（可 -p:NoSqlite=true 降级到内嵌 LiteDb）+ 网络分帧 -->
+  <!-- 生产依赖：SQLite（可 -p:NoSqlite=true 降级到内嵌 LiteDb）
+       System.IO.Pipelines 自 .NET 10 起已内置于共享框架，无需显式引用 -->
   <ItemGroup>
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" Condition="'$(NoSqlite)' != 'true'" />
-    <PackageReference Include="System.IO.Pipelines" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" Condition="'$(NoSqlite)' != 'true'" />
   </ItemGroup>
 
   <!-- 验收测试需访问 internal（GameLoop.StepOne / ShadowPredictor 等） -->

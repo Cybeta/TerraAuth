@@ -11,13 +11,19 @@ TerraAuth 的目标是在**协议层**把关键状态收回服务端，提供可
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | Phase 0 | 协议兼容骨架（TCP Server + Framing + 握手） | ✅ 完成 |
-| Phase 1 | 玩家权威 MVP（HP/MP/位置/速度 + 限速） | ⚠️ 位置权威已落地，HP/MP 只读参考 |
-| Phase 2 | 物品 & 战斗权威 | ⏳ 待实施 |
-| Phase 3 | 世界权威（tile / 液体 / 抛射物 / 电路） | ⏳ 待实施 |
-| Phase 4 | 一致性 & 性能（快照 + WAL + 断线重连） | ⏳ 快照已实现，其余待定 |
+| Phase 1 | 玩家权威（HP/MP/位置/速度 + 限速） | ✅ 位置 / 血上限 / 移动限速已落地（MP 未跟踪） |
+| Phase 2 | 物品 & 战斗权威 | ✅ 物品 ID / 堆叠校验 + SSC 背包对账；单次伤害上限 + DPS 窗口（简化模型） |
+| Phase 3 | 世界权威（tile / 液体 / 抛射物 / 电路） | ◐ tile（挖 / 放）全链路已落地（校验 → Command → 仿真 → 增量广播 → SSC 扣减）；液体 / 电路 / 抛射物待实施 |
+| Phase 4 | 一致性 & 性能（快照 + WAL + 断线重连） | ◐ 快照包 15 + 视野裁剪 + 影子预测已实现；WAL / 断线重连待定 |
 | **Phase 5** | **TCP 传输层（NetworkHost + Connection + 编解码）** | **✅ 完成并实测** |
-| Phase 6 | 基础设施（持久化 / 审计 / 监控） | ⚠️ 骨架就位 |
-| Phase 7 | 红队对抗测试 | ⏳ 待实施 |
+| Phase 6 | 基础设施（持久化 / 审计 / 监控） | ◐ 配置热重载 / 审计 / Prometheus / 封禁已实装；真实 SQLite 落库待补 |
+| Phase 7 | 红队对抗测试 | ⏳ 手册就绪（`Phase7-RedTeam/`），尚未执行 |
+| 扩展 | 插件系统 / Mod 兼容层 / 多线程优化 | ✅ 已整合（Hook 触发写时复制 · 每包零分配） |
+
+> 更细的模块状态与待办：见 [`terraauth/README.md`](terraauth/README.md) §模块实现状态；
+> 未实施的优化 / 补全项：见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
+
+图例：✅ 完成 / ◐ 部分实现 / ⏳ 未实施
 
 ## 已实测能力
 
@@ -26,10 +32,12 @@ TerraAuth 的目标是在**协议层**把关键状态收回服务端，提供可
 - ✅ 位置包（包 13）→ 权威校验 → 仿真 → 快照（包 15）经 TCP 下发完整闭环
 - ✅ 移动广播：A 发包 13 → B 经 TCP 收到转发，位置一致
 - ✅ 移动速度校验：`maxSpeed × 60 × Δt + TeleportTolerance`（Δt 钳制在 `[1/60s, 10s]`，不做静默超时无条件放行）
+- ✅ Tile（挖 / 放方块）服务端权威全链路：校验 → Command → 仿真 → 增量广播 → SSC 背包扣减
+- ✅ 违规处置闭环：窗口内权威拒绝累计达阈值 → 下发包 2 后踢出连接
 
 ## 快速启动
 
-前置：.NET 8 SDK
+前置：.NET 10 SDK
 
 ```bash
 cd terraauth
@@ -48,27 +56,33 @@ dotnet run --project TerraAuth.csproj -- --config server.json
 | 协议 | 原生 Terraria 1.4.5.8（协议 326），位置包 13 / 快照包 15 为核心 |
 | 仿真 | 确定性 GameLoop，20Hz 快照频率，Command 模式应用变更 |
 | 权威 | `MovementAuthority`（位置超速 + 传送频率）、`PlayerAuthority`（属性只读） |
-| 监控 | Prometheus 指标 + 结构化审计日志（SQLite / 控制台） |
-| 语言 | C# 12 + .NET 8 |
+| 监控 | Prometheus 指标 + 结构化审计日志（SQLite / 内嵌 LiteDb） |
+| 语言 | C# 14 + .NET 10 |
 
 ## 代码结构
 
 ```
 terraauth/
-├─ Authority/           # Phase 2：权威管线（移动 / 传送 / 属性）
-│  ├─ AuthoritySubsystems.cs   # MovementAuthority（核心）
+├─ Authority/           # 权威管线（限流 / 库存 / 移动 / 战斗 / 属性 / 世界 + 分片并行）
+│  ├─ AuthoritySubsystems.cs   # 六子系统默认实现
 │  ├─ InboundPipeline.cs       # 权威 → Command 转换
 │  └─ AuditLogger.cs           # 结构化日志
-├─ Simulation/          # Phase 3：仿真 + GameLoop + Command 模型
-│  ├─ WorldSimulator.cs        # 世界状态
-│  ├─ CommandQueue.cs          # MoveCommand 等
-│  └─ World/                   # Tile / WorldState
+├─ Simulation/          # 仿真 + GameLoop + Command 模型
+│  ├─ WorldSimulator.cs        # 世界状态（六阶段 tick）
+│  ├─ CommandQueue.cs          # Move / TileBreak / TilePlace 等
+│  └─ World/                   # Tile / TileIdSets / WorldState / .wld 解析
 ├─ Net/
-│  ├─ Phase4/                  # 快照构造 + 视野裁剪
+│  ├─ Phase4/                  # 快照构造 + 视野裁剪 + 影子预测
 │  └─ Phase5/                  # TCP 传输 + Framing + 编解码
 ├─ Protocol/            # Terraria 包 ID 与类型定义
-├─ Plugins/             # 插件 Hook（预留）
-├─ Tests/               # xUnit 验收测试
+├─ Config/              # 阈值配置 + FileSystemWatcher 热重载
+├─ Persistence/         # 持久化（默认内嵌 LiteDb / 可选 SQLite）
+├─ Monitoring/          # Prometheus 指标 + /metrics 端点
+├─ Security/            # 封禁（滑动窗口 + 存储）
+├─ Plugins/             # 插件系统（Hook / 加载器 / 管线装饰）
+├─ ModCompat/           # Mod 兼容层（策略 / 检测 / 自定义包）
+├─ Concurrency/         # 并行优化（Worker 池 / 分片 / 快照并行）
+├─ Tests/               # xUnit 验收测试（138 用例）
 └─ server.json          # 阈值配置
 ```
 

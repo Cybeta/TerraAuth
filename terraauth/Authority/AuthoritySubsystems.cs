@@ -72,7 +72,7 @@ internal sealed class PlayerAuthority : IPlayerAuthority
         }
 
         var state = _stats.GetOrAdd(playerId, _ => new PlayerStats(_limits.MaxHp, _limits.MaxMana));
-        lock (state)
+        lock (state.Gate)
         {
             // 上限由服务端持有：客户端不得抬高，超出即纠正为服务端值
             if (hp.MaxHp > state.MaxHp)
@@ -106,6 +106,8 @@ internal sealed class PlayerAuthority : IPlayerAuthority
 
     private sealed class PlayerStats
     {
+        /// <summary>每玩家独占的轻量锁（.NET 9+ Lock）。</summary>
+        public readonly Lock Gate = new();
         public int Hp;
         public int MaxHp;
         public readonly int MaxMana;
@@ -177,7 +179,7 @@ internal sealed class MovementAuthority : IMovementAuthority
         var now = DateTimeOffset.UtcNow;
         var state = _motion.GetOrAdd(playerId, _ => new PlayerMotion());
 
-        lock (state)
+        lock (state.Gate)
         {
             // 首个位置包：以客户端上报值建立权威基准
             if (!state.HasBaseline)
@@ -226,7 +228,7 @@ internal sealed class MovementAuthority : IMovementAuthority
         var now = DateTimeOffset.UtcNow;
         var state = _motion.GetOrAdd(playerId, _ => new PlayerMotion());
 
-        lock (state)
+        lock (state.Gate)
         {
             // 实体索引范围：玩家 0..254（Main.player[255]），NPC 0..199（Main.npc[200]）
             var maxEntityId = teleport.Kind == TeleportEntityKind.Npc ? MaxNpcIndex : MaxPlayerIndex;
@@ -272,7 +274,7 @@ internal sealed class MovementAuthority : IMovementAuthority
         var now = DateTimeOffset.UtcNow;
         var state = _motion.GetOrAdd(playerId, _ => new PlayerMotion());
 
-        lock (state)
+        lock (state.Gate)
         {
             if ((byte)request.Kind > (byte)TeleportRequestKind.PlayerNoSpaceTeleport)
             {
@@ -307,6 +309,8 @@ internal sealed class MovementAuthority : IMovementAuthority
 
     private sealed class PlayerMotion
     {
+        /// <summary>每玩家独占的轻量锁（.NET 9+ Lock）。</summary>
+        public readonly Lock Gate = new();
         public Vector2 LastPosition;
         public DateTimeOffset LastSeenAt;
         public bool HasBaseline;
@@ -375,7 +379,7 @@ internal sealed class CombatAuthority : ICombatAuthority
 
         // 统计窗口内伤害总量上限（DPS 约束）
         var window = _windows.GetOrAdd(playerId, _ => new DamageWindow());
-        lock (window)
+        lock (window.Gate)
         {
             window.Prune(DateTimeOffset.UtcNow, TimeSpan.FromSeconds(_limits.MaxDpsWindowSeconds));
             window.Add(strike.Damage);
@@ -394,6 +398,8 @@ internal sealed class CombatAuthority : ICombatAuthority
 
     private sealed class DamageWindow
     {
+        /// <summary>每玩家独占的轻量锁（.NET 9+ Lock）。</summary>
+        public readonly Lock Gate = new();
         private readonly Queue<(DateTimeOffset At, int Damage)> _hits = new();
 
         public int Total { get; private set; }
@@ -661,7 +667,7 @@ internal sealed class RateAuthority : IRateAuthority
         var state = _states.GetOrAdd(context.PlayerId, _ => new PlayerRateState());
         var now = context.ReceivedAt == default ? DateTimeOffset.UtcNow : context.ReceivedAt;
 
-        lock (state)
+        lock (state.Gate)
         {
             // 全局包速率：packet flood / DoS 防护
             if (!state.Global.TryConsume(now, _limits.MaxPacketsPerSecond, TimeSpan.FromSeconds(1)))
@@ -722,6 +728,8 @@ internal sealed class RateAuthority : IRateAuthority
 
     private sealed class PlayerRateState
     {
+        /// <summary>每玩家独占的轻量锁（.NET 9+ Lock）。</summary>
+        public readonly Lock Gate = new();
         public WindowCounter Global;
         public WindowCounter TileBreak;
         public WindowCounter TilePlace;

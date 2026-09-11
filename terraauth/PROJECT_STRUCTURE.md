@@ -9,9 +9,9 @@
 
 | 工程 | 路径 | 类型 | 说明 |
 |------|------|------|------|
-| `TerraAuth` | `TerraAuth.csproj` | Exe（net8.0） | **唯一主工程**：收拢全部分层源码 |
+| `TerraAuth` | `TerraAuth.csproj` | Exe（net10.0） | **唯一主工程**：收拢全部分层源码 |
 | `TerraAuth.Tests` | `Tests/TerraAuth.Tests.csproj` | xUnit 测试库 | 独立保留，经 `ProjectReference` 引用主工程 |
-| `TerraAuth.ExamplePlugins` | `Examples/TerraAuth.ExamplePlugins/TerraAuth.ExamplePlugins.csproj` | 插件类库 | 示例插件（`WelcomePlugin` / `AntiCheatLitePlugin`），构建后自动复制到主工程 `bin/<Config>/net8.0/plugins/` |
+| `TerraAuth.ExamplePlugins` | `Examples/TerraAuth.ExamplePlugins/TerraAuth.ExamplePlugins.csproj` | 插件类库 | 示例插件（`WelcomePlugin` / `AntiCheatLitePlugin`），构建后自动复制到主工程 `bin/<Config>/net10.0/plugins/` |
 
 解决方案 [TerraAuth.sln](TerraAuth.sln) 包含上述 3 个工程。
 
@@ -24,18 +24,18 @@
 
 | 配置项 | 值 | 说明 |
 |--------|-----|------|
-| `TargetFramework` | `net8.0` | 统一目标框架 |
+| `TargetFramework` | `net10.0` | 统一目标框架 |
 | `OutputType` | `Exe` | 可执行（入口 `Program.cs`） |
 | `RootNamespace` | `TerraAuth` | 根命名空间 |
 | `Nullable` | `enable` | 可空引用类型 |
 | `ImplicitUsings` | `enable` | 隐式 using |
 | `EnableDefaultCompileItems` | `false` | 关闭默认 glob，改用显式 glob |
 | `Compile` | `**\*.cs`（`Exclude="Tests\**;bin\**;obj\**"`） | 递归收拢所有源码，排除测试与构建产物 |
-| `PackageReference` | `Microsoft.Data.Sqlite 8.0.0` | 条件：`'$(NoSqlite)' != 'true'`，离线时用内嵌 LiteDb |
-| `PackageReference` | `System.IO.Pipelines 8.0.0` | `PipeReader` 分帧 |
+| `PackageReference` | `Microsoft.Data.Sqlite 10.0.12` | 条件：`'$(NoSqlite)' != 'true'`，离线时用内嵌 LiteDb |
+| `PackageReference` | 无（`System.IO.Pipelines` 自 .NET 10 起内置于共享框架） | `PipeReader` 分帧 |
 | `InternalsVisibleTo` | `TerraAuth.Tests` | 测试可访问 `internal`（原分散在 Simulation/Net，现集中一处） |
 
-**测试工程配置**：`Microsoft.NET.Test.Sdk 17.8.0` + `xunit 2.9.2` + `xunit.runner.visualstudio 2.8.2`，显式 `Compile` 列表（7 个测试文件），单一 `ProjectReference` → `..\TerraAuth.csproj`。
+**测试工程配置**：`Microsoft.NET.Test.Sdk 18.10.0` + `xunit 2.9.3` + `xunit.runner.visualstudio 3.1.5`，显式 `Compile` 列表（7 个测试文件），单一 `ProjectReference` → `..\TerraAuth.csproj`。
 
 ---
 
@@ -44,7 +44,7 @@
 ```
 terraauth/
 ├── TerraAuth.sln                 # 解决方案（1 主工程 + 1 测试 + 1 示例插件）
-├── TerraAuth.csproj              # ★ 单一主工程（Exe / net8.0）
+├── TerraAuth.csproj              # ★ 单一主工程（Exe / net10.0）
 ├── Program.cs                    # 可执行入口：参数解析 → GameHost.Bootstrap → RunAsync
 ├── GameHost.cs                   # ★ 组装根：初始化全部模块 + 仿真/网络/快照三循环
 ├── CoreAdapter.cs                # 核心类型 ↔ 插件/Mod 接口桥接（namespace TerraAuth.Plugins）
@@ -52,6 +52,7 @@ terraauth/
 ├── verify.py                     # 无 SDK 环境静态校验脚本
 ├── README.md                     # 项目说明 + 进度
 ├── architecture.md               # 架构文档（分层 / 模块 / 协议映射 / 验收 KPI）
+├── OPTIMIZATION_BACKLOG.md       # 优化待办（独立立项 / 后续可能优化 / 本轮回溯）
 ├── .gitignore
 │
 ├── Protocol/                     # 协议层          ── namespace TerraAuth.Protocol
@@ -205,10 +206,10 @@ TerraAuth                     ← 组合根（Program / GameHost）
 | `Net/Phase5` `PacketDecoder` | 部分 | 已解析 28 个入站包（握手链 + 权威白名单 10 包 + 伤害/死亡/传送等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
 | `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（先发包 2 再关闭） |
 | `Config/` | 已实现 | `ServerConfig` + `FileSystemWatcher` 热重载 |
-| `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用；真实 `SqliteImpl` 为骨架 |
+| `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用；真实 `SqliteImpl` 为骨架（且封禁 / 审计仅内存、重启即丢）—— 独立立项见 [`OPTIMIZATION_BACKLOG.md`](OPTIMIZATION_BACKLOG.md) §B-1 |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `/metrics` |
-| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射） |
-| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计）；示例插件见 `Examples/TerraAuth.ExamplePlugins/` |
+| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射）；⚠️ 封禁落盘受 `Persistence/` 限制（见 §B-1） |
+| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计）；示例插件见 `Examples/TerraAuth.ExamplePlugins/` |
 | `ModCompat/` | 部分 | 策略 / 检测框架已实现；TModLoader 握手与 ModNet 解析为 TODO |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
 | `Tests/` | 部分 | 7 组验收测试（138 用例通过）；包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、Hook 参数填充包数据、配置阈值启动映射与热重载、实体视图发布、区块分区锁并发安全（真实 TCP）已补，`.wld` 解析测试待补 |

@@ -44,7 +44,7 @@
 
 - [x] 6.1 违规达阈值自动封禁（测试通过）
 - [x] 6.3 配置热重载触发 OnChanged
-- [ ] 6.4 真实 `SqliteImpl` 填充 TODO（存档 + 审计落库）：当前默认走内嵌 `LiteDbPersistence`（`TerraAuth.csproj` 未定义 `USE_SQLITE`），`SqliteImpl` 仍为空壳
+- [ ] 6.4 真实 `SqliteImpl` 填充 TODO（存档 + 审计落库）：当前默认走内嵌 `LiteDbPersistence`（`TerraAuth.csproj` 未定义 `USE_SQLITE`），`SqliteImpl` 仍为空壳 → **已独立立项，见 [`OPTIMIZATION_BACKLOG.md`](../OPTIMIZATION_BACKLOG.md) §B-1**
 - [x] 6.5 审计可按玩家查询（`IAuditRepository.QueryByPlayerAsync` → 后台批量落盘）
 - [x] 6.6 /metrics 端点可被 Prometheus 抓取（`MetricsHttpServer` + `ExportAsText`）
 - [x] 6.7 GameHost.RunAsync 启动三循环（网络 + 仿真 + 快照）

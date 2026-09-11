@@ -1,6 +1,8 @@
 // TerraAuth — Phase 3/4: 快照存储
 // 仿真层每 tick 产出快照，供 Phase 4 编码下发
 
+using System.Threading; // Lock（.NET 9+ 专用同步原语）
+
 namespace TerraAuth.Simulation;
 
 /// <summary>
@@ -11,7 +13,7 @@ namespace TerraAuth.Simulation;
 public sealed class SnapshotStore
 {
     private readonly List<SnapshotFrame> _frames = new();
-    private readonly object _gate = new();
+    private readonly Lock _gate = new();
     private readonly int _capacity;
 
     public SnapshotStore(int capacity = 300) // 默认保留 15 秒 @ 20Hz

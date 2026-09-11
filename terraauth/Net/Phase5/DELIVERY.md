@@ -127,6 +127,7 @@ terraauth/
 ├── TerraAuth.csproj          # ★ 单工程：全部分层源码合并于此
 ├── architecture.md           # 完整工程架构文档
 ├── PROJECT_STRUCTURE.md      # 项目结构文档（目录树 / 工程配置 / 模块状态）
+├── OPTIMIZATION_BACKLOG.md   # 优化待办（独立立项 / 后续可能优化）
 ├── GameHost.cs               # ★ 组装根：串联 Phase 2/3/4/5 + 基础设施 + 扩展层
 ├── Program.cs                # 可执行入口
 ├── CoreAdapter.cs            # 核心类型 ↔ 插件/Mod 接口桥接
@@ -155,4 +156,7 @@ terraauth/
 
 **至此，Phase 2/3/4/5 形成完整闭环**。
 
-剩下 **Phase 6（配置/持久化/监控）**、**Phase 7（对抗测试）**、**Phase 8（性能压测+上线）**。
+进度更新（2026-09-11）：目标框架已升级至 **.NET 10**（`net10.0`）；**Phase 6 已实装**
+（`Config/Persistence/Monitoring/Security`），仅「真实 SQLite 落库」未补 —— 已独立立项，见
+[`OPTIMIZATION_BACKLOG.md`](../../OPTIMIZATION_BACKLOG.md) §B-1。
+剩余 **Phase 7（对抗测试，手册见 `Phase7-RedTeam/`）**、**Phase 8（性能压测 + 上线）**。

@@ -1,12 +1,13 @@
 // Phase 6 - 配置服务默认实现：JSON 文件 + FileSystemWatcher 热重载
 
 using System.Text.Json;
+using System.Threading; // Lock（.NET 9+ 专用同步原语）
 
 namespace TerraAuth.Config;
 
 public sealed class ConfigurationService : IConfigurationService
 {
-    private readonly object _lock = new();
+    private readonly Lock _lock = new();
     private ServerConfig _current = new(); // 默认值
     private string? _path;
     private FileSystemWatcher? _watcher;

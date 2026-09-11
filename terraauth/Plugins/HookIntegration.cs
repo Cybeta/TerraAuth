@@ -48,23 +48,43 @@ public sealed class HookedPipeline : IInboundPipeline
     public Task<AuthorityResult> ProcessAsync(
         INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct = default)
     {
-        // 根据包类型触发对应前置 Hook（可取消 / 可修改）
-        var args = BuildHookArgs(packet, playerId);
-        if (args != null)
+        // 零分配短路：该类 Hook 无订阅者时**不构造 HookArgs**（无插件场景下每包省一次对象分配）
+        if (HasSubscriberFor(packet))
         {
-            var result = _hooks.Trigger(args);
-            if (result.Type == HookResultType.Deny)
+            // 根据包类型触发对应前置 Hook（可取消 / 可修改）
+            var args = BuildHookArgs(packet, playerId);
+            if (args != null)
             {
-                _logger.Debug("Plugin denied packet {Type} for player {PlayerId}: {Reason}",
-                    packet.Type, playerId, result.Reason);
-                return Task.FromResult(AuthorityResult.Reject(result.Reason ?? "Denied by plugin"));
+                var result = _hooks.Trigger(args);
+                if (result.Type == HookResultType.Deny)
+                {
+                    _logger.Debug("Plugin denied packet {Type} for player {PlayerId}: {Reason}",
+                        packet.Type, playerId, result.Reason);
+                    return Task.FromResult(AuthorityResult.Reject(result.Reason ?? "Denied by plugin"));
+                }
+                // Modified：后续可从 args 读取被修改的字段（此处为扩展点）
             }
-            // Modified：后续可从 args 读取被修改的字段（此处为扩展点）
         }
 
         // 调用原始管线（Phase 2 权威校验）
         return _inner.ProcessAsync(packet, playerId, commands, ct);
     }
+
+    /// <summary>
+    /// 包类型 → 对应 HookArgs 类型是否有订阅者。<b>只做类型判断，不实例化</b>，
+    /// 使无插件（或该 Hook 无插件）时每包零分配；与 <see cref="BuildHookArgs"/> 的映射须保持一致。
+    /// </summary>
+    private bool HasSubscriberFor(INetworkPacket packet) => packet switch
+    {
+        PlayerControlsPacket => _hooks.HasSubscribers(typeof(PlayerMovingArgs)),      // 包 13
+        NpcStrikePacket => _hooks.HasSubscribers(typeof(NpcStrikeArgs)),             // 包 28
+        ProjectileNewPacket => _hooks.HasSubscribers(typeof(ProjectileSpawnArgs)),   // 包 27
+        ItemDropPacket => _hooks.HasSubscribers(typeof(ItemDropArgs)),               // 包 21
+        ChestPacket => _hooks.HasSubscribers(typeof(ItemDropArgs)),                  // 包 31
+        TilePlacePacket => _hooks.HasSubscribers(typeof(TilePlaceArgs)),             // 包 79
+        TileBreakPacket => _hooks.HasSubscribers(typeof(TileBreakArgs)),             // 包 17
+        _ => false,
+    };
 
     /// <summary>
     /// 把网络包映射到对应 Hook 参数并**填充包数据**（扩展点：新增包类型在此注册）。

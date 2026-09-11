@@ -21,6 +21,7 @@ public sealed class PluginLoader
     private readonly ILogger _logger;
     private readonly IPluginContext _context;
     private readonly List<LoadedPlugin> _loaded = new();
+    private readonly Lock _loadedGate = new();
 
     public IReadOnlyList<LoadedPlugin> LoadedPlugins => _loaded;
 
@@ -118,7 +119,7 @@ public sealed class PluginLoader
         await plugin.InitializeAsync(_context);
         await plugin.StartAsync();
 
-        lock (_loaded) { _loaded.Remove(lp); _loaded.Add(new LoadedPlugin(plugin, assembly, type, DateTimeOffset.UtcNow)); }
+        lock (_loadedGate) { _loaded.Remove(lp); _loaded.Add(new LoadedPlugin(plugin, assembly, type, DateTimeOffset.UtcNow)); }
         _logger.Info("Hot reload complete: {Id}", pluginId);
     }
 

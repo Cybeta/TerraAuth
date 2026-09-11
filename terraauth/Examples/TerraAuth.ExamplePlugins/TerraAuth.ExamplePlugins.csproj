@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>TerraAuth.ExamplePlugins</RootNamespace>
@@ -15,7 +15,7 @@
   <!-- 构建后把插件 DLL 复制到服务端 plugins/ 目录（PluginLoader 从此目录发现插件） -->
   <Target Name="CopyToServerPlugins" AfterTargets="Build">
     <PropertyGroup>
-      <ServerPluginsDir>$(MSBuildProjectDirectory)\..\..\bin\$(Configuration)\net8.0\plugins</ServerPluginsDir>
+      <ServerPluginsDir>$(MSBuildProjectDirectory)\..\..\bin\$(Configuration)\net10.0\plugins</ServerPluginsDir>
     </PropertyGroup>
     <MakeDir Directories="$(ServerPluginsDir)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ServerPluginsDir)" />

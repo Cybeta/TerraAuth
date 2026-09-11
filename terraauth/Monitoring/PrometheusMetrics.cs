@@ -20,7 +20,7 @@ public sealed class PrometheusMetrics : IMetrics, IDisposable
     private readonly ConcurrentDictionary<string, HistogramBucket> _histograms = new();
 
     private readonly Timer _histogramRotateTimer;
-    private readonly object _rotateLock = new();
+    private readonly Lock _rotateLock = new();
 
     public PrometheusMetrics()
     {

@@ -5,8 +5,9 @@
 >
 > **当前状态**：Phase 1-7 骨架 + Phase 6 完整实装 + **插件系统 / Mod 兼容层 / 多线程优化**（已整合）
 > + **Tile（挖 / 放方块）服务端权威全链路**（解码 → 权威校验 → Command → 仿真 → 增量广播 → SSC 背包扣减）
-> + **违规处置闭环**（权威拒绝累计达阈值 → 发包 2 踢出连接）；
-> 原版 Terraria 客户端已实测连接成功（协议协商 → 进入世界）。
+> + **违规处置闭环**（权威拒绝累计达阈值 → 发包 2 踢出连接）
+> + **热路径优化**（Hook 触发写时复制 · 每包零分配；`System.Threading.Lock`；`FrozenSet`）；
+> 运行时 **.NET 10**（`net10.0`），原版 Terraria 客户端已实测连接成功（协议协商 → 进入世界）。
 
 ---
 
@@ -16,6 +17,7 @@
 terraauth/
 ├── architecture.md          # 架构文档（分层、模块、协议映射、验收 KPI）
 ├── PROJECT_STRUCTURE.md     # 合并后项目结构文档（目录树 / 工程配置 / 模块状态）
+├── OPTIMIZATION_BACKLOG.md  # 优化待办（独立立项 / 后续可能优化 / 本轮回溯）
 ├── TerraAuth.sln            # 解决方案（1 主工程 + 1 测试 + 1 示例插件）
 ├── TerraAuth.csproj         # ★ 单一工程：收拢全部分层源码（Protocol/Authority/Simulation/Net/...）
 ├── GameHost.cs              # ★ 组装根：Bootstrap() 一键初始化全部模块
@@ -77,10 +79,10 @@ TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=fa
 | `Net/Phase5` `PacketDecoder` | 部分 | 已解析 28 个入站包（握手链 + 权威白名单 10 包 + 伤害/死亡/传送等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
 | `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**等待包 2 真正落盘后**再关闭，事件驱动等待、无固定超时） |
 | `Config/` | 已实现 | `ServerConfig`（反作弊阈值唯一来源）+ `FileSystemWatcher` 热重载，阈值热更新直接推送至已构造的权威子系统（无需重启） |
-| `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用（默认路径：`TerraAuth.csproj` 未定义 `USE_SQLITE`）；真实 `SqliteImpl` 为骨架（SQL 省略） |
+| `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用（默认路径：`TerraAuth.csproj` 未定义 `USE_SQLITE`）；真实 `SqliteImpl` 为骨架（SQL 省略）—— 且封禁 / 审计仅内存、重启即丢，**独立立项见 [`OPTIMIZATION_BACKLOG.md`](OPTIMIZATION_BACKLOG.md) §B-1** |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `HttpListener` `/metrics` |
-| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射） |
-| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据，插件可按 Damage / 方块坐标等真实值决策）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计） |
+| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射）；⚠️ 封禁落盘能力受 `Persistence/` 限制（见 §B-1） |
+| `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据，插件可按 Damage / 方块坐标等真实值决策）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计） |
 | `ModCompat/` | 部分 | 策略 / 检测框架已实现；TModLoader 握手与 ModNet 解析为 TODO |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
 | `Tests/` | 部分 | 7 组验收测试（138 用例通过）；真实 TCP 往返集成测试（包 13 → 快照包 15 / 双客户端包 13 转发 / 踢出下发包 2 / 违规阈值触发踢出 / 纠正包按自身类型下发 / 插件 API 踢出与封禁）、配置阈值启动映射与热重载、实体视图发布（快照线程不读活动 WorldState）、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试已补，`.wld` 解析测试待补 |
@@ -96,9 +98,9 @@ TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=fa
 | `Plugins/IPlugin.cs` | `IPlugin` / `PluginBase` / `HookResult` / `HookResultType` |
 | `Plugins/IPluginContext.cs` | `IPluginContext` / `IServerApi` / `ILogger` 适配器 |
 | `Plugins/HookArgs.cs` | 全部 Hook 参数类型（Player/Combat/World/Server/Economy） |
-| `Plugins/HookRegistry.cs` | 线程安全注册表、优先级排序、Deny 短路、Modified 传递 |
+| `Plugins/HookRegistry.cs` | 线程安全注册表（**写时复制不可变快照**，触发端零锁零分配）、优先级排序、Deny 短路、Modified 传递 |
 | `Plugins/PluginLoader.cs` | DLL 反射加载、依赖拓扑排序、热重载 |
-| `Plugins/HookIntegration.cs` | `HookedPipeline` 装饰器 —— 权威管线插入 Hook 的接入点；**Hook 参数已填充包数据**（NpcId/Damage、方块坐标、抛射物、物品）与玩家名 |
+| `Plugins/HookIntegration.cs` | `HookedPipeline` 装饰器 —— 权威管线插入 Hook 的接入点；**Hook 参数已填充包数据**（NpcId/Damage、方块坐标、抛射物、物品）与玩家名；**无订阅者时提前短路**（不构造 HookArgs，每包零分配） |
 | `CoreAdapter.cs`（根目录） | 核心类型 ↔ 插件接口桥接；`ServerApi` 实装踢出 / 封禁 / 在线玩家查询 / 服务器信息 |
 | `Plugins/README.md` | **插件开发指南**（Hook 列表 / 示例 / 生命周期 / 最佳实践） |
 | `Tests/PluginModTests.cs` | Hook 注册/触发/Deny/Modify/卸载 验证 |
@@ -139,7 +141,7 @@ TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=fa
 | `Concurrency/README.md` | **并行优化分析**（并行边界 / 线程模型 / 收益预估 / 风险 / 执行优先级） |
 | `Tests/ConcurrencyTests.cs` | 各并行组件 + 确定性校验 |
 
-**已接入**：`GameHost` 实例化 `WorkerPool` + `ParallelConfig`；`HookedPipeline → ShardedInboundPipeline → InboundPipeline`（按玩家分片并行、同玩家保序）；`ParallelSnapshotBroadcaster` 接入 `SnapshotBroadcaster`；插件 Hook 触发通过 `HookRegistry`（线程安全）；`DoubleBufferedWorldState` 接入 `WorldSimulator` → `SnapshotBroadcaster`（快照线程只读已发布视图，不再触碰活动 `WorldState`）；`SectionLocks` 区块分区锁接入图格读写（仿真写 vs 包 10 编码/权威校验读）。
+**已接入**：`GameHost` 实例化 `WorkerPool` + `ParallelConfig`；`HookedPipeline → ShardedInboundPipeline → InboundPipeline`（按玩家分片并行、同玩家保序）；`ParallelSnapshotBroadcaster` 接入 `SnapshotBroadcaster`；插件 Hook 触发通过 `HookRegistry`（写时复制快照，**读端零锁零分配**）；`DoubleBufferedWorldState` 接入 `WorldSimulator` → `SnapshotBroadcaster`（快照线程只读已发布视图，不再触碰活动 `WorldState`）；`SectionLocks` 区块分区锁接入图格读写（仿真写 vs 包 10 编码/权威校验读）。
 **P4 进展**：已实装「区块分区锁」；「并行区块仿真」暂缓（`MaxConnections=64` 使收益场景不成立、仿真非瓶颈、且并行前须先做每实体确定性 RNG 流）—— 详见 [`Concurrency/README.md`](Concurrency/README.md) §六。
 
 ---
@@ -147,6 +149,8 @@ TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=fa
 ## 五、快速开始
 
 ### 构建
+
+> 需要 **.NET 10 SDK**（三个工程统一目标框架 `net10.0`）。
 
 ```bash
 cd terraauth

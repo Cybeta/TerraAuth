@@ -4,6 +4,7 @@
 //   - TileID.Sets.SaveSlopes = tileSolid || NonSolidSaveSlopes
 //   - TileID.Sets.BasicChest / tileSign
 
+using System.Collections.Frozen;
 using System.Collections.Generic;
 
 namespace TerraAuth.Simulation;
@@ -12,7 +13,7 @@ namespace TerraAuth.Simulation;
 public static class TileIdSets
 {
     /// <summary>原版 <c>Main.tileSolid</c> 为 true 的图格 ID（影响斜坡是否存档）。</summary>
-    private static readonly HashSet<ushort> Solid = new()
+    private static readonly FrozenSet<ushort> Solid = new HashSet<ushort>
     {
         0, 1, 2, 6, 7, 8, 9, 10, 19, 22, 23, 25, 30, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48,
         53, 54, 56, 57, 58, 59, 60, 63, 64, 65, 66, 67, 68, 70, 75, 76, 107, 108, 109, 111, 112,
@@ -30,22 +31,23 @@ public static class TileIdSets
         667, 668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679, 680, 681, 682, 683, 684,
         685, 686, 687, 688, 689, 690, 691, 692, 708, 711, 712, 713, 714, 715, 716, 717, 718, 719,
         722, 726, 734, 735, 736, 737, 738, 739, 740, 741, 742, 743, 744, 745, 746, 747, 748, 749, 750
-    };
+    }.ToFrozenSet();
 
     /// <summary>原版 <c>TileID.Sets.NonSolidSaveSlopes</c>。</summary>
-    private static readonly HashSet<ushort> NonSolidSaveSlopes = new() { 131, 351, 336, 340, 342, 341, 343, 344 };
+    private static readonly FrozenSet<ushort> NonSolidSaveSlopes =
+        new HashSet<ushort> { 131, 351, 336, 340, 342, 341, 343, 344 }.ToFrozenSet();
 
     /// <summary>原版 <c>TileID.Sets.BasicChest</c>。</summary>
-    private static readonly HashSet<ushort> BasicChest = new() { 21, 467 };
+    private static readonly FrozenSet<ushort> BasicChest = new HashSet<ushort> { 21, 467 }.ToFrozenSet();
 
     /// <summary>原版 <c>Main.tileSign</c>。</summary>
-    private static readonly HashSet<ushort> Sign = new() { 55, 85, 425, 573 };
+    private static readonly FrozenSet<ushort> Sign = new HashSet<ushort> { 55, 85, 425, 573 }.ToFrozenSet();
 
     /// <summary>
     /// 原版 <c>Main.tileFrameImportant</c> 为 true 的图格 ID（398 项）。
     /// 包 10 编码时对这些图格额外写入 FrameX/FrameY（各 Int16）。
     /// </summary>
-    private static readonly HashSet<ushort> FrameImportant = new()
+    private static readonly FrozenSet<ushort> FrameImportant = new HashSet<ushort>
     {
         3, 4, 5, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 24, 26, 27, 28, 29, 31, 33, 34,
         35, 36, 42, 49, 50, 55, 61, 71, 72, 73, 74, 77, 78, 79, 81, 82, 83, 84, 85, 86, 87, 88,
@@ -69,7 +71,7 @@ public static class TileIdSets
         639, 640, 642, 643, 644, 645, 646, 653, 654, 656, 657, 658, 660, 663, 664, 665, 695, 696,
         698, 699, 700, 701, 702, 703, 704, 705, 707, 709, 710, 711, 712, 713, 714, 715, 716, 720,
         721, 723, 724, 725, 726, 733, 751, 752, 753
-    };
+    }.ToFrozenSet();
 
     public static bool IsTileSolid(ushort type) => Solid.Contains(type);
 
