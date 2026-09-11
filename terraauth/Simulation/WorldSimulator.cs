@@ -56,6 +56,9 @@ public partial class WorldSimulator : IWorldViewProvider
         // 5. World：液体、Tile、抛射物
         SimulateWorld();
 
+        // 5.5 世界实体：掉落物重力落地 / 弹幕运动与生命周期
+        SimulateEntities();
+
         // 6. Output：产出快照（Phase 4）
         //    同时发布本 tick 的不可变实体视图 —— 快照线程据此构建/裁剪快照，
         //    不再直接读正在被本线程改动的 WorldState（见 WorldEntityView）。
@@ -104,6 +107,53 @@ public partial class WorldSimulator : IWorldViewProvider
     /// <summary>史莱姆（权威：原版 <c>Terraria.ID.NPCID.BlueSlime</c>）与其生命值。</summary>
     private const short BlueSlimeType = 1;
     private const int BlueSlimeLife = 25;
+
+    /// <summary>
+    /// 阶段 5.5：世界实体（服务端权威）。
+    /// 掉落物：重力 + 图格落地；弹幕：直线积分 + 生存期耗尽即失效。
+    /// </summary>
+    private void SimulateEntities()
+    {
+        lock (_world.ItemsLock)
+        {
+            foreach (var item in _world.Items)
+            {
+                if (!item.Active) continue;
+
+                item.Velocity = new Vector2(item.Velocity.X * 0.99f,
+                    Math.Min(item.Velocity.Y + Gravity, MaxFallSpeed));
+
+                var next = new Vector2(item.Position.X + item.Velocity.X, item.Position.Y + item.Velocity.Y);
+                int tileX = (int)(next.X / TileSize);
+                int tileY = (int)((next.Y + 8f) / TileSize); // 物品半高 8px
+                if (tileX >= 0 && tileX < _world.Tiles.Width && tileY >= 0 && tileY < _world.Tiles.Height)
+                {
+                    ref var tile = ref _world.Tiles[tileX, tileY];
+                    if (tile.Active && TileIdSets.IsTileSolid(tile.Type))
+                    {
+                        next = new Vector2(next.X, tileY * TileSize - 8f);
+                        item.Velocity = new Vector2(item.Velocity.X * 0.8f, 0f);
+                    }
+                }
+                item.Position = next;
+            }
+        }
+
+        lock (_world.ProjectilesLock)
+        {
+            foreach (var p in _world.Projectiles)
+            {
+                if (!p.Active) continue;
+
+                p.Position = new Vector2(p.Position.X + p.Velocity.X, p.Position.Y + p.Velocity.Y);
+                if (--p.TimeLeft <= 0)
+                {
+                    p.Active = false;
+                    p.DeadTick = _world.Tick; // 由世界同步补发包 29（客户端掉线时也能清理）
+                }
+            }
+        }
+    }
 
     /// <summary>
     /// 阶段 2：AI。城镇 NPC 在住所附近确定性游走；敌怪朝最近玩家水平移动并受重力。

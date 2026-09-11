@@ -116,6 +116,20 @@ public sealed class WorldState
     /// <summary>NPC 列表的跨线程保护：仿真线程负责增删，世界同步线程负责遍历下发。</summary>
     public object NpcsLock { get; } = new();
 
+    // ---- 掉落物 / 弹幕（服务端权威实体）----
+
+    /// <summary>世界掉落物（原版 <c>Main.item[]</c>）。</summary>
+    public List<WorldItemEntity> Items { get; } = new();
+
+    /// <summary>弹幕（原版 <c>Main.projectile[]</c>）。</summary>
+    public List<ProjectileEntity> Projectiles { get; } = new();
+
+    /// <summary>掉落物列表的跨线程保护。</summary>
+    public object ItemsLock { get; } = new();
+
+    /// <summary>弹幕列表的跨线程保护。</summary>
+    public object ProjectilesLock { get; } = new();
+
     /// <summary>按包 7 布局构造 <see cref="WorldInfoPacket"/>。</summary>
     public WorldInfoPacket ToWorldInfoPacket()
     {

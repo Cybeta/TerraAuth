@@ -86,7 +86,7 @@ terraauth/
 ├─ Plugins/             # 插件系统（Hook / 加载器 / 管线装饰）
 ├─ ModCompat/           # Mod 兼容层（策略 / 检测 / 自定义包）
 ├─ Concurrency/         # 并行优化（Worker 池 / 分片 / 快照并行）
-├─ Tests/               # xUnit 验收测试（168 用例）
+├─ Tests/               # xUnit 验收测试（172 用例）
 └─ server.json          # 阈值配置
 ```
 

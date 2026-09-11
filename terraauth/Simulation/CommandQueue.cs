@@ -138,6 +138,96 @@ public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, in
     }
 }
 
+/// <summary>掉落物生成命令：包 21 权威通过后生成；槽位由服务端分配（不采信客户端上报值）。</summary>
+public sealed record SpawnItemCommand(
+    long Tick, int? PlayerId, int ItemId, int Stack, Vector2 Position, Vector2 Velocity, byte Prefix)
+    : Command(Tick, PlayerId, "spawn_item")
+{
+    /// <summary>世界掉落物槽位上限（与原版 <c>Main.item[400]</c> 一致）。</summary>
+    private const int MaxSlots = 400;
+
+    public override void Apply(WorldState world, IRng rng)
+    {
+        lock (world.ItemsLock)
+        {
+            if (world.Items.Count >= MaxSlots)
+                return;
+
+            int slot = 0;
+            while (world.Items.Any(i => i.Slot == slot)) slot++;
+
+            world.Items.Add(new WorldItemEntity
+            {
+                Slot = slot,
+                ItemId = ItemId,
+                Stack = Stack,
+                Position = Position,
+                Velocity = Velocity,
+                Prefix = Prefix,
+                OwnedBy = PlayerId ?? -1,
+            });
+        }
+    }
+}
+
+/// <summary>弹幕生成 / 更新命令：包 27 权威通过后生成，服务端登记并推进其生命周期。</summary>
+public sealed record SpawnProjectileCommand(
+    long Tick, int? PlayerId, int Key, int Type, Vector2 Position, Vector2 Velocity, int Damage)
+    : Command(Tick, PlayerId, "spawn_projectile")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        lock (world.ProjectilesLock)
+        {
+            // 同一 Key 视为同一弹幕的更新（原版 projectile 索引由归属者选定）
+            var existing = world.Projectiles.FirstOrDefault(p => p.Key == Key);
+            if (existing is not null)
+            {
+                existing.Position = Position;
+                existing.Velocity = Velocity;
+                existing.Active = true;
+                existing.RemovalNotified = false;
+                return;
+            }
+
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = Key,
+                Owner = PlayerId ?? -1,
+                Type = Type,
+                Position = Position,
+                Velocity = Velocity,
+                Damage = Damage,
+            });
+        }
+    }
+}
+
+/// <summary>弹幕销毁命令：包 29 权威通过后生成（仅归属者可销毁）。</summary>
+public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Vector2 Position)
+    : Command(Tick, PlayerId, "kill_projectile")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        lock (world.ProjectilesLock)
+        {
+            foreach (var p in world.Projectiles)
+            {
+                if (p.Key != Key || !p.Active) continue;
+
+                // 服务端权威：只有归属者能销毁自己的弹幕（防伪造他人弹幕消失）
+                if (PlayerId is int owner && p.Owner != owner) return;
+
+                p.Position = Position;
+                p.Active = false;
+                p.DeadTick = Tick;
+                p.RemovalNotified = true; // 客户端已发起销毁，无需服务端再补发
+                return;
+            }
+        }
+    }
+}
+
 /// <summary>命令队列：按 tick 分组、线程安全、稳定排序。</summary>
 public sealed class CommandQueue
 {

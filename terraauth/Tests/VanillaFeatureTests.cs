@@ -686,6 +686,54 @@ public class VanillaFeatureTests
     }
 
     // ========================================================================
+    // 十一、世界实体的服务端权威模拟（包 21 掉落物 / 包 27·29 弹幕）
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_ItemDrop_Is_Tracked_And_Falls_Under_Gravity()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+
+        // 地表上方 3 格处掉落（下落距离短，便于验证落地）
+        await s.SendAsync(PacketId.ItemDrop,
+            new ItemDropPacket(1, 5) { Position = new Vector2(sx * 16f + 8f, (sy - 3) * 16f) });
+
+        Assert.True(await TickUntilAsync(server, () => world.Items.Any(i => i.ItemId == 1),
+            TimeSpan.FromSeconds(5)), "掉落物未被服务端登记");
+
+        // 重力落地：垂直速度归零
+        Assert.True(await TickUntilAsync(server, () => world.Items.All(i => i.Velocity.Y == 0f),
+            TimeSpan.FromSeconds(10)), "掉落物未在重力作用下落地");
+    }
+
+    [Fact]
+    public async Task Vanilla_Projectile_Is_Tracked_And_Expires_With_Server_Destroy()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        // 包 27：服务端登记该弹幕（权威跟踪）
+        await s.SendAsync(PacketId.ProjectileNew,
+            new ProjectileNewPacket(3, new Vector2(320f, 460f), new Vector2(1f, 0f), 1));
+
+        Assert.True(await TickUntilAsync(server, () => world.Projectiles.Any(p => p.Active),
+            TimeSpan.FromSeconds(5)), "弹幕未被服务端登记");
+
+        // 生存期耗尽（默认 300 tick）→ 服务端标记失效
+        Assert.True(await TickUntilAsync(server, () => world.Projectiles.Any(p => !p.Active),
+            TimeSpan.FromSeconds(20)), "弹幕未在生存期结束后失效");
+
+        // 世界同步时服务端补发销毁包 29
+        await server.Host.BroadcastWorldStateAsync();
+        var got = await s.ReadUntilAsync(p => p is ProjectileDestroyPacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p is ProjectileDestroyPacket { ProjectileKey: 3 });
+    }
+
+    // ========================================================================
     // 十、聊天（包 82 = LoadNetModule → NetTextModule，模块号 1）
     // 布局来源：原版 NetTextModule / NetworkInitializer（模块号） / ChatMessage
     // ========================================================================

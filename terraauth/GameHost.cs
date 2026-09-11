@@ -328,6 +328,20 @@ public sealed class GameHost : IDisposable
             await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet,
                 playerId => IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq), ct).ConfigureAwait(false);
         }
+
+        // 弹幕到期：服务端补发销毁包 29（客户端掉线 / 未发 29 时也避免幽灵弹幕）
+        ProjectileEntity[] expired;
+        lock (world.ProjectilesLock)
+        {
+            expired = world.Projectiles.Where(p => !p.Active && !p.RemovalNotified).ToArray();
+            foreach (var p in expired) p.RemovalNotified = true;
+        }
+
+        foreach (var p in expired)
+        {
+            await Network.BroadcastAsync(PacketId.ProjectileDestroy,
+                new ProjectileDestroyPacket(p.Key, p.Position), ct).ConfigureAwait(false);
+        }
     }
 
     /// <summary>玩家当前位置是否落在 (x, y) 的视口半径内。</summary>

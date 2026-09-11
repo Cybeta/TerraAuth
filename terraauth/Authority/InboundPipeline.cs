@@ -183,6 +183,15 @@ public sealed class TerminalStage : IPipelineStage
         TilePlacePacket place => new TilePlaceCommand(context.Tick, context.PlayerId, place.X, place.Y, place.TileType, place.Style),
         // 包 28 DamageNPC → NPC 受击指令（服务端扣血，生命归零即死亡）
         NpcStrikePacket strike => new NpcStrikeCommand(context.Tick, context.PlayerId, strike.NpcId, strike.Damage),
+        // 包 21 SyncItem → 掉落物生成（服务端分配槽位）
+        ItemDropPacket drop => new SpawnItemCommand(context.Tick, context.PlayerId,
+            drop.ItemId, drop.Stack, drop.Position, drop.Velocity, drop.Prefix),
+        // 包 27 SyncProjectile → 弹幕生成 / 更新（服务端登记生命周期）
+        ProjectileNewPacket proj => new SpawnProjectileCommand(context.Tick, context.PlayerId,
+            proj.ProjectileKey, proj.ProjectileType, proj.Position, proj.Velocity, proj.Damage),
+        // 包 29 KillProjectile → 弹幕销毁（仅归属者可销毁）
+        ProjectileDestroyPacket kill => new KillProjectileCommand(context.Tick, context.PlayerId,
+            kill.ProjectileKey, kill.Position),
         _ => null,
     };
 }
