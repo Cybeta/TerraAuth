@@ -21,3 +21,8 @@ terraauth/*.log
 Thumbs.db
 *.swp
 *.tmp
+
+# ---- 原版相关：一律放仓库外，禁止入库（用户规则） ----
+decompiled/
+decompiled-*.zip
+*.bundle
