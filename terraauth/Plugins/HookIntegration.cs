@@ -70,6 +70,9 @@ public sealed class HookedPipeline : IInboundPipeline
         return _inner.ProcessAsync(packet, playerId, commands, ct);
     }
 
+    /// <summary>连接结束：转发给内层管线，清理该玩家的权威状态（避免槽位复用串号）。</summary>
+    public void ResetPlayer(int playerId) => _inner.ResetPlayer(playerId);
+
     /// <summary>
     /// 包类型 → 对应 HookArgs 类型是否有订阅者。<b>只做类型判断，不实例化</b>，
     /// 使无插件（或该 Hook 无插件）时每包零分配；与 <see cref="BuildHookArgs"/> 的映射须保持一致。

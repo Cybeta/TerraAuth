@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-11 ｜ 当前测试：**231 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
+> 生成日期：2026-09-12 ｜ 当前测试：**248 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
 
 ---
 
@@ -35,6 +35,10 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **掉落物拾取（包 22）**：服务端做槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC），
   成功后移除世界实体并下发包 21（stack=0）；拒绝远程拾取 / 重复拾取。
 - **弹幕命中判定（包 27）**：仿真按弹幕 / 敌怪距离判定命中并扣血，不再采信客户端声明。
+- **法力（包 42）**：服务端跟踪法力 / 上限；非负校验，上限由服务端持有（超出即下发权威纠正包）；原版不向他人转发。
+- **治疗（包 35）**：非负校验 → 回血上限钳制到服务端 `HpMax`（客户端超额治疗不会让服务端生命越界）。
+- **增益（包 50）**：条目数 ≤ 44、ID ∈ [1,400] 校验通过后，由服务端持有列表（唯一真相）。
+- **弹幕生成（包 27）**：类型须在 [1,1135]，伤害超单次上限即判为作弊拒绝（与包 28 共用阈值）——关闭「声明 32767 一击秒杀」通道。
 
 ### 2. 世界内容权威
 
@@ -78,19 +82,44 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **231 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
+- 套件 **248 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
 
-### 8. 文档同步
+### 8. 持久化与可靠性
+
+- **世界改动持久化**：玩家挖 / 放方块、墙、液体、电线、执行器的改动按 1Hz **增量落盘**（`WorldTiles`），
+  启动时叠加回确定性基准世界 —— **玩家建筑在服务端重启后不再丢失**。落盘失败会重新排队重试，停机时冲刷一次。
+- **既有持久化**：玩家存档 / 审计 / 封禁（SQLite 或 `-p:NoSqlite=true` 的内嵌兜底后端）。
+- **偶发测试加固**：客户端会话读取补 `IOException` / `SocketException` 处理，消除「踢出瞬间仍在读 socket」导致的偶发失败。
+- **世界文件（`.wld`）加载 / 导出**：`ServerConfig.WorldPath` 指定 `.wld` 即**用真实世界开服**（为空仍程序化生成）；
+  自研写出器（与自身读取器布局严格对称，覆盖全部图格特征位）配合 `WorldExportPath`：**停机导出 + 空服周期导出**，
+  带**写后读回校验 + 原子替换 + `.bak` 滚动**，不会用读不回来的文件覆盖已有世界。
+- **增量落盘加固**：单批上限 2048 → 8192；待落盘集合加上限（溢出降级为「全图游标扫描」，内存有界且最终一致）；
+  停机时循环冲刷到排空。
+
+### 9. 断线会话保留与连接健壮性
+
+- **断线宽限期会话保留**：连接断开不再直接销毁玩家运行时 —— 运行时按**玩家名**保留位置 / 血量 / 增益，
+  宽限期（`SessionResumeGraceSeconds`，默认 60s）内**同身份重连认回原运行时**；出生包（12）改发**恢复后的坐标**，
+  客户端落回原位；超期或被顶号由仿真循环回收。
+- **连接槽位回收（修真实缺陷）**：此前正常断开的连接**永不从连接池移除**，槽位与并发容量持续泄漏（累计 64 次连接后新玩家被拒）。
+  现在连接结束时释放槽位，新连接复用**最小空闲 ID**（与原版一致）；移除按「键 + 实例」双匹配，避免误杀复用同槽位的新连接。
+- **移动基线清理**：断线时经全部管线（含分片）清掉该槽位的移动校验基线（投递到同一分片 / 队列，保证在途包先处理完），
+  否则槽位复用会把上次会话的位置当作基准，重连玩家首个位置包被判超速。
+- **明确限制**：原版客户端**断线即回主菜单**，故这是「手动重进的会话接管」而非自动重连。
+
+### 10. 文档同步
 
 根 `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、
 `OPTIMIZATION_BACKLOG.md`、`Phase6/Phase7` 与 `ModCompat` README 均已按上述实现同步更新。
 
 ---
 
-## 三、本次推送变更文件清单
+## 三、变更文件清单
+
+### 上一轮推送（`3eddcf6`）
 
 共 **41 个文件**（38 修改 + 3 新增），约 +4056 / −185 行。
 
@@ -155,14 +184,48 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/server.json` | +8 | `ModPolicy` 默认配置 |
 | `.gitignore` | — | 移除本机绝对路径与来源描述，守卫规则保留 |
 
+### 本轮（第八~十一轮，待推送）
+
+| 文件 | 说明 |
+|---|---|
+| `terraauth/Protocol/PacketId.cs` | 新增 `PlayerMana = 42` |
+| `terraauth/Protocol/Types.cs` | 新增 `PlayerManaPacket` |
+| `terraauth/Simulation/World/WorldState.cs` | `PlayerRuntime` 新增 `Mp` / `MpMax` / `Buffs` |
+| `terraauth/Simulation/CommandQueue.cs` | `SetManaCommand` / `HealPlayerCommand` / `SetBuffsCommand` |
+| `terraauth/Authority/AuthoritySubsystems.cs` | `ValidateMana` / `ValidateHeal` / `ValidateBuffs` / `ValidateProjectile`（含类型 / 伤害上界） |
+| `terraauth/Authority/InboundPipeline.cs` | 包 35 / 42 / 50 → Command 映射 |
+| `terraauth/Net/Phase5/PacketDecoder.cs`、`PacketEncoder.cs` | 包 42 编解码 |
+| `terraauth/Net/Phase5/ITerrariaProtocol.cs` | 权威白名单新增 35 / 42 / 50 |
+| `terraauth/CoreAdapter.cs` | 玩家快照回报真实 `Mp` / `MaxMp`（原恒为 0） |
+| `terraauth/Simulation/World/Tile.cs` | 图格 15 字节定长序列化（`Serialize` / `Deserialize`） |
+| `terraauth/Simulation/World/WorldState.cs` | 待落盘图格集合 + `MarkPersistTile` / `DrainPersistTiles` |
+| `terraauth/Simulation/CommandQueue.cs` | 挖砖 / 放砖命令登记持久化 |
+| `terraauth/Persistence/IPersistence.cs` | 新增 `IWorldRepository` + `WorldTileRecord` |
+| `terraauth/Persistence/SqlitePersistence.cs` | `WorldTiles` 表（SQLite）与内嵌后端落盘 / 读取 |
+| `terraauth/GameHost.cs` | 启动回放 + 1Hz 落盘 + 停机冲刷（失败重新排队） |
+| `terraauth/Simulation/World/WorldFileWriter.cs` | 新增：`.wld` 写出器（写后读回校验 + 原子替换 + `.bak`） |
+| `terraauth/Config/ServerConfig.cs` | 新增 `WorldPath` / `WorldExportPath` / `WorldExportIntervalSeconds` / `SessionResumeGraceSeconds` |
+| `terraauth/Simulation/World/WorldState.cs` | 待落盘集合上限 + 溢出降级全图扫描 + `HasPendingPersist`；离线会话表 + `MarkPlayerOffline` / `TryResumePlayer` / `ReapOfflineSessions`；`PlayerRuntime` 新增 `ResumeKey` / `Resumed` |
+| `terraauth/Tests/WorldFileTests.cs` | +3 用例（特征世界逐格 round-trip / 世界旗标 round-trip / 按原版顺序的严格分段走查） |
+| `terraauth/Tests/VanillaFeatureTests.cs` | +14 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）） |
+| `terraauth/Net/Phase5/NetworkHost.cs` | 断线走会话保留（`MarkPlayerOffline` + `ResetPlayer`）；登录时按玩家名 `TryResumePlayer`；连接结束回收槽位 |
+| `terraauth/Net/Phase5/ConnectionManager.cs` | `RemoveAsync` 支持「键 + 实例」双匹配（槽位复用时防误杀新连接） |
+| `terraauth/Authority/IAuthorityLayer.cs` | `IMovementAuthority.ResetPlayer` + `IInboundPipeline.ResetPlayer` 默认实现 |
+| `terraauth/Authority/AuthoritySubsystems.cs` | `MovementAuthority.ResetPlayer`（清理移动校验基线） |
+| `terraauth/Authority/InboundPipeline.cs` | `IResettableStage` + 阶段转发 |
+| `terraauth/Authority/ShardedInboundPipeline.cs` | `InboundWork.IsReset` + 重置投递到同一分片 / 队列（保证在途包先处理完） |
+| `terraauth/Plugins/HookIntegration.cs` | `HookedPipeline.ResetPlayer` 转发 |
+| `terraauth/Tests/VanillaFeatureTests.cs` | +3 用例（会话恢复：位置 / 血量续回、宽限期 0 关闭、越期回收） |
+| `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、`OPTIMIZATION_BACKLOG.md`、`SUMMARY.md` | 文档同步（含 §二「无接触伤害」矛盾修正、W-1 立项、第十一轮会话保留） |
+
 ---
 
 ## 四、验证结果
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **231 / 231 通过** |
-| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **231 / 231 通过** |
+| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **248 / 248 通过** |
+| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **248 / 248 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 
@@ -176,4 +239,11 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **电路**：无门电路 / 定时器 / 压力板（action 18 未建模）。
 - **物理 / AI**：弹幕无图格碰撞与追踪 / 反弹行为；掉落物无拾取动画与合并。
 - **图格推送**：服务端驱动的图格修改采用「小矩形包 10」而非原版包 20，若客户端行为有差异需按实测调整。
+- **世界持久化**：在线走**图格增量**（1Hz，崩溃最多丢 1 秒；当前不含箱子内容）；整份 `.wld` 导出为**停机 / 空服**动作
+  （全量 O(世界大小)，避开在线时段）。
+- **导出的 `.wld` 验证程度**：已通过**逐格 round-trip** + **按原版加载器顺序的严格分段走查**（11 段含 5..9 段的合法空编码、
+  段起点递增、逐段位置断言、footer 用尽文件）。**尚未在原版二进制上实测加载** —— 本沙箱无法运行 `TerrariaServer.exe`
+  （连其 `-autocreate` 自建世界也崩溃、零输出，判定为环境限制而非文件格式问题）。
 - **对端一致性**：原版客户端不支持预测协议，延迟只能靠快照频率缓解；Phase 7 的「内存修改类」条目仍需手工实验。
+- **断线会话保留范围**：仅保留**运行时状态**（位置 / 血量 / 法力 / 增益 / 速度清零），不含「在线期间尚未落盘的临时实体归属」；
+  且因原版客户端断线即回主菜单，属**手动重进的会话接管**（宽限期内同身份重连），非自动重连。

@@ -13,6 +13,27 @@ public record ServerConfig
     public int SnapshotRateHz { get; init; } = 20;
     public float ViewportRadius { get; init; } = 2000f;   // 快照视野半径（像素）；0 = 不裁剪
 
+    // ---- 世界 ----
+    /// <summary>基准世界文件路径（.wld）；为空或文件不存在则程序化生成小世界。</summary>
+    public string WorldPath { get; init; } = "";
+
+    /// <summary>
+    /// 世界导出路径（.wld）；为空则不导出。设置后：停机时导出一次，且在**无人在线**时按
+    /// <see cref="WorldExportIntervalSeconds"/> 周期导出（全量遍历 O(世界大小)，故避开在线时段）。
+    /// 与 <see cref="WorldPath"/> 相同即「原地保存」（导出前旧文件滚动为 .bak）。
+    /// </summary>
+    public string WorldExportPath { get; init; } = "";
+
+    /// <summary>空服导出世界的间隔（秒）；仅在 <see cref="WorldExportPath"/> 非空且无人在线时生效。</summary>
+    public int WorldExportIntervalSeconds { get; init; } = 600;
+
+    /// <summary>
+    /// 会话恢复宽限期（秒）：玩家断线后在此时长内以**同一玩家名**重连，服务端把原运行时（位置 / 血量 / 增益）
+    /// 交还给他，而不是当作新玩家从头进服。0 = 关闭（断线即回收）。
+    /// 注意：原版客户端断线只会退回主菜单、手动重进，故这是「手动重进的会话接管」，非自动重连。
+    /// </summary>
+    public int SessionResumeGraceSeconds { get; init; } = 60;
+
     // ---- 玩家属性权威 (Phase 2 IPlayerAuthority) ----
     public int MaxPlayerHp { get; init; } = 500;           // 玩家生命上限（客户端不得抬高，超出即纠正）
     public int MaxPlayerMana { get; init; } = 200;         // 玩家法力上限

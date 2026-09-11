@@ -60,6 +60,16 @@ public sealed record PlayerHealthPacket(int PlayerId, int Hp, int MaxHp) : INetw
 }
 
 /// <summary>
+/// 玩家法力包（PlayerMana，包 42，上行）。
+/// 布局：Byte PlayerId + Int16 statMana + Int16 statManaMax。
+/// 原版不向其他玩家转发法力，故服务端只做权威跟踪（不中继）。
+/// </summary>
+public sealed record PlayerManaPacket(int PlayerId, int Mana, int MaxMana) : INetworkPacket
+{
+    public PacketId Type => PacketId.PlayerMana;
+}
+
+/// <summary>
 /// NPC 受击包（DamageNPC，包 28，上行，客户端发起）。
 /// 布局：Byte NpcId + Byte Generation + Int16 Damage + Single Knockback + Byte Direction + Byte Crit。
 /// </summary>

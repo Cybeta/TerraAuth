@@ -62,6 +62,12 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>违规处置阈值（滑动窗口 + 阈值 → 踢出）。</summary>
     private readonly ViolationKickLimits _violationKick;
 
+    /// <summary>仿真固定步长（与 GameLoop 一致）：用于把「秒」换算成 tick。</summary>
+    private const int TicksPerSecond = 60;
+
+    /// <summary>会话恢复宽限期（tick）；0 = 断线即回收。</summary>
+    private readonly long _sessionResumeGraceTicks;
+
     /// <summary>进程内违规窗口：PlayerId → 窗口起点 + 窗口内拒绝计数。</summary>
     private readonly ConcurrentDictionary<int, ViolationWindow> _violations = new();
 
@@ -100,8 +106,10 @@ public sealed class NetworkHost : IAsyncDisposable
         WorldState world,
         IReadOnlyCollection<string>? playerWhitelist = null,
         IHookRegistry? hooks = null,
-        ViolationKickLimits? violationKick = null)
+        ViolationKickLimits? violationKick = null,
+        int sessionResumeGraceSeconds = 0)
     {
+        _sessionResumeGraceTicks = Math.Max(0, sessionResumeGraceSeconds) * TicksPerSecond;
         _listener = new TcpListener(endpoint);
         _decoder = decoder;
         _encoder = encoder;
@@ -181,8 +189,17 @@ public sealed class NetworkHost : IAsyncDisposable
 
     private async Task RunConnectionAsync(Connection connection, CancellationToken ct)
     {
-        await connection.RunAsync(OnPacketAsync, ct).ConfigureAwait(false);
-        OnConnectionClosed(connection);
+        try
+        {
+            await connection.RunAsync(OnPacketAsync, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            // 先释放槽位再走退出清理：槽位按「最小可用 ID」复用（与原版一致），
+            // 会话恢复依赖「旧槽位已释放」后重连才能拿到同一 ID；顺序颠倒会让重连拿到新 ID。
+            await _connections.RemoveAsync(connection.PlayerId, connection).ConfigureAwait(false);
+            OnConnectionClosed(connection);
+        }
     }
 
     /// <summary>连接结束：清理外观缓存并触发 PlayerLeft Hook。</summary>
@@ -194,7 +211,15 @@ public sealed class NetworkHost : IAsyncDisposable
 
         // 通知其他玩家该玩家已离线（包 14 置为未激活），否则原版客户端会残留幽灵玩家
         if (connection.PlayerId > 0)
+        {
+            // 权威侧：清掉该槽位上的按玩家状态（移动基线等）。否则槽位复用时，
+            // 上一次会话的位置会被当作基准，使重连玩家的首个位置包被判超速。
+            _pipeline.ResetPlayer(connection.PlayerId);
+
+            // 世界侧：移出在线集合并按宽限期保留会话（宽限期 0 即直接回收；同时修掉运行时不释放的泄漏）
+            _world.MarkPlayerOffline(connection.PlayerId, name, _sessionResumeGraceTicks);
             _ = BroadcastLeaveAsync(connection.PlayerId);
+        }
 
         if (_hooks is null) return;
 
@@ -786,11 +811,17 @@ public sealed class NetworkHost : IAsyncDisposable
             return;
         }
 
+        // 会话恢复：同身份（玩家名）在宽限期内重连 → 接管原运行时（位置 / 血量 / 增益一并交还），
+        // 而不是当作新玩家从出生点重新开始。超出宽限期 / 未开启则走常规新玩家流程。
+        bool resumed = _world.TryResumePlayer(connection.PlayerId, name);
+
         // Slot 以服务端分配的 PlayerId 覆盖：客户端上行的包 4 槽位是其本地索引（通常 0），
         // 直接透传会导致其他客户端把该外观画到自己的槽位上。
         _playerAppearances[connection.PlayerId] =
             info with { Name = name, Slot = (byte)connection.PlayerId };
-        Console.WriteLine($"[Net] 玩家 #{connection.PlayerId} 名称 \"{name}\"");
+        Console.WriteLine(resumed
+            ? $"[Net] 玩家 #{connection.PlayerId} 名称 \"{name}\"（会话已恢复）"
+            : $"[Net] 玩家 #{connection.PlayerId} 名称 \"{name}\"");
     }
 
     private static async Task KickAsync(Connection connection, string reason, CancellationToken ct)

@@ -35,6 +35,12 @@ public interface IPipelineStage
         CancellationToken ct);
 }
 
+/// <summary>阶段可选的「按玩家重置」能力：连接结束时清理该玩家的权威状态。</summary>
+public interface IResettableStage
+{
+    void ResetPlayer(int playerId);
+}
+
 public sealed class FrameStage : IPipelineStage
 {
     public int Order => 0;
@@ -92,13 +98,15 @@ public sealed class InventoryAuthorityStage : IPipelineStage
     }
 }
 
-public sealed class MovementAuthorityStage : IPipelineStage
+public sealed class MovementAuthorityStage : IPipelineStage, IResettableStage
 {
     private readonly IMovementAuthority _move;
     private readonly IAuditLogger _audit;
     public int Order => 40;
     public MovementAuthorityStage(IMovementAuthority move, IAuditLogger audit)
         => (_move, _audit) = (move, audit);
+
+    public void ResetPlayer(int playerId) => _move.ResetPlayer(playerId);
 
     public async Task<AuthorityResult> ExecuteAsync(INetworkPacket packet, IPacketContext context,
         Func<INetworkPacket, Task<AuthorityResult>> next, CancellationToken ct)
@@ -207,6 +215,12 @@ public sealed class TerminalStage : IPipelineStage
         PlayerHurtV2Packet hurt => new DamagePlayerCommand(context.Tick, context.PlayerId, hurt.Damage),
         // 包 118 PlayerDeathV2 → 服务端死亡结算
         PlayerDeathV2Packet => new KillPlayerCommand(context.Tick, context.PlayerId),
+        // 包 35 PlayerHeal → 服务端回血（上限由 HealPlayerCommand 钳制到服务端 HpMax）
+        PlayerHealPacket heal => new HealPlayerCommand(context.Tick, context.PlayerId, heal.Amount),
+        // 包 42 PlayerMana → 服务端法力跟踪（原版不向他人转发法力）
+        PlayerManaPacket mana => new SetManaCommand(context.Tick, context.PlayerId, mana.Mana, mana.MaxMana),
+        // 包 50 PlayerBuffs → 服务端持有增益列表
+        PlayerBuffsPacket buffs => new SetBuffsCommand(context.Tick, context.PlayerId, buffs.BuffTypes),
         // 包 12 PlayerSpawn（Playing 阶段）→ 复活请求（服务端划定复活点）
         PlayerSpawnPacket => new RespawnCommand(context.Tick, context.PlayerId),
         // 包 27 SyncProjectile → 弹幕生成 / 更新（服务端登记生命周期）
@@ -228,6 +242,16 @@ public sealed class InboundPipeline : IInboundPipeline
     public InboundPipeline(IEnumerable<IPipelineStage> stages)
     {
         _stages = stages.OrderBy(s => s.Order).ToArray();
+    }
+
+    /// <summary>连接结束：把「按玩家重置」转发给实现了 <see cref="IResettableStage"/> 的阶段。</summary>
+    public void ResetPlayer(int playerId)
+    {
+        foreach (var stage in _stages)
+        {
+            if (stage is IResettableStage resettable)
+                resettable.ResetPlayer(playerId);
+        }
     }
 
     public async Task<AuthorityResult> ProcessAsync(

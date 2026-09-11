@@ -27,27 +27,32 @@ public class VanillaFeatureTests
     private sealed class VanillaServer : IDisposable
     {
         private readonly string _dir;
+        private readonly bool _deleteOnDispose;
 
         public GameHost Host { get; }
         private int Port => Host.Network.BoundPort;
 
-        private VanillaServer(GameHost host, string dir)
+        private VanillaServer(GameHost host, string dir, bool deleteOnDispose)
         {
             Host = host;
             _dir = dir;
+            _deleteOnDispose = deleteOnDispose;
         }
 
-        /// <summary>启动服务端（port 0 = OS 分配端口，避免测试间抢占）。</summary>
-        public static VanillaServer Start(string? configJson = null)
+        /// <summary>
+        /// 启动服务端（port 0 = OS 分配端口，避免测试间抢占）。
+        /// <paramref name="dir"/> 用于重启复现测试：复用同一目录即复用同一 DB（世界改动应被回放）。
+        /// </summary>
+        public static VanillaServer Start(string? configJson = null, string? dir = null, bool deleteOnDispose = true)
         {
-            var dir = Path.Combine(Path.GetTempPath(), $"terraauth-vanilla-{Guid.NewGuid():N}");
+            dir ??= Path.Combine(Path.GetTempPath(), $"terraauth-vanilla-{Guid.NewGuid():N}");
             Directory.CreateDirectory(dir);
             var configPath = Path.Combine(dir, "server.json");
             if (configJson is not null) File.WriteAllText(configPath, configJson);
 
             var host = GameHost.Bootstrap(Path.Combine(dir, "state.db"), configPath, metricsPort: 0, port: 0);
             host.Network.Start();
-            return new VanillaServer(host, dir);
+            return new VanillaServer(host, dir, deleteOnDispose);
         }
 
         /// <summary>接入一个客户端并完成登录链（1→4→6→8→12）至 Playing。</summary>
@@ -63,6 +68,7 @@ public class VanillaFeatureTests
         public void Dispose()
         {
             Host.Dispose();
+            if (!_deleteOnDispose) return;
             try { Directory.Delete(_dir, recursive: true); } catch { /* 临时目录清理失败可忽略 */ }
         }
     }
@@ -160,6 +166,15 @@ public class VanillaFeatureTests
                 }
             }
             catch (OperationCanceledException)
+            {
+                return got;
+            }
+            catch (IOException)
+            {
+                // 服务端踢出 / 关闭连接（本用例期望的路径）：按契约返回已收取的包
+                return got;
+            }
+            catch (SocketException)
             {
                 return got;
             }
@@ -1516,6 +1531,359 @@ public class VanillaFeatureTests
         // 超过免伤帧后应再次结算 7 点
         for (int i = 0; i < 40; i++) server.Host.Simulator.Tick();
         Assert.Equal(86, player.Hp);
+    }
+
+    // ========================================================================
+    // 二十·补、法力 / 治疗 / 增益 / 弹幕生成的权威化（包 42 / 35 / 50 / 27）
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_Mana_Is_Tracked_Server_Side()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 包 42：法力 50 / 上限 100（服务端上限 200，合法）
+        await s.SendAsync(PacketId.PlayerMana, new PlayerManaPacket(0, 50, 100));
+
+        Assert.True(await TickUntilAsync(server, () => world.Players[1].Mp == 50,
+            TimeSpan.FromSeconds(5)), "法力未被服务端跟踪");
+
+        Assert.Equal(100, world.Players[1].MpMax);
+    }
+
+    [Fact]
+    public async Task Vanilla_Mana_Above_Server_Max_Gets_Correction()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 服务端法力上限默认 200；客户端声明 500 → 应下发纠正包（包 42）
+        await s.SendAsync(PacketId.PlayerMana, new PlayerManaPacket(0, 500, 500));
+
+        var got = await s.ReadUntilAsync(p => p is PlayerManaPacket, TimeSpan.FromSeconds(5));
+        var corrected = Assert.Single(got.OfType<PlayerManaPacket>());
+        Assert.Equal(1, corrected.PlayerId);
+        Assert.Equal(200, corrected.MaxMana);
+        Assert.Equal(200, corrected.Mana);
+    }
+
+    [Fact]
+    public async Task Vanilla_Heal_Is_Clamped_To_Server_Max_Hp()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        var player = world.Players[1];
+        player.Hp = 10;
+
+        // 包 35：声明治疗 5000 → 服务端回血上限钳制到 HpMax
+        await s.SendAsync(PacketId.PlayerHeal, new PlayerHealPacket(0, 5000));
+
+        Assert.True(await TickUntilAsync(server, () => player.Hp == player.HpMax,
+            TimeSpan.FromSeconds(5)), $"治疗未钳制到上限：HP={player.Hp}/{player.HpMax}");
+    }
+
+    [Fact]
+    public async Task Vanilla_Negative_Heal_Is_Rejected()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        var player = world.Players[1];
+        player.Hp = 10;
+
+        await s.SendAsync(PacketId.PlayerHeal, new PlayerHealPacket(0, -5));
+
+        Assert.True(await WaitForRejectAsync(server, "invalid_heal", TimeSpan.FromSeconds(5)),
+            "负治疗未被权威拒绝");
+        Assert.Equal(10, player.Hp);
+    }
+
+    [Fact]
+    public async Task Vanilla_Buffs_Are_Held_Server_Side()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        await s.SendAsync(PacketId.PlayerBuffs, new PlayerBuffsPacket(0, new[] { 1, 2 }));
+
+        Assert.True(await TickUntilAsync(server, () => world.Players[1].Buffs.Count == 2,
+            TimeSpan.FromSeconds(5)), "增益列表未被服务端持有");
+        Assert.Equal(new[] { 1, 2 }, world.Players[1].Buffs);
+    }
+
+    [Fact]
+    public async Task Vanilla_Invalid_Buff_Id_Is_Rejected()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 有效增益 ID 区间为 1..400；999 越界 → 拒绝
+        await s.SendAsync(PacketId.PlayerBuffs, new PlayerBuffsPacket(0, new[] { 999 }));
+
+        Assert.True(await WaitForRejectAsync(server, "invalid_buff", TimeSpan.FromSeconds(5)),
+            "越界增益 ID 未被权威拒绝");
+        Assert.Empty(world.Players[1].Buffs);
+    }
+
+    [Fact]
+    public async Task Vanilla_Projectile_Damage_Above_Limit_Is_Rejected()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        // 单次伤害上限默认 30000：声明 32000 → 判为作弊，弹幕不入库
+        await s.SendAsync(PacketId.ProjectileNew,
+            new ProjectileNewPacket(5, new Vector2(320f, 460f), new Vector2(1f, 0f), 1) { Damage = 32000 });
+
+        Assert.True(await WaitForRejectAsync(server, "projectile_damage_exceeded", TimeSpan.FromSeconds(5)),
+            "超上限弹幕伤害未被权威拒绝");
+        Assert.DoesNotContain(world.Projectiles, p => p.Key == 5);
+    }
+
+    [Fact]
+    public async Task Vanilla_Projectile_Invalid_Type_Is_Rejected()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        // 有效弹幕类型区间为 1..1135；9999 越界 → 拒绝
+        await s.SendAsync(PacketId.ProjectileNew,
+            new ProjectileNewPacket(6, new Vector2(320f, 460f), new Vector2(1f, 0f), 9999));
+
+        Assert.True(await WaitForRejectAsync(server, "invalid_projectile_type", TimeSpan.FromSeconds(5)),
+            "越界弹幕类型未被权威拒绝");
+        Assert.DoesNotContain(world.Projectiles, p => p.Key == 6);
+    }
+
+    // ========================================================================
+    // 二十·补二、世界改动持久化（重启后回放，避免玩家建筑丢失）
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_WorldEdits_Survive_ServerRestart()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-persist-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+
+        int tx, ty;
+
+        // ---- 第一次运行：走真实包 17 权威链路挖掉一格 ----
+        using (var server = VanillaServer.Start(dir: dir, deleteOnDispose: false))
+        {
+            await using var s = await server.ConnectAsync("Alice");
+            var world = server.Host.Simulator.State;
+            int sx = world.SpawnTileX, sy = world.SpawnTileY;
+            await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+
+            tx = sx;
+            ty = sy + 3; // 地表下 3 格：实心且在挖掘半径内
+            Assert.True(world.Tiles[tx, ty].Active);
+            var type = world.Tiles[tx, ty].Type;
+
+            await s.SendAsync(PacketId.TileBreak, new TileBreakPacket(tx, ty, 0) { TileType = type });
+            Assert.True(await TickUntilAsync(server, () => !world.Tiles[tx, ty].Active, TimeSpan.FromSeconds(5)),
+                "挖砖未在服务端生效");
+
+            // 落盘（生产环境由 1Hz 世界循环触发；此处显式调用并循环到目标格确实入库）
+            bool saved = false;
+            for (int i = 0; i < 20 && !saved; i++)
+            {
+                await server.Host.FlushWorldChangesAsync();
+                var records = await server.Host.WorldRepo!.LoadTileChangesAsync();
+                saved = records.Any(r => r.X == tx && r.Y == ty);
+            }
+            Assert.True(saved, "挖掉的图格未能落盘");
+        }
+
+        // ---- 第二次运行：复用同一 DB → 改动应被回放 ----
+        using (var server = VanillaServer.Start(dir: dir))
+        {
+            var world = server.Host.Simulator.State;
+
+            // 基准世界为确定性程序化生成，该格本应为实心；回放后必须仍为空
+            Assert.False(world.Tiles[tx, ty].Active,
+                "重启后玩家挖掉的方块又回来了（世界改动未持久化）");
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { /* 清理失败可忽略 */ }
+    }
+
+    // ========================================================================
+    // 二十·补三、世界文件（.wld）：作为基准世界加载 + 导出
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_WorldFile_Is_Used_As_Base_World()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-worldload-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var wldPath = Path.Combine(dir, "custom.wld");
+
+        // 造一个可识别的世界文件：改世界名 / 出生点，并放一块特征图格
+        var source = WorldGenerator.GenerateSmall(worldName: "LoadedWorld");
+        source.SpawnTileX = 120;
+        source.Tiles[100, 100] = new Tile { Active = true, Type = 4, FrameX = 10, FrameY = 20 };
+        WorldFileWriter.Write(wldPath, source, keepBackup: false);
+
+        var configJson = $"{{\"WorldPath\": \"{wldPath.Replace("\\", "\\\\")}\"}}";
+        using var server = VanillaServer.Start(configJson: configJson, dir: dir);
+        var world = server.Host.Simulator.State;
+
+        Assert.Equal("LoadedWorld", world.WorldName);
+        Assert.Equal(source.MaxTilesX, world.MaxTilesX);
+        Assert.Equal(source.MaxTilesY, world.MaxTilesY);
+        Assert.Equal(120, world.SpawnTileX);
+        Assert.True(world.Tiles[100, 100].Active);
+        Assert.Equal(4, world.Tiles[100, 100].Type);
+        Assert.Equal(10, world.Tiles[100, 100].FrameX);
+        Assert.Equal(20, world.Tiles[100, 100].FrameY);
+
+        // 登录链仍可完成（世界尺寸 / 出生点源自文件）
+        await using var s = await server.ConnectAsync("Alice");
+        Assert.Contains(s.HandshakePackets, p => p is FinishedConnectingPacket);
+    }
+
+    [Fact]
+    public void Vanilla_World_Is_Exported_To_Wld_When_Configured()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-worldexport-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var exportPath = Path.Combine(dir, "export.wld");
+
+        var configJson = $"{{\"WorldExportPath\": \"{exportPath.Replace("\\", "\\\\")}\"}}";
+        using var server = VanillaServer.Start(configJson: configJson, dir: dir);
+        var world = server.Host.Simulator.State;
+
+        // 未配置导出路径时不应产生文件；配置后导出应落地
+        Assert.False(File.Exists(exportPath));
+        Assert.True(server.Host.TryExportWorld(force: true), "世界导出未执行");
+        Assert.True(File.Exists(exportPath), "导出文件不存在");
+
+        // 导出的文件必须能被读取器读回，且内容与内存世界一致
+        var loaded = WorldFileReader.Read(exportPath);
+        Assert.Equal(world.WorldName, loaded.WorldName);
+        Assert.Equal(world.WorldId, loaded.WorldId);
+        Assert.Equal(world.MaxTilesX, loaded.MaxTilesX);
+        Assert.Equal(world.MaxTilesY, loaded.MaxTilesY);
+        Assert.Equal(world.SpawnTileX, loaded.SpawnTileX);
+        Assert.Equal(world.Progress.HardMode, loaded.Progress.HardMode);
+
+        // 未配置导出路径时不导出
+        using var plain = VanillaServer.Start();
+        Assert.False(plain.Host.TryExportWorld(force: true), "未配置导出路径却执行了导出");
+    }
+
+    // ========================================================================
+    // 二十·补四、断线会话恢复（宽限期内同身份重连接管原运行时）
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_SessionResume_Restores_Position_And_Hp()
+    {
+        using var server = VanillaServer.Start();
+        var world = server.Host.Simulator.State;
+
+        var a = await server.ConnectAsync("Alice");
+        var spawnX = world.SpawnTileX * 16f + 8f;
+        var spawnY = world.SpawnTileY * 16f - 8f;
+        await StandAtAsync(server, a, spawnX + 320f, spawnY);
+        for (int i = 0; i < 30; i++) server.Host.Simulator.Tick();   // 让重力 / 落地结算稳定后再取样
+
+        float savedX, savedY;
+        lock (world.PlayersLock)
+        {
+            var p = world.Players.Values.Single();
+            savedX = p.Position.X;
+            savedY = p.Position.Y;
+            p.Hp = 42;   // 与满血区分，便于验证状态一并交还
+        }
+
+        // 断线：运行时应移出在线集合（旧实现从不释放，会留下永不回收的幽灵运行时）
+        await a.DisposeAsync();
+        Assert.True(await TickUntilAsync(server, () => world.Players.Count == 0, TimeSpan.FromSeconds(5)),
+            "断线后在线运行时未释放");
+
+        // 同身份（玩家名）重连 → 接管原运行时
+        await using var b = await server.ConnectAsync("Alice");
+        Assert.True(await TickUntilAsync(server, () => world.Players.Count == 1, TimeSpan.FromSeconds(5)),
+            "重连后未建立玩家运行时");
+
+        var resumed = world.Players.Values.Single();
+        Assert.InRange(resumed.Position.X, savedX - 3f, savedX + 3f);
+        Assert.InRange(resumed.Position.Y, savedY - 3f, savedY + 3f);
+        Assert.Equal(42, resumed.Hp);   // 血量等运行时状态一并交还
+
+        // 世界同步应下发**携恢复后坐标**的出生包（而非世界出生点）
+        var resumedX = resumed.Position.X;
+        var resumedY = resumed.Position.Y;
+        await server.Host.BroadcastWorldStateAsync();
+        var got = await b.ReadUntilAsync(p => p is PlayerSpawnPacket, TimeSpan.FromSeconds(5));
+        var spawn = Assert.Single(got.OfType<PlayerSpawnPacket>());
+        Assert.Equal((short)MathF.Floor(resumedX / 16f), spawn.SpawnX);
+        Assert.Equal((short)MathF.Floor(resumedY / 16f), spawn.SpawnY);
+        Assert.NotEqual((short)world.SpawnTileX, spawn.SpawnX);
+    }
+
+    [Fact]
+    public async Task Vanilla_SessionResume_Off_When_Grace_Is_Zero()
+    {
+        using var server = VanillaServer.Start(configJson: "{\"SessionResumeGraceSeconds\": 0}");
+        var world = server.Host.Simulator.State;
+
+        var a = await server.ConnectAsync("Alice");
+        await StandAtAsync(server, a, world.SpawnTileX * 16f + 8f + 320f, world.SpawnTileY * 16f - 8f);
+        world.Players.Values.Single().Hp = 42;   // 断线前人为压低血量，用于验证「未接管」
+
+        await a.DisposeAsync();
+        Assert.True(await TickUntilAsync(server, () => world.Players.Count == 0, TimeSpan.FromSeconds(5)),
+            "断线后在线运行时未释放");
+
+        // 宽限期 0 → 不保留会话：登录阶段不会凭空造出运行时（运行时由移动包惰性创建），
+        // 说明旧会话未被接管。
+        await using var b = await server.ConnectAsync("Alice");
+        Assert.Empty(world.Players);
+
+        // 重连后是全新运行时：满血、而非断线前的 42
+        await StandAtAsync(server, b, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        Assert.Equal(100, world.Players.Values.Single().Hp);
+    }
+
+    [Fact]
+    public void SessionResume_Expires_After_Grace()
+    {
+        var world = new WorldState { MaxTilesX = 8, MaxTilesY = 8, Tiles = new TileMap(8, 8) };
+        world.Players[1] = new PlayerRuntime { Id = 1, Position = new Vector2(100f, 200f), Hp = 7 };
+
+        world.MarkPlayerOffline(1, "Alice", graceTicks: 60);
+        Assert.Empty(world.Players);                                  // 已移出在线集合
+
+        world.Tick += 61;                                             // 时间推进越过宽限期
+        Assert.Equal(1, world.ReapOfflineSessions());                 // 过期会话被回收
+        Assert.False(world.TryResumePlayer(2, "Alice"));              // 过期后不再认回
+        Assert.Empty(world.Players);
+
+        // 宽限期内则应认回，并保留状态
+        world.Players[3] = new PlayerRuntime { Id = 3, Position = new Vector2(11f, 22f), Hp = 33 };
+        world.MarkPlayerOffline(3, "Bob", graceTicks: 60);
+        Assert.True(world.TryResumePlayer(4, "Bob"));
+        Assert.Equal(11f, world.Players[4].Position.X);
+        Assert.Equal(33, world.Players[4].Hp);
     }
 
     // ========================================================================

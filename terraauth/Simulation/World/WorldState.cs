@@ -24,6 +24,78 @@ public sealed class WorldState
     /// </summary>
     public object PlayersLock { get; } = new();
 
+    /// <summary>离线会话（宽限期内可被同身份重连认回）：恢复键 → 运行时 + 截止 tick。受 <see cref="PlayersLock"/> 保护。</summary>
+    private readonly Dictionary<string, OfflineSession> _offlineSessions = new(StringComparer.Ordinal);
+
+    private sealed record OfflineSession(PlayerRuntime Runtime, long DeadlineTick);
+
+    /// <summary>
+    /// 玩家断线：把运行时移出在线集合（**这同时修掉「断线运行时永不释放」的泄漏**）。
+    /// <paramref name="graceTicks"/> &gt; 0 且恢复键非空时挂入离线会话，供同身份重连认回；否则直接丢弃。
+    /// </summary>
+    public void MarkPlayerOffline(int playerId, string resumeKey, long graceTicks)
+    {
+        PlayerRuntime? runtime;
+        lock (PlayersLock)
+        {
+            if (!Players.TryGetValue(playerId, out runtime)) return;
+            Players.Remove(playerId);
+        }
+
+        runtime.Active = false;
+        runtime.Velocity = new Vector2(0, 0);
+
+        if (graceTicks <= 0 || string.IsNullOrEmpty(resumeKey)) return;
+
+        runtime.ResumeKey = resumeKey;
+        lock (PlayersLock)
+            _offlineSessions[resumeKey] = new OfflineSession(runtime, Tick + graceTicks);
+    }
+
+    /// <summary>
+    /// 尝试把离线会话认回到新槽位（同身份重连）：保留位置 / 血量 / 增益等运行时状态，
+    /// 并置 <see cref="PlayerRuntime.Resumed"/>（世界同步据此下发携原坐标的出生包，跳过出生点重定位）。
+    /// </summary>
+    public bool TryResumePlayer(int newPlayerId, string resumeKey)
+    {
+        if (string.IsNullOrEmpty(resumeKey)) return false;
+
+        lock (PlayersLock)
+        {
+            if (!_offlineSessions.TryGetValue(resumeKey, out var session)) return false;
+            _offlineSessions.Remove(resumeKey);
+            if (session.DeadlineTick <= Tick) return false;   // 已超宽限期 → 按新玩家处理
+
+            var runtime = session.Runtime;
+            runtime.Id = newPlayerId;
+            runtime.Active = true;
+            runtime.Resumed = true;
+            runtime.RespawnNotified = false;   // 世界同步据此下发包 12（携恢复后的坐标）
+            Players[newPlayerId] = runtime;
+            return true;
+        }
+    }
+
+    /// <summary>回收超过宽限期的离线会话（由世界同步循环调用）；返回回收数量。</summary>
+    public int ReapOfflineSessions()
+    {
+        lock (PlayersLock)
+        {
+            if (_offlineSessions.Count == 0) return 0;
+
+            List<string>? expired = null;
+            foreach (var kv in _offlineSessions)
+            {
+                if (kv.Value.DeadlineTick > Tick) continue;
+                (expired ??= new List<string>()).Add(kv.Key);
+            }
+
+            if (expired is null) return 0;
+            foreach (var key in expired) _offlineSessions.Remove(key);
+            return expired.Count;
+        }
+    }
+
     // ---- 图格 ----
     public TileMap Tiles { get; set; } = new(1, 1);
 
@@ -245,6 +317,8 @@ public sealed class WorldState
             if (_liquidPendingSync.Count < MaxPendingLiquidSync)
                 _liquidPendingSync.Add((x, y));
         }
+
+        MarkPersistTile(x, y); // 液体属于图格字段，一并纳入持久化
     }
 
     /// <summary>取出至多 <paramref name="max"/> 格待仿真液体（并从待处理集合移除）。</summary>
@@ -298,6 +372,8 @@ public sealed class WorldState
             if (_pendingTileUpdates.Count < MaxPendingTileUpdates)
                 _pendingTileUpdates.Add(y * CoordPackStride + x);
         }
+
+        MarkPersistTile(x, y); // 同时登记持久化（服务端重启后回放）
     }
 
     /// <summary>取出至多 <paramref name="max"/> 格待推送图格（并从待推送集合移除）。</summary>
@@ -315,6 +391,90 @@ public sealed class WorldState
             }
 
             foreach (var (x, y) in result) _pendingTileUpdates.Remove(y * CoordPackStride + x);
+            return result;
+        }
+    }
+
+    // ---- 世界改动持久化（服务端重启后回放，避免玩家建筑 / 箱子丢失）----
+
+    /// <summary>待落盘集合的跨线程保护：仿真线程登记，持久化线程消费。</summary>
+    public object WorldPersistLock { get; } = new();
+
+    /// <summary>单批落盘的图格数上限（同时决定最大排空速率：<c>PersistBatchSize × 落盘频率</c>）。</summary>
+    public const int PersistBatchSize = 8192;
+
+    /// <summary>待落盘坐标集合上限（约 1 MB）：超过则不再增长，降级为「全图扫描」模式。</summary>
+    private const int MaxPendingPersistTiles = 262_144;
+
+    private readonly HashSet<int> _pendingPersistTiles = new();
+
+    /// <summary>全图扫描模式：待处理集合曾溢出，改用游标遍历全图保证最终一致（内存有界）。</summary>
+    private bool _persistFullScan;
+    private int _fullScanX;
+    private int _fullScanY;
+
+    /// <summary>是否仍有改动未落盘（停机冲刷用）。</summary>
+    public bool HasPendingPersist
+    {
+        get { lock (WorldPersistLock) return _persistFullScan || _pendingPersistTiles.Count > 0; }
+    }
+
+    /// <summary>登记一格需要落盘的图格改动（挖 / 放 / 墙 / 液体 / 电线 / 执行器 / 混合反应）。</summary>
+    public void MarkPersistTile(int x, int y)
+    {
+        if (x < 0 || x >= MaxTilesX || y < 0 || y >= MaxTilesY) return;
+
+        lock (WorldPersistLock)
+        {
+            // 改动量极端大（如大范围液体流动）：内存有界优先，降级为全图扫描兜底
+            if (_pendingPersistTiles.Count >= MaxPendingPersistTiles)
+            {
+                _persistFullScan = true;
+                return;
+            }
+
+            _pendingPersistTiles.Add(y * CoordPackStride + x);
+        }
+    }
+
+    /// <summary>
+    /// 取出本批待落盘的图格坐标（取出的会从待处理集合移除）。
+    /// 若曾因改动量过大降级为全图扫描，则按游标遍历全图；走完一整遍后自动回到正常模式。
+    /// </summary>
+    public List<(int X, int Y)> DrainPersistTiles(int max)
+    {
+        lock (WorldPersistLock)
+        {
+            var result = new List<(int X, int Y)>(Math.Min(max, _pendingPersistTiles.Count + 1));
+
+            if (_persistFullScan)
+            {
+                while (result.Count < max)
+                {
+                    result.Add((_fullScanX, _fullScanY));
+
+                    if (++_fullScanY < MaxTilesY) continue;
+
+                    _fullScanY = 0;
+                    if (++_fullScanX < MaxTilesX) continue;
+
+                    // 一整遍走完 → 全图均已落盘，回到正常模式
+                    _fullScanX = 0;
+                    _persistFullScan = false;
+                    break;
+                }
+                return result;
+            }
+
+            if (_pendingPersistTiles.Count == 0) return result;
+
+            foreach (var packed in _pendingPersistTiles)
+            {
+                result.Add((packed % CoordPackStride, packed / CoordPackStride));
+                if (result.Count >= max) break;
+            }
+
+            foreach (var (x, y) in result) _pendingPersistTiles.Remove(y * CoordPackStride + x);
             return result;
         }
     }
@@ -562,6 +722,13 @@ public sealed class PlayerRuntime
     public int Hp = 100;
     public int HpMax = 100;
 
+    /// <summary>法力 / 法力上限（包 42 权威跟踪；原版不对他人转发法力）。</summary>
+    public int Mp = 20;
+    public int MpMax = 20;
+
+    /// <summary>服务端持有的增益 / 减益列表（包 50 权威；上限与原版增益槽位数一致，44）。</summary>
+    public readonly List<int> Buffs = new();
+
     /// <summary>是否处于死亡状态：死亡后不再参与物理 / 战斗，直到复活命令复位。</summary>
     public bool Dead;
 
@@ -576,6 +743,12 @@ public sealed class PlayerRuntime
 
     /// <summary>连续下落距离（像素），落地时用于结算下落伤害。</summary>
     public float FallDistance;
+
+    /// <summary>会话恢复键（玩家名）：断线后用于在宽限期内认回同一运行时。</summary>
+    public string ResumeKey = "";
+
+    /// <summary>本次进服是否由「会话恢复」接管：跳过出生点重定位、保留原坐标与状态。</summary>
+    public bool Resumed;
 }
 
 /// <summary>

@@ -28,6 +28,7 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
 {
     private readonly ShardedAuthorityProcessor<InboundWork, AuthorityResult> _processor;
     private readonly Channel<InboundWork> _queue;
+    private readonly IInboundPipeline _inner;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _dispatcher;
     private readonly int _maxBatchSize;
@@ -35,11 +36,14 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
     public ShardedInboundPipeline(IInboundPipeline inner, int shardCount, int maxBatchSize = 64)
     {
         ArgumentNullException.ThrowIfNull(inner);
+        _inner = inner;
         _maxBatchSize = Math.Max(1, maxBatchSize);
         _processor = new ShardedAuthorityProcessor<InboundWork, AuthorityResult>(
             shardCount,
-            (_, work) => inner.ProcessAsync(work.Packet, work.PlayerId, work.Commands, work.Ct)
-                .GetAwaiter().GetResult());
+            (_, work) => work.IsReset
+                ? ResetPlayerCore(work.PlayerId)
+                : inner.ProcessAsync(work.Packet!, work.PlayerId, work.Commands!, work.Ct)
+                    .GetAwaiter().GetResult());
         _queue = Channel.CreateUnbounded<InboundWork>(new UnboundedChannelOptions { SingleReader = true });
         _dispatcher = Task.Run(() => DispatchLoopAsync(_cts.Token));
     }
@@ -55,6 +59,18 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
         if (!_queue.Writer.TryWrite(new InboundWork(packet, playerId, commands, ct, completion)))
             completion.TrySetException(new ObjectDisposedException(nameof(ShardedInboundPipeline)));
         return completion.Task;
+    }
+
+    /// <summary>
+    /// 连接结束：把「按玩家重置」投递到**同一队列 / 同一分片**，保证该玩家在途包先处理完再清状态
+    /// （否则在途的旧位置包会把基线重新写回，重连后仍被判超速）。
+    /// </summary>
+    public void ResetPlayer(int playerId) => _queue.Writer.TryWrite(InboundWork.Reset(playerId));
+
+    private AuthorityResult ResetPlayerCore(int playerId)
+    {
+        _inner.ResetPlayer(playerId);
+        return AuthorityResult.Accept(null);
     }
 
     /// <summary>单调度协程：按到达顺序批量取出，交给分片处理器，再把结果回填到各自的 TCS。</summary>
@@ -83,13 +99,14 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
                 catch (Exception ex)
                 {
                     foreach (var work in batch)
-                        work.Completion.TrySetException(ex);
+                        work.Completion?.TrySetException(ex);
                     continue;
                 }
 
                 // ProcessBatchAsync 保序返回 → 按下标回填，保证每个调用方拿到自己的结果
+                // （「按玩家重置」工作项无等待方，Completion 为 null）
                 for (var i = 0; i < batch.Count; i++)
-                    batch[i].Completion.TrySetResult(results[i]);
+                    batch[i].Completion?.TrySetResult(results[i]);
             }
         }
         catch (OperationCanceledException)
@@ -100,7 +117,7 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
         {
             // 停机时唤醒所有仍等待的调用方，避免悬挂
             while (_queue.Reader.TryRead(out var pending))
-                pending.Completion.TrySetCanceled();
+                pending.Completion?.TrySetCanceled();
         }
     }
 
@@ -119,10 +136,18 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
         _cts.Dispose();
     }
 
+    /// <summary>
+    /// 一件待处理工作：普通包处理（<see cref="IsReset"/> = false）或「按玩家重置」（无包、无等待方）。
+    /// </summary>
     private sealed record InboundWork(
-        INetworkPacket Packet,
+        INetworkPacket? Packet,
         int PlayerId,
-        CommandQueue Commands,
+        CommandQueue? Commands,
         CancellationToken Ct,
-        TaskCompletionSource<AuthorityResult> Completion);
+        TaskCompletionSource<AuthorityResult>? Completion,
+        bool IsReset = false)
+    {
+        public static InboundWork Reset(int playerId)
+            => new(null, playerId, null, default, null, IsReset: true);
+    }
 }

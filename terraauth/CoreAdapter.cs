@@ -275,8 +275,8 @@ public sealed class ServerApi : IServerApi
     }
 
     /// <summary>
-    /// 组装插件可见的玩家快照：名称取自包 4 记录的外观，HP / 坐标取自世界运行时状态。
-    /// 注意：当前法力值未在服务端跟踪（<see cref="WorldState"/> 只维护 HP），Mp / MaxMp 恒为 0。
+    /// 组装插件可见的玩家快照：名称取自包 4 记录的外观，HP / 法力 / 坐标取自世界运行时状态。
+    /// HP 与法力均由服务端权威跟踪（包 16 / 包 42）。
     /// </summary>
     private PlayerStateSnapshot BuildSnapshot(int playerId, bool isConnected)
     {
@@ -288,8 +288,8 @@ public sealed class ServerApi : IServerApi
             Name: name,
             Hp: runtime?.Hp ?? 0,
             MaxHp: runtime?.HpMax ?? 0,
-            Mp: 0,
-            MaxMp: 0,
+            Mp: runtime?.Mp ?? 0,
+            MaxMp: runtime?.MpMax ?? 0,
             X: runtime?.Position.X ?? 0f,
             Y: runtime?.Position.Y ?? 0f,
             IsConnected: isConnected);

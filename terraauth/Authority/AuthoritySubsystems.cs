@@ -49,6 +49,13 @@ public sealed record WorldLimits(int MaxTileBreakPerSecond, int MaxTilePlacePerS
 
 internal sealed class PlayerAuthority : IPlayerAuthority
 {
+    /// <summary>增益槽位上限（与原版玩家增益数组长度一致）。</summary>
+    private const int MaxBuffSlots = 44;
+
+    /// <summary>有效增益 ID 区间（0 表示无增益；上限为原版增益总数 - 1）。</summary>
+    private const int MinBuffId = 1;
+    private const int MaxBuffId = 400;
+
     private readonly IAuditLogger _audit;
     private volatile PlayerLimits _limits;
     private readonly ConcurrentDictionary<int, PlayerStats> _stats = new();
@@ -63,6 +70,9 @@ internal sealed class PlayerAuthority : IPlayerAuthority
         return packet switch
         {
             PlayerHealthPacket hp => ValidateHealth(hp, playerId),
+            PlayerManaPacket mana => ValidateMana(mana, playerId),
+            PlayerHealPacket heal => ValidateHeal(heal, playerId),
+            PlayerBuffsPacket buffs => ValidateBuffs(buffs, playerId),
             PlayerHurtV2Packet hurt => ValidateHurt(hurt, playerId),
             PlayerDeathV2Packet death => ValidateDeath(death, playerId),
             _ => AuthorityResult.Accept(packet),
@@ -110,6 +120,87 @@ internal sealed class PlayerAuthority : IPlayerAuthority
     }
 
     /// <summary>
+    /// 玩家法力（包 42）：与血量同口径——上限由服务端持有，客户端不得抬高；
+    /// 当前法力不得高于上限。原版不向他人转发法力，故此处只维护服务端权威值。
+    /// </summary>
+    private AuthorityResult ValidateMana(PlayerManaPacket mana, int playerId)
+    {
+        if (mana.Mana < 0 || mana.MaxMana <= 0)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "mana_rejected", "invalid_mana",
+                new { mana.Mana, mana.MaxMana }));
+            return AuthorityResult.Reject("invalid_mana");
+        }
+
+        var state = _stats.GetOrAdd(playerId, _ => new PlayerStats(_limits.MaxHp, _limits.MaxMana));
+        lock (state.Gate)
+        {
+            if (mana.MaxMana > state.MaxMana)
+            {
+                _audit.Log(AuditEvent.Now(playerId, "authority", "mana_corrected", "max_mana_exceeded",
+                    new { ClientMaxMana = mana.MaxMana, ServerMaxMana = state.MaxMana }));
+                return AuthorityResult.Correct(
+                    new PlayerManaPacket(playerId, Math.Min(mana.Mana, state.MaxMana), state.MaxMana),
+                    "max_mana_exceeded");
+            }
+
+            if (mana.Mana > mana.MaxMana)
+            {
+                _audit.Log(AuditEvent.Now(playerId, "authority", "mana_corrected", "mana_exceeded",
+                    new { ClientMana = mana.Mana, MaxMana = mana.MaxMana }));
+                return AuthorityResult.Correct(
+                    new PlayerManaPacket(playerId, mana.MaxMana, mana.MaxMana),
+                    "mana_exceeded");
+            }
+
+            state.Mana = mana.Mana;
+            state.MaxMana = mana.MaxMana;
+            return AuthorityResult.Accept(mana);
+        }
+    }
+
+    /// <summary>
+    /// 玩家治疗（包 35）：原版由客户端声明治疗量，此处只做非负校验；
+    /// 真正的回血上限由仿真层 HealPlayerCommand 钳制到服务端 HpMax（服务端生命不越界）。
+    /// </summary>
+    private AuthorityResult ValidateHeal(PlayerHealPacket heal, int playerId)
+    {
+        if (heal.Amount < 0)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "heal_rejected", "invalid_heal",
+                new { heal.Amount }));
+            return AuthorityResult.Reject("invalid_heal");
+        }
+        return AuthorityResult.Accept(heal);
+    }
+
+    /// <summary>
+    /// 玩家增益（包 50）：服务端持有增益列表唯一真相。
+    /// 校验条目数不超过原版增益槽位数（44）且每个增益 ID 落在有效区间（1..400）。
+    /// </summary>
+    private AuthorityResult ValidateBuffs(PlayerBuffsPacket buffs, int playerId)
+    {
+        if (buffs.BuffTypes.Count > MaxBuffSlots)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "buffs_rejected", "too_many_buffs",
+                new { Count = buffs.BuffTypes.Count, Max = MaxBuffSlots }));
+            return AuthorityResult.Reject("too_many_buffs");
+        }
+
+        foreach (var buffId in buffs.BuffTypes)
+        {
+            if (buffId < MinBuffId || buffId > MaxBuffId)
+            {
+                _audit.Log(AuditEvent.Now(playerId, "authority", "buffs_rejected", "invalid_buff",
+                    new { BuffId = buffId }));
+                return AuthorityResult.Reject("invalid_buff");
+            }
+        }
+
+        return AuthorityResult.Accept(buffs);
+    }
+
+    /// <summary>
     /// 玩家受伤（包 117）：伤害只允许为非负值，实际扣血由仿真层结算（DamagePlayerCommand）。
     /// 负伤害等价于治疗（CE 改血的方向之一），直接拒绝。
     /// </summary>
@@ -145,12 +236,14 @@ internal sealed class PlayerAuthority : IPlayerAuthority
         public readonly Lock Gate = new();
         public int Hp;
         public int MaxHp;
-        public readonly int MaxMana;
+        public int Mana;
+        public int MaxMana;
 
         public PlayerStats(int maxHp, int maxMana)
         {
             Hp = maxHp;
             MaxHp = maxHp;
+            Mana = maxMana;
             MaxMana = maxMana;
         }
     }
@@ -191,6 +284,9 @@ internal sealed class MovementAuthority : IMovementAuthority
 
     /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
     internal void UpdateLimits(MovementLimits limits) => _limits = limits;
+
+    /// <summary>连接结束：丢弃该玩家的移动基线，使重连后的首个位置包重新建立基准。</summary>
+    public void ResetPlayer(int playerId) => _motion.TryRemove(playerId, out _);
 
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
     {
@@ -392,11 +488,54 @@ internal sealed class CombatAuthority : ICombatAuthority
     /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
     internal void UpdateLimits(CombatLimits limits) => _limits = limits;
 
+    /// <summary>有效弹幕类型区间（0 表示无弹幕；上限为原版弹幕总数 - 1）。</summary>
+    private const int MinProjectileType = 1;
+    private const int MaxProjectileType = 1135;
+
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
     {
-        if (packet is not NpcStrikePacket strike)
-            return AuthorityResult.Accept(packet);
+        return packet switch
+        {
+            ProjectileNewPacket proj => ValidateProjectile(proj, playerId),
+            NpcStrikePacket strike => ValidateStrike(strike, playerId),
+            _ => AuthorityResult.Accept(packet),
+        };
+    }
 
+    /// <summary>
+    /// 弹幕生成（包 27）：服务端登记实体并做基础校验。
+    /// 类型须落在有效区间；伤害由客户端声明，超过配置的单次伤害上限即判为作弊并拒绝
+    /// （与包 28 共用同一阈值；原版伤害由武器 / 装备推导，此处为简化上界模型）。
+    /// </summary>
+    private AuthorityResult ValidateProjectile(ProjectileNewPacket proj, int playerId)
+    {
+        if (proj.ProjectileKey < 0)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "projectile_rejected", "invalid_projectile_key",
+                new { proj.ProjectileKey }));
+            return AuthorityResult.Reject("invalid_projectile_key");
+        }
+
+        if (proj.ProjectileType < MinProjectileType || proj.ProjectileType > MaxProjectileType)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "projectile_rejected", "invalid_projectile_type",
+                new { proj.ProjectileType }));
+            return AuthorityResult.Reject("invalid_projectile_type");
+        }
+
+        if (proj.Damage < 0 || proj.Damage > _limits.MaxSingleDamage)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "projectile_rejected", "projectile_damage_exceeded",
+                new { proj.Damage, Max = _limits.MaxSingleDamage }));
+            return AuthorityResult.Reject("projectile_damage_exceeded");
+        }
+
+        return AuthorityResult.Accept(proj);
+    }
+
+    /// <summary>NPC 受击（包 28）：单次伤害上限 + 统计窗口内 DPS 上限。</summary>
+    private AuthorityResult ValidateStrike(NpcStrikePacket strike, int playerId)
+    {
         if (strike.NpcId < 0 || strike.Damage < 0)
         {
             _audit.Log(AuditEvent.Now(playerId, "authority", "strike_rejected", "invalid_strike",
@@ -426,7 +565,7 @@ internal sealed class CombatAuthority : ICombatAuthority
             }
         }
 
-        return AuthorityResult.Accept(packet);
+        return AuthorityResult.Accept(strike);
     }
 
     public int ComputeDamage(int playerId, int targetId) => DefaultBaseDamage;

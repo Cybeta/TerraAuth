@@ -146,6 +146,13 @@ public sealed class PacketEncoder : IPacketEncoder
                     bw.Write((short)health.MaxHp);
                     break;
 
+                case PlayerManaPacket mana:
+                    // PlayerMana（包 42）：Byte PlayerId + Int16 statMana + Int16 statManaMax
+                    bw.Write((byte)mana.PlayerId);
+                    bw.Write((short)mana.Mana);
+                    bw.Write((short)mana.MaxMana);
+                    break;
+
                 case TileBreakPacket tileBreak:
                     // TileManipulation（包 17）：Byte Action + Int16 X + Int16 Y + Int16 TileType + Byte Style
                     bw.Write(tileBreak.Action);

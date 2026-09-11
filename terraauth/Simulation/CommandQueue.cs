@@ -282,6 +282,8 @@ public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, by
         {
             world.Sections.ExitWrite(X, Y);
         }
+
+        world.MarkPersistTile(X, Y); // 客户端发起的图格改动同样要落盘（重启后回放）
     }
 }
 
@@ -378,6 +380,8 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
         {
             world.Sections.ExitWrite(X, Y);
         }
+
+        world.MarkPersistTile(X, Y); // 客户端发起的图格改动同样要落盘（重启后回放）
     }
 }
 
@@ -495,6 +499,68 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
                 return;
             }
         }
+    }
+}
+
+/// <summary>法力更新命令：包 42 权威通过后生成（服务端跟踪法力；原版不对他人转发）。</summary>
+public sealed record SetManaCommand(long Tick, int? PlayerId, int Mana, int MaxMana)
+    : Command(Tick, PlayerId, "set_mana")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int id || MaxMana <= 0)
+            return;
+
+        PlayerRuntime? player;
+        lock (world.PlayersLock)
+            world.Players.TryGetValue(id, out player);
+        if (player is null)
+            return;
+
+        player.MpMax = MaxMana;
+        player.Mp = Math.Clamp(Mana, 0, MaxMana);
+    }
+}
+
+/// <summary>
+/// 治疗命令：包 35 权威通过后生成。服务端为唯一真相源——回血上限钳制到服务端 HpMax，
+/// 客户端上报的超额治疗不会让服务端生命越界。
+/// </summary>
+public sealed record HealPlayerCommand(long Tick, int? PlayerId, int Amount)
+    : Command(Tick, PlayerId, "heal_player")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int id || Amount <= 0)
+            return;
+
+        PlayerRuntime? player;
+        lock (world.PlayersLock)
+            world.Players.TryGetValue(id, out player);
+        if (player is null || player.Dead)
+            return;
+
+        player.Hp = Math.Min(player.Hp + Amount, player.HpMax);
+    }
+}
+
+/// <summary>增益列表命令：包 50 权威通过后生成（服务端持有增益列表唯一真相）。</summary>
+public sealed record SetBuffsCommand(long Tick, int? PlayerId, IReadOnlyList<int> Buffs)
+    : Command(Tick, PlayerId, "set_buffs")
+{
+    public override void Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int id)
+            return;
+
+        PlayerRuntime? player;
+        lock (world.PlayersLock)
+            world.Players.TryGetValue(id, out player);
+        if (player is null)
+            return;
+
+        player.Buffs.Clear();
+        player.Buffs.AddRange(Buffs);
     }
 }
 

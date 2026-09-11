@@ -29,6 +29,9 @@ public sealed class GameHost : IDisposable
     public IMetrics Metrics { get; }
     public IBanManager Bans { get; }
 
+    /// <summary>世界改动仓储（图格 / 箱子增量落盘；启动时回放）。</summary>
+    public IWorldRepository? WorldRepo { get; }
+
     // ---- 核心管线（Phase 2/3/4/5）----
     public IInboundPipeline Pipeline { get; }
     public WorldSimulator Simulator { get; }
@@ -81,13 +84,15 @@ public sealed class GameHost : IDisposable
         WorkerPool workers,
         AuthorityEnforcers enforcers,
         CommandService commands,
-        IAsyncDisposable? pipelineDisposable = null)
+        IAsyncDisposable? pipelineDisposable = null,
+        IWorldRepository? worldRepo = null)
     {
         Config = config;
         Players = players;
         Audit = audit;
         Metrics = metrics;
         Bans = bans;
+        WorldRepo = worldRepo;
         Network = network;
         Pipeline = pipeline;
         Simulator = simulator;
@@ -134,11 +139,12 @@ public sealed class GameHost : IDisposable
         var bans = new BanManager(banStore, config, db);
 
         // 5. 权威层（Phase 2）+ 审计桥接
-        // 世界数据：程序化生成小世界（解除 1×1 默认世界导致的进服阻塞，见 WorldGenerator 注释）
-        var world = WorldGenerator.GenerateSmall();
-        Console.WriteLine(
-            $"[World] 程序化生成 {world.WorldName} {world.MaxTilesX}×{world.MaxTilesY}，" +
-            $"出生点 ({world.SpawnTileX},{world.SpawnTileY})，区块 {world.MaxTilesX / 200}×{world.MaxTilesY / 150}");
+        // 世界数据：优先加载配置指定的 .wld；未配置则程序化生成小世界（见 WorldGenerator 注释）
+        var world = LoadBaseWorld(config.Current.WorldPath);
+
+        // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
+        // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
+        ApplyPersistedWorldChanges(world, db);
         var commands = new CommandQueue();
         var recorder = new EventRecorder();
         var snapshots = new SnapshotStore();
@@ -205,7 +211,8 @@ public sealed class GameHost : IDisposable
             config.Current.PlayerWhitelist, hooks,
             new ViolationKickLimits(
                 config.Current.MaxViolationsBeforeBan,
-                config.Current.ViolationWindowMinutes * 60));
+                config.Current.ViolationWindowMinutes * 60),
+            sessionResumeGraceSeconds: config.Current.SessionResumeGraceSeconds);
         networkForNames = network; // HookedPipeline 的玩家名解析延迟绑定到此
 
         // 6.5 TModLoader 兼容层：Mod 列表解析 + 自定义包转发
@@ -250,7 +257,7 @@ public sealed class GameHost : IDisposable
         var host = new GameHost(
             config, db, db, metrics, bans, network, hookedPipeline, simulator, broadcaster, metricsServer,
             hooks, pluginLoader, modDetector, customPackets, tmodLoader, parallelConfig, workers, enforcers,
-            commandService, shardedPipeline);
+            commandService, shardedPipeline, worldRepo: db);
 
         // 订阅审计：权威层 Reject → Metrics + Ban 累计（架构 §4.5 数据流）
         auditLogger.OnViolation += (playerId, reason) =>
@@ -308,11 +315,161 @@ public sealed class GameHost : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 await BroadcastWorldStateAsync(ct).ConfigureAwait(false);
+                // 世界改动按 1Hz 落盘：够快（崩溃最多丢 1 秒改动）且写放大可控
+                await FlushWorldChangesAsync(ct).ConfigureAwait(false);
+                // 回收超过宽限期的离线会话（会话恢复的时间边界）
+                Simulator.State.ReapOfflineSessions();
+                // 空服时的全量 .wld 导出（配置了 WorldExportPath 才生效；内部自带间隔与在线判定）
+                TryExportWorld();
                 await Task.Delay(1000, ct).ConfigureAwait(false);
             }
         }, ct);
 
         await Task.WhenAll(simTask, netTask, snapTask, worldSyncTask).ConfigureAwait(false);
+
+        // 停机：把待落盘的世界改动冲刷干净（单批上限决定每轮吞吐，故循环到排空；
+        // 极端情况下（曾降级为全图扫描）最多多跑一遍全图，轮数有上限，不会挂死）
+        try
+        {
+            var world = Simulator.State;
+            int maxRounds = world.MaxTilesX * world.MaxTilesY / WorldState.PersistBatchSize + 4;
+            int rounds = 0;
+            while (world.HasPendingPersist && rounds++ < maxRounds)
+                await FlushWorldChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex) { Console.WriteLine($"[World] 停机落盘失败：{ex.Message}"); }
+
+        // 停机导出：此时增量已全部落盘，导出的 .wld 反映最终状态（可被再次作为基准世界加载）
+        TryExportWorld(force: true);
+    }
+
+    /// <summary>
+    /// 载入基准世界：配置了 <see cref="ServerConfig.WorldPath"/> 且文件存在 → 解析该 `.wld`；
+    /// 否则程序化生成小世界（保持既有默认行为）。
+    /// </summary>
+    private static WorldState LoadBaseWorld(string worldPath)
+    {
+        if (!string.IsNullOrWhiteSpace(worldPath) && File.Exists(worldPath))
+        {
+            var loaded = WorldFileReader.Read(worldPath);
+            Console.WriteLine(
+                $"[World] 已加载世界文件 {worldPath}：{loaded.WorldName} " +
+                $"{loaded.MaxTilesX}×{loaded.MaxTilesY}，出生点 ({loaded.SpawnTileX},{loaded.SpawnTileY})");
+            return loaded;
+        }
+
+        if (!string.IsNullOrWhiteSpace(worldPath))
+            Console.WriteLine($"[World] 世界文件不存在，回退为程序化生成：{worldPath}");
+
+        var generated = WorldGenerator.GenerateSmall();
+        Console.WriteLine(
+            $"[World] 程序化生成 {generated.WorldName} {generated.MaxTilesX}×{generated.MaxTilesY}，" +
+            $"出生点 ({generated.SpawnTileX},{generated.SpawnTileY})，区块 {generated.MaxTilesX / 200}×{generated.MaxTilesY / 150}");
+        return generated;
+    }
+
+    /// <summary>
+    /// 启动时回放世界改动：基准世界（程序化生成 / .wld 解析）是确定性的，
+    /// 因此只需把上次运行落盘的图格增量叠加回去即可复原玩家建筑。
+    /// </summary>
+    private static void ApplyPersistedWorldChanges(WorldState world, IWorldRepository repo)
+    {
+        IReadOnlyList<WorldTileRecord> tiles;
+        try
+        {
+            tiles = repo.LoadTileChangesAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[World] 世界改动回放失败（按基准世界启动）：{ex.Message}");
+            return;
+        }
+
+        int applied = 0;
+        foreach (var record in tiles)
+        {
+            if (record.X < 0 || record.X >= world.MaxTilesX ||
+                record.Y < 0 || record.Y >= world.MaxTilesY) continue;
+
+            world.Tiles[record.X, record.Y] = Tile.Deserialize(record.Data);
+            applied++;
+        }
+
+        if (applied > 0)
+            Console.WriteLine($"[World] 已回放上次运行的世界改动：图格 {applied} 格");
+    }
+
+    /// <summary>
+    /// 把服务端的图格改动落盘。由 1Hz 世界同步循环与停机时调用。
+    /// 落盘失败会把本批改动**重新排队**，避免「取出即丢」造成建筑丢失。
+    /// </summary>
+    public async Task FlushWorldChangesAsync(CancellationToken ct = default)
+    {
+        if (WorldRepo is null) return;
+
+        var world = Simulator.State;
+
+        var cells = world.DrainPersistTiles(WorldState.PersistBatchSize);
+        if (cells.Count > 0)
+        {
+            var records = new List<WorldTileRecord>(cells.Count);
+            foreach (var (x, y) in cells)
+            {
+                Tile tile;
+                using (world.Sections.EnterRead(x, y, x, y))
+                    tile = world.Tiles[x, y];
+                records.Add(new WorldTileRecord(x, y, Tile.Serialize(in tile)));
+            }
+
+            try
+            {
+                await WorldRepo.SaveTileChangesAsync(records).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                foreach (var (x, y) in cells) world.MarkPersistTile(x, y);
+                Console.WriteLine($"[World] 图格落盘失败（已重新排队 {cells.Count} 格）：{ex.Message}");
+            }
+        }
+    }
+
+    private DateTimeOffset _lastWorldExport = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// 把当前世界导出为 `.wld`（取 <see cref="ServerConfig.WorldExportPath"/>）。
+    /// <paramref name="force"/> = true（停机）无条件导出；否则仅当「无人在线且距上次导出超过配置间隔」时导出 ——
+    /// 全量序列化是 O(世界大小) 的，故有意避开在线时段（在线可靠性由增量日志负责）。
+    /// 导出走「临时文件 → 读回校验 → 原子替换」，不会用读不回来的文件覆盖已有世界。
+    /// </summary>
+    public bool TryExportWorld(bool force = false)
+    {
+        var path = Config.Current.WorldExportPath;
+        if (string.IsNullOrWhiteSpace(path)) return false;
+
+        var world = Simulator.State;
+
+        if (!force)
+        {
+            if ((DateTimeOffset.UtcNow - _lastWorldExport).TotalSeconds
+                < Math.Max(30, Config.Current.WorldExportIntervalSeconds)) return false;
+
+            bool online;
+            lock (world.PlayersLock) online = world.Players.Values.Any(p => p.Active);
+            if (online) return false;
+        }
+
+        try
+        {
+            WorldFileWriter.Write(path, world);
+            _lastWorldExport = DateTimeOffset.UtcNow;
+            Console.WriteLine($"[World] 已导出世界文件：{path}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[World] 世界导出失败（保留原文件）：{ex.Message}");
+            return false;
+        }
     }
 
     /// <summary>单批液体同步的最大条目数。</summary>
@@ -561,9 +718,20 @@ public sealed class GameHost : IDisposable
             else if (!p.Dead && !p.RespawnNotified)
             {
                 p.RespawnNotified = true;
-                // 复活点由服务端权威划定（世界出生点），并下发满血
+
+                // 出生点由服务端权威划定：常规为世界出生点；「会话恢复」则把客户端放回**恢复后的原坐标**，
+                // 送完即清标记（此后死亡复活仍回世界出生点）。
+                short spawnX = (short)world.SpawnTileX;
+                short spawnY = (short)world.SpawnTileY;
+                if (p.Resumed)
+                {
+                    p.Resumed = false;
+                    spawnX = (short)Math.Clamp((int)MathF.Floor(p.Position.X / TileSizePx), 0, world.MaxTilesX - 1);
+                    spawnY = (short)Math.Clamp((int)MathF.Floor(p.Position.Y / TileSizePx), 0, world.MaxTilesY - 1);
+                }
+
                 await Network.BroadcastAsync(PacketId.PlayerSpawn,
-                    new PlayerSpawnPacket((byte)p.Id, (short)world.SpawnTileX, (short)world.SpawnTileY,
+                    new PlayerSpawnPacket((byte)p.Id, spawnX, spawnY,
                         0, 0, 0, 0, 0), ct).ConfigureAwait(false);
                 await Network.BroadcastAsync(PacketId.PlayerHealth,
                     new PlayerHealthPacket(p.Id, p.Hp, p.HpMax), ct).ConfigureAwait(false);

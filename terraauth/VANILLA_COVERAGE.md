@@ -3,7 +3,7 @@
 > 记录「原版客户端会用到的功能」在服务端的实现与验证状态，供"测试原版所有功能"时对照。
 > 自动化验证见 [`Tests/VanillaFeatureTests.cs`](Tests/VanillaFeatureTests.cs)：**真实权威管线（GameHost.Bootstrap）+ 真实 TCP**，
 > 与 `IntegrationTests`（多为桩管线）互补。
-> 最后更新：2026-09-11
+> 最后更新：2026-09-12
 
 ---
 
@@ -17,6 +17,7 @@
 | 请求出生区块 | 8 | 回包 9（进度）+ 逐块 10 + 49（出生） | `Vanilla_LoginChain_...` |
 | 进入世界 | 12 | 置 Playing → 包 129 + 广播外观 4 / 激活 14 | `Vanilla_Join_Marks_Self_Active` |
 | 玩家激活在线 / 离线 | 14 | 进服广播激活；断线广播 `Active=false` | `Vanilla_PlayerDisconnect_Broadcasts_Inactive` |
+| **断线会话保留 + 槽位回收** | 14 | 断线不销毁运行时：按玩家名保留位置 / 血量 / 增益（`SessionResumeGraceSeconds`，默认 60s），宽限期内同身份重连**认回原运行时**并下发**携带恢复坐标**的出生包（12）；超期 / 被顶号回收。断开时释放连接槽位与并发容量，新连接复用**最小空闲 ID**（与原版一致）。注：原版客户端断线即回主菜单，故为「手动重进的会话接管」而非自动重连 | `Vanilla_SessionResume_Restores_Position_And_Hp` / `..._Off_When_Grace_Is_Zero` / `SessionResume_Expires_After_Grace` |
 | 移动 / 位置 | 13 | 超速校验（`maxSpeed×60×Δt + 容差`）→ Command → 仿真 → 快照 15；并转发其他玩家 | `Vanilla_Movement_Accepted_And_Applied` / `..._Overspeed_IsRejected` |
 | 挖砖 | 17 | 越界 / 超距 / 图格类型对账 → TileBreakCommand → 图格变更 → 转发 | `Vanilla_TileBreak_Removes_Solid_Tile` / `..._OutOfReach_IsRejected` |
 | 放砖 | 79 | 越界 / 超距 / 类型范围 / **背包扣减（SSC）** → TilePlaceCommand | `Vanilla_InventoryReport_Then_TilePlace_Succeeds` / `..._Without_InventoryItem_IsRejected` |
@@ -37,6 +38,10 @@
 | **受伤 / 死亡（服务端结算）** | 117 / 118 | 伤害非负校验 → `DamagePlayerCommand` / `KillPlayerCommand` 结算服务端生命；归零置死亡态并由世界同步补发包 118 | `Vanilla_Hurt_Reduces_ServerHealth` / `Vanilla_Lethal_Hurt_Kills_And_Broadcasts_Death` / `Vanilla_Negative_Hurt_Is_Rejected` |
 | **服务端伤害来源（接触）** | 117 / 16 | `SimulateCombat` 判定敌怪 / Boss 接触（32px）→ `ApplyPlayerDamage` 扣血（60tick 免伤帧）→ 广播包 117 + 单发包 16 权威血量；下落伤害同样经该唯一入口 | `Vanilla_EnemyContact_Damages_Player_And_Notifies` / `Vanilla_ContactDamage_Has_ImmunityWindow` |
 | **复活（服务端划定复活点）** | 12 | Playing 阶段的包 12 = 复活请求 → `RespawnCommand`：忽略客户端坐标，固定回到世界出生点并满血；由世界同步补发包 12 / 16 | `Vanilla_Respawn_After_Death_Uses_Server_Spawn` |
+| **法力（服务端跟踪）** | 42 | 非负校验；法力上限由服务端持有，超出即下发纠正包；当前法力不得高于上限。原版不向他人转发法力，故只做权威跟踪 | `Vanilla_Mana_Is_Tracked_Server_Side` / `Vanilla_Mana_Above_Server_Max_Gets_Correction` |
+| **治疗（上限钳制）** | 35 | 非负校验 → `HealPlayerCommand`：回血上限钳制到服务端 HpMax，客户端超额治疗不会让服务端生命越界 | `Vanilla_Heal_Is_Clamped_To_Server_Max_Hp` / `Vanilla_Negative_Heal_Is_Rejected` |
+| **增益（服务端持有）** | 50 | 条目数 ≤ 44（原版增益槽位）且 ID ∈ [1,400] 校验通过后，由服务端持有增益列表（唯一真相） | `Vanilla_Buffs_Are_Held_Server_Side` / `Vanilla_Invalid_Buff_Id_Is_Rejected` |
+| **弹幕生成校验** | 27 | 弹幕类型须在 [1,1135]；伤害超单次上限即判为作弊拒绝（与包 28 共用阈值）；通过后由服务端登记实体 | `Vanilla_Projectile_Damage_Above_Limit_Is_Rejected` / `Vanilla_Projectile_Invalid_Type_Is_Rejected` |
 | **掉落物拾取** | 22 | 槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC）→ 移除世界实体并下发包 21（stack=0） | `Vanilla_ItemPickup_Removes_WorldItem` / `Vanilla_ItemPickup_OutOfReach_Is_Rejected` |
 | **弹幕命中判定** | 27 | 服务端按弹幕 / 敌怪距离判定命中并扣血，不再采信客户端声明 | `Vanilla_Projectile_Hit_Damages_Enemy` |
 | 请求传送（回城类） | 73 | 类型 / 频率校验（与 65 共窗口） | `Vanilla_TeleportRequest_Is_Accepted` / `Vanilla_TeleportRequest_RateExceeded_Is_Rejected` |
@@ -51,10 +56,13 @@
 
 | 功能 | 现状 | 备注 |
 |---|---|---|
-| 敌怪生成 / AI | 已**简化**实现：史莱姆 + 入侵哥布林 + Boss（眼魔 / 骷髅王 / 史莱姆王）直线追击 | 无原版刷怪规则（生物群系 / 昼夜细分 / 事件）、无 NPC 专属 AI 与接触伤害 |
+| 敌怪生成 / AI | 已**简化**实现：史莱姆 + 入侵哥布林 + Boss（眼魔 / 骷髅王 / 史莱姆王）直线追击 | 无原版刷怪规则（生物群系 / 昼夜细分 / 事件）、无 NPC 专属 AI；接触伤害已由服务端判定（见 §一「服务端伤害来源」） |
 | 箱子内容管理 | 已**服务端持有**：开箱下发权威内容，包 32 校验后落盘 | 未实现包 33（完整箱子同步）/ 箱子命名 / 上锁；客户端 UI 依赖服务端逐槽包 32 |
 | 电路 / 液体 | 已**简化实现**：液体逐格流动 + 混合反应 + NetLiquid 同步；线网 4 色 / 执行器编辑权威 + 受限 BFS 信号传播 | 无液体压力模型；无门电路 / 定时器 / 压力板（action 18 未建模） |
 | 世界进度 / Boss 事件 | 已**简化实现**：血月 / 日食 / 入侵 / Boss 击杀进度 + 掉落（简化表）+ 包 7 广播 | 未实现原版事件触发规则（祭坛 / 召唤物 / 生物群系）与 Boss 专属 AI 行为；掉落为简化表 |
+| 世界改动持久化 | 已**实现增量落盘 + 启动回放**：图格改动（含方块 / 墙 / 液体 / 电线 / 执行器）按 1Hz 落盘（单批 8192，集合溢出降级为全图扫描），重启后叠加回基准世界 | 未含箱子内容（当前基准世界无箱子，且包 34 放置未建模）；崩溃最多丢 1 秒改动 |
+| 世界文件（`.wld`）加载 / 导出 | 已**实现**：`ServerConfig.WorldPath` 指定 `.wld` 即作为基准世界开服；`WorldExportPath` 非空则停机 + 空服周期**导出整份 `.wld`**（自研写出器：全部 11 段含 5..9 段的合法空编码，写后读回校验 + 原子替换 + `.bak` 滚动） | 已验证：**逐格 round-trip** + **按原版加载器顺序的严格分段走查**（段起点递增、逐段位置断言、footer 用尽文件）。**未在**原版二进制**上实测加载**（本沙箱无法运行 TerrariaServer.exe，连其自建世界也崩溃） |
+| 断线重连 | 已**实现「手动重进的会话接管」**：宽限期（默认 60s）内以同身份重连 → 继承位置 / 血量 / 增益，出生点由服务端按恢复坐标下发 | 原版**无自动重连**（断线即 `Netplay.Disconnect` 回主菜单），故不做自动续传；宽限期外 / 被顶号则回收为全新会话 |
 
 > 结论：服务端已达「可进服 + 地形可见 + 彼此可见 + 挖放砖 / 箱子内容 / 液体 / 电路权威 + 受伤死亡复活 / 拾取 / 命中结算
 > + 聊天 + 时间 / NPC / Boss·事件同步」，并已从「简化刷怪」推进到「简化事件与 Boss 闭环」，
@@ -84,6 +92,9 @@
     （原版还允许覆盖可被黑曜石破坏的图格），且无液体压力模型。
 11. **区块超帧上限已有兜底**：编码后超过 `UInt16`（65535）时按较长轴二分拆分再发（`NetworkHost.SendTileSectionAsync`），
     避免高熵区块直接抛异常中断登录；原版是同通道的降级压缩路径，此处用拆分替代。
+12. **弹幕伤害为「上界校验」而非原版推导**：包 27 的伤害仍由客户端声明，服务端只保证不超过配置的单次伤害上限
+    （与包 28 共用阈值）；原版伤害由武器 / 装备推导，此处未建模武器表。法力 / 增益已改为服务端跟踪与持有，
+    但**增益的效果**仍由客户端计算（服务端只维护列表），属简化模型。
 
 ---
 

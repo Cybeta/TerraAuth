@@ -37,12 +37,16 @@ internal interface IDbExecutor
     void SaveBan(BanRecord record);
     bool IsBanned(Guid playerId, string ipAddress);
     void RemoveBan(Guid playerId);
+
+    // ---- 世界改动（IWorldRepository 复用同一 DB）----
+    void SaveWorldTiles(IReadOnlyList<WorldTileRecord> tiles);
+    IReadOnlyList<WorldTileRecord> LoadWorldTiles();
 }
 
 // ============================================================================
 // 公开入口：根据条件编译选择实现
 // ============================================================================
-public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IDisposable
+public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IWorldRepository, IDisposable
 {
     private readonly IDbExecutor _db;
     private readonly Channel<AuditEntry> _auditChannel = Channel.CreateUnbounded<AuditEntry>(
@@ -91,6 +95,15 @@ public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IDi
 
     public Task<IReadOnlyList<AuditEntry>> QueryRecentAsync(int limit)
         => Task.Run(() => _db.QueryRecentAudit(limit));
+
+    // ========================================================================
+    // IWorldRepository（世界改动增量落盘；空批次直接返回，避免无谓 Task）
+    // ========================================================================
+    public Task SaveTileChangesAsync(IReadOnlyList<WorldTileRecord> tiles)
+        => tiles.Count == 0 ? Task.CompletedTask : Task.Run(() => _db.SaveWorldTiles(tiles));
+
+    public Task<IReadOnlyList<WorldTileRecord>> LoadTileChangesAsync()
+        => Task.Run(() => _db.LoadWorldTiles());
 
     // ========================================================================
     // 后台批量落盘
@@ -145,6 +158,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
     private readonly ConcurrentDictionary<Guid, PlayerData> _players = new();
     private readonly ConcurrentDictionary<Guid, List<AuditEntry>> _audit = new();
     private readonly ConcurrentDictionary<Guid, BanRecord> _bans = new();
+    private readonly ConcurrentDictionary<(int X, int Y), WorldTileRecord> _worldTiles = new();
 
     public LiteDbPersistence(string dbPath, bool runMigrations)
     {
@@ -212,6 +226,16 @@ internal sealed class LiteDbPersistence : IDbExecutor
         if (_bans.TryRemove(playerId, out _)) SaveToDisk();
     }
 
+    // ---- 世界改动（内存 + JSON 持久化；整份重写，适合兜底场景）----
+    public void SaveWorldTiles(IReadOnlyList<WorldTileRecord> tiles)
+    {
+        if (tiles.Count == 0) return;
+        foreach (var t in tiles) _worldTiles[(t.X, t.Y)] = t;
+        SaveToDisk();
+    }
+
+    public IReadOnlyList<WorldTileRecord> LoadWorldTiles() => _worldTiles.Values.ToList();
+
     // ---- 磁盘持久化（JSON，模拟 SQLite 文件）----
     private void LoadFromDisk()
     {
@@ -227,6 +251,8 @@ internal sealed class LiteDbPersistence : IDbExecutor
                     _audit.GetOrAdd(e.PlayerId, _ => new List<AuditEntry>()).Add(e); // 启动期单线程
             if (dto.Bans is not null)
                 foreach (var b in dto.Bans) _bans[b.PlayerId] = b;
+            if (dto.WorldTiles is not null)
+                foreach (var t in dto.WorldTiles) _worldTiles[(t.X, t.Y)] = t;
         }
         catch { /* 首次启动无文件 / 解析失败，忽略 */ }
     }
@@ -243,6 +269,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
             Players = _players.Values.ToList(),
             Audit = audit,
             Bans = _bans.Values.ToList(),
+            WorldTiles = _worldTiles.Values.ToList(),
         };
         var tmp = _dbPath + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(dump));
@@ -254,6 +281,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
         public List<PlayerData>? Players { get; set; }
         public List<AuditEntry>? Audit { get; set; }
         public List<BanRecord>? Bans { get; set; }
+        public List<WorldTileRecord>? WorldTiles { get; set; }
     }
 }
 
@@ -328,6 +356,11 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
                 Reason TEXT NOT NULL DEFAULT '',
                 ExpiresAt TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_bans_ip ON Bans(IpAddress);
+            CREATE TABLE IF NOT EXISTS WorldTiles (
+                X INTEGER NOT NULL,
+                Y INTEGER NOT NULL,
+                Data BLOB NOT NULL,
+                PRIMARY KEY(X, Y));
             """);
     }
 
@@ -499,6 +532,42 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         using var conn = Open();
         Exec(conn, "DELETE FROM Bans WHERE PlayerId = $pid;",
             cmd => cmd.Parameters.AddWithValue("$pid", playerId.ToString()));
+    }
+
+    // ---- 世界改动（单事务批量 upsert，避免逐条 fsync）----
+    public void SaveWorldTiles(IReadOnlyList<WorldTileRecord> tiles)
+    {
+        if (tiles.Count == 0) return;
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO WorldTiles (X, Y, Data) VALUES ($x, $y, $data)
+            ON CONFLICT(X, Y) DO UPDATE SET Data = excluded.Data;
+            """;
+        var px = cmd.Parameters.Add("$x", SqliteType.Integer);
+        var py = cmd.Parameters.Add("$y", SqliteType.Integer);
+        var pd = cmd.Parameters.Add("$data", SqliteType.Blob);
+        foreach (var t in tiles)
+        {
+            px.Value = t.X;
+            py.Value = t.Y;
+            pd.Value = t.Data;
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    public IReadOnlyList<WorldTileRecord> LoadWorldTiles()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT X, Y, Data FROM WorldTiles;";
+        var list = new List<WorldTileRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read()) list.Add(new WorldTileRecord(r.GetInt32(0), r.GetInt32(1), (byte[])r[2]));
+        return list;
     }
 
     public void Dispose() { /* 连接池已禁用：连接随 using 释放，无跨连接资源需清理 */ }

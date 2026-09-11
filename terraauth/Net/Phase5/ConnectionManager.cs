@@ -2,6 +2,7 @@
 // 连接池、超时、踢出、并发上限
 
 using System.Collections.Concurrent;
+using System.Collections.Generic; // ICollection<KeyValuePair<,>>（槽位回收的原子双匹配）
 using TerraAuth.Protocol; // PacketId, INetworkPacket
 
 namespace TerraAuth.Net.Phase5;
@@ -49,14 +50,21 @@ public sealed class ConnectionManager
     public Connection? Get(int playerId) =>
         _connections.TryGetValue(playerId, out var c) ? c : null;
 
-    /// <summary>移除并释放连接，释放容量槽位。</summary>
-    public async Task RemoveAsync(int playerId)
+    /// <summary>
+    /// 移除并释放连接，释放容量槽位。
+    /// <paramref name="expected"/> 非空时按「键 + 实例」双匹配移除：槽位被回收后可能已被新连接复用，
+    /// 若仅按 PlayerId 移除会误杀新连接（被踢连接在 <c>RunAsync</c> 结束后会再次走到这里）。
+    /// </summary>
+    public async Task RemoveAsync(int playerId, Connection? expected = null)
     {
-        if (_connections.TryRemove(playerId, out var conn))
-        {
-            await conn.DisposeAsync().ConfigureAwait(false);
-            _capacity.Release();
-        }
+        if (!_connections.TryGetValue(playerId, out var conn)) return;
+        if (expected is not null && !ReferenceEquals(conn, expected)) return;
+        // ICollection.Remove 按「键 + 值」原子匹配：避免在槽位被新连接复用时误杀新连接
+        if (!((ICollection<KeyValuePair<int, Connection>>)_connections)
+                .Remove(new KeyValuePair<int, Connection>(playerId, conn))) return;
+
+        await conn.DisposeAsync().ConfigureAwait(false);
+        _capacity.Release();
     }
 
     /// <summary>

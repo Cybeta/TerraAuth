@@ -77,6 +77,7 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.Snapshot          => new SnapshotPacket(DecodeSnapshot(payload)),
             PacketId.NpcStrike         => DecodeNpcStrike(reader),
             PacketId.PlayerHealth      => DecodePlayerHealth(reader),
+            PacketId.PlayerMana        => DecodePlayerMana(reader),
             PacketId.TileBreak         => DecodeTileBreak(reader),
             PacketId.TilePlace         => DecodeTilePlace(reader),
             PacketId.ItemDrop          => DecodeSyncItem(reader),
@@ -389,6 +390,15 @@ public sealed class PacketDecoder : IPacketDecoder
         var hp = r.ReadInt16();
         var maxHp = r.ReadInt16();
         return new PlayerHealthPacket(playerId, hp, maxHp);
+    }
+
+    private INetworkPacket DecodePlayerMana(BinaryReader r)
+    {
+        // PlayerMana（包 42）：Byte id + Int16 statMana + Int16 statManaMax
+        var playerId = r.ReadByte();
+        var mana = r.ReadInt16();
+        var maxMana = r.ReadInt16();
+        return new PlayerManaPacket(playerId, mana, maxMana);
     }
 
     private INetworkPacket DecodeTileBreak(BinaryReader r)

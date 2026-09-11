@@ -42,6 +42,7 @@ public enum PacketId : byte
     SyncPlayerChestIndex = 34,  // 原版 SyncPlayerChestIndex：告知玩家当前打开的箱子索引（Byte 玩家 + Int16 箱子）
     PlayerHeal          = 35,   // 原版 PlayerHeal：治疗 / 回血事件
     SyncPlayerZone      = 36,   // 原版 SyncPlayerZone：生物群系 / 城镇 NPC 状态
+    PlayerMana          = 42,   // 原版 PlayerMana：法力 / 法力上限
     InitialSpawn        = 49,   // 原版 InitialSpawn：无 payload
     PlayerBuffs         = 50,   // 原版 PlayerBuffs：增益 / 减益列表
     TeleportEntity      = 65,   // 原版 TeleportEntity：玩家 / NPC / 玩家间传送（含确认）

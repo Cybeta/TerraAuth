@@ -59,6 +59,12 @@ public interface IInboundPipeline
         int playerId,
         CommandQueue commands,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 连接结束：清理按玩家索引的权威状态（如移动基线），避免槽位复用串号。
+    /// 默认无操作；包装型管线（Hook / 分片）需转发到内层。
+    /// </summary>
+    void ResetPlayer(int playerId) { }
 }
 
 // ---------- 六个权威子系统接口 ----------
@@ -74,6 +80,13 @@ public interface IMovementAuthority
 {
     AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
     float GetMaxSpeedFor(int playerId);
+
+    /// <summary>
+    /// 连接结束：清除该玩家索引上的权威状态（移动基线 / 传送频率窗口）。
+    /// 必须做，否则槽位复用（含「断线重连拿到同一槽位」）会把上一次会话的位置当作基准，
+    /// 使重连玩家的首个位置包被判超速而拒绝，甚至累计违规被踢。
+    /// </summary>
+    void ResetPlayer(int playerId);
 }
 
 public interface ICombatAuthority

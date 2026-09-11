@@ -3,6 +3,7 @@
 //   - 读写：世界文件的图格段与包 10（TileSection）的压缩块
 
 using System;
+using System.Buffers.Binary;
 using TerraAuth.Protocol;
 
 namespace TerraAuth.Simulation;
@@ -51,6 +52,63 @@ public struct Tile
 
     /// <summary>空图格：frameX/frameY = -1（与原版非重要图格一致）。</summary>
     public static readonly Tile Empty = new() { FrameX = -1, FrameY = -1 };
+
+    /// <summary>序列化字节数（定长，供世界改动持久化使用）。</summary>
+    public const int SerializedSize = 15;
+
+    /// <summary>把图格序列化为定长字节（字段顺序与 <see cref="Deserialize"/> 严格对应）。</summary>
+    public static byte[] Serialize(in Tile t)
+    {
+        var b = new byte[SerializedSize];
+        b[0] = (byte)((t.Active ? 1 : 0) | (t.HalfBrick ? 2 : 0) | (t.Wire ? 4 : 0) | (t.Wire2 ? 8 : 0)
+                    | (t.Wire3 ? 16 : 0) | (t.Wire4 ? 32 : 0) | (t.Actuator ? 64 : 0) | (t.InActive ? 128 : 0));
+        b[1] = (byte)((t.InvisibleBlock ? 1 : 0) | (t.InvisibleWall ? 2 : 0)
+                    | (t.FullbrightBlock ? 4 : 0) | (t.FullbrightWall ? 8 : 0));
+        BinaryPrimitives.WriteUInt16LittleEndian(b.AsSpan(2), t.Type);
+        BinaryPrimitives.WriteUInt16LittleEndian(b.AsSpan(4), t.Wall);
+        b[6] = t.Liquid;
+        b[7] = t.LiquidType;
+        b[8] = t.Slope;
+        b[9] = t.TileColor;
+        b[10] = t.WallColor;
+        BinaryPrimitives.WriteInt16LittleEndian(b.AsSpan(11), t.FrameX);
+        BinaryPrimitives.WriteInt16LittleEndian(b.AsSpan(13), t.FrameY);
+        return b;
+    }
+
+    /// <summary>从定长字节还原图格；长度不足返回 <see cref="Empty"/>。</summary>
+    public static Tile Deserialize(ReadOnlySpan<byte> b)
+    {
+        if (b.Length < SerializedSize) return Empty;
+
+        var t = Empty;
+        byte f1 = b[0];
+        t.Active = (f1 & 1) != 0;
+        t.HalfBrick = (f1 & 2) != 0;
+        t.Wire = (f1 & 4) != 0;
+        t.Wire2 = (f1 & 8) != 0;
+        t.Wire3 = (f1 & 16) != 0;
+        t.Wire4 = (f1 & 32) != 0;
+        t.Actuator = (f1 & 64) != 0;
+        t.InActive = (f1 & 128) != 0;
+
+        byte f2 = b[1];
+        t.InvisibleBlock = (f2 & 1) != 0;
+        t.InvisibleWall = (f2 & 2) != 0;
+        t.FullbrightBlock = (f2 & 4) != 0;
+        t.FullbrightWall = (f2 & 8) != 0;
+
+        t.Type = BinaryPrimitives.ReadUInt16LittleEndian(b[2..]);
+        t.Wall = BinaryPrimitives.ReadUInt16LittleEndian(b[4..]);
+        t.Liquid = b[6];
+        t.LiquidType = b[7];
+        t.Slope = b[8];
+        t.TileColor = b[9];
+        t.WallColor = b[10];
+        t.FrameX = BinaryPrimitives.ReadInt16LittleEndian(b[11..]);
+        t.FrameY = BinaryPrimitives.ReadInt16LittleEndian(b[13..]);
+        return t;
+    }
 
     public void CopyFrom(in Tile other) => this = other;
 }

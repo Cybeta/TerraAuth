@@ -6,10 +6,12 @@
 > **当前状态**：Phase 1-7 骨架 + Phase 6 完整实装 + **插件系统 / Mod 兼容层 / 多线程优化**（已整合）
 > + **Tile（挖 / 放方块）服务端权威全链路**（解码 → 权威校验 → Command → 仿真 → 增量广播 → SSC 背包扣减）
 > + **战斗 / 生存权威**（受伤→死亡→复活的 `DamagePlayerCommand` / `KillPlayerCommand` / `RespawnCommand`、
->   弹幕命中判定、掉落物拾取（包 22）+ SSC 入库、复活点由服务端划定）
+>   弹幕命中判定、掉落物拾取（包 22）+ SSC 入库、复活点由服务端划定；
+>   法力（包 42）服务端跟踪 + 纠正、治疗（包 35）上限钳制、增益（包 50）服务端持有、弹幕生成（包 27）类型 / 伤害校验）
 > + **世界内容权威**（箱子内容服务端持有（包 31/32/34）、液体 NetLiquid 编辑与逐格流动 + 混合反应、电路线网 / 执行器编辑
 >   + 受限 BFS 信号传播、简化 Boss / 事件状态机（血月 · 日食 · 入侵 · Boss 击杀进度 + 掉落 → 包 7 广播 / 包 21 掉落））
 > + **违规处置闭环**（权威拒绝累计达阈值 → 发包 2 踢出连接）
+> + **断线宽限期会话保留**（断开不销毁运行时，宽限期内同身份重连续回位置 / 血量 / 增益；连接槽位随即回收并复用最小空闲 ID）
 > + **热路径优化**（Hook 触发写时复制 · 每包零分配；`System.Threading.Lock`；`FrozenSet`）；
 > 运行时 **.NET 10**（`net10.0`），原版 Terraria 客户端已实测连接成功（协议协商 → 进入世界）。
 
@@ -80,17 +82,17 @@ TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=fa
 | `Simulation/WorldSimulator` | 已实现 | 六阶段 tick + 扩展阶段全部落地：AI（城镇 NPC 游走 / 敌怪 / 入侵怪 / Boss 追击）/ 物理（重力 + 图格碰撞 + 边界钳制）/ 战斗（下落伤害 + 弹幕命中判定 → 敌怪扣血、Boss 击杀记进度 + 生成掉落、玩家死亡置死亡态）/ 世界（昼夜 + 月相 + 简化事件：血月 · 日食）/ 实体（掉落物重力落地、弹幕积分与生存期）/ 液体（逐格简化流动 + 混合反应，下发按视口裁剪）/ 电路（`ActuateCommand` 沿电线受限 BFS 翻转执行器 + 图格变更推送）；为简化模型，非原版全量物理 |
 | `Net/Phase4` | 部分 | 快照广播框架 + `BuildDelta`（实体提取 / 增量 / `Removed` / xxHash32 校验和）+ `SubmitInputs` Command 生成 + `ShadowPredictor` 影子预测（输入重放/速度钳制/偏差阈值）+ 每玩家分桶（`BuildFrameFor`）+ 视野裁剪（`ViewportRadius`）已实现 |
 | `Net/Phase5`（协议） | 部分 | `Framing` / `Connection` / 握手链（1→3、6→7、8→9/10/49、12→129）已实现 |
-| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 30 类出站包（握手链 3/7/9/8/10/12/49/129 + 2/4/5/13/14/16/17/21/22/27/28/31/32/34/35/36/50/65/73/79/117/118 + 包 82 的 NetText / NetLiquid 模块）；包 10 `TileSection`（Deflate + 位标志 + RLE + 尾部列表）、包 15 `Snapshot`（BaseTick/Tick/Checksum/实体/Removed）已实现 |
-| `Net/Phase5` `PacketDecoder` | 部分 | 已解析 30 个入站包（握手链 + 权威白名单 10 包 + 拾取 / 箱子 / 伤害 / 死亡 / 传送等 + 包 82 模块 0/1）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
-| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**等待包 2 真正落盘后**再关闭，事件驱动等待、无固定超时） |
+| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 31 类出站包（握手链 3/7/9/8/10/12/49/129 + 2/4/5/13/14/16/17/21/22/27/28/31/32/34/35/36/42/50/65/73/79/117/118 + 包 82 的 NetText / NetLiquid 模块）；包 10 `TileSection`（Deflate + 位标志 + RLE + 尾部列表）、包 15 `Snapshot`（BaseTick/Tick/Checksum/实体/Removed）已实现 |
+| `Net/Phase5` `PacketDecoder` | 部分 | 已解析 31 个入站包（握手链 + 权威白名单 13 包 + 拾取 / 箱子 / 伤害 / 死亡 / 治疗 / 法力 / 增益 / 传送等 + 包 82 模块 0/1）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
+| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**等待包 2 真正落盘后**再关闭，事件驱动等待、无固定超时）；**断线走宽限期会话保留（按玩家名可被同身份重连认回）并在连接结束时回收槽位** |
 | `Config/` | 已实现 | `ServerConfig`（反作弊阈值唯一来源 + `ModPolicy` 节）+ `FileSystemWatcher` 热重载，阈值热更新直接推送至已构造的权威子系统（无需重启）；枚举以字符串读写 |
-| `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认后端）三表落盘：玩家 / 审计 / 封禁；审计按批单事务写入，停机时冲刷通道残留。`-p:NoSqlite=true` 可降级到内嵌 `LiteDbPersistence`（JSON，同样三类数据落盘） |
+| `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认后端）四表落盘：玩家 / 审计 / 封禁 / **WorldTiles（世界改动）**；审计按批单事务写入，停机时冲刷通道残留。`-p:NoSqlite=true` 可降级到内嵌 `LiteDbPersistence`（JSON，同样四类数据落盘） |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `HttpListener` `/metrics`（`SetGauge` 支持插件自定义指标名与标签） |
 | `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore`（封禁落盘，重启后仍生效）+ `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射） |
 | `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据，插件可按 Damage / 方块坐标等真实值决策）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息 / `ExecuteCommand`（经 `Authority/CommandService.cs` 分发，内置 say / who / kick / help；`Broadcast` / `SendMessage` 经包 82（NetTextModule）真实下发）；`EventStore.QueryAsync` 已接持久化审计查询 |
 | `ModCompat/` | 部分 | 策略 / 检测框架 + `ModPolicy` 从 `server.json` 读取；`TModLoaderCompat` 已装配：Mod 名称清单解析（Int32 数量 + 名称串）、自定义包 250-255 转发（绑定网络层单播）；未含 Mod 版本 / 哈希校验与 TModLoader 原生握手报文 |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
-| `Tests/` | 部分 | 9 组验收测试（231 用例通过）；其中 `VanillaFeatureTests` 用**真实权威管线 + 真实 TCP** 逐项验证原版功能（登录链 / 外观广播 / 移动 / 挖放砖 / 背包 / 战斗（含服务端接触伤害与免伤帧）/ 传送（65·73）/ 血量纠正 / 受伤→死亡→复活 / 掉落物拾取 / 弹幕命中 / 箱子内容 / 液体（含视口裁剪与混合反应）/ 电路（含图格推送）/ Boss·事件（含掉落与已核对 ID 映射）/ 高熵区块拆分 / **Phase 7 对抗自动化** / 断线广播 / 他人可见性中继 / 时间与 NPC 同步 / 聊天），覆盖矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)；`WorldFileTests` 覆盖 `.wld` 解析（最小合法世界 + 版本 / 魔数 / footer 拒绝路径）；另有真实 TCP 往返集成测试、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、命令子系统、指标导出、插件事件查询、实体视图发布、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、持久化往返（玩家 / 审计 / 封禁重启读回）、包 10 / 包 15 / 新增包编解码回归、`WorldGenerator` 确定性测试 |
+| `Tests/` | 部分 | 9 组验收测试（248 用例通过）；其中 `VanillaFeatureTests` 用**真实权威管线 + 真实 TCP** 逐项验证原版功能（登录链 / 外观广播 / 移动 / 挖放砖 / 背包 / 战斗（含服务端接触伤害与免伤帧）/ 传送（65·73）/ 血量纠正 / 法力跟踪与纠正 / 治疗上限钳制 / 增益服务端持有 / 弹幕生成校验 / 受伤→死亡→复活 / 掉落物拾取 / 弹幕命中 / 箱子内容 / 液体（含视口裁剪与混合反应）/ 电路（含图格推送）/ Boss·事件（含掉落与已核对 ID 映射）/ 高熵区块拆分 / **Phase 7 对抗自动化** / 断线广播 / **断线会话保留（宽限期内同身份重连续回位置 / 血量）** / 他人可见性中继 / 时间与 NPC 同步 / 聊天），覆盖矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)；`WorldFileTests` 覆盖 `.wld` 解析（最小合法世界 + 版本 / 魔数 / footer 拒绝路径）；另有真实 TCP 往返集成测试、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、命令子系统、指标导出、插件事件查询、实体视图发布、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、持久化往返（玩家 / 审计 / 封禁重启读回）、包 10 / 包 15 / 新增包编解码回归、`WorldGenerator` 确定性测试 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 部分 | 对抗测试手册（M/P/R 清单）+ 服务端可自动化部分已落为测试（见其 README §零） |
 
