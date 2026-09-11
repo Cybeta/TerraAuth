@@ -173,6 +173,9 @@ public sealed record SyncChestItemCommand(
                 Prefix = Prefix,
             };
         }
+
+        // 服务端重启后回放：登记该箱子（内容已变更）
+        world.MarkPersistChest(ChestIndex);
     }
 }
 

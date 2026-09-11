@@ -210,13 +210,13 @@ TerraAuth                     ← 组合根（Program / GameHost）
 | `Net/Phase5` `PacketDecoder` | 部分 | 已解析 31 个入站包（握手链 + 权威白名单 13 包 + 拾取 / 箱子 / 伤害 / 死亡 / 治疗 / 法力 / 增益 / 传送等 + 包 82 模块 0/1）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
 | `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（先发包 2 再关闭）；**断线走宽限期会话保留并在连接结束时回收槽位（复用最小空闲 ID）** |
 | `Config/` | 已实现 | `ServerConfig`（含 `ModPolicy` 节）+ `FileSystemWatcher` 热重载；枚举以字符串读写 |
-| `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认）四表落盘（玩家 / 审计 / 封禁 / **WorldTiles 世界改动**）；`-p:NoSqlite=true` 降级到内嵌 `LiteDbPersistence`（JSON，同样四类数据落盘） |
+| `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认）五表落盘（玩家 / 审计 / 封禁 / **WorldTiles 世界改动** / **WorldChests 箱子内容**）；`-p:NoSqlite=true` 降级到内嵌 `LiteDbPersistence`（JSON，同样五类数据落盘） |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `/metrics`（`SetGauge` 支持自定义指标名与标签） |
 | `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore`（封禁落盘，重启后仍生效）+ `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射，支持双向互转） |
 | `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息 / `ExecuteCommand`（经 `CommandService` 分发，内置 say / who / kick / help；`Broadcast` / `SendMessage` 经包 82（NetTextModule）真实下发）；`EventStore.QueryAsync` 已接持久化审计查询；示例插件见 `Examples/TerraAuth.ExamplePlugins/` |
 | `ModCompat/` | 部分 | 策略 / 检测框架 + `ModPolicy` 从 `server.json` 读取；`TModLoaderCompat` 已装配（Mod 名称清单解析 + 自定义包 250-255 转发）；未含 Mod 版本 / 哈希校验与原生握手报文 |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
-| `Tests/` | 部分 | 9 组验收测试（248 用例通过）；`VanillaFeatureTests` 以真实权威管线 + 真实 TCP 覆盖原版功能（含箱子内容 / 液体（视口裁剪 + 混合反应）/ 电路（图格推送）/ Boss·事件（含掉落与已核对 ID 映射）/ 受伤→死亡→复活 / 服务端接触伤害（含免伤帧）/ 法力跟踪 / 治疗钳制 / 增益持有 / 弹幕生成校验 / **世界改动持久化（重启回放）** / **世界文件加载与导出** / **断线会话保留（宽限期重连续回状态）** / 掉落物拾取 / 弹幕命中 / 高熵区块拆分 / Phase 7 对抗自动化 / 时间与 NPC 同步 / 聊天，矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)）；`WorldFileTests` 覆盖 `.wld` 解析；包 10 / 包 15 / 新增包编解码回归、`WorldGenerator` 确定性、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、命令子系统、Hook 参数填充包数据、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、指标导出、插件事件查询、实体视图发布、区块分区锁并发安全（真实 TCP）、持久化往返（玩家 / 审计 / 封禁重启读回）已补 |
+| `Tests/` | 部分 | 9 组验收测试（249 用例通过）；`VanillaFeatureTests` 以真实权威管线 + 真实 TCP 覆盖原版功能（含箱子内容（含持久化重启存活） / 液体（视口裁剪 + 混合反应）/ 电路（图格推送）/ Boss·事件（含掉落与已核对 ID 映射）/ 受伤→死亡→复活 / 服务端接触伤害（含免伤帧）/ 法力跟踪 / 治疗钳制 / 增益持有 / 弹幕生成校验 / **世界改动持久化（重启回放）** / **世界文件加载与导出** / **断线会话保留（宽限期重连续回状态）** / 掉落物拾取 / 弹幕命中 / 高熵区块拆分 / Phase 7 对抗自动化 / 时间与 NPC 同步 / 聊天，矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)）；`WorldFileTests` 覆盖 `.wld` 解析；包 10 / 包 15 / 新增包编解码回归、`WorldGenerator` 确定性、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、命令子系统、Hook 参数填充包数据、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、指标导出、插件事件查询、实体视图发布、区块分区锁并发安全（真实 TCP）、持久化往返（玩家 / 审计 / 封禁重启读回）已补 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 部分 | 对抗测试手册（M/P/R 清单）+ **服务端可自动化部分已落地为测试**（`VanillaFeatureTests.AntiCheat_*`） |
 
@@ -234,7 +234,7 @@ dotnet build TerraAuth.csproj -p:NoSqlite=true
 # 运行
 dotnet run --project TerraAuth.csproj -- --config server.json --port 7777
 
-# 测试（248 用例）
+# 测试（249 用例）
 dotnet test Tests/TerraAuth.Tests.csproj
 
 # 无 SDK 环境静态校验（大括号平衡 / ProjectReference 路径 / 接口实现 / TODO 统计）

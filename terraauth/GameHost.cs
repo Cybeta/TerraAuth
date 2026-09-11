@@ -370,7 +370,7 @@ public sealed class GameHost : IDisposable
 
     /// <summary>
     /// 启动时回放世界改动：基准世界（程序化生成 / .wld 解析）是确定性的，
-    /// 因此只需把上次运行落盘的图格增量叠加回去即可复原玩家建筑。
+    /// 因此只需把上次运行落盘的图格 / 箱子内容增量叠加回去即可复原玩家建筑与箱子。
     /// </summary>
     private static void ApplyPersistedWorldChanges(WorldState world, IWorldRepository repo)
     {
@@ -397,6 +397,41 @@ public sealed class GameHost : IDisposable
 
         if (applied > 0)
             Console.WriteLine($"[World] 已回放上次运行的世界改动：图格 {applied} 格");
+
+        ApplyPersistedChests(world, repo);
+    }
+
+    /// <summary>
+    /// 回放落盘的箱子内容：按索引定位并校验坐标（基准世界被替换时坐标不符则跳过，避免错位套用）。
+    /// </summary>
+    private static void ApplyPersistedChests(WorldState world, IWorldRepository repo)
+    {
+        IReadOnlyList<WorldChestRecord> chests;
+        try
+        {
+            chests = repo.LoadChestChangesAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[World] 箱子内容回放失败（保留基准世界内容）：{ex.Message}");
+            return;
+        }
+
+        int applied = 0;
+        lock (world.ChestsLock)
+        {
+            foreach (var record in chests)
+            {
+                var chest = world.FindChestByIndex(record.Index);
+                if (chest is null || chest.X != record.X || chest.Y != record.Y) continue;
+
+                chest.Items = Chest.DeserializeItems(record.Data);
+                applied++;
+            }
+        }
+
+        if (applied > 0)
+            Console.WriteLine($"[World] 已回放上次运行的箱子内容：{applied} 个");
     }
 
     /// <summary>
@@ -430,6 +465,38 @@ public sealed class GameHost : IDisposable
                 foreach (var (x, y) in cells) world.MarkPersistTile(x, y);
                 Console.WriteLine($"[World] 图格落盘失败（已重新排队 {cells.Count} 格）：{ex.Message}");
             }
+        }
+
+        await FlushChestChangesAsync(world).ConfigureAwait(false);
+    }
+
+    /// <summary>把变更过的箱子内容落盘；失败重新排队（同图格语义）。</summary>
+    private async Task FlushChestChangesAsync(WorldState world)
+    {
+        if (WorldRepo is null) return;
+
+        var indices = world.DrainPersistChests(WorldState.PersistBatchSize);
+        if (indices.Count == 0) return;
+
+        var records = new List<WorldChestRecord>(indices.Count);
+        lock (world.ChestsLock)
+        {
+            foreach (var index in indices)
+            {
+                var chest = world.FindChestByIndex(index);
+                if (chest is null) continue;
+                records.Add(new WorldChestRecord(index, chest.X, chest.Y, Chest.SerializeItems(chest.Items)));
+            }
+        }
+
+        try
+        {
+            await WorldRepo.SaveChestChangesAsync(records).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            foreach (var index in indices) world.MarkPersistChest(index);
+            Console.WriteLine($"[World] 箱子内容落盘失败（已重新排队 {indices.Count} 个）：{ex.Message}");
         }
     }
 

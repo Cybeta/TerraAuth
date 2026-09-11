@@ -1760,6 +1760,67 @@ public class VanillaFeatureTests
     }
 
     [Fact]
+    public async Task Vanilla_ChestContent_Survives_ServerRestart()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-chestpersist-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var wldPath = Path.Combine(dir, "chestworld.wld");
+
+        // 基准世界必须自带箱子（程序化生成的世界没有箱子）→ 造一份含箱子的 .wld
+        var source = WorldGenerator.GenerateSmall(worldName: "ChestWorld");
+        int cx = source.SpawnTileX, cy = source.SpawnTileY;
+        source.Chests.Add(new Chest
+        {
+            Index = 0, X = cx, Y = cy, Name = "Persist",
+            Items = new ChestItem[40],
+        });
+        WorldFileWriter.Write(wldPath, source, keepBackup: false);
+
+        var configJson = $"{{\"WorldPath\": \"{wldPath.Replace("\\", "\\\\")}\"}}";
+
+        // ---- 第一次运行：经真实包 32 权威链路写入箱子物品 → 落盘 ----
+        using (var server = VanillaServer.Start(configJson: configJson, dir: dir, deleteOnDispose: false))
+        {
+            await using var s = await server.ConnectAsync("Alice");
+            var world = server.Host.Simulator.State;
+            Assert.Single(world.Chests);
+
+            await StandAtAsync(server, s, cx * 16f + 8f, cy * 16f + 8f);
+            await s.SendAsync(PacketId.SyncChestItem,
+                new SyncChestItemPacket(0, ItemSlot: 5, Stack: 11, Prefix: 0, ItemType: 5));
+
+            Assert.True(await TickUntilAsync(server, () =>
+            {
+                lock (world.ChestsLock) return world.Chests[0].Items[5].Type == 5;
+            }, TimeSpan.FromSeconds(5)), "包 32 未写入服务端箱子");
+
+            // 落盘（生产环境由 1Hz 世界循环触发；此处显式调用并循环到确实入库）
+            bool saved = false;
+            for (int i = 0; i < 20 && !saved; i++)
+            {
+                await server.Host.FlushWorldChangesAsync();
+                var records = await server.Host.WorldRepo!.LoadChestChangesAsync();
+                saved = records.Any(r => r.Index == 0);
+            }
+            Assert.True(saved, "箱子内容未能落盘");
+        }
+
+        // ---- 第二次运行：复用同一 DB → 箱子内容应被回放 ----
+        using (var server = VanillaServer.Start(configJson: configJson, dir: dir))
+        {
+            var world = server.Host.Simulator.State;
+            lock (world.ChestsLock)
+            {
+                Assert.Single(world.Chests);
+                Assert.Equal(5, world.Chests[0].Items[5].Type);
+                Assert.Equal(11, world.Chests[0].Items[5].Stack);
+            }
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { /* 清理失败可忽略 */ }
+    }
+
+    [Fact]
     public void Vanilla_World_Is_Exported_To_Wld_When_Configured()
     {
         var dir = Path.Combine(Path.GetTempPath(), $"terraauth-worldexport-{Guid.NewGuid():N}");

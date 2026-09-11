@@ -45,7 +45,7 @@
 | **掉落物拾取** | 22 | 槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC）→ 移除世界实体并下发包 21（stack=0） | `Vanilla_ItemPickup_Removes_WorldItem` / `Vanilla_ItemPickup_OutOfReach_Is_Rejected` |
 | **弹幕命中判定** | 27 | 服务端按弹幕 / 敌怪距离判定命中并扣血，不再采信客户端声明 | `Vanilla_Projectile_Hit_Damages_Enemy` |
 | 请求传送（回城类） | 73 | 类型 / 频率校验（与 65 共窗口） | `Vanilla_TeleportRequest_Is_Accepted` / `Vanilla_TeleportRequest_RateExceeded_Is_Rejected` |
-| **箱子内容（服务端持有）** | 31 / 32 / 34 | 开箱校验（存在 / 距离）→ 服务端逐槽下发权威内容（包 34 + 包 32×N）；包 32 校验箱子 / 槽位 / 堆叠 / 物品 / 距离后落盘 | `Vanilla_ChestOpen_Sends_Authoritative_Contents` / `Vanilla_ChestItem_Is_Applied_Authoritatively` / `..._Invalid_Slot_...` / `..._OutOfReach_...` |
+| **箱子内容（服务端持有 + 持久化）** | 31 / 32 / 34 | 开箱校验（存在 / 距离）→ 服务端逐槽下发权威内容（包 34 + 包 32×N）；包 32 校验箱子 / 槽位 / 堆叠 / 物品 / 距离后写入服务端箱子，并**登记增量落盘**（重启后回放，按索引 + 坐标校验） | `Vanilla_ChestOpen_Sends_Authoritative_Contents` / `Vanilla_ChestItem_Is_Applied_Authoritatively` / `..._Invalid_Slot_...` / `..._OutOfReach_...` / `Vanilla_ChestContent_Survives_ServerRestart` |
 | **液体（NetLiquid）** | 82 模块 0 | 客户端上报液体编辑（坐标 / 类型 / 距离校验）→ `LiquidEditCommand` 权威落盘 → 简化流动仿真（下落优先、受阻后侧向均衡）+ 混合反应（异种液体累计 ≥ 24 单位 → 黑曜石 / 蜂蜜块 / 松脆蜂蜜块 / 微光块）→ 按快照频率批量下发 | `Vanilla_Liquid_Edit_Is_Applied_And_Flows_Down` / `..._Changes_Are_Broadcast_To_Client` / `..._OutOfReach_...` / `..._Invalid_Type_...` / `Vanilla_LiquidMerge_Water_Plus_Lava_Creates_Obsidian` |
 | **电路（线网 / 执行器）** | 17 | action 0..19 权威应用（方块 / 墙 / 4 色线网 / 执行器的放置与拆除）；action 19 触发服务端沿电线受限 BFS 翻转执行器 | `Vanilla_Wire_Place_And_Kill_Are_Applied` / `..._Actuator_Place_And_Kill_...` / `..._Actuate_Toggles_Connected_Actuators` / `..._Does_Not_Propagate_Without_Wire` |
 | **Boss / 事件** | 7 / 21 / 23 / 28 | 简化事件状态机（血月 / 日食按昼夜概率）+ 入侵（配额刷怪、耗尽结束）+ Boss（简化追击 AI、击杀记录世界进度，进度位按已核对 NPC ID 映射）；进度变化重新下发包 7；击杀按已核对掉落表生成掉落物并由世界同步补发包 21 | `Vanilla_BloodMoon_Is_Broadcast_As_WorldData` / `..._DayNight_Transition_...` / `..._Boss_Spawn_And_Kill_Sets_Progress` / `..._Invasion_Spawns_Enemies_Then_Ends` / `..._Eclipse_...` / `Vanilla_BossKill_Drops_Loot_And_Pushes_Packet21` / `Vanilla_Progress_Uses_Verified_BossIds` |
@@ -57,10 +57,10 @@
 | 功能 | 现状 | 备注 |
 |---|---|---|
 | 敌怪生成 / AI | 已**简化**实现：史莱姆 + 入侵哥布林 + Boss（眼魔 / 骷髅王 / 史莱姆王）直线追击 | 无原版刷怪规则（生物群系 / 昼夜细分 / 事件）、无 NPC 专属 AI；接触伤害已由服务端判定（见 §一「服务端伤害来源」） |
-| 箱子内容管理 | 已**服务端持有**：开箱下发权威内容，包 32 校验后落盘 | 未实现包 33（完整箱子同步）/ 箱子命名 / 上锁；客户端 UI 依赖服务端逐槽包 32 |
+| 箱子内容管理 | 已**服务端持有并持久化**：开箱下发权威内容，包 32 校验后写入服务端箱子并增量落盘（重启回放） | 未实现包 33（完整箱子同步）/ 箱子命名 / 上锁 / 放置新箱子（包 34 语义为 SyncPlayerChestIndex，非放置）；客户端 UI 依赖服务端逐槽包 32 |
 | 电路 / 液体 | 已**简化实现**：液体逐格流动 + 混合反应 + NetLiquid 同步；线网 4 色 / 执行器编辑权威 + 受限 BFS 信号传播 | 无液体压力模型；无门电路 / 定时器 / 压力板（action 18 未建模） |
 | 世界进度 / Boss 事件 | 已**简化实现**：血月 / 日食 / 入侵 / Boss 击杀进度 + 掉落（简化表）+ 包 7 广播 | 未实现原版事件触发规则（祭坛 / 召唤物 / 生物群系）与 Boss 专属 AI 行为；掉落为简化表 |
-| 世界改动持久化 | 已**实现增量落盘 + 启动回放**：图格改动（含方块 / 墙 / 液体 / 电线 / 执行器）按 1Hz 落盘（单批 8192，集合溢出降级为全图扫描），重启后叠加回基准世界 | 未含箱子内容（当前基准世界无箱子，且包 34 放置未建模）；崩溃最多丢 1 秒改动 |
+| 世界改动持久化 | 已**实现增量落盘 + 启动回放**：图格改动（含方块 / 墙 / 液体 / 电线 / 执行器）与**箱子内容**（包 32）按 1Hz 落盘（单批 8192，集合溢出降级为全图扫描），重启后叠加回基准世界 | 箱子内容回放按「索引 + 坐标」双校验，基准世界被替换时坐标不符则跳过；崩溃最多丢 1 秒改动 |
 | 世界文件（`.wld`）加载 / 导出 | 已**实现**：`ServerConfig.WorldPath` 指定 `.wld` 即作为基准世界开服；`WorldExportPath` 非空则停机 + 空服周期**导出整份 `.wld`**（自研写出器：全部 11 段含 5..9 段的合法空编码，写后读回校验 + 原子替换 + `.bak` 滚动） | 已验证：**逐格 round-trip** + **按原版加载器顺序的严格分段走查**（段起点递增、逐段位置断言、footer 用尽文件）。**未在**原版二进制**上实测加载**（本沙箱无法运行 TerrariaServer.exe，连其自建世界也崩溃） |
 | 断线重连 | 已**实现「手动重进的会话接管」**：宽限期（默认 60s）内以同身份重连 → 继承位置 / 血量 / 增益，出生点由服务端按恢复坐标下发 | 原版**无自动重连**（断线即 `Netplay.Disconnect` 回主菜单），故不做自动续传；宽限期外 / 被顶号则回收为全新会话 |
 

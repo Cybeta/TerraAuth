@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using TerraAuth.Protocol;
 
 namespace TerraAuth.Simulation;
@@ -408,6 +409,11 @@ public sealed class WorldState
 
     private readonly HashSet<int> _pendingPersistTiles = new();
 
+    /// <summary>待落盘箱子索引上限（普通世界箱子数量远小于此，仅作无界增长防御）。</summary>
+    private const int MaxPendingPersistChests = 65_536;
+
+    private readonly HashSet<int> _pendingPersistChests = new();
+
     /// <summary>全图扫描模式：待处理集合曾溢出，改用游标遍历全图保证最终一致（内存有界）。</summary>
     private bool _persistFullScan;
     private int _fullScanX;
@@ -416,7 +422,11 @@ public sealed class WorldState
     /// <summary>是否仍有改动未落盘（停机冲刷用）。</summary>
     public bool HasPendingPersist
     {
-        get { lock (WorldPersistLock) return _persistFullScan || _pendingPersistTiles.Count > 0; }
+        get
+        {
+            lock (WorldPersistLock)
+                return _persistFullScan || _pendingPersistTiles.Count > 0 || _pendingPersistChests.Count > 0;
+        }
     }
 
     /// <summary>登记一格需要落盘的图格改动（挖 / 放 / 墙 / 液体 / 电线 / 执行器 / 混合反应）。</summary>
@@ -475,6 +485,33 @@ public sealed class WorldState
             }
 
             foreach (var (x, y) in result) _pendingPersistTiles.Remove(y * CoordPackStride + x);
+            return result;
+        }
+    }
+
+    /// <summary>登记一个需要落盘的箱子（内容被客户端修改，包 32 权威通过后）。</summary>
+    public void MarkPersistChest(int chestIndex)
+    {
+        if (chestIndex < 0) return;
+        lock (WorldPersistLock)
+        {
+            if (_pendingPersistChests.Count >= MaxPendingPersistChests) return;
+            _pendingPersistChests.Add(chestIndex);
+        }
+    }
+
+    /// <summary>取出本批待落盘的箱子索引（取出的会从待处理集合移除；失败重排见调用方）。</summary>
+    public List<int> DrainPersistChests(int max)
+    {
+        lock (WorldPersistLock)
+        {
+            var result = new List<int>(Math.Min(max, _pendingPersistChests.Count));
+            foreach (var index in _pendingPersistChests)
+            {
+                result.Add(index);
+                if (result.Count >= max) break;
+            }
+            foreach (var index in result) _pendingPersistChests.Remove(index);
             return result;
         }
     }
@@ -877,6 +914,53 @@ public sealed class Chest
     public int Y;
     public string Name = "";
     public ChestItem[] Items = Array.Empty<ChestItem>();
+
+    /// <summary>单格物品的定长字节数：Int32 Type + Int16 Stack + Byte Prefix。</summary>
+    private const int ItemSize = 7;
+
+    /// <summary>物品格上限（防御非法长度导致的超大分配）。</summary>
+    private const int MaxItems = 1024;
+
+    /// <summary>
+    /// 把物品格整体序列化为字节串（供箱子内容持久化）。
+    /// 编码为「Int32 格数 + 每格定长 7 字节」，与 <see cref="DeserializeItems"/> 严格对称。
+    /// </summary>
+    public static byte[] SerializeItems(ChestItem[] items)
+    {
+        using var ms = new MemoryStream(sizeof(int) + items.Length * ItemSize);
+        using (var w = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            w.Write(items.Length);
+            foreach (var item in items)
+            {
+                w.Write(item.Type);
+                w.Write(item.Stack);
+                w.Write(item.Prefix);
+            }
+        }
+        return ms.ToArray();
+    }
+
+    /// <summary>反序列化物品格（长度非法时返回空数组，避免损坏数据导致崩溃）。</summary>
+    public static ChestItem[] DeserializeItems(byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var r = new BinaryReader(ms);
+        var count = r.ReadInt32();
+        if (count < 0 || count > MaxItems) return Array.Empty<ChestItem>();
+
+        var items = new ChestItem[count];
+        for (var i = 0; i < count; i++)
+        {
+            items[i] = new ChestItem
+            {
+                Type = r.ReadInt32(),
+                Stack = r.ReadInt16(),
+                Prefix = r.ReadByte(),
+            };
+        }
+        return items;
+    }
 }
 
 /// <summary>世界牌子（存档 section 4）。</summary>

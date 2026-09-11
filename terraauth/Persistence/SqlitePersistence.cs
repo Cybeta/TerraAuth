@@ -41,6 +41,8 @@ internal interface IDbExecutor
     // ---- 世界改动（IWorldRepository 复用同一 DB）----
     void SaveWorldTiles(IReadOnlyList<WorldTileRecord> tiles);
     IReadOnlyList<WorldTileRecord> LoadWorldTiles();
+    void SaveWorldChests(IReadOnlyList<WorldChestRecord> chests);
+    IReadOnlyList<WorldChestRecord> LoadWorldChests();
 }
 
 // ============================================================================
@@ -105,6 +107,12 @@ public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IWo
     public Task<IReadOnlyList<WorldTileRecord>> LoadTileChangesAsync()
         => Task.Run(() => _db.LoadWorldTiles());
 
+    public Task SaveChestChangesAsync(IReadOnlyList<WorldChestRecord> chests)
+        => chests.Count == 0 ? Task.CompletedTask : Task.Run(() => _db.SaveWorldChests(chests));
+
+    public Task<IReadOnlyList<WorldChestRecord>> LoadChestChangesAsync()
+        => Task.Run(() => _db.LoadWorldChests());
+
     // ========================================================================
     // 后台批量落盘
     // ========================================================================
@@ -159,6 +167,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
     private readonly ConcurrentDictionary<Guid, List<AuditEntry>> _audit = new();
     private readonly ConcurrentDictionary<Guid, BanRecord> _bans = new();
     private readonly ConcurrentDictionary<(int X, int Y), WorldTileRecord> _worldTiles = new();
+    private readonly ConcurrentDictionary<int, WorldChestRecord> _worldChests = new();
 
     public LiteDbPersistence(string dbPath, bool runMigrations)
     {
@@ -236,6 +245,15 @@ internal sealed class LiteDbPersistence : IDbExecutor
 
     public IReadOnlyList<WorldTileRecord> LoadWorldTiles() => _worldTiles.Values.ToList();
 
+    public void SaveWorldChests(IReadOnlyList<WorldChestRecord> chests)
+    {
+        if (chests.Count == 0) return;
+        foreach (var c in chests) _worldChests[c.Index] = c;
+        SaveToDisk();
+    }
+
+    public IReadOnlyList<WorldChestRecord> LoadWorldChests() => _worldChests.Values.ToList();
+
     // ---- 磁盘持久化（JSON，模拟 SQLite 文件）----
     private void LoadFromDisk()
     {
@@ -253,6 +271,8 @@ internal sealed class LiteDbPersistence : IDbExecutor
                 foreach (var b in dto.Bans) _bans[b.PlayerId] = b;
             if (dto.WorldTiles is not null)
                 foreach (var t in dto.WorldTiles) _worldTiles[(t.X, t.Y)] = t;
+            if (dto.WorldChests is not null)
+                foreach (var c in dto.WorldChests) _worldChests[c.Index] = c;
         }
         catch { /* 首次启动无文件 / 解析失败，忽略 */ }
     }
@@ -270,6 +290,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
             Audit = audit,
             Bans = _bans.Values.ToList(),
             WorldTiles = _worldTiles.Values.ToList(),
+            WorldChests = _worldChests.Values.ToList(),
         };
         var tmp = _dbPath + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(dump));
@@ -282,6 +303,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
         public List<AuditEntry>? Audit { get; set; }
         public List<BanRecord>? Bans { get; set; }
         public List<WorldTileRecord>? WorldTiles { get; set; }
+        public List<WorldChestRecord>? WorldChests { get; set; }
     }
 }
 
@@ -361,6 +383,11 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
                 Y INTEGER NOT NULL,
                 Data BLOB NOT NULL,
                 PRIMARY KEY(X, Y));
+            CREATE TABLE IF NOT EXISTS WorldChests (
+                ChestIndex INTEGER PRIMARY KEY,
+                X INTEGER NOT NULL,
+                Y INTEGER NOT NULL,
+                Data BLOB NOT NULL);
             """);
     }
 
@@ -567,6 +594,45 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         var list = new List<WorldTileRecord>();
         using var r = cmd.ExecuteReader();
         while (r.Read()) list.Add(new WorldTileRecord(r.GetInt32(0), r.GetInt32(1), (byte[])r[2]));
+        return list;
+    }
+
+    // ---- 箱子内容（单事务批量 upsert）----
+    public void SaveWorldChests(IReadOnlyList<WorldChestRecord> chests)
+    {
+        if (chests.Count == 0) return;
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO WorldChests (ChestIndex, X, Y, Data) VALUES ($i, $x, $y, $data)
+            ON CONFLICT(ChestIndex) DO UPDATE SET X = excluded.X, Y = excluded.Y, Data = excluded.Data;
+            """;
+        var pi = cmd.Parameters.Add("$i", SqliteType.Integer);
+        var px = cmd.Parameters.Add("$x", SqliteType.Integer);
+        var py = cmd.Parameters.Add("$y", SqliteType.Integer);
+        var pd = cmd.Parameters.Add("$data", SqliteType.Blob);
+        foreach (var c in chests)
+        {
+            pi.Value = c.Index;
+            px.Value = c.X;
+            py.Value = c.Y;
+            pd.Value = c.Data;
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    public IReadOnlyList<WorldChestRecord> LoadWorldChests()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT ChestIndex, X, Y, Data FROM WorldChests;";
+        var list = new List<WorldChestRecord>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            list.Add(new WorldChestRecord(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), (byte[])r[3]));
         return list;
     }
 

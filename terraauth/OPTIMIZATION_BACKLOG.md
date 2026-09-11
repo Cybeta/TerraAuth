@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第十一轮：断线宽限期会话保留 + 连接槽位回收）
+> 最后更新：2026-09-12（第十二轮：箱子内容持久化）
 
 ---
 
@@ -56,6 +56,30 @@
 ---
 
 ## 附：本轮回溯
+
+### 第十二轮（2026-09-12）：箱子内容持久化（W-1 解除阻塞项）
+
+**问题**：第九轮评估箱子内容持久化时，因「基准世界恒为程序化生成 → 世界里没有箱子」而判定落盘路径不可达、未留死代码，
+记为「待 W-1（加载真实 `.wld`）落地后一并补」。第十轮已落地 `.wld` 加载 → **阻塞解除**：
+真实世界自带箱子，玩家开箱取放（包 32）会改服务端箱子内容，但此前该改动只存在内存，**重启即丢**（与修复前的「重启丢建筑」同性质）。
+
+**已实施**（自研，沿用图格增量落盘的同构设计）：
+
+- **脏集登记**：`WorldState` 新增箱子待落盘集合（`_pendingPersistChests`，受 `WorldPersistLock` 保护）与
+  `MarkPersistChest` / `DrainPersistChests`；`HasPendingPersist` 一并纳入箱子。
+  `SyncChestItemCommand.Apply`（包 32 权威通过后）在写入服务端箱子后登记该索引。
+- **序列化**：`Chest.SerializeItems` / `DeserializeItems` —— 「Int32 格数 + 每格定长 7 字节（Type/Stack/Prefix）」，
+  与自身严格对称；反序列化对非法格数做防御（返回空数组，避免损坏数据导致崩溃）。
+- **持久化层**：`IWorldRepository` 新增 `SaveChestChangesAsync` / `LoadChestChangesAsync`（`WorldChestRecord`：索引 + 坐标 + 字节串）；
+  SQLite 新增 `WorldChests` 表（单事务批量 upsert），内嵌兜底后端同步 `_worldChests` + JSON 段。
+- **回放**：`GameHost.ApplyPersistedWorldChanges` 在回放图格后回放箱子 —— 按**索引定位 + 坐标校验**
+  （基准世界被替换时坐标不符则跳过，避免错位套用）。
+- **落盘**：`FlushWorldChangesAsync` 追加 `FlushChestChangesAsync`（同一 1Hz 循环与停机冲刷路径）；
+  失败**重新排队**（同图格语义，避免「取出即丢」）。
+
+**测试**：+1（**249 通过**）——`Vanilla_ChestContent_Survives_ServerRestart`：
+造一份含箱子的 `.wld` 作为基准世界 → 经真实包 32 权威链路写入物品 → 落盘 → **复用同一 DB 重启** → 箱子内容被回放。
+默认后端与 `-p:NoSqlite=true` 兜底后端均 249/249 通过。
 
 ### 第十一轮（2026-09-12）：断线宽限期会话保留 + 连接槽位回收
 
