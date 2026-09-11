@@ -156,7 +156,7 @@ terraauth/
 
 **至此，Phase 2/3/4/5 形成完整闭环**。
 
-进度更新（2026-09-11）：目标框架已升级至 **.NET 10**（`net10.0`）；**Phase 6 已实装**
-（`Config/Persistence/Monitoring/Security`），仅「真实 SQLite 落库」未补 —— 已独立立项，见
-[`OPTIMIZATION_BACKLOG.md`](../../OPTIMIZATION_BACKLOG.md) §B-1。
+进度更新（2026-09-11）：目标框架已升级至 **.NET 10**（`net10.0`）；**Phase 6 已完整实装**
+（`Config/Persistence/Monitoring/Security`），含真实 SQLite 落库（玩家 / 审计 / 封禁，`USE_SQLITE`），
+`-p:NoSqlite=true` 可降级到内嵌 LiteDb。
 剩余 **Phase 7（对抗测试，手册见 `Phase7-RedTeam/`）**、**Phase 8（性能压测 + 上线）**。

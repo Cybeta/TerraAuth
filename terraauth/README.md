@@ -79,13 +79,13 @@ TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=fa
 | `Net/Phase5` `PacketDecoder` | 部分 | 已解析 28 个入站包（握手链 + 权威白名单 10 包 + 伤害/死亡/传送等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
 | `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**等待包 2 真正落盘后**再关闭，事件驱动等待、无固定超时） |
 | `Config/` | 已实现 | `ServerConfig`（反作弊阈值唯一来源）+ `FileSystemWatcher` 热重载，阈值热更新直接推送至已构造的权威子系统（无需重启） |
-| `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用（默认路径：`TerraAuth.csproj` 未定义 `USE_SQLITE`）；真实 `SqliteImpl` 为骨架（SQL 省略）—— 且封禁 / 审计仅内存、重启即丢，**独立立项见 [`OPTIMIZATION_BACKLOG.md`](OPTIMIZATION_BACKLOG.md) §B-1** |
+| `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认后端）三表落盘：玩家 / 审计 / 封禁；审计按批单事务写入，停机时冲刷通道残留。`-p:NoSqlite=true` 可降级到内嵌 `LiteDbPersistence`（JSON，同样三类数据落盘） |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `HttpListener` `/metrics` |
-| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射）；⚠️ 封禁落盘能力受 `Persistence/` 限制（见 §B-1） |
+| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore`（封禁落盘，重启后仍生效）+ `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射） |
 | `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据，插件可按 Damage / 方块坐标等真实值决策）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计） |
 | `ModCompat/` | 部分 | 策略 / 检测框架已实现；TModLoader 握手与 ModNet 解析为 TODO |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
-| `Tests/` | 部分 | 7 组验收测试（138 用例通过）；真实 TCP 往返集成测试（包 13 → 快照包 15 / 双客户端包 13 转发 / 踢出下发包 2 / 违规阈值触发踢出 / 纠正包按自身类型下发 / 插件 API 踢出与封禁）、配置阈值启动映射与热重载、实体视图发布（快照线程不读活动 WorldState）、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试已补，`.wld` 解析测试待补 |
+| `Tests/` | 部分 | 7 组验收测试（141 用例通过）；真实 TCP 往返集成测试（包 13 → 快照包 15 / 双客户端包 13 转发 / 踢出下发包 2 / 违规阈值触发踢出 / 纠正包按自身类型下发 / 插件 API 踢出与封禁）、配置阈值启动映射与热重载、实体视图发布（快照线程不读活动 WorldState）、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、持久化往返（玩家 / 审计 / 封禁重启读回）、包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试已补，`.wld` 解析测试待补 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 文档 | 对抗测试手册（M/P/R 清单），尚未执行 |
 

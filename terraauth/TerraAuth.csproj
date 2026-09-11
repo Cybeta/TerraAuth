@@ -10,15 +10,20 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
+  <!-- 持久化后端开关：默认走真实 SQLite；-p:NoSqlite=true 降级到内嵌 LiteDb（零依赖） -->
+  <PropertyGroup Condition="'$(NoSqlite)' != 'true'">
+    <DefineConstants>$(DefineConstants);USE_SQLITE</DefineConstants>
+  </PropertyGroup>
+
   <!-- 全部分层源码（目录结构保持不变：Protocol/Authority/Simulation/Net/...） -->
   <ItemGroup>
     <Compile Include="**\*.cs" Exclude="Tests\**;Examples\**;bin\**;obj\**" />
   </ItemGroup>
 
-  <!-- 生产依赖：SQLite（可 -p:NoSqlite=true 降级到内嵌 LiteDb）
+  <!-- 生产依赖：SQLite（USE_SQLITE 打开时使用；-p:NoSqlite=true 时既不引包也不定义常量）
        System.IO.Pipelines 自 .NET 10 起已内置于共享框架，无需显式引用 -->
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" Condition="'$(NoSqlite)' != 'true'" />
+  <ItemGroup Condition="'$(NoSqlite)' != 'true'">
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
   </ItemGroup>
 
   <!-- 验收测试需访问 internal（GameLoop.StepOne / ShadowPredictor 等） -->

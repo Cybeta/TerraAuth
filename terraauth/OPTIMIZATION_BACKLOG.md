@@ -1,38 +1,13 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-11（随 .NET 8 → .NET 10 升级同期评估）
+> 最后更新：2026-09-11（第二轮：真实 SQLite 持久化落地）
 
 ---
 
-## 一、独立立项（功能缺口，非性能优化）
+## 一、独立立项
 
-### B-1 真实 SQLite 持久化（补全 `SqliteImpl`）
-
-**现状**
-
-- `Persistence/SqlitePersistence.cs` 以 `#if USE_SQLITE` 选择实现，但**全仓无任何位置定义 `USE_SQLITE`**（也无 `Directory.Build.props`），
-  因此编译产物恒走 `LiteDbPersistence` 分支。
-- `SqliteImpl` 的全部方法均为**空壳**：`GetPlayer` 恒返回 `null`、`SavePlayer` / `CreatePlayer` / `AppendAudit` 为空方法体、
-  `QueryAudit` 返回空数组，`Open` / `Execute` 亦为占位实现。
-- 当前生效的 `LiteDbPersistence` 的磁盘快照（`LiteDump`）**只序列化 `Players`**，因此
-  **封禁记录与审计日志是纯内存的，进程重启即丢失**。
-- `Microsoft.Data.Sqlite` 虽已引用（10.0.12），但实际未被使用。
-
-**影响**：封禁在服务端重启后失效（可被绕过）；审计无法用于事后追溯。属功能性缺口，不是性能问题。
-
-**为何不能「加个常量」了事**：一旦定义 `USE_SQLITE`，就会切换到空壳实现，持久化会**比现状更差**（完全写不进去）。
-
-**工作项**
-
-1. 决定依赖方式：直接引用 `Microsoft.Data.Sqlite` 替换当前的反射加载（`Type.GetType`）。
-2. 实装 `SqliteImpl`：`Migrate`（建表 DDL 已具备）/ `GetPlayer` / `SavePlayer`(UPSERT) / `CreatePlayer` /
-   `AppendAudit` / `QueryAudit`，以及封禁四方法。
-3. （可选）`LiteDbPersistence.LiteDump` 补 `Bans`，至少消除「封禁重启丢失」。
-4. 落地开关：csproj 增加 `DefineConstants`，或直接以 `SqliteImpl` 为默认实现。
-5. 补充持久化往返测试（写入 → 重新打开 → 读回）。
-
-**验收**：进程重启后封禁记录与审计仍可查询；`SqliteImpl` 不再包含空方法体。
+> 暂无。（原 B-1「真实 SQLite 持久化」已完成，见文末回溯。）
 
 ---
 
@@ -67,9 +42,30 @@
 
 ---
 
-## 附：本轮回溯（.NET 8 → .NET 10，2026-09-11）
+## 附：本轮回溯
 
-**已实施**（仅备注，不在待办之列）：
+### 第二轮（2026-09-11）：真实 SQLite 持久化落地
+
+**问题**：`SqliteImpl` 全为空方法体（`GetPlayer` 返回 `null`、`SavePlayer`/`CreatePlayer`/`AppendAudit` 空实现、
+`QueryAudit` 返回空数组），且全仓从未定义 `USE_SQLITE` → 实际恒走 `LiteDbPersistence`；
+而它只序列化 `Players` → **封禁与审计重启即丢**（`Microsoft.Data.Sqlite` 被引用却从未生效）。
+
+**已实施**：
+
+- `TerraAuth.csproj` 新增 `DefineConstants=USE_SQLITE`（条件 `'$(NoSqlite)' != 'true'`），与 SQLite 包引用同开关。
+- `Persistence/SqlitePersistence.cs` 实装 `SqliteImpl`：`Players` / `AuditLogs` / `Bans` 三表 + 索引，
+  UPSERT、单事务批量审计插入、封禁过期判定（时间戳统一 ISO-8601 UTC 文本，字符串比较即时间比较）。
+  连接策略 `Pooling=false`：句柄随 `using` 立即释放，避免 Windows 下 DB 文件被占用（备份 / 迁移 / 测试清理）。
+- `IDbExecutor.AppendAudit(AuditEntry)` → `AppendAuditBatch(IReadOnlyList<AuditEntry>)`：审计按批单事务落盘
+  （原先注释声称「事务包裹」但实际逐条写）。
+- 停机时把审计通道残留条目一并落盘（原先 `finally` 只 flush 已取出的 buffer，通道内条目会丢）。
+- `LiteDbPersistence` 兜底路径同步补齐：玩家 / 审计 / 封禁三类数据均落盘。
+- 测试 +3（141 通过）：玩家+审计重启读回、封禁重启读回、过期封禁不生效；
+  且两种后端（默认 SQLite 与 `-p:NoSqlite=true`）均全绿。
+
+### 第一轮（2026-09-11）：.NET 8 → .NET 10 升级 + Hook 热路径优化
+
+**已实施**：
 
 - 目标框架 → `net10.0`（3 个工程）；`Microsoft.Data.Sqlite` → 10.0.12；移除 `System.IO.Pipelines`
   显式引用（.NET 10 起已内置于共享框架）。
@@ -83,6 +79,6 @@
 - 日志 `params object[]` 装箱改造：实测 `Debug/Info/Warn/Error` 仅出现在 Deny / 插件加载 / Mod 包拦截等
   低频路径，**不在每包稳态路径**，装箱开销可忽略；且 `ILogger` 属插件公共 API，改造有兼容成本，故不做。
   - 若后续需要可运维性改进，可单独增加日志级别开关（当前 `CoreLogger.Debug` 无条件写 `Console`）。
-- `JsonSerializerContext` 源生成：调用点均为低频（配置变更 / 每 32 条审计落盘）；
+- `JsonSerializerContext` 源生成：调用点均为低频（配置变更 / 审计批量落盘）；
   唯一较高频点 `PersistenceAuditLogger.Log` 序列化的是**匿名类型** `details`，源生成无法覆盖，
   需先定义具体 DTO 才有意义。

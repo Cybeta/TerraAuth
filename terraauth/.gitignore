@@ -7,3 +7,9 @@ obj/
 
 # Logs
 *.log
+
+# 本地数据库（SQLite / 内嵌 LiteDb 落盘产物）
+*.db
+*.db-wal
+*.db-shm
+*.db.tmp

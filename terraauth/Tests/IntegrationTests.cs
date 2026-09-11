@@ -9,6 +9,7 @@ using TerraAuth.Concurrency;
 using TerraAuth.Monitoring;
 using TerraAuth.Net.Phase4;
 using TerraAuth.Net.Phase5;
+using TerraAuth.Persistence;
 using TerraAuth.Plugins;
 using TerraAuth.Protocol;
 using TerraAuth.Security;
@@ -702,5 +703,102 @@ public class EndToEndTests
             if (File.Exists(dbPath)) File.Delete(dbPath);
             if (File.Exists(configPath)) File.Delete(configPath);
         }
+    }
+
+    // ========================================================================
+    // Phase 6：持久化往返（"进程重启"后数据仍在）
+    // ========================================================================
+
+    [Fact]
+    public async Task Persistence_Player_And_Audit_SurviveReopen()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-persist-{Guid.NewGuid():N}.db");
+        var playerId = Guid.NewGuid();
+        try
+        {
+            // Act 1：写入玩家档案 + 审计，随后关闭（模拟进程退出）
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                await db.CreateIfNotExistsAsync(playerId, "Alice");
+                await db.SaveAsync(new PlayerData(playerId, "Alice", new byte[] { 1, 2, 3 }, 250, 120));
+                await db.AppendAsync(new AuditEntry(DateTime.UtcNow, playerId, "authority", "speed_exceeded", "1.2.3.4"));
+            }
+
+            // Act 2：重新打开（模拟进程重启）→ 数据必须仍在
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                var loaded = await db.GetAsync(playerId);
+                Assert.NotNull(loaded);
+                Assert.Equal("Alice", loaded!.Name);
+                Assert.Equal(250, loaded.MaxHp);
+                Assert.Equal(120, loaded.MaxMp);
+                Assert.Equal(new byte[] { 1, 2, 3 }, loaded.InventoryBlob);
+
+                var events = await db.QueryByPlayerAsync(playerId, DateTime.UtcNow.AddMinutes(-5));
+                var only = Assert.Single(events);
+                Assert.Equal("authority", only.EventType);
+                Assert.Equal("speed_exceeded", only.Detail);
+                Assert.Equal("1.2.3.4", only.IpAddress);
+            }
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task Persistence_Ban_SurvivesReopen()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-ban-{Guid.NewGuid():N}.db");
+        var playerId = Guid.NewGuid();
+        try
+        {
+            // Act 1：落一条封禁，关闭
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                await new SqliteBanStore(db).AddAsync(
+                    new BanRecord(playerId, "10.0.0.7", "auto:cheat", DateTime.UtcNow.AddHours(24)));
+            }
+
+            // Act 2：重启后按玩家 ID 与按 IP 都应命中
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                var store = new SqliteBanStore(db);
+                Assert.True(await store.ContainsAsync(playerId, ""));
+                Assert.True(await store.ContainsAsync(Guid.NewGuid(), "10.0.0.7"));
+            }
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task Persistence_ExpiredBan_IsNotActive()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-expban-{Guid.NewGuid():N}.db");
+        var playerId = Guid.NewGuid();
+        try
+        {
+            using (var db = new SqlitePersistence(dbPath))
+                await new SqliteBanStore(db).AddAsync(
+                    new BanRecord(playerId, "", "old", DateTime.UtcNow.AddMinutes(-1))); // 已过期
+
+            using (var db = new SqlitePersistence(dbPath))
+                Assert.False(await new SqliteBanStore(db).ContainsAsync(playerId, ""));
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
+    /// <summary>清理 DB 及其附属文件（SQLite 的 -wal/-shm、内嵌 LiteDb 的 .tmp）。</summary>
+    private static void CleanupDb(string dbPath)
+    {
+        foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + ".tmp" })
+            if (File.Exists(path)) File.Delete(path);
     }
 }

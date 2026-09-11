@@ -32,6 +32,7 @@
 | `EnableDefaultCompileItems` | `false` | 关闭默认 glob，改用显式 glob |
 | `Compile` | `**\*.cs`（`Exclude="Tests\**;bin\**;obj\**"`） | 递归收拢所有源码，排除测试与构建产物 |
 | `PackageReference` | `Microsoft.Data.Sqlite 10.0.12` | 条件：`'$(NoSqlite)' != 'true'`，离线时用内嵌 LiteDb |
+| `DefineConstants` | `USE_SQLITE` | 条件同左；选择持久化后端（SQLite / 内嵌 LiteDb） |
 | `PackageReference` | 无（`System.IO.Pipelines` 自 .NET 10 起内置于共享框架） | `PipeReader` 分帧 |
 | `InternalsVisibleTo` | `TerraAuth.Tests` | 测试可访问 `internal`（原分散在 Simulation/Net，现集中一处） |
 
@@ -206,13 +207,13 @@ TerraAuth                     ← 组合根（Program / GameHost）
 | `Net/Phase5` `PacketDecoder` | 部分 | 已解析 28 个入站包（握手链 + 权威白名单 10 包 + 伤害/死亡/传送等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
 | `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10；包 7 下发真实世界元数据（`WorldState.ToWorldInfoPacket`）；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（先发包 2 再关闭） |
 | `Config/` | 已实现 | `ServerConfig` + `FileSystemWatcher` 热重载 |
-| `Persistence/` | 部分 | 内嵌 `LiteDbPersistence` 可用；真实 `SqliteImpl` 为骨架（且封禁 / 审计仅内存、重启即丢）—— 独立立项见 [`OPTIMIZATION_BACKLOG.md`](OPTIMIZATION_BACKLOG.md) §B-1 |
+| `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认）三表落盘（玩家 / 审计 / 封禁）；`-p:NoSqlite=true` 降级到内嵌 `LiteDbPersistence`（JSON，同样三类数据落盘） |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `/metrics` |
-| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore` + `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射）；⚠️ 封禁落盘受 `Persistence/` 限制（见 §B-1） |
+| `Security/` | 已实现 | `BanManager` 滑动窗口 + `SqliteBanStore`（封禁落盘，重启后仍生效）+ `PlayerIdentity`（连接槽位 ↔ 封禁 Guid 的统一映射） |
 | `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息（`Broadcast` / `SendMessage` / `ExecuteCommand` 待文本包与命令子系统，当前仅落审计）；示例插件见 `Examples/TerraAuth.ExamplePlugins/` |
 | `ModCompat/` | 部分 | 策略 / 检测框架已实现；TModLoader 握手与 ModNet 解析为 TODO |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
-| `Tests/` | 部分 | 7 组验收测试（138 用例通过）；包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、Hook 参数填充包数据、配置阈值启动映射与热重载、实体视图发布、区块分区锁并发安全（真实 TCP）已补，`.wld` 解析测试待补 |
+| `Tests/` | 部分 | 7 组验收测试（141 用例通过）；包 10 / 包 15 编解码回归、`WorldGenerator` 确定性测试、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、Hook 参数填充包数据、配置阈值启动映射与热重载、实体视图发布、区块分区锁并发安全（真实 TCP）、持久化往返（玩家 / 审计 / 封禁重启读回）已补，`.wld` 解析测试待补 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 文档 | 对抗测试手册（M/P/R 清单），尚未执行 |
 
@@ -230,7 +231,7 @@ dotnet build TerraAuth.csproj -p:NoSqlite=true
 # 运行
 dotnet run --project TerraAuth.csproj -- --config server.json --port 7777
 
-# 测试（138 用例）
+# 测试（141 用例）
 dotnet test Tests/TerraAuth.Tests.csproj
 
 # 无 SDK 环境静态校验（大括号平衡 / ProjectReference 路径 / 接口实现 / TODO 统计）
