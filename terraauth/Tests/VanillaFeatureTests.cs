@@ -536,4 +536,68 @@ public class VanillaFeatureTests
         // 连接仍可用：后续合法移动必须生效
         await StandAtAsync(server, s, 400f, 460f);
     }
+
+    // ========================================================================
+    // 八、他人可见性：权威通过后转发给其他玩家（原版服务端中继语义）
+    // ========================================================================
+
+    [Fact]
+    public async Task Vanilla_Projectile_Is_Relayed_To_OtherPlayers()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        await a.SendAsync(PacketId.ProjectileNew,
+            new ProjectileNewPacket(7, new Vector2(320f, 460f), new Vector2(1f, 0f), 1));
+
+        var got = await b.ReadUntilAsync(p => p is ProjectileNewPacket, TimeSpan.FromSeconds(5));
+        var proj = Assert.Single(got.OfType<ProjectileNewPacket>());
+        Assert.Equal(7, proj.ProjectileKey);
+    }
+
+    [Fact]
+    public async Task Vanilla_ItemDrop_Is_Relayed_To_OtherPlayers()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        await a.SendAsync(PacketId.ItemDrop, new ItemDropPacket(1, 5));
+
+        var got = await b.ReadUntilAsync(p => p is ItemDropPacket, TimeSpan.FromSeconds(5));
+        var item = Assert.Single(got.OfType<ItemDropPacket>());
+        Assert.Equal(1, item.ItemId);
+        Assert.Equal(5, item.Stack);
+    }
+
+    [Fact]
+    public async Task Vanilla_PlayerHurt_Is_Relayed_With_ServerPlayerId()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        // A 上报受击（客户端本地索引为 0）→ 服务端必须以分配的 #1 覆盖后再转发
+        await a.SendAsync(PacketId.PlayerHurtV2, new PlayerHurtV2Packet(0, 10));
+
+        var got = await b.ReadUntilAsync(p => p is PlayerHurtV2Packet, TimeSpan.FromSeconds(5));
+        var hurt = Assert.Single(got.OfType<PlayerHurtV2Packet>());
+        Assert.Equal(1, hurt.PlayerId);
+    }
+
+    [Fact]
+    public async Task Vanilla_PlayerBuffs_Is_Relayed_With_ServerPlayerId()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        await a.SendAsync(PacketId.PlayerBuffs, new PlayerBuffsPacket(0, new[] { 1, 2 }));
+
+        var got = await b.ReadUntilAsync(p => p is PlayerBuffsPacket, TimeSpan.FromSeconds(5));
+        var buffs = Assert.Single(got.OfType<PlayerBuffsPacket>());
+        Assert.Equal(1, buffs.PlayerId);
+        Assert.Equal(new[] { 1, 2 }, buffs.BuffTypes);
+    }
 }

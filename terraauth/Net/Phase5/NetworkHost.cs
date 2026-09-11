@@ -247,14 +247,9 @@ public sealed class NetworkHost : IAsyncDisposable
         {
             case AuthorityDecision.Accept:
                 // Command 已由管线写入 _commands（Phase 3 仿真消费）
-                // 包 13：转发给其他玩家（原版客户端会忽略 TerraAuth 专用快照包 15，玩家间可见性依赖包 13）
-                if (packet is PlayerControlsPacket controls)
-                    await BroadcastControlsAsync(connection, controls, ct).ConfigureAwait(false);
-                // 包 17 / 79：挖砖/放砖权威通过 → 广播给其他玩家，原版客户端会自动更新 tile 显示
-                else if (packet is TileBreakPacket brk)
-                    await _connections.BroadcastExceptAsync(connection.PlayerId, PacketId.TileBreak, brk, ct).ConfigureAwait(false);
-                else if (packet is TilePlacePacket place)
-                    await _connections.BroadcastExceptAsync(connection.PlayerId, PacketId.TilePlace, place, ct).ConfigureAwait(false);
+                // 权威通过 → 转发给其他玩家：原版客户端依赖这些原版包渲染他人状态
+                // （TerraAuth 专用快照包 15 会被原版客户端忽略，故玩家间可见性必须靠原版包）
+                await RelayToOthersAsync(packet, connection, ct).ConfigureAwait(false);
                 break;
 
             case AuthorityDecision.Correct:
@@ -323,16 +318,75 @@ public sealed class NetworkHost : IAsyncDisposable
     }
 
     /// <summary>
-    /// 包 13 转发：把玩家控制状态发给其他 Playing 连接。
-    /// 原版客户端不解析 TerraAuth 专用快照包 15，玩家间可见性依赖原版包 13。
-    /// PlayerId 以服务端分配值覆盖，防止客户端伪造他人身份驱动其移动。
+    /// 权威通过后把该包转发给其他 Playing 连接（原版语义：服务端中继客户端状态变更）。
+    /// <para>
+    /// 身份覆盖：凡携带玩家字段的包，一律以服务端分配的 PlayerId 覆盖客户端上报值，
+    /// 防止伪造他人身份驱动其移动 / 受伤 / 增益。
+    /// </para>
+    /// <para>
+    /// 原样转发：包 21（掉落物槽位）/ 27（抛射物索引）中的索引为全局量，原版即原样中继；
+    /// 包 32（箱子内物品）无玩家字段。
+    /// </para>
     /// </summary>
-    private async Task BroadcastControlsAsync(
-        Connection sender, PlayerControlsPacket controls, CancellationToken ct)
+    private async Task RelayToOthersAsync(INetworkPacket packet, Connection sender, CancellationToken ct)
     {
-        var forwarded = controls with { PlayerId = (byte)sender.PlayerId };
-        await _connections.BroadcastExceptAsync(
-            sender.PlayerId, PacketId.PlayerPosition, forwarded, ct).ConfigureAwait(false);
+        switch (packet)
+        {
+            case PlayerControlsPacket controls:      // 13 移动 / 控制（含速度等可选字段）
+                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerPosition,
+                    controls with { PlayerId = (byte)sender.PlayerId }, ct).ConfigureAwait(false);
+                break;
+
+            case TileBreakPacket brk:                // 17 挖砖
+                await _connections.BroadcastExceptAsync(
+                    sender.PlayerId, PacketId.TileBreak, brk, ct).ConfigureAwait(false);
+                break;
+
+            case TilePlacePacket place:              // 79 放砖
+                await _connections.BroadcastExceptAsync(
+                    sender.PlayerId, PacketId.TilePlace, place, ct).ConfigureAwait(false);
+                break;
+
+            case ProjectileNewPacket proj:           // 27 抛射物
+                await _connections.BroadcastExceptAsync(
+                    sender.PlayerId, PacketId.ProjectileNew, proj, ct).ConfigureAwait(false);
+                break;
+
+            case ItemDropPacket drop:                // 21 世界掉落物
+                await _connections.BroadcastExceptAsync(
+                    sender.PlayerId, PacketId.ItemDrop, drop, ct).ConfigureAwait(false);
+                break;
+
+            case PlayerHurtV2Packet hurt:            // 117 受伤（他人可见受击表现）
+                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerHurtV2,
+                    hurt with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
+                break;
+
+            case PlayerDeathV2Packet death:          // 118 死亡
+                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerDeathV2,
+                    death with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
+                break;
+
+            case PlayerHealPacket heal:              // 35 治疗
+                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerHeal,
+                    heal with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
+                break;
+
+            case SyncPlayerZonePacket zone:          // 36 生物群系 / 城镇状态
+                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.SyncPlayerZone,
+                    zone with { PlayerId = (byte)sender.PlayerId }, ct).ConfigureAwait(false);
+                break;
+
+            case PlayerBuffsPacket buffs:            // 50 增益 / 减益列表
+                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerBuffs,
+                    buffs with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
+                break;
+
+            case SyncChestItemPacket chestItem:      // 32 箱子内物品（无玩家字段）
+                await _connections.BroadcastExceptAsync(
+                    sender.PlayerId, PacketId.SyncChestItem, chestItem, ct).ConfigureAwait(false);
+                break;
+        }
     }
 
     // ---------- 连接状态管理 ----------

@@ -29,6 +29,7 @@
 | 传送 | 65 | 实体索引 / 落点越界 / 频率校验 | `Vanilla_Teleport_OutOfBounds_IsRejected` |
 | 请求传送（回城类） | 73 | 类型 / 频率校验（与 65 共窗口） | 解码 + 校验已实现，**未单测** |
 | 弃用包健壮性 | 25 | 未知 / 弃用包透传，连接不受影响 | `Vanilla_DeprecatedChatPacket_DoesNot_Disconnect` |
+| **他人可见性（中继）** | 27 / 21 / 117 / 118 / 35 / 36 / 50 / 32 | 权威通过后**转发给其他玩家**；携带玩家字段的包一律以服务端分配 ID 覆盖（防伪造身份驱动他人状态） | `Vanilla_Projectile_Is_Relayed_To_OtherPlayers` / `..._ItemDrop_...` / `..._PlayerHurt_Is_Relayed_With_ServerPlayerId` / `..._PlayerBuffs_...` |
 
 ---
 
@@ -79,3 +80,22 @@
 # 仅原版功能端到端套件
 dotnet test Tests/TerraAuth.Tests.csproj -c Release --filter "FullyQualifiedName~VanillaFeatureTests"
 ```
+
+---
+
+## 六、下一轮：待补协议布局（阻塞项）
+
+以下三项**需要权威线格式**才能实现。不做猜测式实现 —— 布局错误会产出真实客户端无法解析的包，
+比"未实现"更糟（会表现为客户端异常/掉线，且难以定位）。
+
+| 项 | 需要的包 | 需要的布局信息 | 阻塞原因 |
+|---|---|---|---|
+| 时间 / 天气 / 月相同步 | **18 (Time)** | `NetMessage.SendData` case 18 的字段顺序与类型（dayTime / time / moonPhase / bloodMoon / eclipse …） | 仓库内既无该包编解码，也无布局文档；TShock 官方 Wiki 抓取只取到目录部分 |
+| 聊天 | **82 (NetModule) + NetTextModule** | NetModule 帧结构（模块标识 + 长度 + 负载）与 `NetTextModule.SerializeServerMessage` 的负载字段（作者 / 文本 / 颜色） | 同上 |
+| NPC 同步 | **23 (NPC Update)** | 完整字段序列与条件位（netId / 命中 / 生命 / 增益 / 目标 / `ai[]` 等随标志位增减）；另需服务端 NPC 生命周期（生成 / 定期更新 / 失效） | 同上 |
+
+**解除阻塞方式**：提供本机原版源码中 `Terraria.MessageBuffer.GetData` / `NetMessage.SendData` 的
+`case 18 / 23 / 82` 片段（工作区已有 `Terraria/Terraria.exe`），或指定一份可信的 1.4.5.8 协议参考。
+
+> 另注：**时间同步是否需要**尚待实测确认 —— 原版客户端可能自行按 tick 推进 `Main.time`（服务端同样每 tick +1），
+> 若确实如此则无需持续下发；只有在服务端强制改时间（如日月切换）时才需要包 18。建议先用真实客户端观察昼夜是否自行推进。
