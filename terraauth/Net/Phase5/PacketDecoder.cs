@@ -1,6 +1,6 @@
 // TerraAuth — Phase 5: 数据包解码器
 // 字节流 → INetworkPacket
-// 布局权威来源：本地客户端原版 Terraria.MessageBuffer.GetData（1.4.5.8 / Protocol 326）
+// 布局权威来源：原版客户端收包读取的字段顺序与类型（Terraria 1.4.5.8 / Protocol 326）
 
 using System.Buffers;    // ReadOnlySequence<byte>
 using System.IO;
@@ -100,7 +100,7 @@ public sealed class PacketDecoder : IPacketDecoder
 
             // 其余包统一透传为 UnknownPacket：保留原始 PacketId 与 payload，
             // 编码侧原样转发，无需逐包建模；仅权威校验所需的包在此显式结构化。
-            // 如需结构化某包，参考本地原版 MessageBuffer.GetData 对应 case 的 read 实现。
+            // 如需结构化某包，先确认该包在客户端读取侧的字段顺序与类型（类型以读取侧为准）。
             _ => new UnknownPacket(type, payload.ToArray()),
         };
     }

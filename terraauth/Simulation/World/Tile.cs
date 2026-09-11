@@ -1,6 +1,6 @@
 // TerraAuth — Phase 6: 世界数据模型（Tile / TileMap）
-// 字段布局权威来源：本地客户端原版 Terraria.Tile（1.4.5.8 / Protocol 326）
-//   - 读写：WorldFile.LoadWorldTiles / NetMessage.CompressTileBlock_Inner
+// 字段布局权威来源：原版客户端的图格字段布局（Terraria 1.4.5.8 / Protocol 326）
+//   - 读写：世界文件的图格段与包 10（TileSection）的压缩块
 
 using System;
 using TerraAuth.Protocol;

@@ -1,6 +1,6 @@
 // TerraAuth — Phase 5: 数据包编码器
 // ISnapshotSender 输出 → 字节流
-// 布局权威来源：本地客户端原版 Terraria.NetMessage.SendData（1.4.5.8 / Protocol 326）
+// 布局权威来源：原版客户端发包实现的字段顺序（Terraria 1.4.5.8 / Protocol 326）
 
 using System.Buffers;
 using System.IO;

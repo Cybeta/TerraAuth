@@ -2,7 +2,7 @@
 // 目的：解除进服阻塞——默认 new WorldState() 是 1×1 世界，NetworkHost 的
 //   maxSectionsX = MaxTilesX/200 = 0 → 区块列表为空 → 客户端收不到任何 TileSection（包 10）而掉线。
 // 本生成器产出与原版小世界同尺寸（4200×1200）的确定性地形，供 NetworkHost 构造包 7（WorldInfo）
-//   与包 10（TileSection）。字段 / 尺寸权威来源：原版 Main.maxTilesX/Y、sectionWidth/Height。
+//   与包 10（TileSection）。尺寸权威来源：原版客户端的世界宽高上限与区块尺寸常量。
 
 using System;
 
@@ -11,11 +11,11 @@ namespace TerraAuth.Simulation;
 /// <summary>确定性程序化世界生成（当前仅"最小可加载世界"）。</summary>
 public static class WorldGenerator
 {
-    /// <summary>原版小世界尺寸（Main：rightWorld/16+1 × bottomWorld/16+1）。</summary>
+    /// <summary>原版小世界尺寸（由其宽高像素 / 16 + 1 得出区块数）。</summary>
     public const int SmallWorldWidth = 4200;
     public const int SmallWorldHeight = 1200;
 
-    /// <summary>原版 <c>Main.WorldGeneratorVersion</c>（1.4.5.8）。</summary>
+    /// <summary>原版世界生成器版本（1.4.5.8）。</summary>
     public const ulong GeneratorVersion = 1400159338497UL;
 
     // 图格 ID（Terraria.TileID）：0=泥土、1=石、2=草
@@ -31,7 +31,7 @@ public static class WorldGenerator
     private const int BaseSurfaceY = 360;
     private const int RockLayerY = 720;
 
-    /// <summary>向导 NPC 的类型 ID（权威：原版 <c>Terraria.ID.NPCID.Guide</c>）。</summary>
+    /// <summary>向导 NPC 的类型 ID（原版常量 22）。</summary>
     private const short GuideNpcType = 22;
 
     /// <summary>出生点周围压平的半宽（图格），保证稳定出生。</summary>

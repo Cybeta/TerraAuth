@@ -104,7 +104,7 @@ public partial class WorldSimulator : IWorldViewProvider
     private const int SpawnIntervalTicks = 60;
     /// <summary>敌怪清理延迟（tick）：确保 life=0 已通过世界同步下发后再从列表移除。</summary>
     private const long EnemyRemovalDelayTicks = 120;
-    /// <summary>史莱姆（权威：原版 <c>Terraria.ID.NPCID.BlueSlime</c>）与其生命值。</summary>
+    /// <summary>史莱姆（原版 NPC 类型 ID 1）与其生命值。</summary>
     private const short BlueSlimeType = 1;
     private const int BlueSlimeLife = 25;
 

@@ -1,6 +1,6 @@
 // TerraAuth — Phase 6: 世界状态（权威数据模型）
-// 字段来源：本地客户端原版 WorldFile.LoadHeader / LoadWorldFlags / LoadChests / LoadSigns / LoadNPCs
-//   以及 NetMessage.SendData case 7（WorldData 包）的字段顺序（1.4.5.8 / Protocol 326）
+// 字段来源：原版客户端世界文件的头部与各分段（世界旗标 / 箱子 / 告示牌 / NPC），
+//   以及包 7（WorldData）的字段顺序（Terraria 1.4.5.8 / Protocol 326）
 // 该类型是服务端权威世界的唯一真相来源：.wld 解析 / 程序化生成均产出它，NetworkHost 由它构造出站包。
 
 using System;

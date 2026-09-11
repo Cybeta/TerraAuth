@@ -1,8 +1,8 @@
 // TerraAuth — Phase 6: 图格 ID 静态集合
-// 权威来源：本地客户端原版 Terraria.ID.TileID.Sets / Terraria.Main（1.4.5.8 / Protocol 326）
-//   - Main.tileSolid（298 个 true，已剔除被显式置 false 的 110/3/4/5/11/634/379）
-//   - TileID.Sets.SaveSlopes = tileSolid || NonSolidSaveSlopes
-//   - TileID.Sets.BasicChest / tileSign
+// 权威来源：原版客户端的图格 ID 集合定义（Terraria 1.4.5.8 / Protocol 326）
+//   - 实心图格集合（298 个 true，已剔除被显式置 false 的 110/3/4/5/11/634/379）
+//   - 可保存斜坡 = 实心图格 ∪ 非实心可保存斜坡
+//   - 基础箱子 / 告示牌集合
 
 using System.Collections.Frozen;
 using System.Collections.Generic;

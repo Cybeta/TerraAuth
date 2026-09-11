@@ -1,7 +1,6 @@
 // TerraAuth — Phase 6: .wld 世界文件解析器
-// 权威来源：本地客户端原版 WorldFile.LoadWorld_Version2 及其分段加载方法
-//   LoadFileFormatHeader / LoadHeader / LoadWorldFlags / LoadWorldTiles / LoadChests / LoadSigns /
-//   LoadNPCs / LoadFooter（Terraria 1.4.5.8 / 世界版本 326）
+// 权威来源：原版客户端世界文件 v2 的分段读取顺序
+//   文件格式头 / 头部 / 世界旗标 / 图格 / 箱子 / 告示牌 / NPC / 尾部（Terraria 1.4.5.8 / 世界版本 326）
 // 兼容：自动识别 gzip 压缩（1f 8b）与原始字节两种世界文件。
 
 using System;

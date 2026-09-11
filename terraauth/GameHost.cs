@@ -289,7 +289,7 @@ public sealed class GameHost : IDisposable
 
     /// <summary>
     /// 把世界时间与 NPC 状态同步给所有在线玩家（包 18 / 23）。
-    /// 布局权威：原版 <c>NetMessage.SendData</c> case 18 / case 23。
+    /// 布局依据：原版客户端（协议 326）包 18 / 包 23 的字段顺序。
     /// </summary>
     public async Task BroadcastWorldStateAsync(CancellationToken ct = default)
     {

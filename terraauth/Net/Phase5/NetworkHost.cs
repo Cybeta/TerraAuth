@@ -493,7 +493,7 @@ public sealed class NetworkHost : IAsyncDisposable
 
     /// <summary>
     /// 包 8：客户端请求出生区块。回 9（状态文本，携带区块总数）→ 逐块 10（TileSection）→ 49（InitialSpawn）。
-    /// 区块矩形与顺序对应原版 <c>MessageBuffer</c> case 8：
+    /// 区块矩形与顺序对应原版客户端包 8 的读取顺序：
     ///   世界出生点 5×3 矩形 + 请求出生点 6×4 矩形（去重）。
     /// </summary>
     private async Task HandleSpawnTileDataAsync(
