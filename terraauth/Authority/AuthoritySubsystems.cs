@@ -18,7 +18,18 @@ public sealed record PlayerLimits(int MaxHp, int MaxMana)
 }
 
 /// <summary>移动校验阈值。</summary>
-public sealed record MovementLimits(float MaxSpeed, float TeleportTolerance, int MaxTeleportsPerSecond = 5)
+/// <param name="MaxSpeed">水平 / 上行的最大速度（像素/帧）。</param>
+/// <param name="TeleportTolerance">单帧允许的额外容差（像素）。</param>
+/// <param name="MaxTeleportsPerSecond">每秒传送次数上限。</param>
+/// <param name="MaxFallSpeed">
+/// 垂直**向下**的最大速度（像素/帧）。原版下落终速（<c>MaxFallSpeed</c> ≈ 20）远高于水平速度，
+/// 若按水平上限判定，任何一次正常坠落都会被判超速 → 服务端位置不再更新且累计违规踢人。
+/// </param>
+public sealed record MovementLimits(
+    float MaxSpeed,
+    float TeleportTolerance,
+    int MaxTeleportsPerSecond = 5,
+    float MaxFallSpeed = 20.0f)
 {
     /// <summary>兜底默认值（与 ServerConfig 默认一致）。</summary>
     public static MovementLimits Default => new(MaxSpeed: 8.0f, TeleportTolerance: 4.0f, MaxTeleportsPerSecond: 5);
@@ -331,14 +342,19 @@ internal sealed class MovementAuthority : IMovementAuthority
             var maxSpeed = GetMaxSpeedFor(playerId);
             var dx = reported.X - state.LastPosition.X;
             var dy = reported.Y - state.LastPosition.Y;
-            var distance = MathF.Sqrt(dx * dx + dy * dy);
-            var allowed = maxSpeed * FramesPerSecond * (float)dt + _limits.TeleportTolerance;
 
-            if (distance > allowed)
+            // 分轴判定：水平用 MaxSpeed，**垂直用 max(MaxSpeed, MaxFallSpeed)**（上行 / 下落都算）。
+            // 若垂直也按水平上限，原版正常坠落（终速 ≈20 px/帧）会被误判超速 → 服务端位置
+            // 不再更新（后续挖 / 放 / 交互全部 out_of_reach）且累计违规被踢。
+            var verticalSpeed = MathF.Max(maxSpeed, _limits.MaxFallSpeed);
+            var horizontal = maxSpeed * FramesPerSecond * (float)dt + _limits.TeleportTolerance;
+            var vertical = verticalSpeed * FramesPerSecond * (float)dt + _limits.TeleportTolerance;
+
+            if (MathF.Abs(dx) > horizontal || MathF.Abs(dy) > vertical)
             {
                 // 拒绝时保持权威基准不变：瞬移包不得污染服务端位置
                 _audit.Log(AuditEvent.Now(playerId, "authority", "position_rejected", "speed_exceeded",
-                    new { Distance = distance, Allowed = allowed, MaxSpeed = maxSpeed, Dt = dt }));
+                    new { Dx = dx, Dy = dy, AllowedX = horizontal, AllowedY = vertical, MaxSpeed = maxSpeed, Dt = dt }));
                 return AuthorityResult.Reject("speed_exceeded");
             }
 

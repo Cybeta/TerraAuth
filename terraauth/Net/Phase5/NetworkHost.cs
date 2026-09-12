@@ -427,8 +427,36 @@ public sealed class NetworkHost : IAsyncDisposable
                 await _connections.BroadcastExceptAsync(
                     sender.PlayerId, PacketId.SyncChestItem, chestItem, ct).ConfigureAwait(false);
                 break;
+
+            default:
+                // 未建模的客户端包（UnknownPacket）：原版服务端默认把客户端状态变更中继给其他人，
+                // 否则表情 / 告示牌 / 家具 / NetModule 其他模块等「他人可见性」全部静默丢失。
+                // 少数「握手 / 世界请求 / 自身状态 / 服务端自持」类包不中继（见 IsSelfOnlyPacket）。
+                if (packet is UnknownPacket unknown && !IsSelfOnlyPacket(unknown.Type))
+                {
+                    await _connections.BroadcastExceptAsync(
+                        sender.PlayerId, unknown.Type, unknown, ct).ConfigureAwait(false);
+                }
+                break;
         }
     }
+
+    /// <summary>
+    /// 「只与该连接自身有关」的包：不应中继给其他玩家。
+    /// 覆盖握手 / 世界与区块请求 / 自身属性上报 / 服务端自持（库存 / 箱子 / 拾取）等。
+    /// 其余未建模包一律按原版语义中继（他人可见性依赖它）。
+    /// </summary>
+    private static bool IsSelfOnlyPacket(PacketId id) => id switch
+    {
+        PacketId.ConnectionRequest or PacketId.Disconnect or PacketId.ContinueConnecting
+            or PacketId.PlayerInfo or PacketId.InventorySlot or PacketId.RequestWorldInfo
+            or PacketId.WorldInfo or PacketId.TileGetSection or PacketId.StatusText
+            or PacketId.TileSendSection or PacketId.TileFrameSection or PacketId.PlayerSpawn
+            or PacketId.Snapshot or PacketId.PlayerHealth or PacketId.PlayerMana
+            or PacketId.ItemPickup or PacketId.Chest or PacketId.SyncPlayerChestIndex
+            or PacketId.InitialSpawn or PacketId.FinishedConnecting => true,
+        _ => false,
+    };
 
     /// <summary>
     /// 打开箱子（包 31）权威通过后，把服务端持有的箱子内容逐槽下发：
@@ -579,6 +607,12 @@ public sealed class NetworkHost : IAsyncDisposable
                 await HandleSpawnTileDataAsync(spawn, connection, ct).ConfigureAwait(false);
                 return false;
 
+            case SpawnTileDataPacket spawn when connection.State == ConnectionState.Playing:
+                // 游戏内请求周边区块（原版客户端边走边请求）→ 补发该点周边**尚未下发过**的区块。
+                // 仅在登录时发一次会让玩家离开出生点后看不到地形。
+                await StreamSectionsAroundAsync(spawn.SpawnX, spawn.SpawnY, connection, ct).ConfigureAwait(false);
+                return false;
+
             case PlayerSpawnPacket when connection.State == ConnectionState.Authenticating:
                 // 包 12 PlayerSpawn：服务端置 Playing 并回包 129（连接完成）
                 await HandlePlayerSpawnAsync(connection, ct).ConfigureAwait(false);
@@ -648,19 +682,95 @@ public sealed class NetworkHost : IAsyncDisposable
             ct).ConfigureAwait(false);
 
         foreach (var (sx, sy) in sections)
-        {
-            int xStart = sx * 200;
-            int yStart = sy * 150;
-            int width = Math.Min(200, _world.MaxTilesX - xStart);
-            int height = Math.Min(150, _world.MaxTilesY - yStart);
-
-            await SendTileSectionAsync(connection, xStart, yStart, width, height, ct).ConfigureAwait(false);
-        }
+            await SendSectionOnceAsync(connection, sx, sy, ct).ConfigureAwait(false);
 
         await connection.SendEncodedAsync(
             PacketId.InitialSpawn,
             new InitialSpawnPacket(),
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>流送区块的矩形尺寸（区块数）：5 宽 × 3 高，与登录期出生点矩形一致。</summary>
+    private const int StreamSectionsWide = 5;
+    private const int StreamSectionsTall = 3;
+
+    /// <summary>
+    /// 按玩家当前所在区块流送周边区块：**仅当该玩家跨越区块边界时**触发，且跳过已下发过的区块。
+    /// 原版会在玩家移动时持续补发附近区块；若只在登录时发一次，离开出生点后客户端地形为空。
+    /// 由快照循环按 20Hz 调用（未跨区块时只做一次坐标比较，开销可忽略）。
+    /// </summary>
+    public async Task StreamSectionsForPlayersAsync(CancellationToken ct = default)
+    {
+        foreach (var connection in _connections.All())
+        {
+            if (connection.State != ConnectionState.Playing) continue;
+            if (!TryGetPlayerPosition(connection.PlayerId, out var position)) continue;
+
+            var current = (TileMap.GetSectionX((int)(position.X / 16f)),
+                           TileMap.GetSectionY((int)(position.Y / 16f)));
+            if (connection.LastStreamSection == current) continue;
+
+            connection.LastStreamSection = current;
+            await StreamSectionsAroundSectionAsync(current.Item1, current.Item2, connection, ct)
+                .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>按图格坐标流送周边区块（包 8 请求路径）。</summary>
+    private async Task StreamSectionsAroundAsync(int tileX, int tileY, Connection connection, CancellationToken ct)
+    {
+        // 请求坐标无效（-1 / 越界）时退回服务端记录的位置
+        if (tileX <= 0 || tileY <= 0 || tileX >= _world.MaxTilesX || tileY >= _world.MaxTilesY)
+        {
+            if (!TryGetPlayerPosition(connection.PlayerId, out var position)) return;
+            tileX = (int)(position.X / 16f);
+            tileY = (int)(position.Y / 16f);
+        }
+
+        await StreamSectionsAroundSectionAsync(
+            TileMap.GetSectionX(tileX), TileMap.GetSectionY(tileY), connection, ct).ConfigureAwait(false);
+    }
+
+    private async Task StreamSectionsAroundSectionAsync(
+        int sectionX, int sectionY, Connection connection, CancellationToken ct)
+    {
+        int maxSectionsX = _world.MaxTilesX / 200;
+        int maxSectionsY = _world.MaxTilesY / 150;
+        int halfW = StreamSectionsWide / 2;
+        int halfH = StreamSectionsTall / 2;
+
+        for (int sx = sectionX - halfW; sx <= sectionX + halfW; sx++)
+            for (int sy = sectionY - halfH; sy <= sectionY + halfH; sy++)
+            {
+                if (sx < 0 || sy < 0 || sx >= maxSectionsX || sy >= maxSectionsY) continue;
+                await SendSectionOnceAsync(connection, sx, sy, ct).ConfigureAwait(false);
+            }
+    }
+
+    /// <summary>下发一个区块（已下发过的跳过；编码超帧上限时自动拆分）。</summary>
+    private async Task SendSectionOnceAsync(Connection connection, int sx, int sy, CancellationToken ct)
+    {
+        if (!connection.SyncedSections.Add((sx, sy))) return; // 已发过 → 不重复编码
+
+        int xStart = sx * 200;
+        int yStart = sy * 150;
+        int width = Math.Min(200, _world.MaxTilesX - xStart);
+        int height = Math.Min(150, _world.MaxTilesY - yStart);
+        if (width <= 0 || height <= 0) return;
+
+        await SendTileSectionAsync(connection, xStart, yStart, width, height, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>取服务端权威的玩家位置（无运行时 / 未在线返回 false）。</summary>
+    private bool TryGetPlayerPosition(int playerId, out Vector2 position)
+    {
+        position = default;
+        lock (_world.PlayersLock)
+        {
+            if (!_world.Players.TryGetValue(playerId, out var player)) return false;
+            position = player.Position;
+            return true;
+        }
     }
 
     /// <summary>

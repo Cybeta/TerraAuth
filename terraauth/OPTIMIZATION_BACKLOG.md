@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第十三轮：程序化生成支持原版三档世界尺寸）
+> 最后更新：2026-09-12（第十四轮：Play 阶段区块流送 + 移动权威垂直轴 + 未建模包中继）
 
 ---
 
@@ -56,6 +56,46 @@
 ---
 
 ## 附：本轮回溯
+
+### 第十四轮（2026-09-12）：Play 阶段区块流送 + 移动权威垂直轴 + 未建模包中继
+
+**问题**（本轮以「原版客户端能否正常游玩」为线索做代码核对时发现，此前文档均未列）：
+
+1. **出生点以外没有地形**：包 8（`SpawnTileData`）只在握手期处理（`when State == Authenticating`），
+   进入 Playing 后落到 `default: return State == Playing` → 进管线 → 无命令 → **丢弃**。
+   而原版客户端是**边走边请求周边区块**的。结果：玩家离开登录时下发的出生区块后，远处地形在客户端为空。
+2. **正常坠落被判超速**：移动权威只用水平上限算允许位移（`MaxSpeed = MaxFlightSpeed = 8` px/帧），
+   而原版下落终速 `MaxFallSpeed ≈ 20 px/帧` 必然超出。拒绝时又**不更新基准、也不生成 MoveCommand**
+   → 服务端位置停在原处（后续挖 / 放 / 开箱 / 拾取的 `IsWithinReach` 全部判 out_of_reach），
+   且每次 Reject 计入违规窗口 → 默认 **10 次 / 60s 直接踢出** ⇒ **从高处掉落即被踢**。
+3. **未建模包被静默丢弃**：解码器只结构化约 35 个包，其余统一 `UnknownPacket`；
+   而 `RelayToOthersAsync` 的 switch **没有 default 分支** → 未建模包既不中继也不处理，
+   表情 / 告示牌 / 家具 / NetModule 其他模块等「他人可见性」全部丢失。
+
+**已实施**：
+
+- **区块流送**：`Connection` 记录 `SyncedSections`（已下发区块，避免重复 Deflate 编码）与 `LastStreamSection`；
+  `NetworkHost.SendSectionOnceAsync` 统一「未发过才下发」；新增 `StreamSectionsForPlayersAsync`
+  （由快照循环按 20Hz 调用，**仅当玩家跨越区块边界**时补发其周边 5×3 区块）；
+  包 8 在 Playing 阶段也被处理（按请求点补发）。登录期出生区块路径复用同一去重逻辑。
+- **移动权威分轴判定**：`MovementLimits` 新增 `MaxFallSpeed`（默认 20，由 `ServerConfig.MaxFallSpeed` 注入）；
+  水平用 `MaxSpeed`，**垂直用 `max(MaxSpeed, MaxFallSpeed)`**；拒绝时仍保持基准不变（防瞬移污染）。
+- **未建模包默认中继**：`RelayToOthersAsync` 增加 default 分支 —— `UnknownPacket` 默认转发给其他玩家；
+  `IsSelfOnlyPacket` 列出「握手 / 世界与区块请求 / 自身属性上报 / 服务端自持（库存 / 箱子 / 拾取）」等不中继的包。
+
+**测试**：+3（**256 通过**）——`Vanilla_TileSections_Stream_As_Player_Moves`（移动后补发区块、位置未变不重复下发）、
+`MovementAuthority_Accepts_FastFall_But_Still_Rejects_HorizontalTeleport`（垂直放宽但水平瞬移仍拒）、
+`Vanilla_UnmodeledPacket_Is_Relayed_To_OtherPlayers`（未建模包到达其他玩家）。
+顺带把既有偶发用例 `AntiCheat_PacketFlood_...` 的等待窗口 5s → 15s（全量并行跑时踢出会变慢）。
+默认后端与 `-p:NoSqlite=true` 兜底后端均 256/256 通过。
+
+**未纳入（原因见前一轮「已知限制」）**：
+
+- **NPC 同步的 ai 字段**：包 23 已发位置 / 速度 / 朝向 / 生命，但**缺 ai 值**。真正补齐需要**真实 NPC AI 模型**
+  （当前为简化 AI），且补发改动会让客户端与服务端 ai 分叉；无真实客户端可验证，故不盲改。
+- **服务端图格推送用包 10 而非包 20**：包 10（TileSection）与登录期地形走的是**同一客户端处理路径**，
+  故中途推送大概率同样适用；换成包 20（SendTileSquare）属未经验证的协议改动，需真实客户端实测后再定。
+- **世界内容**：程序化生成仍是「可加载地形」（三档尺寸已支持），完整地形需 `WorldPath` 指定真实 `.wld`。
 
 ### 第十三轮（2026-09-12）：程序化生成支持原版三档世界尺寸
 

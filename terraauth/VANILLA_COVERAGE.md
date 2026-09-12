@@ -15,10 +15,12 @@
 | 玩家信息 / 外观 | 4 | 名称合法性 + 白名单 + 记录外观（Slot 覆盖为服务端 ID） | `Vanilla_SecondPlayer_Is_Broadcast_To_First` |
 | 请求世界数据 | 6 | 回包 7（真实世界元数据） | `Vanilla_LoginChain_...` |
 | 请求出生区块 | 8 | 回包 9（进度）+ 逐块 10 + 49（出生） | `Vanilla_LoginChain_...` |
+| **区块流送（离开出生点后的地形）** | 8 / 10 | 包 8 在 **Playing 阶段也处理**：按请求点补发尚未下发过的周边区块（5×3）；快照循环 20Hz 按玩家位置流送（**跨区块才补发**，已发过的区块不重复编码） | `Vanilla_TileSections_Stream_As_Player_Moves` |
+| **未建模包中继** | （任意） | 未结构化的客户端包**默认中继**给其他玩家（握手 / 世界请求 / 自身属性 / 服务端自持等例外除外），修掉「表情 / 告示牌 / 家具等他人不可见」 | `Vanilla_UnmodeledPacket_Is_Relayed_To_OtherPlayers` |
 | 进入世界 | 12 | 置 Playing → 包 129 + 广播外观 4 / 激活 14 | `Vanilla_Join_Marks_Self_Active` |
 | 玩家激活在线 / 离线 | 14 | 进服广播激活；断线广播 `Active=false` | `Vanilla_PlayerDisconnect_Broadcasts_Inactive` |
 | **断线会话保留 + 槽位回收** | 14 | 断线不销毁运行时：按玩家名保留位置 / 血量 / 增益（`SessionResumeGraceSeconds`，默认 60s），宽限期内同身份重连**认回原运行时**并下发**携带恢复坐标**的出生包（12）；超期 / 被顶号回收。断开时释放连接槽位与并发容量，新连接复用**最小空闲 ID**（与原版一致）。注：原版客户端断线即回主菜单，故为「手动重进的会话接管」而非自动重连 | `Vanilla_SessionResume_Restores_Position_And_Hp` / `..._Off_When_Grace_Is_Zero` / `SessionResume_Expires_After_Grace` |
-| 移动 / 位置 | 13 | 超速校验（`maxSpeed×60×Δt + 容差`）→ Command → 仿真 → 快照 15；并转发其他玩家 | `Vanilla_Movement_Accepted_And_Applied` / `..._Overspeed_IsRejected` |
+| 移动 / 位置 | 13 | **分轴**超速校验（水平 `maxSpeed×60×Δt`；垂直 `max(maxSpeed, MaxFallSpeed)×60×Δt`，均 + 容差）→ Command → 仿真 → 快照 15；并转发其他玩家 | `Vanilla_Movement_Accepted_And_Applied` / `..._Overspeed_IsRejected` |
 | 挖砖 | 17 | 越界 / 超距 / 图格类型对账 → TileBreakCommand → 图格变更 → 转发 | `Vanilla_TileBreak_Removes_Solid_Tile` / `..._OutOfReach_IsRejected` |
 | 放砖 | 79 | 越界 / 超距 / 类型范围 / **背包扣减（SSC）** → TilePlaceCommand | `Vanilla_InventoryReport_Then_TilePlace_Succeeds` / `..._Without_InventoryItem_IsRejected` |
 | 背包同步 | 5 | 槽位 / 堆叠 / 物品校验；SSC 下服务端持有唯一真相 | `Vanilla_InventorySlot_InvalidSlot_IsRejected` |
@@ -84,7 +86,8 @@
    并下发包 117 表现 + 包 16 权威血量）；遗留：**敌怪远程弹幕**未建模（当前敌怪不会发射弹幕），
    且客户端上报的包 117 仍作为「额外伤害来源」被接受（可叠加，但无法凭空回血 / 抬高上限）。
 7. **图格变更推送采用「小矩形包 10」**：服务端驱动的图格修改（电路翻转执行器等）以包 10 小矩形（宽 × 1，按行合并）
-   推送给视口内玩家，而非原版的包 20（SendTileSquare）；若与原版客户端行为有差异，需按实测调整。
+   推送给视口内玩家，而非原版的包 20（SendTileSquare）。**登录期地形与游戏内区块流送同样走包 10**，
+   二者在客户端是同一处理路径，故中途推送大概率同样适用；是否换成包 20 需真实客户端实测后再定。
 8. **液体同步已按视口裁剪**，但仍为「每玩家全量过滤」（复杂度 O(玩家数 × 变更数)）；玩家数 / 变更数继续增大后需按区块分桶下发。
 9. **Boss / 事件为简化模型**：Boss AI 仅直线追击、生命值为简化表；血月 / 日食为昼夜概率、入侵为配额刷怪，均非原版规则；
    掉落为**简化表**（仅收录眼魔 / 世界吞噬者 → 恶魔矿、史莱姆王 → 凝胶、蜂后 → 蜂蜡），未复刻原版掉落数据库。

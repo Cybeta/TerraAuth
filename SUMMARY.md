@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**253 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
+> 生成日期：2026-09-12 ｜ 当前测试：**256 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
 
 ---
 
@@ -82,7 +82,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **253 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
+- 套件 **256 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -113,7 +113,20 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
   否则槽位复用会把上次会话的位置当作基准，重连玩家首个位置包被判超速。
 - **明确限制**：原版客户端**断线即回主菜单**，故这是「手动重进的会话接管」而非自动重连。
 
-### 10. 文档同步
+### 10. 原版可玩性核对与修复（三项硬伤）
+
+以「原版客户端能否正常游玩」为线索做了一次**代码级核对**，修掉三项此前文档未列的硬伤：
+
+- **出生点以外没有地形**（最严重）：包 8（区块请求）原先只在握手期处理，进入游戏后请求被丢弃。
+  现在 **Playing 阶段也处理**，并由快照循环按玩家位置流送周边区块（跨区块才补发、已发过的区块不重复编码）——
+  玩家走出出生点后远处地形正常出现。
+- **正常坠落会被判超速并被踢**：移动权威原先只用水平上限（8 px/帧）判定，而原版下落终速约 20 px/帧，
+  必然超标 → 服务端位置停在原处（后续挖 / 放 / 开箱全部 out_of_reach）+ 违规累计到 10 次即踢。
+  现改为**分轴判定**：水平用 `MaxSpeed`，垂直用 `max(MaxSpeed, MaxFallSpeed)`（`MaxFallSpeed` 由配置注入）。
+- **未建模的客户端包被静默丢弃**：`RelayToOthersAsync` 无 default 分支，表情 / 告示牌 / 家具 / NetModule 其他模块等
+  「他人可见性」全部丢失。现在**未建模包默认中继**（握手 / 世界请求 / 自身属性 / 服务端自持等例外不中继）。
+
+### 11. 文档同步
 
 根 `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、
 `OPTIMIZATION_BACKLOG.md`、`Phase6/Phase7` 与 `ModCompat` README 均已按上述实现同步更新。
@@ -205,12 +218,12 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Simulation/CommandQueue.cs` | 挖砖 / 放砖命令登记持久化 |
 | `terraauth/Persistence/IPersistence.cs` | 新增 `IWorldRepository` + `WorldTileRecord` |
 | `terraauth/Persistence/SqlitePersistence.cs` | `WorldTiles` 表（SQLite）与内嵌后端落盘 / 读取 |
-| `terraauth/GameHost.cs` | 启动回放 + 1Hz 落盘 + 停机冲刷（失败重新排队）；`LoadBaseWorld` 按 `ServerConfig.WorldSize` 程序化生成 |
+| `terraauth/GameHost.cs` | 启动回放 + 1Hz 落盘 + 停机冲刷（失败重新排队）；`LoadBaseWorld` 按 `ServerConfig.WorldSize` 程序化生成；快照循环驱动区块流送 |
 | `terraauth/Simulation/World/WorldFileWriter.cs` | 新增：`.wld` 写出器（写后读回校验 + 原子替换 + `.bak`） |
 | `terraauth/Config/ServerConfig.cs` | 新增 `WorldPath` / `WorldSize` / `WorldExportPath` / `WorldExportIntervalSeconds` / `SessionResumeGraceSeconds` |
 | `terraauth/Simulation/World/WorldState.cs` | 待落盘集合上限 + 溢出降级全图扫描 + `HasPendingPersist`；离线会话表 + `MarkPlayerOffline` / `TryResumePlayer` / `ReapOfflineSessions`；`PlayerRuntime` 新增 `ResumeKey` / `Resumed` |
 | `terraauth/Tests/WorldFileTests.cs` | +3 用例（特征世界逐格 round-trip / 世界旗标 round-trip / 按原版顺序的严格分段走查） |
-| `terraauth/Tests/VanillaFeatureTests.cs` | +16 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 世界尺寸配置（中世界生成）/ 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）/ 箱子内容重启存活） |
+| `terraauth/Tests/VanillaFeatureTests.cs` | +18 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 世界尺寸配置（中世界生成）/ 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）/ 箱子内容重启存活 / 区块流送 / 未建模包中继）；偶发用例等待窗口 5s → 15s |
 | `terraauth/Simulation/World/WorldGenerator.cs` | 新增 `WorldSize`（Small/Medium/Large）与 `Generate(size)`；地表 / 岩层按高度比例缩放 |
 | `terraauth/Tests/SimulationTests.cs` | +3 用例（三档世界尺寸生成：尺寸 / 区块数 / Int16 范围 / 出生点贴地 / 包 7 字段） |
 | `terraauth/Simulation/World/WorldState.cs` | 箱子待落盘集合（`MarkPersistChest` / `DrainPersistChests`）+ `Chest.SerializeItems` / `DeserializeItems` |
@@ -225,7 +238,11 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Authority/InboundPipeline.cs` | `IResettableStage` + 阶段转发 |
 | `terraauth/Authority/ShardedInboundPipeline.cs` | `InboundWork.IsReset` + 重置投递到同一分片 / 队列（保证在途包先处理完） |
 | `terraauth/Plugins/HookIntegration.cs` | `HookedPipeline.ResetPlayer` 转发 |
-| `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、`OPTIMIZATION_BACKLOG.md`、`SUMMARY.md` | 文档同步（含 §二「无接触伤害」矛盾修正、W-1 立项、第十一 / 十二轮） |
+| `terraauth/Net/Phase5/Connection.cs` | 新增 `SyncedSections` / `LastStreamSection`（区块流送去重 + 跨区块判定） |
+| `terraauth/Net/Phase5/NetworkHost.cs` | 包 8 在 **Playing 阶段也处理**；`StreamSectionsForPlayersAsync`（跨区块补发周边 5×3）；未建模包**默认中继**（`IsSelfOnlyPacket` 例外表） |
+| `terraauth/Authority/AuthoritySubsystems.cs` | 移动校验改**分轴**（垂直用 `max(MaxSpeed, MaxFallSpeed)`）；`MovementLimits` 新增 `MaxFallSpeed` |
+| `terraauth/Tests/AuthorityTests.cs` | +1 用例（快速坠落接受 / 水平瞬移仍拒） |
+| `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、`OPTIMIZATION_BACKLOG.md`、`SUMMARY.md` | 文档同步（含 §二「无接触伤害」矛盾修正、W-1 立项、第十一 ~ 十四轮） |
 
 ---
 
@@ -233,8 +250,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **253 / 253 通过** |
-| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **253 / 253 通过** |
+| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **256 / 256 通过** |
+| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **256 / 256 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 
@@ -249,8 +266,10 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
   掉落为**简化表**（仅收录眼魔 / 世界吞噬者 / 史莱姆王 / 蜂后），未复刻原版掉落数据库。
 - **液体**：混合反应仅在本格为空时生成；无液体压力模型。
 - **电路**：无门电路 / 定时器 / 压力板（action 18 未建模）。
-- **物理 / AI**：弹幕无图格碰撞与追踪 / 反弹行为；掉落物无拾取动画与合并。
-- **图格推送**：服务端驱动的图格修改采用「小矩形包 10」而非原版包 20，若客户端行为有差异需按实测调整。
+- **物理 / AI**：弹幕无图格碰撞与追踪 / 反弹行为；掉落物无拾取动画与合并；
+  **NPC 同步只发位置 / 速度 / 朝向 / 生命，不含 ai 值**（客户端拿不到 ai 驱动的动作，补齐需真实 NPC AI 模型）。
+- **图格推送**：服务端驱动的图格修改采用「小矩形包 10」而非原版包 20（SendTileSquare）；
+  登录期地形与游戏内区块流送同样走包 10（客户端同一处理路径），是否换包 20 需真实客户端实测后再定。
 - **世界持久化**：在线走**图格 + 箱子内容增量**（1Hz，崩溃最多丢 1 秒）；整份 `.wld` 导出为**停机 / 空服**动作
   （全量 O(世界大小)，避开在线时段）。
 - **导出的 `.wld` 验证程度**：已通过**逐格 round-trip** + **按原版加载器顺序的严格分段走查**（11 段含 5..9 段的合法空编码、

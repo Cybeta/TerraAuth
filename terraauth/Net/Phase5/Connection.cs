@@ -53,6 +53,15 @@ public sealed class Connection : IAsyncDisposable
     public ConnectionState State { get; internal set; } = ConnectionState.Handshaking;
     public bool IsConnected => State != ConnectionState.Disconnected;
 
+    /// <summary>
+    /// 已下发过的图格区块（sectionX, sectionY）。区块编码（Deflate）成本高，同一区块不重复下发。
+    /// 仅由该连接自身的读循环 / 流送路径访问（同一玩家串行），无需加锁。
+    /// </summary>
+    public HashSet<(int X, int Y)> SyncedSections { get; } = new();
+
+    /// <summary>上次按玩家位置流送区块时所在的区块坐标（用于「跨区块才补发」判定）。</summary>
+    public (int X, int Y)? LastStreamSection { get; set; }
+
     /// <summary>对端地址（用于连接生命周期日志）。</summary>
     public string RemoteEndPoint { get; internal set; } = "unknown";
 

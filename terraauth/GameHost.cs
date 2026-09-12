@@ -304,6 +304,8 @@ public sealed class GameHost : IDisposable
                 await FlushPlayerHurtAsync(ct).ConfigureAwait(false);
                 // 服务端主动生成的掉落物（Boss 掉落等）→ 包 21
                 await FlushNewItemsAsync(ct).ConfigureAwait(false);
+                // 按玩家位置流送其周边图格区块（仅跨区块时补发，跳过已发过的区块）
+                await Network.StreamSectionsForPlayersAsync(ct).ConfigureAwait(false);
                 await Task.Delay(1000 / Math.Max(1, Config.Current.SnapshotRateHz), ct);
             }
         }, ct);
@@ -943,7 +945,7 @@ public sealed class GameHost : IDisposable
             },
             Player: new PlayerLimits(c.MaxPlayerHp, c.MaxPlayerMana),
             // 移动限速用飞行上限覆盖步行/冲刺，降低误判
-            Movement: new MovementLimits(c.MaxFlightSpeed, c.TeleportTolerance),
+            Movement: new MovementLimits(c.MaxFlightSpeed, c.TeleportTolerance, MaxFallSpeed: c.MaxFallSpeed),
             Combat: new CombatLimits(c.MaxSingleDamage, c.MaxDpsWindowSeconds, c.MaxDps),
             Inventory: new InventoryLimits(c.SscEnabled, c.MaxStackSize),
             World: new WorldLimits(c.MaxTileBreakPerSecond, c.MaxTilePlacePerSecond));

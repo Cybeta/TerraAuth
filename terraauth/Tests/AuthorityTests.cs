@@ -132,6 +132,28 @@ public class AuthorityTests
     }
 
     [Fact]
+    public void MovementAuthority_Accepts_FastFall_But_Still_Rejects_HorizontalTeleport()
+    {
+        var enforcers = new AuthorityEnforcers(
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
+            new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f, MaxFallSpeed: 20.0f));
+        var move = enforcers.Movement;
+        var commands = new CommandQueue();
+
+        move.Validate(new PlayerControlsPacket(1, new Vector2(0, 0)), 1, commands); // 建立基准
+
+        // 原版下落终速 ≈20 px/帧（MaxFallSpeed）：必须被接受，否则正常坠落会被判超速 →
+        // 服务端位置不再更新且累计违规踢人。
+        Assert.Equal(AuthorityDecision.Accept,
+            move.Validate(new PlayerControlsPacket(1, new Vector2(0, 20f)), 1, commands).Decision);
+
+        // 水平瞬移仍必须被拒（分轴判定不放宽水平上限）
+        var teleport = move.Validate(new PlayerControlsPacket(1, new Vector2(1000f, 20f)), 1, commands);
+        Assert.Equal(AuthorityDecision.Reject, teleport.Decision);
+        Assert.Equal("speed_exceeded", teleport.Reason);
+    }
+
+    [Fact]
     public void MovementAuthority_SharedBaseline_Across_Packet13_And_InternalPosition()
     {
         var enforcers = new AuthorityEnforcers(

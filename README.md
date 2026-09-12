@@ -32,7 +32,9 @@ TerraAuth 的目标是在**协议层**把关键状态收回服务端，提供可
 - ✅ 双客户端同时进服，互相可见（需正确下发包 14 `PlayerActive`）
 - ✅ 位置包（包 13）→ 权威校验 → 仿真 → 快照（包 15）经 TCP 下发完整闭环
 - ✅ 移动广播：A 发包 13 → B 经 TCP 收到转发，位置一致
-- ✅ 移动速度校验：`maxSpeed × 60 × Δt + TeleportTolerance`（Δt 钳制在 `[1/60s, 10s]`，不做静默超时无条件放行）
+- ✅ 移动速度校验：**分轴**判定 —— 水平 `maxSpeed × 60 × Δt + 容差`，垂直 `max(maxSpeed, MaxFallSpeed) × 60 × Δt + 容差`（Δt 钳制在 `[1/60s, 10s]`，不做静默超时无条件放行）
+- ✅ 区块流送：包 8 在**游戏内也处理**，并由快照循环按玩家位置补发周边区块（跨区块才发、已发过的区块不重复编码）—— 离开出生点后地形正常
+- ✅ 未建模包中继：未结构化的客户端包**默认转发**给其他玩家（表情 / 告示牌 / 家具 / NetModule 其他模块等「他人可见性」）
 - ✅ Tile（挖 / 放方块）服务端权威全链路：校验 → Command → 仿真 → 增量广播 → SSC 背包扣减
 - ✅ 违规处置闭环：窗口内权威拒绝累计达阈值 → 下发包 2 后踢出连接
 - ✅ 断线会话保留：断开不销毁运行时，宽限期（`SessionResumeGraceSeconds`，默认 60s）内**同身份重连续回位置 / 血量 / 增益**，出生包下发恢复坐标；连接槽位与并发容量随即释放并复用最小空闲 ID（原版客户端断线即回主菜单，故为「手动重进的会话接管」）
@@ -93,21 +95,25 @@ terraauth/
 ├─ Plugins/             # 插件系统（Hook / 加载器 / 管线装饰）
 ├─ ModCompat/           # Mod 兼容层（策略 / 检测 / 自定义包）
 ├─ Concurrency/         # 并行优化（Worker 池 / 分片 / 快照并行）
-├─ Tests/               # xUnit 验收测试（253 用例）
+├─ Tests/               # xUnit 验收测试（256 用例）
 └─ server.json          # 阈值配置
 ```
 
 ## 移动权威判定
 
 ```
-allowed = maxSpeed × 60 × Δt + TeleportTolerance
+allowedX = MaxSpeed × 60 × Δt + TeleportTolerance
+allowedY = max(MaxSpeed, MaxFallSpeed) × 60 × Δt + TeleportTolerance
 Δt = ClampDt(now - state.LastSeenAt)   // 钳制 [1/60, 10] 秒
-if (distance > allowed) → Reject("speed_exceeded")，拒绝时不更新权威基准
+if (|dx| > allowedX || |dy| > allowedY) → Reject("speed_exceeded")，拒绝时不更新权威基准
 ```
 
-- `MaxFlightSpeed = 8.0`（像素/帧），`TeleportTolerance = 4` 像素
-- 长时静默（>10s）一律按 10s 计，单包允许位移上限 `4804px`，**不做无条件放行**（防穿墙 / 瞬移缺口）
-- **已知限制**：客户端失焦时位置包间隔可达 4~7s（客户端降频），若静默 >30s 且位移 >4804px 会被误判为超速，且拒绝不更新基准会导致后续包连续被拒（原「基准冻结」现象），彻底解决需服务端权威移动 / 碰撞校验（Phase 3 世界权威落地后补齐）
+- **分轴判定**：水平用 `MaxSpeed = MaxFlightSpeed = 8.0`（像素/帧）；**垂直用 `max(MaxSpeed, MaxFallSpeed)`**
+  （`MaxFallSpeed = 20.0`）。原版下落终速约 20 px/帧，若垂直也按 8 判定，**任何一次正常坠落都会被误判超速**
+  → 服务端位置不再更新（后续挖 / 放 / 交互全部 out_of_reach）且累计违规被踢（默认 10 次 / 60s）。
+- `TeleportTolerance = 4` 像素；长时静默（>10s）一律按 10s 计（水平上限 `4804px`），**不做无条件放行**（防穿墙 / 瞬移）
+- **已知限制**：客户端失焦时位置包间隔可达 4~7s（客户端降频），**水平**静默位移过大仍可能被误判；
+  彻底解决需服务端权威移动 / 碰撞校验（Phase 3 世界权威落地后补齐）
 
 ## 许可
 

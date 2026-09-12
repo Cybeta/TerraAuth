@@ -604,6 +604,49 @@ public class VanillaFeatureTests
     }
 
     [Fact]
+    public async Task Vanilla_UnmodeledPacket_Is_Relayed_To_OtherPlayers()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        // 包 99（表情类，未建模）：原版服务端会中继给其他人；此前被静默丢弃（他人完全看不到）
+        await a.SendRawAsync((PacketId)99, new byte[] { 7, 8, 9 });
+
+        var got = await b.ReadUntilAsync(p => p.Type == (PacketId)99, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p.Type == (PacketId)99);
+    }
+
+    [Fact]
+    public async Task Vanilla_TileSections_Stream_As_Player_Moves()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        // 建立玩家运行时（移动包惰性创建），位置固定在出生点
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 排空登录期残留（出生区块已在握手期下发）
+        await s.ReadUntilAsync(_ => false, TimeSpan.FromMilliseconds(500));
+
+        // 把玩家挪到远处（直接改服务端权威位置，模拟「已走到别处」）
+        lock (world.PlayersLock)
+            world.Players[1].Position = new Vector2((world.SpawnTileX + 1200) * 16f, world.SpawnTileY * 16f);
+
+        // 生产环境由快照循环（20Hz）驱动；测试显式调用
+        await server.Host.Network.StreamSectionsForPlayersAsync();
+        var streamed = await s.ReadUntilAsync(_ => false, TimeSpan.FromMilliseconds(1500));
+        Assert.True(streamed.Count(p => p.Type == PacketId.TileSendSection) > 0,
+            "玩家移动后未流送新区块（离开出生点将看不到地形）");
+
+        // 位置未变 → 不重复下发同一区块（区块编码成本高）
+        await server.Host.Network.StreamSectionsForPlayersAsync();
+        var again = await s.ReadUntilAsync(_ => false, TimeSpan.FromMilliseconds(800));
+        Assert.DoesNotContain(again, p => p.Type == PacketId.TileSendSection);
+    }
+
+    [Fact]
     public async Task Vanilla_PlayerHurt_Is_Relayed_With_ServerPlayerId()
     {
         using var server = VanillaServer.Start();
@@ -2046,7 +2089,8 @@ public class VanillaFeatureTests
         Assert.True(limited, "洪水攻击未被限流");
 
         // 违规累计达阈值（10 次 / 窗口）→ 下发包 2 并踢出连接（处置闭环）
-        var got = await s.ReadUntilAsync(p => p is DisconnectPacket, TimeSpan.FromSeconds(5));
+        // 超时放宽到 15s：全量套件并行跑时服务端处理 400 包 + 踢出会明显变慢（曾多次偶发失败）
+        var got = await s.ReadUntilAsync(p => p is DisconnectPacket, TimeSpan.FromSeconds(15));
         Assert.Contains(got, p => p is DisconnectPacket);
     }
 
