@@ -446,6 +446,78 @@ public class EndToEndTests
         }
     }
 
+    [Fact]
+    public async Task StaleConnectionKick_DoesNotAffectSlotReplacement()
+    {
+        // Arrange：真实 TCP 监听；槽位按「最小可用 ID」复用，同一 PlayerId 会被新连接接管
+        var world = new WorldState();
+        var commands = new CommandQueue();
+        var pipeline = new InboundPipeline(new IPipelineStage[]
+        {
+            new FrameStage(),
+            new TerminalStage(),
+        });
+
+        var decoder = new PacketDecoder();
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var protocol = new TerrariaProtocol();
+        var connections = new ConnectionManager();
+
+        using var workers = new WorkerPool(2);
+        var network = new NetworkHost(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            decoder, encoder, protocol, connections, pipeline,
+            commands, workers, world);
+        network.Start();
+
+        try
+        {
+            // 旧连接占用槽位 1，随后断开（断线清理异步进行，实例会晚于 socket 离开管理器）
+            Connection? stale;
+            using (var first = new TcpClient())
+            {
+                await first.ConnectAsync(IPAddress.Loopback, network.BoundPort);
+                await HandshakeAsync(first.GetStream(), encoder, protocol, "Old");
+                Assert.True(await WaitUntilAsync(
+                        () => connections.Get(1)?.State == ConnectionState.Playing, TimeSpan.FromSeconds(5)),
+                    "旧连接未进入 Playing");
+                stale = connections.Get(1);
+            }
+
+            Assert.NotNull(stale);
+            Assert.True(await WaitUntilAsync(() => connections.Get(1) is null, TimeSpan.FromSeconds(5)),
+                "旧连接断开后未释放槽位");
+
+            // 新连接复用同一槽位
+            using var second = new TcpClient();
+            await second.ConnectAsync(IPAddress.Loopback, network.BoundPort);
+            var stream = second.GetStream();
+            await HandshakeAsync(stream, encoder, protocol, "New");
+            Assert.True(await WaitUntilAsync(
+                    () => connections.Get(1)?.State == ConnectionState.Playing, TimeSpan.FromSeconds(5)),
+                "新连接未进入 Playing");
+
+            var replacement = connections.Get(1);
+            Assert.NotNull(replacement);
+            Assert.NotSame(stale, replacement);
+
+            // Act：旧连接的延迟清理路径拿着旧实例来踢出 / 移除槽位 1
+            await connections.KickAsync(1, "stale kick", CancellationToken.None, expected: stale);
+            await connections.RemoveAsync(1, stale);
+
+            // Assert：槽位仍属于新连接，且新连接未被下发包 2
+            Assert.Same(replacement, connections.Get(1));
+            Assert.Equal(ConnectionState.Playing, connections.Get(1)!.State);
+
+            var kick = await ReadPacketAsync(stream, decoder, PacketId.Disconnect, TimeSpan.FromSeconds(1));
+            Assert.Null(kick);
+        }
+        finally
+        {
+            await network.DisposeAsync();
+        }
+    }
+
     /// <summary>测试替身：记录最近一次封禁请求（验证 ServerApi 的参数与身份映射）。</summary>
     private sealed class RecordingBanManager : IBanManager
     {

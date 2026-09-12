@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**263 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
+> 生成日期：2026-09-12 ｜ 当前测试：**283 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
 
 ---
 
@@ -82,7 +82,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **263 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
+- 套件 **283 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -149,9 +149,79 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 根 `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、
 `OPTIMIZATION_BACKLOG.md`、`Phase6/Phase7` 与 `ModCompat` README 均已按上述实现同步更新。
 
+### 13. 连接会话隔离（SessionId）与箱子会话绑定
+
+连接槽位（`PlayerId`）按「最小空闲 ID」复用后，旧连接的异步收尾会与新连接**共享同一个 `PlayerId`**，
+仅按 `PlayerId` 校验会让旧连接的在途命令 / 清理动作作用到新玩家身上。本轮引入内部会话代数隔离：
+
+- **`SessionId`（不进协议、不入存档）**：每个 `Connection` 实例一个唯一 `long`，
+  贯穿 `PacketContext` → `Command` → `PlayerRuntime`，命令在 `Apply` 阶段比对，
+  不一致返回 **`stale_session`**；认证完成即显式创建带 `SessionId` 的运行时（不再依赖首个移动命令惰性创建）。
+- **会话恢复换代**：宽限期内同身份重连认回运行时，同时把 `SessionId` 覆盖为新连接的值，旧在途命令立即失效。
+- **断线清理按代数收窄**：移动基线重置 / 离线会话回收 / 箱子会话关闭 / 外观与会话时长缓存 / 违规窗口 /
+  离开广播（按 Connection 实例双匹配）只在「槽位仍属于本连接」时生效。
+- **箱子会话改为 `(PlayerId, SessionId) → ChestIndex`**：包 31 生成 **`OpenChestCommand`**，
+  由仿真提交阶段建立会话（权威只读校验不再直接改世界）；箱子广播按连接会话筛选接收者。
+- **测试**：新增旧连接清理 / 踢出不影响复用槽位新连接的用例（含真实 TCP 下的槽位复用）；
+  会话恢复用例补断言「重连后 `SessionId` 已更换」。
+
+### 14. 广播可靠性收尾 · 箱子会话生命周期 · 拾取并发 · 事件模型
+
+- **实体广播失败不再丢更新**：掉落物新增 / 移除、弹幕销毁、玩家死亡 / 复活此前都是**发送前**就把
+  「已通知」标记置位，发送抛异常（连接断开、出站队列关闭）后该状态变更永久丢失。
+  现在统一改为**发出成功后才置位**，失败仅记录 `broadcast_failed` 事件并留待下一轮重试
+  （与箱子路径的重新入队语义一致），取消仍向上传播。
+- **箱子会话生命周期补全**：①包 31 负坐标视为「关闭箱子」请求（原版客户端关闭时只清本地状态、不发包），
+  权威只读校验直接放行、由 `CloseChestCommand` 在仿真提交阶段关闭会话（且校验会话代数，
+  旧连接关不掉复用同槽位的新连接会话）；②仿真每 tick 做**距离复核**，玩家离开交互距离即关闭会话，
+  避免会话长期驻留后被误用。
+- **拾取原子性回归测试**：背包满时掉落物保留且不进入「待通知移除」；两个玩家并发抢同一掉落物**只成功一次**；
+  越界拾取不改变实体状态。实现本就原子（同一把 `ItemsLock` 内完成入库 + 失效），本轮补齐断言。
+- **事件模型分层**：`GameEvent` 增加 `Category`（`StateCommit` / `Persistence` / `Broadcast` / `Failure`），
+  事件名收敛到 `GameEventKinds` 常量；命令失败原因收敛到 `CommandFailures` 常量
+  （值与原字符串完全一致，指标与测试断言不受影响）；图格 / 箱子落盘失败、实体 / 箱子广播失败现在都会留下事件。
+
 ---
 
 ## 三、变更文件清单
+
+### 本轮变更（广播重试 · 箱子会话生命周期 · 拾取并发 · 事件模型）
+
+共 **16 个文件**（13 源码 / 3 文档 + 测试），+676 / −113 行；全量 **283 / 283 通过**。
+
+| 文件 | 说明 |
+|---|---|
+| `terraauth/GameHost.cs` | 掉落物 / 弹幕 / 玩家死亡复活的「已通知」标记改为**发送成功后置位**，瞬时失败记录 `broadcast_failed` 并重试；箱子广播失败重排保留；落盘失败记录 `persist_failed` |
+| `terraauth/Simulation/EventRecorder.cs` | 新增 `GameEventCategory`（状态提交 / 持久化 / 广播 / 失败）、`GameEventKinds`、`CommandFailures`；`GameEvent` 增加 `Category` |
+| `terraauth/Simulation/CommandQueue.cs` | 失败原因改用 `CommandFailures` 常量；新增 `CloseChestCommand`（按会话代数关箱） |
+| `terraauth/Simulation/WorldSimulator.cs` | 事件名 / 类别接入；新增每 tick 的**箱子会话距离复核**（离开交互距离即关闭）；暴露 `Recorder` |
+| `terraauth/Simulation/World/WorldState.cs` | 新增 `SnapshotChestSessions()`（供距离复核遍历） |
+| `terraauth/Authority/InboundPipeline.cs` | 包 31 负坐标 → `CloseChestCommand` |
+| `terraauth/Authority/AuthoritySubsystems.cs` | 包 31 负坐标只读放行（关箱请求不按越界拒绝） |
+| `terraauth/Tests/SimulationTests.cs` | +6 用例（关箱会话 / 旧会话关不掉新会话 / 离开距离关闭会话 / 背包满保留掉落物 / 越界拾取 / 并发拾取只成功一次） |
+| `terraauth/Tests/VanillaFeatureTests.cs` | 越界开箱用例改用正数越界坐标；+1 用例（包 31 负坐标为关箱请求） |
+| `terraauth/Tests/IntegrationTests.cs` | +1 用例（旧连接实例踢出 / 移除不得影响复用槽位的新连接） |
+| `README.md`、`terraauth/README.md`、`terraauth/PROJECT_STRUCTURE.md`、`terraauth/VANILLA_COVERAGE.md`、`terraauth/OPTIMIZATION_BACKLOG.md`、`SUMMARY.md` | 测试数 283 与本轮说明同步 |
+
+### 上一轮推送（`1efc999` Add connection session isolation）
+
+共 **13 个文件**（全部修改），+627 / −117 行；另含本条汇总与文档同步。
+
+| 文件 | 说明 |
+|---|---|
+| `terraauth/Net/Phase5/Connection.cs` | 连接实例持有唯一 `SessionId` |
+| `terraauth/Authority/IAuthorityLayer.cs` | 权威 `Validate` 增加带 `SessionId` 的重载；`ResetPlayer` 增加带代数的重载 |
+| `terraauth/Authority/InboundPipeline.cs` | `PacketContext.SessionId` 贯通；包 31 → `OpenChestCommand`；命令落地前写入 `SessionId` |
+| `terraauth/Authority/ShardedInboundPipeline.cs` | 分片工作项携带 `SessionId`，`Reset` 按代数投递到同一分片 |
+| `terraauth/Authority/AuthoritySubsystems.cs` | 箱子打开 / 写入校验接入 `SessionId`；移动 `ResetPlayer` 按代数据收窄 |
+| `terraauth/GameHost.cs` | 箱子广播按 `Connection.SessionId` 筛选；发送失败重排保持 |
+| `terraauth/Net/Phase5/ConnectionManager.cs` | 移除 / 踢出按「键 + 实例」双匹配，不再误杀复用槽位的新连接 |
+| `terraauth/Net/Phase5/NetworkHost.cs` | 认证完成显式创建带 `SessionId` 的运行时；外观 / 会话时长 / 违规窗口与会话代数绑定；离开广播按连接实例校验；箱子广播改 `Func<Connection, bool>` |
+| `terraauth/Simulation/CommandQueue.cs` | 新增 `OpenChestCommand`；命令基类统一 `stale_session` 判定 |
+| `terraauth/Simulation/World/WorldState.cs` | 箱子会话升级为 `(PlayerId, SessionId) → ChestIndex`；断线清理 / 恢复按代数收窄 |
+| `terraauth/Tests/SimulationTests.cs` | +6 用例（会话命令拒绝 `stale_session` / 箱子会话代数 / 离线清理代数 / 会话恢复续期） |
+| `terraauth/Tests/VanillaFeatureTests.cs` | 会话恢复用例补断言「重连后 `SessionId` 已更换」 |
+| `terraauth/Tests/IntegrationTests.cs` | +1 用例（旧连接实例踢出 / 移除不得影响复用槽位的新连接） |
 
 ### 上一轮推送（`3eddcf6`）
 
@@ -278,8 +348,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **263 / 263 通过** |
-| Vanilla-only 网络与集成过滤 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore --filter "FullyQualifiedName~IntegrationTests|FullyQualifiedName~VanillaFeatureTests"` | **92 / 92 通过** |
+| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **283 / 283 通过** |
+| Vanilla-only 网络与集成过滤 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore --filter "FullyQualifiedName~IntegrationTests|FullyQualifiedName~VanillaFeatureTests"` | **94 / 94 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 

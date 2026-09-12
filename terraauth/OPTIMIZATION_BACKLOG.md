@@ -86,6 +86,75 @@
 
 ## 附：本轮回溯
 
+### 第十八轮（2026-09-12）：广播失败重试 · 箱子会话生命周期 · 拾取并发 · 事件模型
+
+**问题**（以「状态变更会不会丢」为线索）：
+
+1. **实体广播失败即丢更新**：掉落物新增 / 移除、弹幕销毁、玩家死亡 / 复活都是**发送前**就把
+   `NewNotified` / `RemovalNotified` / `DeathNotified` / `RespawnNotified` 置位；发送抛异常（连接断开、
+   出站队列已关闭）后这些状态变更**永久丢失**——客户端再也收不到最终结果（只有箱子路径做了重新入队）。
+2. **箱子会话只会「换」和「断线关」**：缺少「关箱」与「离开范围」两条收尾路径，会话可能长期驻留。
+   （协议核对结论：原版客户端关闭箱子时只清本地 `player.chest`，**不发任何包**；包 31 只用于开箱，
+   服务端以包 80 告知 `player.chest` 值。）
+3. **拾取并发无回归测试**：实现本身是原子的（同一把 `ItemsLock` 内入库 + 失效），但无断言保护。
+4. **事件模型单一**：`GameEvent` 只有 `(Tick, PlayerId, Kind, object? Payload)`，状态提交 / 持久化 / 广播 /
+   失败四类语义混在 `Kind` 字符串里，失败原因散落为字面量。
+
+**已实施**：
+
+- **实体广播改为「成功后才置位」**：`FlushNewItemsAsync` / 弹幕销毁 / 掉落物移除 / 玩家死亡复活
+  全部改为 `await 广播` 成功后再置位标记；`IsTransientSendFailure`（`IOException` /
+  `ObjectDisposedException` / `ChannelClosedException`）时仅记录 `broadcast_failed` 事件并在下一轮重试；
+  `OperationCanceledException` 仍向上传播；箱子路径保持「重新入队」语义不变。
+- **箱子会话生命周期补全**：包 31 负坐标 → `CloseChestCommand`（在仿真提交阶段按会话代数关闭，
+  旧连接关不掉复用同槽位的新连接会话）；`WorldSimulator` 每 tick 做**距离复核**
+  （`SnapshotChestSessions` + 箱子中心 160px），离开交互距离即关闭；玩家已离线或箱子不存在时兜底关闭。
+- **拾取并发回归**：新增「背包满 → 掉落物保留且不进入待移除」「越界拾取不改状态」
+  「两玩家并发抢同一掉落物只成功一次」三项断言。
+- **事件模型分层**：`GameEventCategory`（`StateCommit` / `Persistence` / `Broadcast` / `Failure`）+
+  `GameEventKinds` + `CommandFailures` 常量；命令失败原因常量值与既有字符串**逐字一致**
+  （`stale_session` / `inventory_full` / `chest_not_open` …），指标与测试断言不受影响；
+  图格 / 箱子落盘失败、实体 / 箱子广播失败均记录事件。
+
+**协议核对结论（只读，不含工具链 / 路径）**：包 31 为 `Int16 x + Int16 y`；服务端仅在坐标命中箱子时
+下发内容并回包 80；客户端关闭箱子不发包；包 34 是「放置 / 破坏箱子等世界结构变更」，不是「玩家当前打开的箱子」。
+
+**测试**：+7（关箱会话 / 旧会话关不掉新会话 / 离开距离关闭会话 / 背包满保留 / 越界拾取 /
+并发拾取只成功一次 / 包 31 负坐标为关箱请求）；越界开箱用例改用正数越界坐标。全量 **283 / 283 通过**。
+
+### 第十七轮（2026-09-12）：连接会话隔离（SessionId）+ 箱子会话绑定
+
+**问题**：连接槽位（`PlayerId`）按「最小空闲 ID」复用后，**旧连接的异步收尾会与新连接共享同一个 `PlayerId`**：
+
+1. 旧连接的命令已入队但尚未提交，此时断开 → 新连接复用槽位 → 旧命令在下一次 `Tick` 仍按 `PlayerId` 通过校验，
+   改的是新玩家的状态（位置 / 拾取 / 箱子）。
+2. 旧连接的断线清理（移动基线重置、离线会话回收、箱子会话关闭、离开广播、违规踢出）同样只按 `PlayerId`，
+   会把**新连接**的状态当成自己的清掉或踢掉。
+3. 箱子打开会话此前是 `PlayerId → ChestIndex`，A 打开、A 断线、B 复用槽位后，B 的箱子写入会被 A 的会话放行。
+
+**已实施**：
+
+- **内部会话标识 `SessionId`（不进协议、不入存档）**：每个 `Connection` 实例一个唯一 `long`，
+  贯穿 `PacketContext.SessionId` → `Command.SessionId` → `PlayerRuntime.SessionId`，
+  命令在 `Apply` 阶段比对，不一致即返回 **`stale_session`** 拒绝（`TryGetPlayer` 统一入口）。
+- **玩家运行时在认证完成时显式创建**（带 `SessionId`）：此前依赖首个移动命令惰性创建，
+  与「命令必带会话标识」冲突 —— 认证后首个命令因运行时不存在而无法应用（曾导致大批端到端用例失败）。
+- **会话恢复同时换代**：`TryResumePlayer(newPlayerId, newSessionId, resumeKey)` 认回离线运行时的同时
+  **覆盖为新连接的 `SessionId`**，旧连接的在途命令随即失效。
+- **断线清理按代数收窄**（`expectedSessionId` 参数）：移动管线 `ResetPlayer`、`MarkPlayerOffline`、
+  `CloseChestSession`、外观 / 会话时长 / 违规窗口缓存、离开广播（按 **Connection 实例**双匹配）
+  均只在「槽位仍属于本连接」时生效。
+- **箱子会话升级为 `(PlayerId, SessionId) → ChestIndex`**；包 31 不再在校验阶段直接改世界，
+  而是生成 **`OpenChestCommand`**，由 `WorldSimulator.Tick()` → `Command.Apply()` 在提交阶段建立会话，
+  与「客户端包 → 权威校验 → 命令 → 仿真提交」链路一致；箱子广播按 `Connection.SessionId` 筛选接收者。
+- **移除重复判定**：`BroadcastChestUpdateAsync` 的状态 / 会话检查由两遍收敛为一遍。
+
+**测试**：新增 4 项 —— `StaleSessionOfflineCleanup_PreservesReplacementChestSession`、
+`MatchingSessionOfflineCleanup_ClosesOwnChestSession`、`ChestSession_RejectsStaleConnectionAndPreservesReplacement`、
+`StaleConnectionKick_DoesNotAffectSlotReplacement`（真实 TCP 下用旧 `Connection` 实例踢出 / 移除复用同槽位的新连接，
+须被双匹配拦住且新连接收不到包 2）；会话恢复用例补断言「重连后 `SessionId` 已更换」。
+全量 **276 / 276 通过**。
+
 ### 第十六轮（2026-09-12）：地形生成器重写 + 包 13 尾随字段 + 箱子索引修复
 
 **问题**（用户指定两项）：
@@ -121,7 +190,7 @@
 （断言矿脉 / 洞穴 / 草皮 / 地狱层 / 海水 / 宝箱数量与战利品）、
 `Vanilla_PlayerControls_Relay_Preserves_Mount_And_Camera`（包 13 中继保留挂载与相机）；
 另把两个受「世界生成变重」影响的既有用例等待窗口放宽（`KickAsync_...` 与 `AntiCheat_PacketFlood_...`）。
-该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 263/263 通过。
+该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 283/283 通过。
 
 ### 第十五轮（2026-09-12）：协议字段核对后落地（包 20 图格方阵 + 区块流送对齐 + NPC 同步细节）
 

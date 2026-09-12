@@ -334,6 +334,18 @@ public sealed class WorldState
     public void CloseChestSession(int playerId)
         => CloseChestSession(playerId, 0);
 
+    /// <summary>当前所有箱子打开会话的快照（玩家 / 会话 / 箱子索引），供仿真做距离复核。</summary>
+    public List<(int PlayerId, long SessionId, int ChestIndex)> SnapshotChestSessions()
+    {
+        lock (ChestsLock)
+        {
+            var result = new List<(int, long, int)>(_openChests.Count);
+            foreach (var kv in _openChests)
+                result.Add((kv.Key, kv.Value.SessionId, kv.Value.ChestIndex));
+            return result;
+        }
+    }
+
     public void CloseChestSession(int playerId, long expectedSessionId)
     {
         lock (ChestsLock)

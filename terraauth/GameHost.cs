@@ -4,6 +4,7 @@
 using System.Net;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Channels;
 using TerraAuth.Config;
 using TerraAuth.Persistence;
 using TerraAuth.Monitoring;
@@ -470,6 +471,8 @@ public sealed class GameHost : IDisposable
             catch (Exception ex)
             {
                 foreach (var (x, y) in cells) world.MarkPersistTile(x, y);
+                Simulator.Recorder.Record(new GameEvent(world.Tick, null,
+                    GameEventKinds.PersistFailed, cells.Count, GameEventCategory.Persistence));
                 Console.WriteLine($"[World] 图格落盘失败（已重新排队 {cells.Count} 格）：{ex.Message}");
             }
         }
@@ -503,6 +506,8 @@ public sealed class GameHost : IDisposable
         catch (Exception ex)
         {
             foreach (var index in indices) world.MarkPersistChest(index);
+            Simulator.Recorder.Record(new GameEvent(world.Tick, null,
+                GameEventKinds.PersistFailed, indices.Count, GameEventCategory.Persistence));
             Console.WriteLine($"[World] 箱子内容落盘失败（已重新排队 {indices.Count} 个）：{ex.Message}");
         }
     }
@@ -648,13 +653,11 @@ public sealed class GameHost : IDisposable
     public async Task FlushNewItemsAsync(CancellationToken ct = default)
     {
         var world = Simulator.State;
+        var recorder = Simulator.Recorder;
 
         WorldItemEntity[] fresh;
         lock (world.ItemsLock)
-        {
             fresh = world.Items.Where(i => i.Active && !i.NewNotified).ToArray();
-            foreach (var item in fresh) item.NewNotified = true;
-        }
 
         if (fresh.Length == 0) return;
 
@@ -663,18 +666,35 @@ public sealed class GameHost : IDisposable
 
         foreach (var item in fresh)
         {
-            await Network.BroadcastWhereAsync(PacketId.ItemDrop,
-                new ItemDropPacket(item.ItemId, item.Stack)
-                {
-                    ItemSlotIndex = item.Slot,
-                    Position = item.Position,
-                    Velocity = item.Velocity,
-                    Prefix = item.Prefix,
-                },
-                playerId => IsPlayerWithin(world, playerId, item.Position.X, item.Position.Y, radiusSq),
-                ct).ConfigureAwait(false);
+            try
+            {
+                await Network.BroadcastWhereAsync(PacketId.ItemDrop,
+                    new ItemDropPacket(item.ItemId, item.Stack)
+                    {
+                        ItemSlotIndex = item.Slot,
+                        Position = item.Position,
+                        Velocity = item.Velocity,
+                        Prefix = item.Prefix,
+                    },
+                    playerId => IsPlayerWithin(world, playerId, item.Position.X, item.Position.Y, radiusSq),
+                    ct).ConfigureAwait(false);
+
+                item.NewNotified = true;   // 只有真正发出才记「已通知」，否则下次循环重试
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                recorder.Record(new GameEvent(world.Tick, null,
+                    GameEventKinds.BroadcastFailed, "item_drop", GameEventCategory.Broadcast));
+            }
         }
     }
+
+    /// <summary>
+    /// 瞬时发送失败：连接已断开 / 出站队列已关闭。此时**不得**把「已通知」标记置位，
+    /// 否则该状态变更会永久丢失（客户端再也收不到最终结果）。
+    /// </summary>
+    private static bool IsTransientSendFailure(Exception ex)
+        => ex is IOException or ObjectDisposedException or ChannelClosedException;
 
     private const int MaxChestUpdatesPerFlush = 256;
 
@@ -718,13 +738,12 @@ public sealed class GameHost : IDisposable
                         updates[retry].Slot);
                 throw;
             }
-            catch (IOException)
+            catch (Exception ex) when (IsTransientSendFailure(ex))
             {
+                // 发送失败 → 重新登记该槽位，由下一轮 flush 重试（否则客户端永远收不到最终内容）
                 world.MarkChestChanged(chestIndex, slot);
-            }
-            catch (ObjectDisposedException)
-            {
-                world.MarkChestChanged(chestIndex, slot);
+                Simulator.Recorder.Record(new GameEvent(world.Tick, null,
+                    GameEventKinds.BroadcastFailed, "chest_item", GameEventCategory.Broadcast));
             }
         }
     }
@@ -810,6 +829,7 @@ public sealed class GameHost : IDisposable
     public async Task BroadcastWorldStateAsync(CancellationToken ct = default)
     {
         var world = Simulator.State;
+        var recorder = Simulator.Recorder;
 
         // 世界进度 / 事件变化（Boss 击杀、入侵起止、昼夜切换）→ 重新下发包 7（WorldData）
         if (world.ProgressDirty)
@@ -858,15 +878,22 @@ public sealed class GameHost : IDisposable
         // 弹幕到期：服务端补发销毁包 29（客户端掉线 / 未发 29 时也避免幽灵弹幕）
         ProjectileEntity[] expired;
         lock (world.ProjectilesLock)
-        {
             expired = world.Projectiles.Where(p => !p.Active && !p.RemovalNotified).ToArray();
-            foreach (var p in expired) p.RemovalNotified = true;
-        }
 
         foreach (var p in expired)
         {
-            await Network.BroadcastAsync(PacketId.ProjectileDestroy,
-                new ProjectileDestroyPacket(p.Key, p.Position), ct).ConfigureAwait(false);
+            try
+            {
+                await Network.BroadcastAsync(PacketId.ProjectileDestroy,
+                    new ProjectileDestroyPacket(p.Key, p.Position), ct).ConfigureAwait(false);
+
+                p.RemovalNotified = true;   // 发出后才记「已通知」，失败则留待下一轮重试
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                recorder.Record(new GameEvent(world.Tick, null,
+                    GameEventKinds.BroadcastFailed, "projectile_destroy", GameEventCategory.Broadcast));
+            }
         }
 
         // 玩家死亡 / 复活：服务端结算后由本线程补发权威包（118 死亡 / 12+16 复活）
@@ -878,50 +905,74 @@ public sealed class GameHost : IDisposable
         {
             if (p.Dead && !p.DeathNotified)
             {
-                p.DeathNotified = true;
-                await Network.BroadcastAsync(PacketId.PlayerDeathV2,
-                    new PlayerDeathV2Packet(p.Id, 0), ct).ConfigureAwait(false);
+                try
+                {
+                    await Network.BroadcastAsync(PacketId.PlayerDeathV2,
+                        new PlayerDeathV2Packet(p.Id, 0), ct).ConfigureAwait(false);
+
+                    p.DeathNotified = true;
+                }
+                catch (Exception ex) when (IsTransientSendFailure(ex))
+                {
+                    recorder.Record(new GameEvent(world.Tick, p.Id,
+                        GameEventKinds.BroadcastFailed, "player_death", GameEventCategory.Broadcast));
+                }
             }
             else if (!p.Dead && !p.RespawnNotified)
             {
-                p.RespawnNotified = true;
-
                 // 出生点由服务端权威划定：常规为世界出生点；「会话恢复」则把客户端放回**恢复后的原坐标**，
                 // 送完即清标记（此后死亡复活仍回世界出生点）。
                 short spawnX = (short)world.SpawnTileX;
                 short spawnY = (short)world.SpawnTileY;
                 if (p.Resumed)
                 {
-                    p.Resumed = false;
                     spawnX = (short)Math.Clamp((int)MathF.Floor(p.Position.X / TileSizePx), 0, world.MaxTilesX - 1);
                     spawnY = (short)Math.Clamp((int)MathF.Floor(p.Position.Y / TileSizePx), 0, world.MaxTilesY - 1);
                 }
 
-                await Network.BroadcastAsync(PacketId.PlayerSpawn,
-                    new PlayerSpawnPacket((byte)p.Id, spawnX, spawnY,
-                        0, 0, 0, 0, 0), ct).ConfigureAwait(false);
-                await Network.BroadcastAsync(PacketId.PlayerHealth,
-                    new PlayerHealthPacket(p.Id, p.Hp, p.HpMax), ct).ConfigureAwait(false);
+                try
+                {
+                    await Network.BroadcastAsync(PacketId.PlayerSpawn,
+                        new PlayerSpawnPacket((byte)p.Id, spawnX, spawnY,
+                            0, 0, 0, 0, 0), ct).ConfigureAwait(false);
+                    await Network.BroadcastAsync(PacketId.PlayerHealth,
+                        new PlayerHealthPacket(p.Id, p.Hp, p.HpMax), ct).ConfigureAwait(false);
+
+                    p.RespawnNotified = true;
+                    p.Resumed = false;   // 恢复坐标已送达（失败则保留标记，下一轮仍按恢复坐标下发）
+                }
+                catch (Exception ex) when (IsTransientSendFailure(ex))
+                {
+                    recorder.Record(new GameEvent(world.Tick, p.Id,
+                        GameEventKinds.BroadcastFailed, "player_respawn", GameEventCategory.Broadcast));
+                }
             }
         }
 
         // 掉落物被拾取 / 失效：服务端补发包 21（stack=0）通知客户端移除
         WorldItemEntity[] removedItems;
         lock (world.ItemsLock)
-        {
             removedItems = world.Items.Where(i => !i.Active && !i.RemovalNotified).ToArray();
-            foreach (var i in removedItems) i.RemovalNotified = true;
-        }
 
         foreach (var item in removedItems)
         {
-            await Network.BroadcastAsync(PacketId.ItemDrop,
-                new ItemDropPacket(item.ItemId, 0)
-                {
-                    ItemSlotIndex = item.Slot,
-                    Position = item.Position,
-                    Velocity = new Vector2(0, 0),
-                }, ct).ConfigureAwait(false);
+            try
+            {
+                await Network.BroadcastAsync(PacketId.ItemDrop,
+                    new ItemDropPacket(item.ItemId, 0)
+                    {
+                        ItemSlotIndex = item.Slot,
+                        Position = item.Position,
+                        Velocity = new Vector2(0, 0),
+                    }, ct).ConfigureAwait(false);
+
+                item.RemovalNotified = true;
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                recorder.Record(new GameEvent(world.Tick, null,
+                    GameEventKinds.BroadcastFailed, "item_remove", GameEventCategory.Broadcast));
+            }
         }
     }
 

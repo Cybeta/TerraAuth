@@ -498,11 +498,33 @@ public class VanillaFeatureTests
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
 
-        await s.SendAsync(PacketId.Chest, new ChestPacket(-1, 0));
+        // 正数但越界：不得按「关闭箱子」处理（关箱语义只认负坐标）
+        await s.SendAsync(PacketId.Chest, new ChestPacket((short)(world.MaxTilesX + 10), 0));
 
         Assert.True(await WaitForRejectAsync(server, "out_of_bounds", TimeSpan.FromSeconds(5)),
             "越界开箱未被拒绝");
+    }
+
+    [Fact]
+    public async Task Vanilla_Chest_CloseRequest_ClosesSession()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY);
+
+        await s.SendAsync(PacketId.Chest, new ChestPacket(world.SpawnTileX, world.SpawnTileY));
+        Assert.True(await TickUntilAsync(server, () => world.HasChestSession(1, index), TimeSpan.FromSeconds(5)),
+            "开箱未建立会话");
+
+        // 负坐标 = 关箱请求（原版客户端关闭时只清本地状态，不发包；此处兼容显式关闭请求）
+        await s.SendAsync(PacketId.Chest, new ChestPacket(-1, -1));
+
+        Assert.True(await TickUntilAsync(server, () => !world.HasChestSession(1, index), TimeSpan.FromSeconds(5)),
+            "关箱请求未关闭会话");
     }
 
     // ========================================================================
@@ -2043,11 +2065,13 @@ public class VanillaFeatureTests
         for (int i = 0; i < 30; i++) server.Host.Simulator.Tick();   // 让重力 / 落地结算稳定后再取样
 
         float savedX, savedY;
+        long oldSessionId;
         lock (world.PlayersLock)
         {
             var p = world.Players.Values.Single();
             savedX = p.Position.X;
             savedY = p.Position.Y;
+            oldSessionId = p.SessionId;
             p.Hp = 42;   // 与满血区分，便于验证状态一并交还
         }
 
@@ -2065,6 +2089,9 @@ public class VanillaFeatureTests
         Assert.InRange(resumed.Position.X, savedX - 3f, savedX + 3f);
         Assert.InRange(resumed.Position.Y, savedY - 3f, savedY + 3f);
         Assert.Equal(42, resumed.Hp);   // 血量等运行时状态一并交还
+
+        // 接管的同时更换会话标识：旧连接的在途命令不得再影响这个运行时
+        Assert.NotEqual(oldSessionId, resumed.SessionId);
 
         // 世界同步应下发**携恢复后坐标**的出生包（而非世界出生点）
         var resumedX = resumed.Position.X;

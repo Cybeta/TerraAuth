@@ -151,6 +151,35 @@ public class SimulationTests
     }
 
     [Fact]
+    public void StaleSessionOfflineCleanup_PreservesReplacementChestSession()
+    {
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 22, Active = true };
+        world.OpenChestSession(1, 22, 3);
+
+        // 旧连接（会话 11）的清理不得关闭复用同槽位的新连接的箱子会话
+        world.MarkPlayerOffline(1, 11, "old", 10);
+
+        Assert.True(world.TryGetCurrentPlayer(1, 22, out _));
+        Assert.True(world.HasChestSession(1, 22, 3));
+    }
+
+    [Fact]
+    public void MatchingSessionOfflineCleanup_ClosesOwnChestSession()
+    {
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 22, Active = true };
+        world.OpenChestSession(1, 22, 3);
+
+        world.MarkPlayerOffline(1, 22, "old", 10);
+
+        Assert.False(world.TryGetCurrentPlayer(1, 22, out _));
+        Assert.False(world.HasChestSession(1, 22, 3));
+    }
+
+    [Fact]
     public void SessionConditionedOfflineCleanup_RemovesMatchingPlayer()
     {
         var world = new WorldState();
@@ -268,6 +297,157 @@ public class SimulationTests
     }
 
     [Fact]
+    public void CloseChestCommand_ClosesSession()
+    {
+        var world = new WorldState();
+        world.OpenChestSession(1, 22, 3);
+
+        var closed = new CloseChestCommand(1, 1) { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(closed.Applied);
+        Assert.False(world.HasChestSession(1, 22, 3));
+    }
+
+    [Fact]
+    public void StaleSessionCloseChestCommand_DoesNotCloseReplacementSession()
+    {
+        var world = new WorldState();
+        world.OpenChestSession(1, 33, 4);
+
+        // 旧连接（会话 22）的关箱请求不得关闭复用同槽位的新连接会话
+        new CloseChestCommand(1, 1) { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(world.HasChestSession(1, 33, 4));
+    }
+
+    [Fact]
+    public void ChestSession_ClosesOnlyAfterPlayerLeavesReach()
+    {
+        // 箱子位于图格 (0,0)（中心像素 8,8），玩家先站在箱子旁、再走远
+        var world = new WorldState { Tiles = new TileMap(16, 16), MaxTilesX = 16, MaxTilesY = 16 };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                SessionId = 7,
+                Active = true,
+                Position = new Vector2(8, 8),
+            };
+        }
+
+        world.Chests.Add(new Chest { Index = 0, X = 0, Y = 0, Items = new ChestItem[40] });
+        world.OpenChestSession(1, 7, 0);
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        sim.Tick();
+        Assert.True(world.HasChestSession(1, 7, 0));   // 仍在交互距离内 → 会话保留
+
+        lock (world.PlayersLock)
+            world.Players[1].Position = new Vector2(8 + 160f * 2, 8);
+
+        sim.Tick();
+        Assert.False(world.HasChestSession(1, 7, 0));  // 离开距离 → 仿真关闭会话
+    }
+
+    [Fact]
+    public void PickupItemCommand_FullInventory_KeepsItemAndDefersRemoval()
+    {
+        var world = new WorldState { InventoryLedger = new RejectingInventoryLedger() };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Position = new Vector2(8, 8),
+            };
+        }
+        lock (world.ItemsLock)
+        {
+            world.Items.Add(new WorldItemEntity
+            {
+                Slot = 0,
+                ItemId = 1,
+                Stack = 1,
+                Position = new Vector2(8, 8),
+            });
+        }
+
+        var result = new PickupItemCommand(1, 1, 0).Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal("inventory_full", result.Reason);
+
+        // 背包不足 → 掉落物必须保留，且不得进入「已通知移除」状态（否则客户端会看到物品凭空消失）
+        var item = Assert.Single(world.Items);
+        Assert.True(item.Active);
+        Assert.False(item.RemovalNotified);
+    }
+
+    [Fact]
+    public void PickupItemCommand_OutOfReach_DoesNotQueueRemoval()
+    {
+        var world = new WorldState { InventoryLedger = new AcceptingInventoryLedger() };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Position = new Vector2(8, 8),
+            };
+        }
+        lock (world.ItemsLock)
+        {
+            world.Items.Add(new WorldItemEntity
+            {
+                Slot = 0,
+                ItemId = 1,
+                Stack = 1,
+                Position = new Vector2(8 + 160f * 4, 8),
+            });
+        }
+
+        var result = new PickupItemCommand(1, 1, 0).Apply(world, new XoshiroRng(1));
+
+        Assert.Equal("out_of_reach", result.Reason);
+        Assert.True(Assert.Single(world.Items).Active);
+    }
+
+    [Fact]
+    public void PickupItemCommand_ConcurrentPickups_OnlyOneSucceeds()
+    {
+        var world = new WorldState { InventoryLedger = new AcceptingInventoryLedger() };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+            world.Players[2] = new PlayerRuntime { Id = 2, Active = true, Position = new Vector2(8, 8) };
+        }
+        lock (world.ItemsLock)
+        {
+            world.Items.Add(new WorldItemEntity
+            {
+                Slot = 0,
+                ItemId = 1,
+                Stack = 1,
+                Position = new Vector2(8, 8),
+            });
+        }
+
+        // 两个玩家同时抢同一掉落物：掉落物实体的「失效 + 入库」必须在同一把锁内原子完成
+        int succeeded = 0;
+        Parallel.For(1, 3, playerId =>
+        {
+            var result = new PickupItemCommand(1, playerId, 0).Apply(world, new XoshiroRng(1));
+            if (result.Applied) Interlocked.Increment(ref succeeded);
+        });
+
+        Assert.Equal(1, succeeded);
+        Assert.False(Assert.Single(world.Items).Active);
+    }
+
+    [Fact]
     public void CommandQueue_Drains_InStableOrder()
     {
         var q = new CommandQueue();
@@ -340,6 +520,14 @@ public class SimulationTests
         public bool ConsumeItem(int playerId, int itemId) => false;
         public bool TryAddItem(int playerId, int itemId, int stack) => false;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => false;
+    }
+
+    /// <summary>背包一律接受（用于并发拾取等只关心原子性的用例）。</summary>
+    private sealed class AcceptingInventoryLedger : IInventoryLedger
+    {
+        public bool ConsumeItem(int playerId, int itemId) => true;
+        public bool TryAddItem(int playerId, int itemId, int stack) => true;
+        public bool TryAddItemExactly(int playerId, int itemId, int stack) => true;
     }
 }
 

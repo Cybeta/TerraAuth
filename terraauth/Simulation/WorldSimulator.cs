@@ -20,6 +20,9 @@ public partial class WorldSimulator : IWorldViewProvider
 
     public WorldState State => _world;
 
+    /// <summary>事件记录器：仿真提交事件由本类记录，世界同步线程也用它记录广播 / 持久化事件。</summary>
+    public EventRecorder Recorder => _recorder;
+
     /// <summary>最近一次 tick 发布的实体视图（快照线程读取，见 <see cref="IWorldViewProvider"/>）。</summary>
     public WorldEntityView CurrentEntityView => _entityViews.Current ?? WorldEntityView.Empty;
 
@@ -111,6 +114,9 @@ public partial class WorldSimulator : IWorldViewProvider
         // 5.6 液体：按脏格集合推进简化流动（下落优先，受阻后向两侧均衡）
         SimulateLiquids();
 
+        // 5.7 箱子会话：玩家离开交互距离 → 关闭会话（协议无「关箱」包，以距离作为可观测等价物）
+        ReapChestSessionsOutOfReach();
+
         // 6. Output：产出快照（Phase 4）
         //    同时发布本 tick 的不可变实体视图 —— 快照线程据此构建/裁剪快照，
         //    不再直接读正在被本线程改动的 WorldState（见 WorldEntityView）。
@@ -121,6 +127,51 @@ public partial class WorldSimulator : IWorldViewProvider
 
     // ---------- 各阶段（扩展点，逐步填充） ----------
 
+    /// <summary>箱子交互最大距离（像素），与权威层 <c>ChestReachPx</c> 保持一致。</summary>
+    private const float ChestReachPx = 160f;
+
+    /// <summary>
+    /// 箱子会话距离复核：原版协议没有「关闭箱子」包（客户端关闭时只清本地 <c>chest</c> 字段），
+    /// 故以「离开交互距离」作为可观测等价物 —— 玩家走远后服务端主动关闭会话，
+    /// 避免会话长期驻留（此后该玩家的箱子写入会被 <c>chest_not_open</c> 拒绝）。
+    /// </summary>
+    private void ReapChestSessionsOutOfReach()
+    {
+        var sessions = _world.SnapshotChestSessions();
+        if (sessions.Count == 0) return;
+
+        foreach (var (playerId, sessionId, chestIndex) in sessions)
+        {
+            Vector2 position;
+            lock (_world.PlayersLock)
+            {
+                if (!_world.Players.TryGetValue(playerId, out var player))
+                {
+                    // 玩家已离线：断线路径本应关闭会话，这里兜底，避免槽位复用时残留
+                    _world.CloseChestSession(playerId, sessionId);
+                    continue;
+                }
+
+                position = player.Position;
+            }
+
+            Chest? chest;
+            lock (_world.ChestsLock)
+                chest = _world.FindChestByIndex(chestIndex);
+
+            if (chest is null)
+            {
+                _world.CloseChestSession(playerId, sessionId);
+                continue;
+            }
+
+            var dx = position.X - (chest.X * TileSize + TileSize / 2f);
+            var dy = position.Y - (chest.Y * TileSize + TileSize / 2f);
+            if (dx * dx + dy * dy > ChestReachPx * ChestReachPx)
+                _world.CloseChestSession(playerId, sessionId);
+        }
+    }
+
     private void ApplyCommandsForTick(long tick)
     {
         // 取出不晚于当前 tick 的命令，Command.Apply 是唯一允许变更 WorldState 的地方。
@@ -130,7 +181,9 @@ public partial class WorldSimulator : IWorldViewProvider
             if (result.Applied)
                 _recorder.Record(new GameEvent(tick, cmd.PlayerId, cmd.Kind, null));
             else
-                _recorder.Record(new GameEvent(tick, cmd.PlayerId, "command_failed", result.Reason));
+                _recorder.Record(new GameEvent(
+                    tick, cmd.PlayerId, GameEventKinds.CommandFailed, result.Reason,
+                    GameEventCategory.Failure));
         }
     }
 
@@ -234,7 +287,7 @@ public partial class WorldSimulator : IWorldViewProvider
                     }
                     p.Active = false;
                     p.DeadTick = _world.Tick;
-                    _recorder.Record(new GameEvent(_world.Tick, p.Owner, "projectile_hit", damage));
+                    _recorder.Record(new GameEvent(_world.Tick, p.Owner, GameEventKinds.ProjectileHit, damage));
                     continue;
                 }
 
@@ -302,7 +355,7 @@ public partial class WorldSimulator : IWorldViewProvider
 
         _world.MarkLiquidChanged(x, y);
         _world.MarkTileChanged(x, y); // 新方块推送客户端（包 10 小矩形）
-        _recorder.Record(new GameEvent(_world.Tick, 0, "liquid_merge", mergeTile));
+        _recorder.Record(new GameEvent(_world.Tick, 0, GameEventKinds.LiquidMerge, mergeTile));
         return true;
     }
 

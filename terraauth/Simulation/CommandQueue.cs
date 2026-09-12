@@ -26,7 +26,7 @@ public abstract record Command(
 
         if (player is null)
         {
-            failure = new(false, "player_not_active");
+            failure = new(false, CommandFailures.PlayerNotActive);
             return false;
         }
 
@@ -34,13 +34,13 @@ public abstract record Command(
             player.SessionId = SessionId;
         else if (SessionId != 0 && player.SessionId != SessionId)
         {
-            failure = new(false, "stale_session");
+            failure = new(false, CommandFailures.StaleSession);
             return false;
         }
 
         if (!player.Active)
         {
-            failure = new(false, "player_not_active");
+            failure = new(false, CommandFailures.PlayerNotActive);
             return false;
         }
 
@@ -59,10 +59,10 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
 
         if (!float.IsFinite(Position.X) || !float.IsFinite(Position.Y))
-            return new(false, "invalid_position");
+            return new(false, CommandFailures.InvalidPosition);
 
         PlayerRuntime player;
         lock (world.PlayersLock)
@@ -70,7 +70,7 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
             if (!world.Players.TryGetValue(id, out var existing))
             {
                 if (SessionId != 0)
-                    return new(false, "player_not_active");
+                    return new(false, CommandFailures.PlayerNotActive);
                 existing = new PlayerRuntime { Id = id, SessionId = SessionId };
                 world.Players[id] = existing;
             }
@@ -78,11 +78,11 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
         }
 
         if (SessionId != 0 && player.SessionId != SessionId)
-            return new(false, "stale_session");
+            return new(false, CommandFailures.StaleSession);
 
         // 死亡期间不接受移动：复活点由服务端在复活命令中划定，避免"死后瞬移"
         if (player.Dead)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         // 权威位置赋值：服务端校验通过后直接生效，并清零速度（避免与物理阶段积分叠加）
         player.Position = Position;
@@ -100,12 +100,12 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id || Damage <= 0)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
         if (player!.Dead)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         player.Hp -= Damage;
         if (player.Hp <= 0)
@@ -127,7 +127,7 @@ public sealed record KillPlayerCommand(long Tick, int? PlayerId)
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
@@ -155,12 +155,12 @@ public sealed record RespawnCommand(long Tick, int? PlayerId)
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
         if (!player!.Dead)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         player.Hp = player.HpMax;
         player.Dead = false;
@@ -181,19 +181,19 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
 
         if (world.InventoryLedger is null)
-            return new(false, "inventory_unavailable");
+            return new(false, CommandFailures.InventoryUnavailable);
 
         lock (world.PlayersLock)
         {
             if (!world.Players.TryGetValue(playerId, out var player))
-                return new(false, "player_not_active");
+                return new(false, CommandFailures.PlayerNotActive);
             if (SessionId != 0 && player.SessionId != SessionId)
-                return new(false, "stale_session");
+                return new(false, CommandFailures.StaleSession);
             if (!player.Active || player.Dead)
-                return new(false, "player_not_active");
+                return new(false, CommandFailures.PlayerNotActive);
 
             lock (world.ItemsLock)
             {
@@ -204,14 +204,14 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
                     var dx = player.Position.X - item.Position.X;
                     var dy = player.Position.Y - item.Position.Y;
                     if (dx * dx + dy * dy > 160f * 160f)
-                        return new(false, "out_of_reach");
+                        return new(false, CommandFailures.OutOfReach);
 
                     if (!world.InventoryLedger.TryAddItemExactly(
                             playerId,
                             item.ItemId,
                             item.Stack))
                     {
-                        return new(false, "inventory_full");
+                        return new(false, CommandFailures.InventoryFull);
                     }
 
                     item.Active = false;
@@ -223,7 +223,7 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
             }
         }
 
-        return new(false, "item_not_found");
+        return new(false, CommandFailures.ItemNotFound);
     }
 }
 
@@ -234,12 +234,12 @@ public sealed record OpenChestCommand(long Tick, int? PlayerId, int X, int Y)
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
 
         if (!TryGetPlayer(world, playerId, out var player, out var failure))
             return failure;
         if (player!.Dead)
-            return new(false, "player_not_active");
+            return new(false, CommandFailures.PlayerNotActive);
 
         Chest? chest;
         lock (world.ChestsLock)
@@ -247,9 +247,23 @@ public sealed record OpenChestCommand(long Tick, int? PlayerId, int X, int Y)
             chest = world.FindChestAt(X, Y);
         }
         if (chest is null)
-            return new(false, "chest_not_found");
+            return new(false, CommandFailures.ChestNotFound);
 
         world.OpenChestSession(playerId, SessionId, chest.Index);
+        return new(true);
+    }
+}
+
+/// <summary>关闭箱子命令：包 31 负坐标（客户端主动关箱）权威通过后生成，由仿真关闭带会话的打开状态。</summary>
+public sealed record CloseChestCommand(long Tick, int? PlayerId)
+    : Command(Tick, PlayerId, "close_chest")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int playerId)
+            return new(false, CommandFailures.MissingPlayer);
+
+        world.CloseChestSession(playerId, SessionId);
         return new(true);
     }
 }
@@ -265,33 +279,33 @@ public sealed record SyncChestItemCommand(
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
 
         lock (world.PlayersLock)
         {
             if (!world.Players.TryGetValue(playerId, out var player))
-                return new(false, "player_not_active");
+                return new(false, CommandFailures.PlayerNotActive);
             if (SessionId != 0 && player.SessionId != SessionId)
-                return new(false, "stale_session");
+                return new(false, CommandFailures.StaleSession);
             if (!player.Active || player.Dead)
-                return new(false, "player_not_active");
+                return new(false, CommandFailures.PlayerNotActive);
 
             lock (world.ChestsLock)
             {
                 if (!world.HasChestSession(playerId, SessionId, ChestIndex))
-                    return new(false, "chest_not_open");
+                    return new(false, CommandFailures.ChestNotOpen);
 
                 var chest = world.FindChestByIndex(ChestIndex);
                 if (chest is null)
-                    return new(false, "chest_not_found");
+                    return new(false, CommandFailures.ChestNotFound);
 
                 if (Slot < 0 || Slot >= chest.Items.Length)
-                    return new(false, "invalid_slot");
+                    return new(false, CommandFailures.InvalidSlot);
 
                 var dx = player.Position.X - chest.X * 16f - 8f;
                 var dy = player.Position.Y - chest.Y * 16f - 8f;
                 if (dx * dx + dy * dy > 160f * 160f)
-                    return new(false, "out_of_reach");
+                    return new(false, CommandFailures.OutOfReach);
 
                 chest.Items[Slot] = new ChestItem
                 {
@@ -318,7 +332,7 @@ public sealed record LiquidEditCommand(long Tick, int? PlayerId, IReadOnlyList<L
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
         if (!TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
 
@@ -357,11 +371,11 @@ public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, by
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
         if (!TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
-return new(false, "not_applied");
+return new(false, CommandFailures.NotApplied);
 
         // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
         bool changed = false;
@@ -431,7 +445,7 @@ return new(false, "not_applied");
         }
 
         if (changed) world.MarkTileChanged(X, Y);
-        return changed ? new(true) : new(false, "no_change");
+        return changed ? new(true) : new(false, CommandFailures.NoChange);
     }
 }
 
@@ -452,10 +466,10 @@ public sealed record ActuateCommand(long Tick, int? PlayerId, int X, int Y)
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
-return new(false, "not_applied");
+return new(false, CommandFailures.NotApplied);
 
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
         if (!TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
 
@@ -510,7 +524,7 @@ return new(false, "not_applied");
             }
         }
 
-        return toggledAny ? new(true) : new(false, "no_change");
+        return toggledAny ? new(true) : new(false, CommandFailures.NoChange);
     }
 }
 
@@ -521,14 +535,14 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
-return new(false, "not_applied");
+return new(false, CommandFailures.NotApplied);
 
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
         if (!TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
         if (world.InventoryLedger is null)
-return new(false, "not_applied");
+return new(false, CommandFailures.NotApplied);
 
         // 图格和背包必须在同一提交单元中处理。先占住图格写锁，再确认目标仍为空并扣除物品。
         world.Sections.EnterWrite(X, Y);
@@ -536,7 +550,7 @@ return new(false, "not_applied");
         {
             ref var tile = ref world.Tiles[X, Y];
             if (tile.Active || !world.InventoryLedger.ConsumeItem(playerId, TileType))
-                return new(false, "not_applied");
+                return new(false, CommandFailures.NotApplied);
             tile.Active = true;
             tile.Type = (ushort)TileType;
             tile.Wall = 0;
@@ -558,18 +572,18 @@ public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, in
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
         if (!TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
 
         lock (world.NpcsLock)
         {
             if (NpcIndex < 0 || NpcIndex >= world.Npcs.Count)
-                return new(false, "not_applied");
+                return new(false, CommandFailures.NotApplied);
 
             var npc = world.Npcs[NpcIndex];
             if (!npc.Active)
-                return new(false, "not_applied");
+                return new(false, CommandFailures.NotApplied);
 
             npc.Life -= Damage;
             if (npc.Life <= 0)
@@ -601,7 +615,7 @@ public sealed record SpawnItemCommand(
         lock (world.ItemsLock)
         {
             if (world.Items.Count >= MaxSlots)
-                return new(false, "not_applied");
+                return new(false, CommandFailures.NotApplied);
 
             int slot = 0;
             while (world.Items.Any(i => i.Slot == slot)) slot++;
@@ -630,7 +644,7 @@ public sealed record SpawnProjectileCommand(
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
-            return new(false, "missing_player");
+            return new(false, CommandFailures.MissingPlayer);
         if (!TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
 
@@ -675,7 +689,7 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
                 if (p.Key != Key || !p.Active) continue;
 
                 // 服务端权威：只有归属者能销毁自己的弹幕（防伪造他人弹幕消失）
-                if (PlayerId is int owner && p.Owner != owner) return new(false, "not_owner");
+                if (PlayerId is int owner && p.Owner != owner) return new(false, CommandFailures.NotOwner);
 
                 p.Position = Position;
                 p.Active = false;
@@ -685,7 +699,7 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
             }
         }
 
-        return new(false, "projectile_not_found");
+        return new(false, CommandFailures.ProjectileNotFound);
     }
 }
 
@@ -696,7 +710,7 @@ public sealed record SetManaCommand(long Tick, int? PlayerId, int Mana, int MaxM
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id || MaxMana <= 0)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
@@ -717,12 +731,12 @@ public sealed record HealPlayerCommand(long Tick, int? PlayerId, int Amount)
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id || Amount <= 0)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
         if (player!.Dead)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         player.Hp = Math.Min(player.Hp + Amount, player.HpMax);
         return new(true);
@@ -736,7 +750,7 @@ public sealed record SetBuffsCommand(long Tick, int? PlayerId, IReadOnlyList<int
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return new(false, "not_applied");
+            return new(false, CommandFailures.NotApplied);
 
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;

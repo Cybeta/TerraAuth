@@ -879,6 +879,11 @@ internal sealed class WorldAuthority : IWorldAuthority
         int playerId,
         long sessionId)
     {
+        // 负坐标 = 关闭箱子请求（见 InboundPipeline 的命令映射）：只读校验阶段直接放行，
+        // 会话关闭由 CloseChestCommand 在仿真提交阶段执行。
+        if (chest.X < 0 || chest.Y < 0)
+            return AuthorityResult.Accept(chest);
+
         if (!IsInWorld(chest.X, chest.Y))
             return Deny(playerId, "chest_rejected", "out_of_bounds", new { chest.X, chest.Y });
 
