@@ -654,9 +654,13 @@ public sealed class GameHost : IDisposable
     /// <summary>单次推送的矩形区块数上限（其余重新排队，下次 flush 继续）。</summary>
     private const int MaxTileUpdateRectsPerFlush = 64;
 
+    /// <summary>包 20 的矩形宽/高为 Byte：单个矩形宽度上限。</summary>
+    private const int MaxTileSquareWidth = 255;
+
     /// <summary>
     /// 推送服务端驱动的图格变更（如电路翻转执行器）：把待推送图格按行合并为连续矩形，
-    /// 以包 10（TileSection）小矩形下发给**视口内**的玩家。由快照循环按快照频率调用。
+    /// 以**包 20（TileSquare）**下发给**视口内**的玩家 —— 原版对「少量图格改动」走包 20，
+    /// 只有区块级地形下载才走包 10。由快照循环按快照频率调用。
     /// </summary>
     public async Task FlushTileUpdatesAsync(CancellationToken ct = default)
     {
@@ -664,7 +668,7 @@ public sealed class GameHost : IDisposable
         var cells = world.DrainTileUpdates(MaxTileUpdatesPerFlush);
         if (cells.Count == 0) return;
 
-        // 先把待推送图格按行合并为「宽 × 1」矩形
+        // 先把待推送图格按行合并为「宽 × 1」矩形；宽度超 Byte 上限则再切分
         var rects = new List<(int X, int Y, int Width)>();
         foreach (var row in cells.GroupBy(c => c.Y))
         {
@@ -675,10 +679,10 @@ public sealed class GameHost : IDisposable
             for (int i = 1; i < xs.Length; i++)
             {
                 if (xs[i] == prev + 1) { prev = xs[i]; continue; }
-                rects.Add((start, row.Key, prev - start + 1));
+                AddRowRects(rects, start, prev, row.Key);
                 start = prev = xs[i];
             }
-            rects.Add((start, row.Key, prev - start + 1));
+            AddRowRects(rects, start, prev, row.Key);
         }
 
         var radius = Math.Max(1, Config.Current.ViewportRadius);
@@ -700,11 +704,22 @@ public sealed class GameHost : IDisposable
             float centerY = (y + 0.5f) * TileSizePx;
 
             await Network.BroadcastWhereAsync(
-                PacketId.TileSendSection,
-                new TileSectionPacket(world, x, y, width, 1),
+                PacketId.TileSquare,
+                new TileSquarePacket(world, x, y, width, 1),
                 playerId => IsPlayerWithin(world, playerId, centerX, centerY, radiusSq),
                 ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>把一行内的连续区间按包 20 的宽度上限切成若干矩形。</summary>
+    private static void AddRowRects(List<(int X, int Y, int Width)> rects, int start, int end, int y)
+    {
+        while (end - start + 1 > MaxTileSquareWidth)
+        {
+            rects.Add((start, y, MaxTileSquareWidth));
+            start += MaxTileSquareWidth;
+        }
+        rects.Add((start, y, end - start + 1));
     }
 
     /// <summary>
@@ -748,7 +763,9 @@ public sealed class GameHost : IDisposable
                 Generation: npc.Generation,
                 Position: new Vector2(npc.X, npc.Y),
                 Velocity: new Vector2(npc.VelocityX, npc.VelocityY),
-                Target: 0,
+                // 255 = 显式「无目标」：客户端侧 NPC AI 以 target==255（部分 AI 还含 <=0）判为无目标并自行 TargetClosest。
+                // 若发 0，会被当作「目标 = 玩家槽位 0」，客户端 AI 会去追那个玩家（通常是错的）。
+                Target: 255,
                 NetId: npc.NetId == 0 ? (short)npc.Type : npc.NetId,
                 Life: npc.Active ? npc.Life : 0,   // 已死亡 → life=0，客户端据此移除
                 LifeMax: Math.Max(1, npc.LifeMax));

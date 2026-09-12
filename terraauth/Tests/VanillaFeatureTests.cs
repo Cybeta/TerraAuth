@@ -1465,11 +1465,11 @@ public class VanillaFeatureTests
         Assert.True(await TickUntilAsync(server, () => world.Tiles[x + 1, y].InActive, TimeSpan.FromSeconds(5)),
             "执行器未被通电");
 
-        // 服务端驱动的图格变更 → 由快照循环推送小矩形包 10
+        // 服务端驱动的图格变更 → 由快照循环推送小矩形**包 20（TileSquare）**（原版对少量图格改动走此包）
         await server.Host.FlushTileUpdatesAsync();
 
-        var got = await s.ReadUntilAsync(p => p.Type == PacketId.TileSendSection, TimeSpan.FromSeconds(5));
-        Assert.Contains(got, p => p.Type == PacketId.TileSendSection);
+        var got = await s.ReadUntilAsync(p => p.Type == PacketId.TileSquare, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p.Type == PacketId.TileSquare);
     }
 
     [Fact]

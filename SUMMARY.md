@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**256 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
+> 生成日期：2026-09-12 ｜ 当前测试：**257 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
 
 ---
 
@@ -82,7 +82,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **256 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
+- 套件 **257 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -125,6 +125,15 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
   现改为**分轴判定**：水平用 `MaxSpeed`，垂直用 `max(MaxSpeed, MaxFallSpeed)`（`MaxFallSpeed` 由配置注入）。
 - **未建模的客户端包被静默丢弃**：`RelayToOthersAsync` 无 default 分支，表情 / 告示牌 / 家具 / NetModule 其他模块等
   「他人可见性」全部丢失。现在**未建模包默认中继**（握手 / 世界请求 / 自身属性 / 服务端自持等例外不中继）。
+
+**随后按原版读写两侧核对，把三项「待确认」落实到位**：
+
+- **图格改动改用包 20（TileSquare）**：原版对少量图格改动走包 20（未压缩小矩形 + 逐格位标志/可选段），
+  只有区块级地形下载才走包 10。现在执行器翻转 / 液体混合等走**包 20**（矩形宽度超 255 自动切分），区块流送仍走包 10。
+- **区块流送参数对齐原版**：流送矩形改为 **3×3**（以玩家所在区块为中心），下发前先发**包 9（进度）**，
+  并沿用**逐连接去重**（原版同样按客户端记录已发区块）。
+- **NPC 同步细节**：核对客户端读取侧 —— **省略 ai 与发送 ai=0 等价**（无需补发）；
+  补齐**同步锚点**（史莱姆王：位置 + 体型×锚点，修正客户端画偏）；目标字段由 `0` 改为 **255（显式无目标）**。
 
 ### 11. 文档同步
 
@@ -239,10 +248,15 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Authority/ShardedInboundPipeline.cs` | `InboundWork.IsReset` + 重置投递到同一分片 / 队列（保证在途包先处理完） |
 | `terraauth/Plugins/HookIntegration.cs` | `HookedPipeline.ResetPlayer` 转发 |
 | `terraauth/Net/Phase5/Connection.cs` | 新增 `SyncedSections` / `LastStreamSection`（区块流送去重 + 跨区块判定） |
-| `terraauth/Net/Phase5/NetworkHost.cs` | 包 8 在 **Playing 阶段也处理**；`StreamSectionsForPlayersAsync`（跨区块补发周边 5×3）；未建模包**默认中继**（`IsSelfOnlyPacket` 例外表） |
+| `terraauth/Net/Phase5/NetworkHost.cs` | 包 8 在 **Playing 阶段也处理**；`StreamSectionsForPlayersAsync`（跨区块补发周边 **3×3** + 先发包 9 进度）；未建模包**默认中继**（`IsSelfOnlyPacket` 例外表） |
 | `terraauth/Authority/AuthoritySubsystems.cs` | 移动校验改**分轴**（垂直用 `max(MaxSpeed, MaxFallSpeed)`）；`MovementLimits` 新增 `MaxFallSpeed` |
+| `terraauth/Protocol/PacketId.cs` | 新增 `TileSquare = 20` |
+| `terraauth/Simulation/World/Tile.cs` | 新增 `TileSquarePacket`（包 20 契约：未压缩小矩形 + 逐格位标志/可选段） |
+| `terraauth/Net/Phase5/PacketEncoder.cs` | 新增**包 20 编码**（按写入/读取两侧核对逐字段实现）；NPC 同步**锚点偏移**（史莱姆王） |
+| `terraauth/GameHost.cs` | 图格改动由包 10 改为**包 20**（宽度超 255 切分）；NPC 目标字段改 **255（无目标）** |
+| `terraauth/Tests/NetworkTests.cs` | +1 用例（包 20 线格式逐字段断言） |
 | `terraauth/Tests/AuthorityTests.cs` | +1 用例（快速坠落接受 / 水平瞬移仍拒） |
-| `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、`OPTIMIZATION_BACKLOG.md`、`SUMMARY.md` | 文档同步（含 §二「无接触伤害」矛盾修正、W-1 立项、第十一 ~ 十四轮） |
+| `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、`OPTIMIZATION_BACKLOG.md`、`SUMMARY.md` | 文档同步（含 §二「无接触伤害」矛盾修正、W-1 立项、第十一 ~ 十五轮） |
 
 ---
 
@@ -250,8 +264,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **256 / 256 通过** |
-| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **256 / 256 通过** |
+| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **257 / 257 通过** |
+| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **257 / 257 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 
@@ -267,9 +281,10 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **液体**：混合反应仅在本格为空时生成；无液体压力模型。
 - **电路**：无门电路 / 定时器 / 压力板（action 18 未建模）。
 - **物理 / AI**：弹幕无图格碰撞与追踪 / 反弹行为；掉落物无拾取动画与合并；
-  **NPC 同步只发位置 / 速度 / 朝向 / 生命，不含 ai 值**（客户端拿不到 ai 驱动的动作，补齐需真实 NPC AI 模型）。
-- **图格推送**：服务端驱动的图格修改采用「小矩形包 10」而非原版包 20（SendTileSquare）；
-  登录期地形与游戏内区块流送同样走包 10（客户端同一处理路径），是否换包 20 需真实客户端实测后再定。
+  **NPC 同步省略 ai**（客户端在 ai 位未置位时置 0，故与发送 0 等价）—— NPC 动作由**客户端自身 AI** 驱动（与原版一致），
+  已补齐同步锚点（史莱姆王）与目标字段语义；遗留：NPC 增益（buff）未同步。
+- **图格推送**：**少量图格改动**（执行器翻转 / 液体混合）走**包 20（TileSquare）**，**区块级地形流送**走**包 10（TileSection）**
+  —— 与原版一致。图格流送矩形为 3×3（跨区块才补发、逐连接去重）。
 - **世界持久化**：在线走**图格 + 箱子内容增量**（1Hz，崩溃最多丢 1 秒）；整份 `.wld` 导出为**停机 / 空服**动作
   （全量 O(世界大小)，避开在线时段）。
 - **导出的 `.wld` 验证程度**：已通过**逐格 round-trip** + **按原版加载器顺序的严格分段走查**（11 段含 5..9 段的合法空编码、

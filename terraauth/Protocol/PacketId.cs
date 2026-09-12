@@ -30,6 +30,7 @@ public enum PacketId : byte
     PlayerHealth        = 16,   // 原版 PlayerLifeMana
     TileBreak           = 17,   // 原版 TileManipulation：破块 / 改块
     Time                = 18,   // 原版 Time：世界时间（Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY）
+    TileSquare          = 20,   // 原版 TileSquare：小矩形图格变更（服务端驱动的图格改动走这里）
     ItemDrop            = 21,   // 原版 SyncItem
     ItemPickup          = 22,   // 原版 SyncItemOwner：物品拾取（Int16 物品槽位 + Byte 归属玩家）
     NpcUpdate           = 23,   // 原版 SyncNPC：NPC 生成 / 更新（条件位 + 可选 ai / 生命段）

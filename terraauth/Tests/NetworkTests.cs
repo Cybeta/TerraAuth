@@ -1055,6 +1055,70 @@ public class TileSectionCodecTests
         Assert.True(Interlocked.Read(ref writes) > 0, "写入线程未执行");
     }
 
+    [Fact]
+    public void Encode_TileSquare_Writes_Vanilla_Layout()
+    {
+        // 包 20（TileSquare）：Int16 X/Y + Byte 宽/高 + Byte 变更类型 + 逐格（3 个标志字节 + 可选段），未压缩。
+        // 用单格覆盖全部可选段：油漆（方块/墙）、frame-important 帧、墙、液体、线网 / 执行器 / 斜坡 / 全亮 / 隐形。
+        var world = new WorldState
+        {
+            MaxTilesX = 32,
+            MaxTilesY = 32,
+            Tiles = new TileMap(32, 32),
+        };
+        world.Tiles[5, 6] = new Tile
+        {
+            Active = true, Type = 4, FrameX = 10, FrameY = 20, // 4 = frame-important
+            Wall = 300, WallColor = 3, TileColor = 7,
+            Liquid = 100, LiquidType = 1,
+            Wire = true, Wire4 = true, Actuator = true, InActive = true,
+            Slope = 2, HalfBrick = false,
+            FullbrightBlock = true, InvisibleWall = true,
+        };
+
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var writer = new ArrayBufferWriter<byte>();
+        encoder.Encode(writer, PacketId.TileSquare, new TileSquarePacket(world, 5, 6, 1, 1));
+
+        var buffer = new ReadOnlySequence<byte>(writer.WrittenMemory);
+        Assert.True(Framing.TryReadFrame(ref buffer, out var type, out var payload));
+        Assert.Equal(PacketId.TileSquare, type);
+
+        using var br = new BinaryReader(new MemoryStream(payload.ToArray()));
+        Assert.Equal((short)5, br.ReadInt16());
+        Assert.Equal((short)6, br.ReadInt16());
+        Assert.Equal((byte)1, br.ReadByte());   // 宽
+        Assert.Equal((byte)1, br.ReadByte());   // 高
+        Assert.Equal((byte)0, br.ReadByte());   // 变更类型
+
+        byte b1 = br.ReadByte();
+        Assert.True((b1 & 0x01) != 0, "active");
+        Assert.True((b1 & 0x04) != 0, "wall");
+        Assert.True((b1 & 0x08) != 0, "liquid");
+        Assert.True((b1 & 0x10) != 0, "wire");
+        Assert.True((b1 & 0x40) != 0, "actuator");
+        Assert.True((b1 & 0x80) != 0, "inActive");
+
+        byte b2 = br.ReadByte();
+        Assert.True((b2 & 0x04) != 0, "tileColor 存在");
+        Assert.True((b2 & 0x08) != 0, "wallColor 存在");
+        Assert.Equal(2, (b2 >> 4) & 0x07);       // 斜坡 bits4-6
+        Assert.True((b2 & 0x80) != 0, "wire4");
+
+        byte b3 = br.ReadByte();
+        Assert.True((b3 & 0x01) != 0, "fullbrightBlock");
+        Assert.True((b3 & 0x08) != 0, "invisibleWall");
+
+        Assert.Equal((byte)7, br.ReadByte());    // 方块油漆
+        Assert.Equal((byte)3, br.ReadByte());    // 墙油漆
+        Assert.Equal((ushort)4, br.ReadUInt16()); // 类型
+        Assert.Equal((short)10, br.ReadInt16());  // frameX
+        Assert.Equal((short)20, br.ReadInt16());  // frameY
+        Assert.Equal((ushort)300, br.ReadUInt16()); // 墙
+        Assert.Equal((byte)100, br.ReadByte());   // 液体量
+        Assert.Equal((byte)1, br.ReadByte());     // 液体类型
+    }
+
     private static Tile[,] EncodeThenDecode(
         WorldState world, int xStart, int yStart, int width, int height,
         out int chestCount, out int signCount)

@@ -154,3 +154,15 @@ public sealed record TileSectionPacket(WorldState World, int XStart, int YStart,
 {
     public PacketId Type => PacketId.TileSendSection;
 }
+
+/// <summary>
+/// 图格方阵变更（TileSquare，包 20）。
+/// 用于**服务端驱动的图格改动**（执行器翻转、液体混合等）的小矩形下发 —— 原版对「少量图格改动」走此包，
+/// 只有区块级地形下载才走包 10（TileSection）。
+/// 线格式：Int16 X + Int16 Y + Byte 宽 + Byte 高 + Byte 变更类型 + 逐格位标志与可选段（未压缩）。
+/// </summary>
+public sealed record TileSquarePacket(
+    WorldState World, int X, int Y, int Width, int Height, byte ChangeType = 0) : INetworkPacket
+{
+    public PacketId Type => PacketId.TileSquare;
+}

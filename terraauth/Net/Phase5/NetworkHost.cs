@@ -690,9 +690,10 @@ public sealed class NetworkHost : IAsyncDisposable
             ct).ConfigureAwait(false);
     }
 
-    /// <summary>流送区块的矩形尺寸（区块数）：5 宽 × 3 高，与登录期出生点矩形一致。</summary>
-    private const int StreamSectionsWide = 5;
-    private const int StreamSectionsTall = 3;
+    /// <summary>
+    /// 流送半径（区块数）：与原版一致 —— 以玩家所在区块为中心取 (2×fluff+1)² 的方块（fluff=1 → 3×3）。
+    /// </summary>
+    private const int StreamSectionFluff = 1;
 
     /// <summary>
     /// 按玩家当前所在区块流送周边区块：**仅当该玩家跨越区块边界时**触发，且跳过已下发过的区块。
@@ -736,15 +737,26 @@ public sealed class NetworkHost : IAsyncDisposable
     {
         int maxSectionsX = _world.MaxTilesX / 200;
         int maxSectionsY = _world.MaxTilesY / 150;
-        int halfW = StreamSectionsWide / 2;
-        int halfH = StreamSectionsTall / 2;
 
-        for (int sx = sectionX - halfW; sx <= sectionX + halfW; sx++)
-            for (int sy = sectionY - halfH; sy <= sectionY + halfH; sy++)
+        // 先收集「尚未下发」的区块（原版会先发包 9 告知进度，再逐块下发；重复请求不重复编码）
+        var pending = new List<(int X, int Y)>();
+        for (int sx = sectionX - StreamSectionFluff; sx <= sectionX + StreamSectionFluff; sx++)
+            for (int sy = sectionY - StreamSectionFluff; sy <= sectionY + StreamSectionFluff; sy++)
             {
                 if (sx < 0 || sy < 0 || sx >= maxSectionsX || sy >= maxSectionsY) continue;
-                await SendSectionOnceAsync(connection, sx, sy, ct).ConfigureAwait(false);
+                if (connection.SyncedSections.Contains((sx, sy))) continue;
+                pending.Add((sx, sy));
             }
+
+        if (pending.Count == 0) return;
+
+        await connection.SendEncodedAsync(
+            PacketId.StatusText,
+            new StatusTextPacket(StatusMax: pending.Count, StatusText: "Receiving tile data"),
+            ct).ConfigureAwait(false);
+
+        foreach (var (sx, sy) in pending)
+            await SendSectionOnceAsync(connection, sx, sy, ct).ConfigureAwait(false);
     }
 
     /// <summary>下发一个区块（已下发过的跳过；编码超帧上限时自动拆分）。</summary>

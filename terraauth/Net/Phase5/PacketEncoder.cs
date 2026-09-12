@@ -112,6 +112,11 @@ public sealed class PacketEncoder : IPacketEncoder
                     WriteTileSection(ms, section);
                     break;
 
+                case TileSquarePacket square:
+                    // TileSquare（包 20）：未压缩的小矩形图格变更（服务端驱动的图格改动）
+                    WriteTileSquare(bw, square);
+                    break;
+
                 case PlayerSpawnPacket playerSpawn:
                     WritePlayerSpawn(bw, playerSpawn);
                     break;
@@ -351,7 +356,10 @@ public sealed class PacketEncoder : IPacketEncoder
     {
         bw.Write(npc.Index);            // Byte 索引（0..199）
         bw.Write(npc.Generation);       // Byte generation
-        WriteVector2(bw, npc.Position);
+        // 同步锚点：对「锚点非零」的 NPC，上报的是 position + 体型 × 锚点，客户端接收后再减去同一偏移。
+        // 不补偿会让客户端把该 NPC 画偏（当前只有史莱姆王 50：锚点 (0.5,1)、体型 98×92 → 偏移 (49,92)）。
+        var anchor = NpcSyncAnchorOffset(npc.NetId);
+        WriteVector2(bw, new Vector2(npc.Position.X + anchor.X, npc.Position.Y + anchor.Y));
         WriteVector2(bw, npc.Velocity);
         bw.Write(npc.Target);           // UInt16 target
 
@@ -379,6 +387,16 @@ public sealed class PacketEncoder : IPacketEncoder
             default: bw.Write((sbyte)npc.Life); break;
         }
     }
+
+    /// <summary>
+    /// NPC 同步锚点偏移（体型 × 锚点，像素）。锚点默认 (0,0)，只有极少数 NPC 非零
+    /// （当前仅史莱姆王 50：锚点 (0.5,1)，体型 98×92 → 偏移 (49,92)）。
+    /// </summary>
+    private static Vector2 NpcSyncAnchorOffset(short netId) => netId switch
+    {
+        50 => new Vector2(49f, 92f),
+        _ => default,
+    };
 
     /// <summary>
     /// 聊天（包 82 = LoadNetModule → NetTextModule）。
@@ -718,6 +736,90 @@ public sealed class PacketEncoder : IPacketEncoder
         }
 
         return snapshot;
+    }
+
+    /// <summary>
+    /// 图格方阵（包 20）：Int16 X/Y + Byte 宽/高 + Byte 变更类型 + 逐格（3 个位标志字节 + 可选段），**未压缩**。
+    /// 逐格顺序与客户端读取侧严格一致：三个标志字节 → 方块/墙油漆 → 类型（可含 frameX/Y）→ 墙 → 液体。
+    /// </summary>
+    private static void WriteTileSquare(BinaryWriter bw, TileSquarePacket square)
+    {
+        var world = square.World;
+        int width = Math.Clamp(square.Width, 1, byte.MaxValue);
+        int height = Math.Clamp(square.Height, 1, byte.MaxValue);
+
+        // 坐标钳制：保证矩形完全落在世界内（原版同样把左上角钳到 [size, max - size]）
+        int x = Math.Clamp(square.X, Math.Min(width, world.MaxTilesX - 1),
+            Math.Max(0, world.MaxTilesX - width - 1));
+        int y = Math.Clamp(square.Y, Math.Min(height, world.MaxTilesY - 1),
+            Math.Max(0, world.MaxTilesY - height - 1));
+
+        bw.Write((short)x);
+        bw.Write((short)y);
+        bw.Write((byte)width);
+        bw.Write((byte)height);
+        bw.Write(square.ChangeType);
+
+        using (world.Sections.EnterRead(x, y, x + width - 1, y + height - 1))
+        {
+            for (int tx = x; tx < x + width; tx++)
+                for (int ty = y; ty < y + height; ty++)
+                    WriteSquareTile(bw, in world.Tiles[tx, ty]);
+        }
+    }
+
+    /// <summary>单格编码（包 20 的逐格负载；字段顺序与客户端读取侧对称）。</summary>
+    private static void WriteSquareTile(BinaryWriter bw, in Tile tile)
+    {
+        byte b1 = 0;
+        if (tile.Active) b1 |= 1 << 0;
+        if (tile.Wall > 0) b1 |= 1 << 2;
+        if (tile.Liquid > 0) b1 |= 1 << 3;
+        if (tile.Wire) b1 |= 1 << 4;
+        if (tile.HalfBrick) b1 |= 1 << 5;
+        if (tile.Actuator) b1 |= 1 << 6;
+        if (tile.InActive) b1 |= 1 << 7;
+
+        byte b2 = 0;
+        if (tile.Wire2) b2 |= 1 << 0;
+        if (tile.Wire3) b2 |= 1 << 1;
+        bool hasTileColor = tile.Active && tile.TileColor > 0;
+        bool hasWallColor = tile.Wall > 0 && tile.WallColor > 0;
+        if (hasTileColor) b2 |= 1 << 2;
+        if (hasWallColor) b2 |= 1 << 3;
+        b2 |= (byte)((tile.Slope & 0x07) << 4); // bits4-6 = 斜坡
+        if (tile.Wire4) b2 |= 1 << 7;
+
+        byte b3 = 0;
+        if (tile.FullbrightBlock) b3 |= 1 << 0;
+        if (tile.FullbrightWall) b3 |= 1 << 1;
+        if (tile.InvisibleBlock) b3 |= 1 << 2;
+        if (tile.InvisibleWall) b3 |= 1 << 3;
+
+        bw.Write(b1);
+        bw.Write(b2);
+        bw.Write(b3);
+
+        if (hasTileColor) bw.Write(tile.TileColor);
+        if (hasWallColor) bw.Write(tile.WallColor);
+
+        if (tile.Active)
+        {
+            bw.Write(tile.Type);
+            if (TileIdSets.IsTileFrameImportant(tile.Type))
+            {
+                bw.Write(tile.FrameX);
+                bw.Write(tile.FrameY);
+            }
+        }
+
+        if (tile.Wall > 0) bw.Write(tile.Wall);
+
+        if (tile.Liquid > 0)
+        {
+            bw.Write(tile.Liquid);
+            bw.Write(tile.LiquidType);
+        }
     }
 
     /// <summary>
