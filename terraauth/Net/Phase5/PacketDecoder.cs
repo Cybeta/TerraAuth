@@ -338,22 +338,35 @@ public sealed class PacketDecoder : IPacketDecoder
         var position = new Vector2(r.ReadSingle(), r.ReadSingle());
 
         var velocity = default(Vector2);
-        if ((stateBits & 0x04) != 0)
+        var hasVelocity = (stateBits & 0x04) != 0;
+        if (hasVelocity)
             velocity = new Vector2(r.ReadSingle(), r.ReadSingle());
+
+        // 以下三个尾随段必须**读取并保留**：只跳过会让转发时丢失（他人看不到坐骑 / 相机 / 回城），
+        // 而编码侧又按标志位写字段，标志位与负载不一致会整条连接错位。
+        ushort? mountType = null;
         if ((stateBits & 0x80) != 0)
-            r.ReadUInt16(); // 挂载类型，暂不透出
+            mountType = r.ReadUInt16();
+
+        Vector2? potionOriginal = null, potionHome = null;
         if ((stateBits2 & 0x40) != 0)
         {
-            r.ReadSingle(); r.ReadSingle(); // PotionOfReturn 使用位置
-            r.ReadSingle(); r.ReadSingle(); // PotionOfReturn 返回位置
-        }
-        if ((stateBits3 & 0x20) != 0)
-        {
-            r.ReadSingle(); r.ReadSingle(); // 相机目标
+            potionOriginal = new Vector2(r.ReadSingle(), r.ReadSingle());
+            potionHome = new Vector2(r.ReadSingle(), r.ReadSingle());
         }
 
+        Vector2? cameraTarget = null;
+        if ((stateBits3 & 0x20) != 0)
+            cameraTarget = new Vector2(r.ReadSingle(), r.ReadSingle());
+
         return new PlayerControlsPacket(
-            playerId, position, velocity, selectedItem, controlBits, stateBits, stateBits2, stateBits3);
+            playerId, position, velocity, selectedItem, controlBits, stateBits, stateBits2, stateBits3)
+        {
+            MountType = mountType,
+            PotionReturnOriginal = potionOriginal,
+            PotionReturnHome = potionHome,
+            CameraTarget = cameraTarget,
+        };
     }
 
     private INetworkPacket DecodePlayerActive(BinaryReader r)

@@ -218,6 +218,51 @@ public class WorldGeneratorTests
     }
 
     [Fact]
+    public void Generate_Produces_Layered_Terrain_With_Ores_Caves_Ocean_And_Chests()
+    {
+        var world = WorldGenerator.GenerateSmall();
+
+        // 层位：地表 < 岩层（岩层为泥土/石分界）
+        Assert.True(world.WorldSurface > 0, "世界地表未设置");
+        Assert.True(world.RockLayer > world.WorldSurface, "岩层应深于地表");
+        Assert.InRange(world.WorldSurface, 1, short.MaxValue);
+
+        int hellStart = world.MaxTilesY - 200;
+        int oreCount = 0, caveCount = 0, grassCount = 0, ashCount = 0, waterCount = 0;
+
+        for (int y = 0; y < world.MaxTilesY; y++)
+        {
+            for (int x = 0; x < world.MaxTilesX; x++)
+            {
+                ref var tile = ref world.Tiles[x, y];
+
+                // 洞穴：岩层到地狱之间的空格
+                if (y >= world.RockLayer && y < hellStart && !tile.Active) caveCount++;
+
+                if (tile.Liquid > 0) waterCount++;
+                if (!tile.Active) continue;
+
+                switch (tile.Type)
+                {
+                    case 6 or 7 or 8 or 9: oreCount++; break;   // 铁 / 铜 / 金 / 银
+                    case 2: grassCount++; break;                 // 草皮
+                    case 57: ashCount++; break;                  // 灰烬（地狱层）
+                }
+            }
+        }
+
+        Assert.True(oreCount > 200, $"矿脉过少：{oreCount}");
+        Assert.True(caveCount > 5_000, $"洞穴过少：{caveCount}");
+        Assert.True(grassCount > 1_000, $"地表草皮过少：{grassCount}");
+        Assert.True(ashCount > 10_000, $"地狱层过少：{ashCount}");
+        Assert.True(waterCount > 1_000, $"海水过少：{waterCount}");
+        Assert.True(world.Chests.Count >= 3, $"地下宝箱过少：{world.Chests.Count}");
+
+        // 宝箱战利品非空（否则宝箱没有意义）
+        Assert.Contains(world.Chests, c => c.Items.Any(i => i.Stack > 0));
+    }
+
+    [Fact]
     public void GenerateSmall_IsDeterministic()
     {
         var a = WorldGenerator.GenerateSmall();

@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**257 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
+> 生成日期：2026-09-12 ｜ 当前测试：**259 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
 
 ---
 
@@ -82,7 +82,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **257 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
+- 套件 **259 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -135,7 +135,17 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **NPC 同步细节**：核对客户端读取侧 —— **省略 ai 与发送 ai=0 等价**（无需补发）；
   补齐**同步锚点**（史莱姆王：位置 + 体型×锚点，修正客户端画偏）；目标字段由 `0` 改为 **255（显式无目标）**。
 
-### 11. 文档同步
+### 11. 地形生成器重写 + 包 13 尾随字段保真
+
+- **地形生成器重写**：原实现只有「正弦地表 + 草/土/石」，现在生成**分层地形**——地表起伏改用确定性哈希噪声，
+  并含**洞穴、按深度分带的矿脉、两端海滩与海水、地狱层（灰烬/狱石）、地下宝箱（2×2 摆放 + 战利品）**；
+  层高比例（地表 / 岩层 / 海平面 / 地狱层）、图格 ID、宝箱摆放与帧约定**均按原版核对**；
+  出生点半径内不挖洞（防出生坠落）。
+- **包 13 尾随字段保真**：解码时原先把**挂载类型 / 回城双坐标 / 相机目标**读后即丢、编码时强制清标志位 →
+  现在**原样保留并写出**，他人可看到坐骑、相机与回城表现（标志位与负载严格自洽，避免整连接错位）。
+- **顺带修复**：`.wld` 箱子去重后未重排 `Index`（会让 `FindChestByIndex` 错位）。
+
+### 12. 文档同步
 
 根 `README.md`、`terraauth/README.md`、`PROJECT_STRUCTURE.md`、`VANILLA_COVERAGE.md`、
 `OPTIMIZATION_BACKLOG.md`、`Phase6/Phase7` 与 `ModCompat` README 均已按上述实现同步更新。
@@ -232,9 +242,14 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Config/ServerConfig.cs` | 新增 `WorldPath` / `WorldSize` / `WorldExportPath` / `WorldExportIntervalSeconds` / `SessionResumeGraceSeconds` |
 | `terraauth/Simulation/World/WorldState.cs` | 待落盘集合上限 + 溢出降级全图扫描 + `HasPendingPersist`；离线会话表 + `MarkPlayerOffline` / `TryResumePlayer` / `ReapOfflineSessions`；`PlayerRuntime` 新增 `ResumeKey` / `Resumed` |
 | `terraauth/Tests/WorldFileTests.cs` | +3 用例（特征世界逐格 round-trip / 世界旗标 round-trip / 按原版顺序的严格分段走查） |
-| `terraauth/Tests/VanillaFeatureTests.cs` | +18 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 世界尺寸配置（中世界生成）/ 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）/ 箱子内容重启存活 / 区块流送 / 未建模包中继）；偶发用例等待窗口 5s → 15s |
-| `terraauth/Simulation/World/WorldGenerator.cs` | 新增 `WorldSize`（Small/Medium/Large）与 `Generate(size)`；地表 / 岩层按高度比例缩放 |
-| `terraauth/Tests/SimulationTests.cs` | +3 用例（三档世界尺寸生成：尺寸 / 区块数 / Int16 范围 / 出生点贴地 / 包 7 字段） |
+| `terraauth/Tests/VanillaFeatureTests.cs` | +19 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 世界尺寸配置（中世界生成）/ 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）/ 箱子内容重启存活 / 区块流送 / 未建模包中继 / **包 13 中继保留挂载与相机**）；偶发用例等待窗口 5s → 15s |
+| `terraauth/Simulation/World/WorldGenerator.cs` | **重写为分层地形生成**：噪声地表 / 洞穴 / 按深度分带矿脉 / 海滩+海水 / 地狱层 / 2×2 宝箱+战利品；层高比例与图格 ID 按原版核对（`WorldSize` 三档保留） |
+| `terraauth/Tests/SimulationTests.cs` | +4 用例（三档世界尺寸生成 / **分层地形内容：矿脉·洞穴·草皮·地狱层·海水·宝箱**） |
+| `terraauth/Protocol/Types.cs` | `PlayerControlsPacket` 新增 `MountType` / `PotionReturnOriginal` / `PotionReturnHome` / `CameraTarget`（包 13 可选尾随段） |
+| `terraauth/Net/Phase5/PacketDecoder.cs` | 包 13 尾随段**读取并保留**（不再读后即丢） |
+| `terraauth/Net/Phase5/PacketEncoder.cs` | 包 13 按字段存在性**校准可选位并写出尾随字段** |
+| `terraauth/Simulation/World/WorldFileReader.cs` | 箱子去重后**按列表下标重排 `Index`**（修 `FindChestByIndex` 错位） |
+| `terraauth/Tests/IntegrationTests.cs` | 踢出用例等待窗口 5s → 10s（世界生成变重后的偶发） |
 | `terraauth/Simulation/World/WorldState.cs` | 箱子待落盘集合（`MarkPersistChest` / `DrainPersistChests`）+ `Chest.SerializeItems` / `DeserializeItems` |
 | `terraauth/Simulation/CommandQueue.cs` | `SyncChestItemCommand.Apply`（包 32）写入后登记箱子落盘 |
 | `terraauth/Persistence/IPersistence.cs` | `IWorldRepository` 新增 `SaveChestChangesAsync` / `LoadChestChangesAsync` + `WorldChestRecord` |
@@ -264,8 +279,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **257 / 257 通过** |
-| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **257 / 257 通过** |
+| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **259 / 259 通过** |
+| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **259 / 259 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 
@@ -273,8 +288,9 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ## 五、已知限制（简化模型，非原版全量）
 
-- **程序化世界生成**：支持原版三档尺寸（小 / 中 / 大），但地形只是「可加载地形」——
-  正弦地表 + 草/土/石 + 背景墙 + 一名向导 NPC，**无矿石 / 洞穴 / 生物群系 / 树木 / 地牢 / 生命水晶**；
+- **程序化世界生成**：支持原版三档尺寸（小 / 中 / 大），并生成**分层地形**（草皮 / 泥土 / 岩层 / 地狱层、
+  洞穴、按深度分带矿脉、两端海滩与海水、地下宝箱 + 战利品），层高比例 / 图格 ID / 摆放约定按原版核对。
+  但**不是原版地形生成器的逐段移植**：**无树木 / 生命水晶 / 生物群系（雪原 / 沙漠 / 丛林 / 腐化）/ 地牢·神庙等结构体**；
   需要完整地形请用 `WorldPath` 指定真实 `.wld`。大世界（8400×2400 ≈ 2000 万图格）内存约 0.5 GB。
 - **Boss / 事件**：AI 仅直线追击、生命值为简化表；血月 / 日食为昼夜概率、入侵为配额刷怪；
   掉落为**简化表**（仅收录眼魔 / 世界吞噬者 / 史莱姆王 / 蜂后），未复刻原版掉落数据库。

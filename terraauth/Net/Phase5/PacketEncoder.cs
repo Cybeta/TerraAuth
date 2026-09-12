@@ -641,16 +641,25 @@ public sealed class PacketEncoder : IPacketEncoder
 
     /// <summary>
     /// PlayerControls（包 13）：Byte id + BitsByte×4 + Byte selectedItem + Vector2 position
-    /// + 可选 Vector2 velocity（StateBits bit2）。挂载 / 回城 / 相机等可选字段当前不发出。
+    /// + 可选 velocity / 挂载类型 / 回城双坐标 / 相机目标（各由对应标志位决定）。
     /// </summary>
     private static void WritePlayerControls(BinaryWriter bw, PlayerControlsPacket p)
     {
-        // 标志位与尾随字段必须自洽：解码端会按 StateBits bit7（挂载）、StateBits2 bit6（回城）、
-        // StateBits3 bit5（相机）读取尾随字段，而本编码器不发出这些字段。若原样透传标志位，
-        // 接收端会多读字节，整条连接的后续包全部错位（流式协议无法自愈）。
-        var stateBits = (byte)(p.StateBits & ~0x80);
-        var stateBits2 = (byte)(p.StateBits2 & ~0x40);
-        var stateBits3 = (byte)(p.StateBits3 & ~0x20);
+        // 标志位必须与「实际写出的尾随字段」自洽：否则接收端会多读 / 少读字节，整条连接错位。
+        // 三个可选位按字段是否存在校准（速度位沿用发送端语义）。
+        var stateBits = p.StateBits;
+        var stateBits2 = p.StateBits2;
+        var stateBits3 = p.StateBits3;
+
+        stateBits = p.MountType.HasValue
+            ? (byte)(stateBits | PlayerControlsPacket.StateBitHasMount)
+            : (byte)(stateBits & ~PlayerControlsPacket.StateBitHasMount);
+        stateBits2 = p.PotionReturnOriginal.HasValue && p.PotionReturnHome.HasValue
+            ? (byte)(stateBits2 | PlayerControlsPacket.StateBit2HasPotionReturn)
+            : (byte)(stateBits2 & ~PlayerControlsPacket.StateBit2HasPotionReturn);
+        stateBits3 = p.CameraTarget.HasValue
+            ? (byte)(stateBits3 | PlayerControlsPacket.StateBit3HasCamera)
+            : (byte)(stateBits3 & ~PlayerControlsPacket.StateBit3HasCamera);
 
         bw.Write(p.PlayerId);
         bw.Write(p.ControlBits);
@@ -662,6 +671,19 @@ public sealed class PacketEncoder : IPacketEncoder
 
         if ((stateBits & PlayerControlsPacket.StateBitHasVelocity) != 0)
             WriteVector2(bw, p.Velocity);
+
+        // 挂载 / 回城 / 相机：原样保留（否则他人看不到坐骑、相机与回城表现）
+        if ((stateBits & PlayerControlsPacket.StateBitHasMount) != 0)
+            bw.Write(p.MountType!.Value);
+
+        if ((stateBits2 & PlayerControlsPacket.StateBit2HasPotionReturn) != 0)
+        {
+            WriteVector2(bw, p.PotionReturnOriginal!.Value);
+            WriteVector2(bw, p.PotionReturnHome!.Value);
+        }
+
+        if ((stateBits3 & PlayerControlsPacket.StateBit3HasCamera) != 0)
+            WriteVector2(bw, p.CameraTarget!.Value);
     }
 
     /// <summary>

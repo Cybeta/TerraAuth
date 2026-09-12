@@ -32,7 +32,7 @@
 | 生命 / 法力上报 | 16 | 上限校验；超限则下发**纠正包 16** | `Vanilla_Health_Above_ServerMax_Gets_Correction` |
 | 传送 | 65 | 实体索引 / 落点越界 / 频率校验 | `Vanilla_Teleport_OutOfBounds_IsRejected` |
 | 弃用包健壮性 | 25 | 未知 / 弃用包透传，连接不受影响 | `Vanilla_DeprecatedChatPacket_DoesNot_Disconnect` |
-| **他人可见性（中继）** | 117 / 35 / 36 / 50 / 32 | 权威通过后转发给其他玩家；携带玩家字段的包以服务端分配 ID 覆盖（防伪造身份）。注：118 死亡不在此中继，改由服务端结算后统一广播 | `Vanilla_PlayerHurt_Is_Relayed_With_ServerPlayerId` / `..._PlayerBuffs_...` |
+| **他人可见性（中继）** | 117 / 35 / 36 / 50 / 32 / 13 | 权威通过后转发给其他玩家；携带玩家字段的包以服务端分配 ID 覆盖（防伪造身份）；**包 13 的挂载 / 相机 / 回城等可选尾随字段一并保留转发**。注：118 死亡不在此中继，改由服务端结算后统一广播 | `Vanilla_PlayerHurt_Is_Relayed_With_ServerPlayerId` / `..._PlayerBuffs_...` / `..._PlayerControls_Relay_Preserves_Mount_And_Camera` |
 | **世界时间同步** | 18 (Time) | 持续下发 `Byte dayTime + Int32 time + Int16 sunModY + Int16 moonModY` | `Vanilla_Time_Is_Synced_To_Client` |
 | **NPC 生成 / 同步** | 23 (SyncNPC) | 定期下发世界 NPC（索引 / netID / 位置 / 速度 / 朝向）；已满血形态省略生命段 | `Vanilla_Npc_Is_Synced_To_Client` |
 | **聊天** | 82 (NetModule → NetTextModule) | 客户端发言 → 转服务端下行形态广播给所有人；`IServerApi.Broadcast/SendMessage` 真实下发 | `Vanilla_Chat_Is_Relayed_To_OtherPlayers` / `Vanilla_ServerBroadcast_Reaches_Client` |
@@ -59,7 +59,7 @@
 
 | 功能 | 现状 | 备注 |
 |---|---|---|
-| 世界生成 | 已**支持原版三档尺寸的程序化生成**（`ServerConfig.WorldSize` = `Small` 4200×1200 / `Medium` 6400×1800 / `Large` 8400×2400）；`WorldPath` 指定 `.wld` 时以真实世界为准 | 程序化地形为「可加载地形」（正弦地表 + 草/土/石 + 背景墙 + 一名向导 NPC），**非原版地形生成器**：无矿石 / 洞穴 / 生物群系 / 树木 / 地牢 / 生命水晶等。大世界内存约 0.5 GB |
+| 世界生成 | 已**支持原版三档尺寸的程序化生成**（`ServerConfig.WorldSize` = `Small` 4200×1200 / `Medium` 6400×1800 / `Large` 8400×2400），并生成**分层地形**：草皮 / 泥土（含黏土、沙斑）/ 岩层 / 地狱层、洞穴、按深度分带的矿脉、两端海滩与海水、地下宝箱（2×2 摆放 + 战利品）；层高比例 / 图格 ID / 摆放约定按原版核对；`WorldPath` 指定 `.wld` 时以真实世界为准 | 仍是「原版风格的分层生成」，**不是原版地形生成器的逐段移植**：**无树木 / 生命水晶 / 生物群系（雪原 / 沙漠 / 丛林 / 腐化）/ 地牢·神庙等结构体**。大世界内存约 0.5 GB |
 | 敌怪生成 / AI | 已**简化**实现：史莱姆 + 入侵哥布林 + Boss（眼魔 / 骷髅王 / 史莱姆王）直线追击 | 无原版刷怪规则（生物群系 / 昼夜细分 / 事件）、无 NPC 专属 AI；接触伤害已由服务端判定（见 §一「服务端伤害来源」） |
 | 箱子内容管理 | 已**服务端持有并持久化**：开箱下发权威内容，包 32 校验后写入服务端箱子并增量落盘（重启回放） | 未实现包 33（完整箱子同步）/ 箱子命名 / 上锁 / 放置新箱子（包 34 语义为 SyncPlayerChestIndex，非放置）；客户端 UI 依赖服务端逐槽包 32 |
 | 电路 / 液体 | 已**简化实现**：液体逐格流动 + 混合反应 + NetLiquid 同步；线网 4 色 / 执行器编辑权威 + 受限 BFS 信号传播 | 无液体压力模型；无门电路 / 定时器 / 压力板（action 18 未建模） |

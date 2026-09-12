@@ -45,6 +45,27 @@ public sealed record PlayerControlsPacket(
 
     /// <summary>StateBits 第 2 位（0x04）：速度非零，payload 尾部携带 Vector2 速度。</summary>
     public const byte StateBitHasVelocity = 0x04;
+
+    /// <summary>StateBits 第 7 位（0x80）：尾部携带 UInt16 挂载类型。</summary>
+    public const byte StateBitHasMount = 0x80;
+
+    /// <summary>StateBits2 第 6 位（0x40）：尾部携带回城药水的两个 Vector2。</summary>
+    public const byte StateBit2HasPotionReturn = 0x40;
+
+    /// <summary>StateBits3 第 5 位（0x20）：尾部携带 Vector2 相机目标。</summary>
+    public const byte StateBit3HasCamera = 0x20;
+
+    /// <summary>挂载类型（仅 <see cref="StateBitHasMount"/> 置位时存在于线格式）。</summary>
+    public ushort? MountType { get; init; }
+
+    /// <summary>回城药水使用位置（仅 <see cref="StateBit2HasPotionReturn"/> 置位时存在）。</summary>
+    public Vector2? PotionReturnOriginal { get; init; }
+
+    /// <summary>回城药水的「家」位置（与 <see cref="PotionReturnOriginal"/> 成对出现）。</summary>
+    public Vector2? PotionReturnHome { get; init; }
+
+    /// <summary>相机目标（仅 <see cref="StateBit3HasCamera"/> 置位时存在）。</summary>
+    public Vector2? CameraTarget { get; init; }
 }
 
 /// <summary>玩家位置同步包（上行）。</summary>

@@ -647,6 +647,37 @@ public class VanillaFeatureTests
     }
 
     [Fact]
+    public async Task Vanilla_PlayerControls_Relay_Preserves_Mount_And_Camera()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+
+        // 包 13 的可选尾随段（挂载 / 相机）此前被丢弃 → 他人看不到坐骑；现要求原样透传
+        await a.SendAsync(PacketId.PlayerPosition, new PlayerControlsPacket(
+            PlayerId: 1,
+            Position: new Vector2(300f, 400f),
+            Velocity: new Vector2(1f, 0f),
+            SelectedItem: 3,
+            ControlBits: 0x01,
+            StateBits: PlayerControlsPacket.StateBitHasVelocity)
+        {
+            MountType = 3,
+            CameraTarget = new Vector2(111f, 222f),
+        });
+
+        var got = await b.ReadUntilAsync(p => p is PlayerControlsPacket { MountType: not null },
+            TimeSpan.FromSeconds(5));
+        var relayed = got.OfType<PlayerControlsPacket>().Last();
+
+        Assert.Equal((ushort)3, relayed.MountType);
+        Assert.Equal(111f, relayed.CameraTarget!.Value.X);
+        Assert.Equal(222f, relayed.CameraTarget.Value.Y);
+        Assert.Equal(1, relayed.PlayerId);          // 身份由服务端覆盖
+        Assert.Equal(300f, relayed.Position.X);
+    }
+
+    [Fact]
     public async Task Vanilla_PlayerHurt_Is_Relayed_With_ServerPlayerId()
     {
         using var server = VanillaServer.Start();
@@ -1809,12 +1840,13 @@ public class VanillaFeatureTests
         Directory.CreateDirectory(dir);
         var wldPath = Path.Combine(dir, "chestworld.wld");
 
-        // 基准世界必须自带箱子（程序化生成的世界没有箱子）→ 造一份含箱子的 .wld
+        // 基准世界用程序化生成（现在自带地下宝箱）→ 在末尾追加一个「已知索引」的箱子再写 .wld
         var source = WorldGenerator.GenerateSmall(worldName: "ChestWorld");
         int cx = source.SpawnTileX, cy = source.SpawnTileY;
+        int chestIndex = source.Chests.Count;
         source.Chests.Add(new Chest
         {
-            Index = 0, X = cx, Y = cy, Name = "Persist",
+            Index = chestIndex, X = cx, Y = cy, Name = "Persist",
             Items = new ChestItem[40],
         });
         WorldFileWriter.Write(wldPath, source, keepBackup: false);
@@ -1826,15 +1858,15 @@ public class VanillaFeatureTests
         {
             await using var s = await server.ConnectAsync("Alice");
             var world = server.Host.Simulator.State;
-            Assert.Single(world.Chests);
+            Assert.True(world.Chests.Count > chestIndex, "追加的箱子未随世界文件载入");
 
             await StandAtAsync(server, s, cx * 16f + 8f, cy * 16f + 8f);
             await s.SendAsync(PacketId.SyncChestItem,
-                new SyncChestItemPacket(0, ItemSlot: 5, Stack: 11, Prefix: 0, ItemType: 5));
+                new SyncChestItemPacket(chestIndex, ItemSlot: 5, Stack: 11, Prefix: 0, ItemType: 5));
 
             Assert.True(await TickUntilAsync(server, () =>
             {
-                lock (world.ChestsLock) return world.Chests[0].Items[5].Type == 5;
+                lock (world.ChestsLock) return world.Chests[chestIndex].Items[5].Type == 5;
             }, TimeSpan.FromSeconds(5)), "包 32 未写入服务端箱子");
 
             // 落盘（生产环境由 1Hz 世界循环触发；此处显式调用并循环到确实入库）
@@ -1843,7 +1875,7 @@ public class VanillaFeatureTests
             {
                 await server.Host.FlushWorldChangesAsync();
                 var records = await server.Host.WorldRepo!.LoadChestChangesAsync();
-                saved = records.Any(r => r.Index == 0);
+                saved = records.Any(r => r.Index == chestIndex);
             }
             Assert.True(saved, "箱子内容未能落盘");
         }
@@ -1854,9 +1886,9 @@ public class VanillaFeatureTests
             var world = server.Host.Simulator.State;
             lock (world.ChestsLock)
             {
-                Assert.Single(world.Chests);
-                Assert.Equal(5, world.Chests[0].Items[5].Type);
-                Assert.Equal(11, world.Chests[0].Items[5].Stack);
+                Assert.True(world.Chests.Count > chestIndex, "重启后追加的箱子丢失");
+                Assert.Equal(5, world.Chests[chestIndex].Items[5].Type);
+                Assert.Equal(11, world.Chests[chestIndex].Items[5].Stack);
             }
         }
 

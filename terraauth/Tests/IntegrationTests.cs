@@ -263,7 +263,8 @@ public class EndToEndTests
             await connections.KickAsync(1, "test kick");
 
             // Assert 1：客户端收到包 2（Disconnect），且携带踢出原因
-            var kick = await ReadPacketAsync(stream, decoder, PacketId.Disconnect, TimeSpan.FromSeconds(5));
+            // 超时放宽到 10s：全量套件并行跑（含世界生成）时写循环 + 关闭会明显变慢
+            var kick = await ReadPacketAsync(stream, decoder, PacketId.Disconnect, TimeSpan.FromSeconds(10));
             Assert.NotNull(kick);
             Assert.Equal("test kick", Assert.IsType<DisconnectPacket>(kick).Reason);
 

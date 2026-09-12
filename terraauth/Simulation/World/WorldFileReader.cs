@@ -742,6 +742,10 @@ public static class WorldFileReader
         {
             if (state.Chests[i] is null) state.Chests.RemoveAt(i);
         }
+
+        // 去重会移动列表位置：Index 必须与「列表下标」重新对齐，否则 FindChestByIndex 会错位
+        for (int i = 0; i < state.Chests.Count; i++)
+            state.Chests[i].Index = i;
     }
 
     // ---------------- Signs ----------------
