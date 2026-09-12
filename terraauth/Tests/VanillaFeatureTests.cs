@@ -1850,6 +1850,26 @@ public class VanillaFeatureTests
         Assert.False(plain.Host.TryExportWorld(force: true), "未配置导出路径却执行了导出");
     }
 
+    [Fact]
+    public async Task Vanilla_WorldSize_Config_Generates_Medium_World()
+    {
+        // 配置字符串枚举 → ServerConfig.WorldSize → 程序化生成中世界（6400×1800）
+        using var server = VanillaServer.Start(configJson: "{\"WorldSize\": \"Medium\"}");
+        var world = server.Host.Simulator.State;
+
+        Assert.Equal(6400, world.MaxTilesX);
+        Assert.Equal(1800, world.MaxTilesY);
+
+        // 尺寸变更后登录链仍可完成（区块 / 包 7 / 包 10 均按新尺寸构造）
+        await using var s = await server.ConnectAsync("Alice");
+        Assert.Contains(s.HandshakePackets, p => p is FinishedConnectingPacket);
+
+        // 包 7 的尺寸字段按新尺寸下发（服务端侧构造，客户端解码器未建模包 7）
+        var info = world.ToWorldInfoPacket();
+        Assert.Equal((short)6400, info.MaxTilesX);
+        Assert.Equal((short)1800, info.MaxTilesY);
+    }
+
     // ========================================================================
     // 二十·补四、断线会话恢复（宽限期内同身份重连接管原运行时）
     // ========================================================================

@@ -2,6 +2,7 @@
 // 反作弊阈值的唯一来源（架构 §4.5）
 
 using TerraAuth.ModCompat;
+using TerraAuth.Simulation;
 
 namespace TerraAuth.Config;
 
@@ -14,8 +15,15 @@ public record ServerConfig
     public float ViewportRadius { get; init; } = 2000f;   // 快照视野半径（像素）；0 = 不裁剪
 
     // ---- 世界 ----
-    /// <summary>基准世界文件路径（.wld）；为空或文件不存在则程序化生成小世界。</summary>
+    /// <summary>基准世界文件路径（.wld）；为空或文件不存在则按 <see cref="WorldSize"/> 程序化生成。</summary>
     public string WorldPath { get; init; } = "";
+
+    /// <summary>
+    /// 程序化生成的世界尺寸档（server.json 用字符串枚举："Small" / "Medium" / "Large"），
+    /// 对应原版三档：小 4200×1200、中 6400×1800、大 8400×2400。
+    /// 仅在 <see cref="WorldPath"/> 为空或文件不存在时生效（指定真实 .wld 时以文件尺寸为准）。
+    /// </summary>
+    public WorldSize WorldSize { get; init; } = WorldSize.Small;
 
     /// <summary>
     /// 世界导出路径（.wld）；为空则不导出。设置后：停机时导出一次，且在**无人在线**时按

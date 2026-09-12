@@ -181,6 +181,42 @@ public class WorldGeneratorTests
         Assert.Equal(WorldGenerator.GeneratorVersion, info.WorldGeneratorVersion);
     }
 
+    [Theory]
+    [InlineData(WorldSize.Small, 4200, 1200)]
+    [InlineData(WorldSize.Medium, 6400, 1800)]
+    [InlineData(WorldSize.Large, 8400, 2400)]
+    public void Generate_Supports_All_Vanilla_Sizes(WorldSize size, int expectedW, int expectedH)
+    {
+        var world = WorldGenerator.Generate(size);
+
+        // 尺寸与原版三档一致
+        Assert.Equal(expectedW, world.MaxTilesX);
+        Assert.Equal(expectedH, world.MaxTilesY);
+
+        // 区块数必须 > 0（否则客户端收不到任何包 10 而掉线）
+        Assert.True(world.MaxTilesX / 200 > 0);
+        Assert.True(world.MaxTilesY / 150 > 0);
+
+        // 尺寸必须落在包 7 线格式（Int16）范围内
+        Assert.InRange(world.MaxTilesX, 1, short.MaxValue);
+        Assert.InRange(world.MaxTilesY, 1, short.MaxValue);
+
+        // 出生点有效、上方空气、脚下实心
+        Assert.InRange(world.SpawnTileX, 10, world.MaxTilesX - 10);
+        Assert.InRange(world.SpawnTileY, 10, world.MaxTilesY - 10);
+        Assert.False(world.Tiles[world.SpawnTileX, world.SpawnTileY - 1].Active);
+        Assert.True(world.Tiles[world.SpawnTileX, world.SpawnTileY].Active);
+
+        // 地表 / 岩层落在 short 范围且岩层更深
+        Assert.InRange(world.WorldSurface, 1, short.MaxValue);
+        Assert.True(world.RockLayer > world.WorldSurface);
+
+        // 包 7 反映所选尺寸
+        var info = world.ToWorldInfoPacket();
+        Assert.Equal((short)expectedW, info.MaxTilesX);
+        Assert.Equal((short)expectedH, info.MaxTilesY);
+    }
+
     [Fact]
     public void GenerateSmall_IsDeterministic()
     {

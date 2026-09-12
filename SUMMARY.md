@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**249 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
+> 生成日期：2026-09-12 ｜ 当前测试：**253 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
 
 ---
 
@@ -82,7 +82,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **249 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
+- 套件 **253 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -95,7 +95,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
   重启时按「索引 + 坐标」双校验回放 —— **箱子内容在服务端重启后不再丢失**（W-1 落地后解除的阻塞项）。
 - **既有持久化**：玩家存档 / 审计 / 封禁（SQLite 或 `-p:NoSqlite=true` 的内嵌兜底后端）。
 - **偶发测试加固**：客户端会话读取补 `IOException` / `SocketException` 处理，消除「踢出瞬间仍在读 socket」导致的偶发失败。
-- **世界文件（`.wld`）加载 / 导出**：`ServerConfig.WorldPath` 指定 `.wld` 即**用真实世界开服**（为空仍程序化生成）；
+- **世界文件（`.wld`）加载 / 导出**：`ServerConfig.WorldPath` 指定 `.wld` 即**用真实世界开服**；
+  未指定时按 `ServerConfig.WorldSize` **程序化生成三档尺寸**（`Small` 4200×1200 / `Medium` 6400×1800 / `Large` 8400×2400，与原版三档一致）；
   自研写出器（与自身读取器布局严格对称，覆盖全部图格特征位）配合 `WorldExportPath`：**停机导出 + 空服周期导出**，
   带**写后读回校验 + 原子替换 + `.bak` 滚动**，不会用读不回来的文件覆盖已有世界。
 - **增量落盘加固**：单批上限 2048 → 8192；待落盘集合加上限（溢出降级为「全图游标扫描」，内存有界且最终一致）；
@@ -204,12 +205,14 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Simulation/CommandQueue.cs` | 挖砖 / 放砖命令登记持久化 |
 | `terraauth/Persistence/IPersistence.cs` | 新增 `IWorldRepository` + `WorldTileRecord` |
 | `terraauth/Persistence/SqlitePersistence.cs` | `WorldTiles` 表（SQLite）与内嵌后端落盘 / 读取 |
-| `terraauth/GameHost.cs` | 启动回放 + 1Hz 落盘 + 停机冲刷（失败重新排队） |
+| `terraauth/GameHost.cs` | 启动回放 + 1Hz 落盘 + 停机冲刷（失败重新排队）；`LoadBaseWorld` 按 `ServerConfig.WorldSize` 程序化生成 |
 | `terraauth/Simulation/World/WorldFileWriter.cs` | 新增：`.wld` 写出器（写后读回校验 + 原子替换 + `.bak`） |
-| `terraauth/Config/ServerConfig.cs` | 新增 `WorldPath` / `WorldExportPath` / `WorldExportIntervalSeconds` / `SessionResumeGraceSeconds` |
+| `terraauth/Config/ServerConfig.cs` | 新增 `WorldPath` / `WorldSize` / `WorldExportPath` / `WorldExportIntervalSeconds` / `SessionResumeGraceSeconds` |
 | `terraauth/Simulation/World/WorldState.cs` | 待落盘集合上限 + 溢出降级全图扫描 + `HasPendingPersist`；离线会话表 + `MarkPlayerOffline` / `TryResumePlayer` / `ReapOfflineSessions`；`PlayerRuntime` 新增 `ResumeKey` / `Resumed` |
 | `terraauth/Tests/WorldFileTests.cs` | +3 用例（特征世界逐格 round-trip / 世界旗标 round-trip / 按原版顺序的严格分段走查） |
-| `terraauth/Tests/VanillaFeatureTests.cs` | +15 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）/ 箱子内容重启存活） |
+| `terraauth/Tests/VanillaFeatureTests.cs` | +16 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 世界尺寸配置（中世界生成）/ 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）/ 箱子内容重启存活） |
+| `terraauth/Simulation/World/WorldGenerator.cs` | 新增 `WorldSize`（Small/Medium/Large）与 `Generate(size)`；地表 / 岩层按高度比例缩放 |
+| `terraauth/Tests/SimulationTests.cs` | +3 用例（三档世界尺寸生成：尺寸 / 区块数 / Int16 范围 / 出生点贴地 / 包 7 字段） |
 | `terraauth/Simulation/World/WorldState.cs` | 箱子待落盘集合（`MarkPersistChest` / `DrainPersistChests`）+ `Chest.SerializeItems` / `DeserializeItems` |
 | `terraauth/Simulation/CommandQueue.cs` | `SyncChestItemCommand.Apply`（包 32）写入后登记箱子落盘 |
 | `terraauth/Persistence/IPersistence.cs` | `IWorldRepository` 新增 `SaveChestChangesAsync` / `LoadChestChangesAsync` + `WorldChestRecord` |
@@ -230,8 +233,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **249 / 249 通过** |
-| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **249 / 249 通过** |
+| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **253 / 253 通过** |
+| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **253 / 253 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 
@@ -239,6 +242,9 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ## 五、已知限制（简化模型，非原版全量）
 
+- **程序化世界生成**：支持原版三档尺寸（小 / 中 / 大），但地形只是「可加载地形」——
+  正弦地表 + 草/土/石 + 背景墙 + 一名向导 NPC，**无矿石 / 洞穴 / 生物群系 / 树木 / 地牢 / 生命水晶**；
+  需要完整地形请用 `WorldPath` 指定真实 `.wld`。大世界（8400×2400 ≈ 2000 万图格）内存约 0.5 GB。
 - **Boss / 事件**：AI 仅直线追击、生命值为简化表；血月 / 日食为昼夜概率、入侵为配额刷怪；
   掉落为**简化表**（仅收录眼魔 / 世界吞噬者 / 史莱姆王 / 蜂后），未复刻原版掉落数据库。
 - **液体**：混合反应仅在本格为空时生成；无液体压力模型。

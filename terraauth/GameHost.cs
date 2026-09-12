@@ -139,8 +139,8 @@ public sealed class GameHost : IDisposable
         var bans = new BanManager(banStore, config, db);
 
         // 5. 权威层（Phase 2）+ 审计桥接
-        // 世界数据：优先加载配置指定的 .wld；未配置则程序化生成小世界（见 WorldGenerator 注释）
-        var world = LoadBaseWorld(config.Current.WorldPath);
+        // 世界数据：优先加载配置指定的 .wld；未配置则按 WorldSize 程序化生成（见 WorldGenerator 注释）
+        var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize);
 
         // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
         // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
@@ -345,9 +345,9 @@ public sealed class GameHost : IDisposable
 
     /// <summary>
     /// 载入基准世界：配置了 <see cref="ServerConfig.WorldPath"/> 且文件存在 → 解析该 `.wld`；
-    /// 否则程序化生成小世界（保持既有默认行为）。
+    /// 否则按 <see cref="ServerConfig.WorldSize"/> 程序化生成（小 / 中 / 大三档）。
     /// </summary>
-    private static WorldState LoadBaseWorld(string worldPath)
+    private static WorldState LoadBaseWorld(string worldPath, WorldSize size)
     {
         if (!string.IsNullOrWhiteSpace(worldPath) && File.Exists(worldPath))
         {
@@ -361,9 +361,9 @@ public sealed class GameHost : IDisposable
         if (!string.IsNullOrWhiteSpace(worldPath))
             Console.WriteLine($"[World] 世界文件不存在，回退为程序化生成：{worldPath}");
 
-        var generated = WorldGenerator.GenerateSmall();
+        var generated = WorldGenerator.Generate(size);
         Console.WriteLine(
-            $"[World] 程序化生成 {generated.WorldName} {generated.MaxTilesX}×{generated.MaxTilesY}，" +
+            $"[World] 程序化生成（{size}）{generated.WorldName} {generated.MaxTilesX}×{generated.MaxTilesY}，" +
             $"出生点 ({generated.SpawnTileX},{generated.SpawnTileY})，区块 {generated.MaxTilesX / 200}×{generated.MaxTilesY / 150}");
         return generated;
     }

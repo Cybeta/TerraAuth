@@ -4,6 +4,7 @@
   "SnapshotRateHz": 20,
   "ViewportRadius": 2000,
   "WorldPath": "",
+  "WorldSize": "Small",
   "WorldExportPath": "",
   "WorldExportIntervalSeconds": 600,
   "SessionResumeGraceSeconds": 60,
