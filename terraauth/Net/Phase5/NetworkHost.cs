@@ -339,7 +339,8 @@ public sealed class NetworkHost : IAsyncDisposable
                 // 诊断：限频打印拒绝原因，否则"移动包是否被权威层丢弃"在服务端完全不可见
                 var rejectNo = Interlocked.Increment(ref _rejectCount);
                 if (rejectNo <= 50 || rejectNo % 1000 == 0)
-                    Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}");
+                    Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}"
+                        + (result.Detail is { Length: > 0 } d ? $"（{d}）" : ""));
 
                 // 处置：窗口内拒绝累计达阈值 → 踢出（先发包 2 说明原因，再关闭连接）
                 // 仅「计入违规」的拒绝参与累计；未建模包等客户端行为噪声只统计不惩罚。

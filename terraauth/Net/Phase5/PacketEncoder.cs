@@ -367,10 +367,24 @@ public sealed class PacketEncoder : IPacketEncoder
         byte bitsA = 0;
         if (npc.DirectionPositive) bitsA |= 0x01;
         if (npc.DirectionYPositive) bitsA |= 0x02;
-        if (npc.SpriteDirectionPositive) bitsA |= 0x40;
         if (lifeFull) bitsA |= 0x80;    // bit7=1：生命为满 → 省略生命段
+
+        // ai[0..3] 存在位（bit2..5）：原版客户端按位置位读出 4 个 float，未置位则显式置 0
+        var ai = npc.Ai;
+        var sendAi = ai is { Length: >= 4 };
+        if (sendAi) bitsA |= 0x3C;
+
+        if (npc.SpriteDirectionPositive) bitsA |= 0x40;
         bw.Write(bitsA);
         bw.Write((byte)0);              // BitsByte B：无玩家数缩放 / 非雕像 / 无难度覆盖 / 非需同步生成
+
+        if (sendAi)
+        {
+            bw.Write(ai![0]);
+            bw.Write(ai[1]);
+            bw.Write(ai[2]);
+            bw.Write(ai[3]);
+        }
 
         bw.Write(npc.NetId);            // Int16 netID（客户端据此 SetDefaults 生成 NPC）
 

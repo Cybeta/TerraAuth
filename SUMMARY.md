@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**285 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
+> 生成日期：2026-09-12 ｜ 当前测试：**305 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
 
 ---
 
@@ -58,7 +58,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
   猪龙鱼公爵 / 邪教徒 / 月亮领主 / 三机械 Boss / 小丑 → 置对应世界进度位，进度变化重新下发包 7。
 - **Boss 掉落**：按已核对掉落表生成服务端掉落物（眼魔 / 世界吞噬者 → 恶魔矿、史莱姆王 → 凝胶、蜂后 → 蜂蜡），
   由世界同步按视口补发包 21。
-- **事件状态机**：血月 / 日食按昼夜概率触发；入侵按配额刷怪、耗尽即结束；Boss 为简化直线追击 AI。
+- **事件状态机**：血月 / 日食按昼夜概率触发；入侵按配额刷怪、耗尽即结束；Boss 中眼魔（4）/ 魔焰眼（31）/ 蜂后（43）已按原版 aiStyle 驱动运动与攻击，其余为简化直线追击 AI。
 
 ### 4. 健壮性兜底
 
@@ -82,7 +82,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **285 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
+- 套件 **305 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -190,6 +190,34 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **统计**：`NetworkHost.UnmodeledPacketCounts`（`PacketId → 次数`）+ 首次出现必打印 / 每 100 次打印 / **停机汇总**，
   用于真机测试后拿到「客户端实际发了哪些包」的清单，决定「登记为中继」还是「权威建模」，而非盲目构造全部包。
 - **测试**：+1 → **285 / 285**；并反向验证（临时改回旧行为 → 用例如期失败：计数停在 10 即被踢出）。
+
+### 16. 真机实测修复（一）：NPC 同步 20Hz + AI 每 tick 步进
+
+原版客户端真机进图后报告「怪物移动卡顿」，定位到两处叠加原因并修复：
+
+- **NPC 同步原先只有 1Hz**（包 23 只在 1Hz 的世界同步循环下发）→ 客户端每秒被拽一次；
+  现有新增 `GameHost.BroadcastNpcUpdatesAsync` 由快照循环按 **20Hz** 调用，
+  **状态变化才发**（X/Y/速度/生命/存活），未变化按 1s 心跳补发（保证新入服玩家能看到静止 NPC）。
+- **服务端 AI 每 4 tick 才步进一步**（等效 0.25 px/tick）→ 改为**每 tick 步进**（敌怪 1 px/tick + 每 tick 重力）；
+  城镇 NPC 另改为「方向持久 + 到住所 ±4 格边界折返」的平滑往返（原实现每步随机改向，高频同步下会抖动）。
+- 顺带修：`MetricsHttpServer.Dispose` 在端口占用时抛 `ObjectDisposedException` 掩盖真实启动错误。
+- **测试**：+2 → **287 / 287**（城镇 NPC 平滑步进 / NPC 同步变化检测）。
+
+> 真机同批报告另两项（**向导卡在土里**、**未碰怪却掉血**）本轮未修，已记入 `OPTIMIZATION_BACKLOG.md` 第二十二轮「仍未修」。
+
+### 17. 敌怪改为跳跃式移动（恢复史莱姆的「跳」）
+
+真机反馈：卡顿缓解后**跳跃动作消失**（看着像贴地滑行）。两侧根因：
+
+- **服务端**：`SimulateEnemyStep` 只做「每 tick 水平 ±1px + 重力」，从不给 `VelocityY` 向上初速度 → 权威运动没有滞空阶段。
+- **客户端**：包 23 处理会 `npc.position = …; npc.velocity = …; npc.ai[i] = ai[i]` **覆盖速度与 ai**（未置位的 ai 位即 0），
+  所以 20Hz 的「地面速度 + ai 全零」每 50ms 冲掉客户端本地史莱姆的跳跃状态。
+
+**修复**：服务端改为跳跃式 —— 贴地静止等待 20~45 tick → 起跳（`VelocityY = -6`，≈45px 高 / 30 tick 滞空）
++ 朝玩家水平速度 2px/tick，空中只受重力，落地重新计时。贴地判定改用**碰撞结果** `WorldNpc.Grounded`
+（用 `VelocityY == 0` 会让悬空生成的敌怪不落体；且贴地时必须直接返回，否则等待计数每 tick 被落地清零、永不起跳）。
+
+**测试**：+1 → **288 / 288**（`Enemy_Hops_WithGroundedWait_InsteadOfGroundGliding`）；接触免伤用例改为钉住敌怪，只验证免伤窗口。
 
 ---
 
@@ -358,7 +386,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **285 / 285 通过** |
+| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **305 / 305 通过** |
 | Vanilla-only 网络与集成过滤 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore --filter "FullyQualifiedName~IntegrationTests|FullyQualifiedName~VanillaFeatureTests"` | **94 / 94 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
@@ -396,7 +424,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
   洞穴、按深度分带矿脉、两端海滩与海水、地下宝箱 + 战利品），层高比例 / 图格 ID / 摆放约定经协议行为验证。
   但**仍为简化的分层生成模型**：**无树木 / 生命水晶 / 生物群系（雪原 / 沙漠 / 丛林 / 腐化）/ 地牢·神庙等结构体**；
   需要完整地形请用 `WorldPath` 指定真实 `.wld`。大世界（8400×2400 ≈ 2000 万图格）内存约 0.5 GB。
-- **Boss / 事件**：AI 仅直线追击、生命值为简化表；血月 / 日食为昼夜概率、入侵为配额刷怪；
+- **Boss / 事件**：眼魔 / 魔焰眼 / 蜂后已按原版 aiStyle 驱动，其余 Boss AI 仅直线追击、生命值为简化表；血月 / 日食为昼夜概率、入侵为配额刷怪；
   掉落为**简化表**（仅收录眼魔 / 世界吞噬者 / 史莱姆王 / 蜂后），未复刻原版掉落数据库。
 - **液体**：混合反应仅在本格为空时生成；无液体压力模型。
 - **电路**：无门电路 / 定时器 / 压力板（action 18 未建模）。

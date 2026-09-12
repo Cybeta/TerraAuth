@@ -507,7 +507,13 @@ public sealed record NpcUpdatePacket(
     int LifeMax = 100,
     bool DirectionPositive = true,
     bool DirectionYPositive = true,
-    bool SpriteDirectionPositive = true) : INetworkPacket
+    bool SpriteDirectionPositive = true,
+    /// <summary>
+    /// 原版 <c>ai[0..3]</c>（长度 4 时下发：bitsA bit2..5 置位并写出 4 个 float）。
+    /// 为 null 表示不下发 —— 原版客户端收到未置位的 ai 位会**把该 ai 显式置 0**，故两者不等价，
+    /// 依赖 ai 的 aiStyle（如史莱姆的跳跃状态）必须下发。
+    /// </summary>
+    float[]? Ai = null) : INetworkPacket
 {
     public PacketId Type => PacketId.NpcUpdate;
 }

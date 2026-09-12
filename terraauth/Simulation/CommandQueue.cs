@@ -56,6 +56,13 @@ public abstract record Command(
 public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     : Command(Tick, PlayerId, "move")
 {
+    /// <summary>
+    /// 该位置包是否伴随**水平移动操作**（包 13 的控制位里按着左/右）。
+    /// 用于判断「观测速度」是否可信：原版客户端只在操作变化时发包，只有按着方向键时才能据此外推，
+    /// 否则松开按键后的那一包会把行走速度的平均值继续外推下去。
+    /// </summary>
+    public bool Moving { get; init; }
+
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
@@ -84,6 +91,25 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
         if (player.Dead)
             return new(false, CommandFailures.NotApplied);
 
+        // 记录「观测速度」：原版客户端只在操作变化时发位置包，服务端必须据此外推玩家位置，
+        // 否则 NPC 会去追一个玩家已经离开的旧坐标（真机症状：没被碰到却扣血）。
+        // 仅在「按着方向键 + 有上一包 + 平均速度合理」时更新，避免松开按键 / 首次进服 / 传送把速度算飞。
+        long gap = world.Tick - player.LastMoveTick;
+        float reportedDx = Position.X - player.Position.X;
+        float averageSpeed = gap > 0 ? reportedDx / gap : 0f;
+        player.ObservedSpeedX =
+            Moving && player.LastMoveTick != 0 && gap > 0
+            && MathF.Abs(averageSpeed) <= PlayerRuntime.MaxObservedSpeedX
+                ? averageSpeed
+                : 0f;
+        player.LastMoveTick = world.Tick;
+
+        // 客户端上报的 Y 与上一包持平 → 玩家处于站立 / 贴地状态，不可能在下落 → 清空下落累计。
+        // 这是**客户端权威信号**，不依赖服务端自己的落地判定（后者只探两列，台阶 / 边界处可能漏判，
+        // 漏判会让 FallDistance 一直累积 → 站着 / 走路也会被结算下落伤害，即「没碰到却掉血」）。
+        if (MathF.Abs(Position.Y - player.Position.Y) < 0.05f)
+            player.FallDistance = 0f;
+
         // 权威位置赋值：服务端校验通过后直接生效，并清零速度（避免与物理阶段积分叠加）
         player.Position = Position;
         player.Velocity = new Vector2(0, 0);
@@ -107,7 +133,17 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
         if (player!.Dead)
             return new(false, CommandFailures.NotApplied);
 
+        // 免伤帧内忽略：本包是「客户端自己判定的受击」，而服务端对同一次接触也会自行判定并结算。
+        // 不共用免伤窗口就会出现双倍伤害（实测日志：contact_damage 与 client_reported 交替，
+        // 每秒扣 7+7）。原版 Player.immune 同样是跨来源的统一窗口。
+        if (player.HurtCooldown > 0)
+            return new(false, CommandFailures.NotApplied);
+
         player.Hp -= Damage;
+        player.HurtCooldown = PlayerRuntime.HurtImmunityTicks;
+        // 诊断：客户端上报的包 117 是「扣血但没有服务端碰撞」的嫌疑来源之一，先记录出处。
+        Console.WriteLine($"[Damage] 玩家 #{id} -{Damage}（client_reported/包117）HP={player.Hp} " +
+                          $"位置={player.Position.X:F0},{player.Position.Y:F0}");
         if (player.Hp <= 0)
         {
             player.Hp = 0;
@@ -216,7 +252,7 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
 
                     item.Active = false;
                     item.OwnedBy = playerId;
-                    item.DeadTick = Tick;
+                    item.DeadTick = world.Tick;   // 用仿真 tick（命令的 Tick 可能落后于当前世界 tick）
                     item.RemovalNotified = false; // 由世界同步下发包 21（stack=0）通知其他客户端移除
                     return new(true);
                 }
@@ -669,6 +705,7 @@ public sealed record SpawnProjectileCommand(
                 Position = Position,
                 Velocity = Velocity,
                 Damage = Damage,
+                NewNotified = false,   // 由世界同步循环推送给其他玩家（包 27）
             });
         }
 
@@ -693,7 +730,7 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
 
                 p.Position = Position;
                 p.Active = false;
-                p.DeadTick = Tick;
+                p.DeadTick = world.Tick;   // 用仿真 tick（命令的 Tick 可能落后于当前世界 tick）
                 p.RemovalNotified = true; // 客户端已发起销毁，无需服务端再补发
                 return new(true);
             }

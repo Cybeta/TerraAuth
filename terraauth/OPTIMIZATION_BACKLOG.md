@@ -1,7 +1,30 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第二十一轮：未建模包「拒绝但不计违规」+ 按 PacketId 统计）
+> 最后更新：2026-09-12（第三十二轮：接触阈值收到 8px + NPC 水平阻挡（不再穿墙））
+
+---
+
+## 真机联调缺陷汇总（第二十二 ~ 三十二轮）
+
+> 本段汇总**原版客户端真机进图**后暴露并已修复的缺陷，供追溯；逐轮细节见文末「本轮回溯」。
+
+| # | 真机症状 | 根因 | 修复 | 轮次 |
+|---|---|---|---|---|
+| 1 | 怪物移动大面积卡顿 | NPC 同步只有 1Hz；AI 每 4 tick 才步进 0.25px | 同步提到 20Hz（后为 60Hz）；AI 每 tick 步进 | 22 |
+| 2 | 向导卡在土里 | 生成 Y 语义错；城镇 NPC 不走重力/落地 | 城镇 NPC 走共用物理步（`StepNpcPhysics`） | 22 / 24 |
+| 3 | 史莱姆不跳（贴地滑行） | 用 `VelocityY == 0` 当"贴地"判据（悬空生成的敌怪不落体）；贴地仍积分重力把等待期清零 | 改用碰撞结果 `WorldNpc.Grounded`；贴地等待期直接 return | 23 |
+| 4 | 未建模包导致误踢 | 未建模包被计入违规窗口 | 未建模包只统计、不计违规 | 21 |
+| 5 | 向导陷地 + 怪物抖动/"像加速" | 位置口径与客户端不一致（原版 `position` = 碰撞盒左上角、脚底 = `+height`，我们按 21 高建模）；落地时**连水平速度一起清零** | 逐类型碰撞盒表 `NpcSizes`（按原版 `SetDefaults` 核对）+ 脚底 = `Y + height` + 落地不清零水平速度 | 27 |
+| 6 | 站着/走路莫名掉血；被史莱姆打刷 `speed_exceeded` | 玩家脚底按 `Y + 21` 判 → 永不判定落地 → `FallDistance` 持续累积；匀速上限过紧，击退/被挤出方块被拒后级联 | 玩家脚底 = `Y + 42`；落地判左右两列；移动权威加 ×4「可疑带」；上报 Y 未变即清空下落累计 | 27 / 28 |
+| 7 | 向导一直跳 | 障碍探针探了"脚下的支撑行"（平地前方本来就有地面 → 每 tick 都算障碍） | 改探身体所在行（`supportRow - 1`） | 28 |
+| 8 | 没碰到却扣血（第二次） | NPC 重力/终速与原版不一致（`0.4/16` vs 原版 `0.3/10`）→ 跳跃/下落弧线与客户端发散 | 物理常数对齐原版 `UpdateNPC_UpdateGravity` | 29 |
+| 9 | 没碰到却扣血（第三次） | 2px 擦边被判成接触；客户端上报包 117 与服务端接触**各自结算**（双倍伤害） | 接触最小重叠；包 117 纳入统一免伤帧 | 30 |
+| 10 | "一次都没碰到"却扣血 | 原版客户端**只在操作变化时**发位置包，而原版服务端会自行模拟玩家；我们不自模拟 → NPC 追/打 1 秒前的旧坐标 | 观测速度 + 位置外推（`AimPosition`）；NPC 同步提到 **60Hz** | 31 |
+| 11 | 史莱姆一直朝一个方向走 | NPC 物理**没有水平碰撞** → 服务端 NPC 穿墙直线前进，与客户端发散 | 加 `NpcBlockedHorizontally` 水平阻挡 | 32 |
+| 12 | 擦着走仍扣血 | 3~4px 贴边算接触 | 接触阈值收到 **8px**（半格） | 32 |
+
+> 未解决/待观察（见文末「剩余清单」）：擦边阈值是否收得过紧；玩家移动仍未做服务端操作模拟（现为外推近似）。
 
 ---
 
@@ -86,6 +109,397 @@
 ---
 
 ## 附：本轮回溯
+
+### 第三十二轮（2026-09-12）：接触阈值收到 8px + NPC 水平阻挡（不再穿墙）
+
+**真机日志**（第三十一轮修复后重测，第一段 15s / 第二段 39.7s）：
+
+```
+[Damage] -7（client_reported/包117）HP=93 位置=33598,4950
+[Damage] -7（contact_damage）HP=86 NPC 1@33524,4974 玩家判定=33507,4950（上报=33507,4950）
+[Damage] -7（contact_damage）HP=79 NPC 1@33350,4974 玩家判定=33334,4950（上报=33321,4950）
+[Damage] -7（contact_damage）HP=72 NPC 1@33290,4974 玩家判定=33311,4950（上报=33326,4950）
+```
+- **第二段 39.7 秒零受伤** ✓（外推 + 60Hz NPC 同步起效）。
+- 第一段 3 次 `contact_damage` 全是**水平只重叠 3~4px 的"擦着走"**（史莱姆 Y=4974 → 脚底正好在地面，
+  即它站在你旁边贴着走，而不是撞上来）。
+
+**修复 1：接触阈值 3px → 8px**。真正走进玩家身上的重叠是十几~二十像素（史莱姆盒 24 宽 / 玩家盒 20 宽，
+走穿时重叠可达 20px），所以取半格 8px 只丢"擦着走"。同时加 `[Contact] 擦边未计入 …` 限频诊断（最多 30 条），
+便于继续确认阈值是否合适。
+
+**修复 2（用户反馈"史莱姆一直往左走、我在右边"）**：NPC 物理此前**只做垂直落地、水平完全不阻挡** ——
+服务端 NPC 会穿过地形直线前进，而客户端有完整碰撞，两边位置持续发散（既解释"一直朝一个方向走"，
+也是历次"看着离得很远却掉血"的发散来源之一）。给 `StepNpcPhysics` 加**水平阻挡**
+（`NpcBlockedHorizontally`：前进方向边缘格实心即停在原地并清零水平速度），顺带让原版「卡住翻向」
+判定（`ai[3] == position.X`）能真正生效。
+
+**测试**：+1（**305 / 305 通过**）—— `Enemy_Stops_At_Wall`（朝墙冲不得穿过）；
+`ContactDamage_Requires_MinOverlap` 改为 4px 擦边不扣血 / 16px 走进必扣。
+
+**剩余清单（后续各轮）**：
+
+1. **玩家移动的服务端模拟（对齐原版做法）**：当前用「观测速度外推」近似原版「服务端按控制位模拟玩家」，
+   外推上限 15 tick。彻底的做法是按包 13 的控制位（左/右/上跳）+ 图格碰撞在服务端跑玩家物理。
+2. **框架：buff 表**（施加 debuff 通道 + 剩余时间）。
+3. **框架：粉尘 / 音效**（纯客户端表现，最后补齐）。
+4. **NPC 逐类型物理覆盖**（`gravity` / `maxFallSpeed` 的少数类型覆盖，如 258、576/577）。
+5. **未建模包**：`#40`(SyncPlayer) / `#41`(SyncEquipment) / `#56` / `#152` / `#154` 与 NetModule 子模块一律被拒（不计违规）；
+   外观类包（40）值得建模。
+6. **弹幕碰撞盒逐类型**：命中判定现统一按 16×16 近似。
+7. 其余 aiStyle：服务端不可达（不刷），移植无收益 —— 按需登记 `NpcAiStyleOf` 即可扩展。
+
+### 第三十一轮（2026-09-12）：真机「一次都没碰到却在扣血」—— 服务端在追玩家早已离开的坐标
+
+**真机日志**（第三十轮修复后重测，35 秒 7 次扣血，均为 `contact_damage` —— 客户端上报那条已被免伤帧挡掉 ✓）：
+
+```
+[Damage] 玩家 #1 -7（contact_damage）HP=93 NPC 1@33809,4937 玩家=33800,4950
+[Damage] 玩家 #1 -7（contact_damage）HP=86 NPC 1@33985,4937 玩家=33998,4950
+... 玩家坐标每次 +130~210px（正好是走速 3.3px/tick × 1s）
+```
+
+**根因（协议行为）**：原版客户端**只在操作变化时**才发位置包 —— `Player.cs` 里 `SendData(13)` 的触发条件是
+`controlLeft/controlRight/... 与上一帧不同`（见 `Player.cs` 7421-7451）。原版服务端之所以没问题，是因为
+**它自己也在跑玩家的 `Update`（用同步来的控制位继续模拟玩家移动）**，所以两边的玩家坐标始终一致。
+
+TerraAuth **不做玩家操作模拟**：`MoveCommand` 只是把上报坐标赋值过去，不发包期间玩家在服务端"站住不动"。
+于是——
+- NPC 的 `NearestPlayer` 追的是一个**已经过期的玩家坐标**（记录里玩家每 1s 才被"更新"一次）；
+- 服务端的接触判定也用这个过期坐标 → 史莱姆打的是"1 秒前的你" → 你看着它从没碰到你，血却在掉。
+
+**修复**：给玩家加「观测速度 + 位置外推」，NPC 追击 / 接触 / 弹幕命中 / 刷怪点全部改读这个外推位置：
+
+- `PlayerRuntime.ObservedSpeedX` / `LastMoveTick` / `AimPosition`（[WorldState.cs](Simulation/World/WorldState.cs)）：
+  `Extrapolate(nowTick)` = 上报坐标 + 观测速度 × min(间隔, **15 tick**)。
+- `MoveCommand`（[CommandQueue.cs](Simulation/CommandQueue.cs)）：
+  用「本包与上一包的位移 ÷ 间隔」算观测速度，**只在按着方向键**（包 13 控制位 bit2/bit3）且平均速度合理（≤20px/tick）时更新 ——
+  松开按键的那一包会立刻把外推速度归零，首次进服 / 传送也不会算飞。
+- `SimulateAi` 每 tick 刷新所有玩家的 `AimPosition`；`NearestPlayer` / 各 aiStyle 的 `target.Position`、
+  `SimulateBossStep`、接触与敌对弹幕命中、刷怪点全部改用 `AimPosition`。
+  注：`player.Position`（上报值）不变，仍是同步 / 挖放砖距离 / 落盘的权威坐标，故对既有行为零影响。
+- 接触日志同时打出「判定位置」与「上报位置」，便于继续核对。
+
+**测试**：+1（**304 / 304 通过**）—— `PlayerAimPosition_Extrapolates_Between_PositionPackets`
+（观测速度 = 位移 ÷ 间隔；无新包时外推；松开方向键立即停止外推）。
+
+**剩余清单**：后续项（玩家移动的服务端模拟 / buff 表 / 粉尘音效 / NPC 逐类型物理 / 未建模包 / 弹幕碰撞盒）见**第三十二轮**「剩余清单」。
+
+### 第三十轮（2026-09-12）：真机日志定案「没碰到却扣血」—— 2px 擦边 + 双倍伤害
+
+**做法**：先给受伤路径补上诊断日志（此前服务端**不打印任何受伤记录**，无法判断血是怎么掉的），
+再让用户实战一轮，用日志定案。实测日志（50 秒内死亡）：
+
+```
+[Damage] 玩家 #1 -7（contact_damage）HP=93  NPC 1@33617,4934  玩家=33605,4950   ← 垂直只重叠 2px
+[Damage] 玩家 #1 -7（client_reported/包117）HP=86  位置=33402,4950             ← 同一秒的第二次
+[Damage] 玩家 #1 -7（contact_damage）HP=79  NPC 1@33382,4974  玩家=33402,4950
+...
+```
+
+**两个真问题**：
+
+1. **2px 擦边被判成接触**：史莱姆跳到头顶高度掠过时，其碰撞盒（24×18）与玩家盒（20×42）**垂直只重叠 2px**，
+   视觉上"没碰到"却结算了伤害。根因是服务端 NPC 位置与客户端画面存在几像素偏差，边界处就会来回翻转。
+2. **同一次接触被结算两次**：服务端自己的接触判定与客户端上报的包 117 各自扣一次血
+   （日志里 `contact_damage` 与 `client_reported` 交替出现，每秒 7+7=14）。
+   原版 `Player.immune` 是**跨来源的统一窗口**，而 `DamagePlayerCommand` 当时完全没看免伤帧。
+
+**修复**：
+
+- 接触判定加**最小重叠**：两轴重叠都要 ≥ `ContactMinOverlap = 3px` 才算接触
+  （实测擦边 2px、正常贴身 4px~18px，取 3 即「只丢 ≤3px 的擦边」）。`BoxesOverlap` 增加可选 `minOverlap`。
+- `DamagePlayerCommand`（客户端上报的包 117）**纳入统一免伤帧**：`HurtCooldown > 0` 时忽略，
+  结算后置 `HurtCooldown = PlayerRuntime.HurtImmunityTicks`（60）。免伤帧常量上移到 `PlayerRuntime` 供两处共用。
+- 保留诊断日志（`[Damage]` + 来源 + 双方坐标），便于后续继续定位。
+
+**测试**：+2（**303 / 303 通过**）—— `ContactDamage_Requires_MinOverlap`（2px 擦边不扣血、4px 正常接触必结算）、
+`ClientReportedDamage_Respects_ImmunityWindow`（免伤帧内忽略客户端上报伤害）。
+
+**剩余清单**：后续项（玩家移动的服务端模拟 / buff 表 / 粉尘音效 / NPC 逐类型物理 / 未建模包 / 弹幕碰撞盒 / NPC 水平碰撞）见**第三十一轮**「剩余清单」。
+
+### 第二十九轮（2026-09-12）：史莱姆「没碰到却扣血」—— NPC 重力 / 终速必须与原版一致
+
+**真机症状**（用户反馈）：有时候史莱姆并没有碰到我，我仍在扣血。
+**服务端日志核对**：本轮**没有** `speed_exceeded`（只有不建模包的 `unknown_packet`），
+所以不是上一轮的「位置被拒 → 服务端坐标变陈旧」那条路径。
+
+**根因**：服务端 NPC 物理常数与原版不一致。原版 `NPC.UpdateNPC_UpdateGravity` 的默认值是
+**`gravity = 0.3`、`maxFallSpeed = 10`**（蓝史莱姆等我们模拟的类型都没有覆盖），而 TerraAuth 用的是
+`0.4 / 16` → **同一只史莱姆，服务端算出的跳跃 / 下落弧线与客户端按原版算出的不同**。
+
+这条发散为什么表现为「没碰到却扣血」：原版客户端收到包 23 后把 NPC 位置**硬赋值**，之后自己按原版跑 AI，
+并把「本地位置 − 服务端位置」记进 `netOffset` **只用于渲染**（`NPC.Update` 里 `position += netOffset` 的括号块）。
+于是玩家**看到**的是客户端本地算出的位置，而**碰撞判定用的是服务端下发的那个位置**（客户端与服务端都用它）——
+双方弧线不一致时，就会出现「看它没碰到，判定说碰到了」。
+
+**修复**（[WorldSimulator.cs](Simulation/WorldSimulator.cs)）：
+
+- 拆出明确的原版常数：`NpcGravity = 0.3` / `NpcMaxFallSpeed = 10`（NPC 物理步），
+  `PlayerGravity = 0.4` / `PlayerMaxFallSpeed = 10`（原版 `Player.maxFallSpeed = 10`）。
+- 掉落物继续用原值，不动。
+- 顺带核对：我们移植的 `AI_001_Slimes` 起跳档位 / `ai[0]` 复位值（`-120 + num54(×2)`、`-200`）与原版
+  `NPC.cs` 73407-73468 逐行一致，无发散。
+
+**测试**：+1（**301 / 301 通过**）—— `Enemy_Fall_Uses_Vanilla_Gravity_And_TerminalSpeed`
+（每 tick +0.3、终速 10）。
+
+**剩余清单**：后续项（buff 表 / 粉尘音效 / NPC 逐类型物理 / 未建模包 / 弹幕碰撞盒 / NPC 水平碰撞）见**第三十轮**「剩余清单」。
+
+### 第二十八轮（2026-09-12）：向导一直跳 / 移动误判超速 / 平地误判下落伤害
+
+**真机症状**（用户反馈）：①向导一直在跳；②移动时没有碰撞也提示扣血；③站着不动被史莱姆打也提示 `speed exceeded`。
+
+**根因 1（向导一直跳）—— 上一轮我引入的回归**：障碍起跳探测用了「脚下的支撑行」，
+而平地前方本来就有地面 → 每 tick 都判为障碍 → `velocity.Y = -4.4 / -5 / -6` 一直触发。
+原版（`NPC.cs` 64412-64474）只在**朝向方向正在移动**时才有条件起跳，且探的是**身体所在行**（支撑行上方的
+`tileSafely4/5`）与「台阶高度差」条件，不是支撑行。→ 改为 `supportRow = (Y + height + 1) / 16`、
+`bodyRow = supportRow - 1`，只探 `bodyRow` / `bodyRow - 1`（向导 -6/-5，战士 -8/-6），并去掉恒真的第三档。
+
+**根因 2（平地/移动时误判下落伤害）**：玩家碰撞盒宽 20、站立时可能跨两列，而落地判定只探**左列** →
+站在台阶边缘 / 地形拐角时漏判「落地」→ `FallDistance` 持续累积 → 回到平地时被结算下落伤害。
+→ 落地判定改为**左右两列任一实心即落地**（与 NPC 物理一致）。
+
+**根因 3（正常移动被判超速）**：`speed_exceeded` 用的是匀速上限（`maxSpeed × 60 × Δt + 容差`，默认 8×1 帧 + 4 = 12px），
+但原版客户端在**受击击退 / 被方块挤出 / 斜坡校正**时会有十几~几十像素的合法单帧位移 →
+被拒后权威基准不更新 → 后续包位移更大 → 连续拒绝并累计违规（达阈值即踢）。
+→ 引入「可疑带」：超上限在 **×4** 以内一律放行，只有**真瞬移量级**（> 上限 ×4）才拒绝；
+拒绝原因行同时输出量测值 `dx/dy/允许/dt/上限`（`AuthorityResult.Detail`），便于继续定位。
+
+**测试**：+2（**300 / 300 通过**）—— `Guide_DoesNotJump_OnFlatGround`（平地 120 tick 不起跳）、
+`MovementAuthority_Accepts_KnockbackScale_Step`（20px 击退级单帧位移放行）；
+`StandingPlayer_DoesNotAccumulate_FallDistance` 继续覆盖根因 2 的落地判定。
+
+**剩余清单**：后续项（buff 表 / 粉尘音效 / 客户端 117 伤害声明 / NPC 逐类型物理 / 弹幕碰撞盒 / NPC 水平碰撞）见**第二十九轮**「剩余清单」。
+
+### 第二十七轮（2026-09-12）：实体碰撞盒按原版口径对齐（真机抖动 / 向导陷地 / 莫名掉血）
+
+**真机症状**（用户反馈）：①怪物异常抖动、像是加速；②向导仍卡在地里。
+
+**核对原版后的根因**：服务端下发的位置语义与客户端不一致。原版约定（`MessageBuffer` 包 23 接收侧 + `NPC.SetDefaults`）：
+
+- 实体 `position` = **碰撞盒左上角**，脚底 = `position.Y + height`；客户端收到包 23 后 `npc.position = 收到的位置 − 同步锚点`，
+  随后按 `velocity` / `ai[]` **自行推进 + 自行做图格碰撞**（`netOffset` 只是渲染插值，见 `NPC.Update` 里 `position += netOffset` 的括号）。
+- 玩家碰撞盒 = **20×42**（`Player.cs`）；NPC 逐类型（Guide 18×40、Blue Slime 24×18、Goblin Peon 18×38、
+  Eye of Cthulhu 100×110、Spazmatism 100×110、Queen Bee 66×66、Hornet 12×12 / 8×8、King Slime 98×92、Skeletron 80×102）。
+
+TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一按 21 高建模，于是：
+
+1. **向导陷地**：我们上报的 Y 比客户端尺寸应有的位置高 19px（40 高的碰撞盒只留了 21）→ 客户端把向导画进地里，
+   且其自身 AI 碰撞把向导往上推、我们下一次同步又把它按回去 → **陷地 + 抖动**。
+2. **怪物抖动、像加速**：`StepNpcPhysics` 落地时**同时清零水平速度**，贴地 NPC 每 tick 只能拿到 AI 的那一点瞬时加速度
+   （城镇 NPC 0.07 px/tick），而客户端按自己的 AI 以 1 px/tick 走 → 每个同步周期都要把客户端拉回来 → **抖动 / 忽快忽慢**。
+3. **站着莫名掉血**：玩家脚底按 `Y + 21` 判 → 站在地上永远检测不到「落地」→ `FallDistance` 持续累积
+   （重力不断加速，最高 16 px/tick），而客户端每个位置包都会把 Velocity 清零（被当成「刚落地」）→ 凭空结算下落伤害。
+
+**修复**：
+
+- 新增 `Simulation/NpcSizes.cs`：玩家 20×42 + 上述 NPC 逐类型尺寸（**逐个类型按原版 `SetDefaults` 核对**，
+  不是估的；写进去之前逐条 grep 过 `width/height`）。
+- `SimulatePhysics`：玩家脚底改为 `Position.Y + 42`（落地判定与吸附都用全高）→ 站着不再累积下落距离 / 不再凭空掉血。
+- `StepNpcPhysics`：改用该 NPC 的 `width/height`（脚底 = `Y + height`，左右任一侧脚底实心即落地），
+  且**落地不再清零水平速度**（地面摩擦交回各 aiStyle：史莱姆 `×0.8`、城镇 NPC 收敛到 ±1）。
+- 生成 / 落位 / 瞄准 / 命中全部改到原版口径：向导与刷怪点按「脚底贴地表上沿」摆碰撞盒；
+  `SpawnBoss` / `SpawnNpcNear` 以「碰撞盒中心 = 调用方给的点」换算左上角；服务端弹幕从**碰撞盒中心**射出。
+- 命中判定改为 **AABB 求交**（原版 `Collision.CheckAABBvAABBCollision`）：接触伤害用玩家 20×42 与 NPC 实际尺寸；
+  弹幕命中用 16×16 近似（原版弹幕宽 6~16）；敌对弹幕打玩家同理。移除了「点 + 32px 半径」的近似。
+
+**测试**：+2（**298 / 298 通过**）—— `StandingPlayer_DoesNotAccumulate_FallDistance`（站着不掉血 / 不下沉）、
+`GroundedEnemy_Keeps_Horizontal_Velocity`（落地不清零水平速度）；`Guide_Spawns_WithFeet_On_Ground` 改为断言原版尺寸 18×40 与脚底贴地。
+
+**剩余清单**：后续项（buff 表 / 粉尘音效 / 客户端 117 伤害声明 / 弹幕碰撞盒 / NPC 水平碰撞）见**第二十八轮**「剩余清单」。
+
+### 第二十六轮（2026-09-12）：失效实体回收 + NPC 落位修正
+
+**缺陷 1：失效实体只标记不回收（列表只增不减）**
+
+- 现象：弹幕 / 掉落物失效后由世界同步补发销毁包（包 29 / 21）并置 `RemovalNotified`，
+  但**从不从 `WorldState.Projectiles` / `Items` 移除** —— 长跑下每 tick 遍历、20Hz 快照过滤都按整个列表长度做，
+  内存与耗时随游戏时间线性增长（Boss 每秒发弹、掉落物不断产生）。
+- 修复：`SimulateEntities` 在遍历结束后回收 —— `!Active && (RemovalNotified || Tick - DeadTick > 600)`。
+  - 以 `RemovalNotified` 为准 → **销毁包已成功下发才移除**，不会让客户端留下幽灵实体；
+  - `600 tick（10s）` 为兜底：下发持续失败（无连接 / 瞬时错误）时也不至于永久泄漏。
+  - **不在失效的同一 tick 移除**（`Tick > DeadTick`）：留一 tick 让世界同步 / 事件 / 测试观察到失效态。
+- 附带修正：`KillProjectileCommand` / 拾取命令的 `DeadTick` 改用 `world.Tick`（命令的 `Tick` 可能落后于当前世界 tick，
+  导致「同一 tick 即回收」而观察方看不到失效态）。
+
+**缺陷 2：NPC 生成落位悬空（向导 / 史莱姆 / 哥布林）**
+
+- 现象：仿真物理的落地不变量是「脚底 = Y + 21」（`PlayerHalfHeight`），但生成时用的是别的口径 ——
+  向导 `(spawnGroundY - 2) × 16` 比正确位置**高 11px**（生成后先自由落体），史莱姆 / 哥布林 `(y - 1) × 16` 则**陷地 5px**。
+- 修复：统一为 `Y = 地表图格上沿 − 21`（`WorldGenerator.NpcFeetOffset` / `WorldSimulator.PlayerHalfHeight`），
+  脚底正好落在地表上沿，生成当帧即静止，无双帧抖动。
+
+**测试**：+2（**296 / 296 通过**）—— `Guide_Spawns_WithFeet_On_Ground`（向导脚底贴地）、
+`Expired_Projectiles_Are_Reclaimed_After_Removal_Notified`（失效弹幕在销毁包下发后回收）。
+
+**剩余清单**：「接触 / 命中判定口径」已在**第二十七轮**按原版碰撞盒对齐；其余项（buff 表 / 粉尘音效 /
+弹幕行为表扩展）见第二十七轮「剩余清单」。
+
+### 第二十五轮（2026-09-12）：按原版 aiStyle 重建 NPC AI（二）—— aiStyle 31/43 + 服务端弹幕推送框架
+
+**继续移植 Boss aiStyle**（承第二十四轮的「剩余清单」第 1、2 项，逐条对照原版源码行号）：
+
+- **aiStyle 31（Spazmatism，type 126）** —— `Ai031Spazmatism`：
+  - 一阶段 `ai[1] == 0`：绕到「玩家中心 ±400px」的侧面（加速 0.4 / 限速 12），每 **60 帧**发 1 枚 type 96 魔焰弹
+    （初速 12 / 伤害 25 / 生存 300）；600 帧后转冲刺。
+  - `ai[1] == 1`：朝玩家 13f → `ai[1] = 2`；`ai[1] == 2`：8 帧后 `velocity *= 0.9`，42 帧计一次冲刺，连冲 **10** 次回落。
+  - 二阶段：`life < lifeMax * 0.4` → `ai[0] = 1` 自旋 100 帧 → `ai[0] = 2`；贴身 180px 悬停（加速 0.1 / 限速 4）
+    + 每 **>8 帧**发 1 枚 type 101 火球（初速 6 / 伤害 30，用 `localAI[1]` 节流）；400 帧后冲刺 14f、50 帧后 `*= 0.93`、
+    80 帧计一次、连冲 **6** 次（原版 32227-32867）。
+  - 未移植：专家模式数值、二阶段 `rotation` 自旋（纯客户端表现）、白天脱战（简化为无目标上浮）。
+- **aiStyle 43（Queen Bee，type 222）** —— `Ai043QueenBee`：`ai[0]` 攻击选择状态机（原版 35530-36226）
+  - `-1`：随机挑下一招（只从 0/2/3 里选，`localAI[0]` 记上一招避免连续重复）。
+  - `0` 悬停 / 对齐：高度差 `|py - (npc.Y + 33)| < 20` 时对齐后以 12f 冲刺（`num754 = 2` 轮后重选）；
+    否则纵向 0.15 趋近（限速 12）、横向按 |dx| 与 600 / 300 的关系 ±0.15（限速 16）。
+  - `1` 黄蜂突进：14f 冲玩家，每 40 帧召 1 只 210/211（初速 5），5 次后重选。
+  - `2` 重新接近：加速 0.07 / 限速 12（目标点 = 玩家上方 200px），距 < 200 转突进。
+  - `3` 毒刺齐射：玩家在下方时每 40 帧发 1 枚 type 719（初速 8 / 伤害 11），20 个周期后重选。
+  - `4` 拉开距离：速度朝「远离玩家 14f」收敛（`(v*14 + e)/15`），距 < 2000 重选。
+  - `5` 离场：减速上浮，出世界上边界置 `Active = false`。距离 > 3000 强制 `ai[0] = 4`。
+  - 未移植：`num750` 难度修正（水下 / 非丛林 / 古德世界）、专家数值。
+
+**服务端弹幕推送框架（包 27）** —— 此前 **Boss / NPC 发射的弹幕在服务端生成后从不外发**，其他玩家看不到：
+
+- `ProjectileEntity` 新增 `NewNotified`（生成是否已下发，同掉落物的 `NewNotified` 语义）。
+- AI 发射走 `SpawnNpcProjectileToward` → 暂存 `_pendingProjectiles`，**遍历结束后统一入队**（避免遍历中改集合），
+  键取**负键段** `_nextServerProjectileKey`（客户端弹幕用非负键，二者不冲突）。
+- `GameHost.FlushNewProjectilesAsync`（快照循环内，与 NPC 同步同频）：对 `!NewNotified` 的弹幕按 `Owner` 分流 ——
+  客户端弹幕发给**除归属者外**的玩家（`BroadcastWhereAsync`），服务端弹幕（`Owner < 0`）发给所有人；
+  **发送成功才置位**，瞬时失败记 `broadcast_failed`（下轮重试）。
+
+**弹幕行为表（原版字段驱动）** —— 新增 `Simulation/WorldSimulator.Projectiles.cs`：
+
+- 按原版 `Projectile.SetDefaults` 的字段建立行为表 `ProjectileBehaviorOf(type)`（仅收录**服务端会发射**的三种）：
+  **96** CursedFlameHostile（aiStyle 8）直线 / 图格碰撞 / `timeLeft = 3600`；
+  **101** EyeFire（aiStyle 23）`extraUpdates = 3`（每 tick 积分 4 次）/ `timeLeft` 钳到 60；
+  **719** QueenBeeStinger（aiStyle 1）直线 / 图格碰撞。未登记类型保持简化直线积分（与客户端上报弹幕解耦）。
+- `StepProjectile`：按 `UpdatesPerTick` 次积分位置，`TileCollide` 类型撞到实心图格 / 出界即失效。
+- **命中归属修正**：玩家弹幕（`Owner >= 0`）才结算敌怪伤害；敌对弹幕（`Owner = -1`）改由
+  `SimulateCombat` 结算**玩家伤害**（`projectile_damage`，与接触伤害共用免伤帧）。三类弹幕原版 `penetrate = -1`
+  （不因命中销毁），故不消耗弹幕、靠免伤帧限频。
+
+**测试**：+5（**294 / 294 通过**）—— `Vanilla_ServerProjectile_IsBroadcastToOtherPlayers`（服务端弹幕外发）、
+`Vanilla_Spazmatism_EmitsFireball_And_EntersCharge`（31 的 `ai` 状态机 + 弹幕生成）、
+`Vanilla_QueenBee_CyclesAttackChoice`（43 的 `ai[0]` 攻击选择推进）、
+`Vanilla_HostileProjectile_Damages_Player`（敌对弹幕命中玩家）、`Vanilla_Projectile_Stops_At_SolidTile`（图格碰撞）。
+
+**剩余清单**：「向导落位」与「失效实体回收」已在**第二十六轮**完成；其余项（buff 表 / 粉尘音效 /
+接触判定口径 / 弹幕行为表扩展）见第二十六轮「剩余清单」。
+
+### 第二十四轮（2026-09-12）：按原版 aiStyle 重建 NPC AI（一）—— 地基 + aiStyle 1 + ai 下发
+
+**目标**（用户要求）：怪物 AI 全部参考原版源码实现、重新构建；含框架、并把 `ai[0..3]` 下发。
+**本轮交付地基 + 第一个 aiStyle**（其余 aiStyle 与框架按同法逐轮补齐，见文末「剩余清单」）。
+
+**结构调整（对齐原版）**：
+
+- `WorldNpc` 新增 `AiStyle`（原版 `NPC.aiStyle`）、`Ai[0..3]`（原版 `NPC.ai[]`）、`Direction`（原版 `NPC.direction`）。
+- 新增 `Simulation/WorldSimulator.NpcAi.cs`：`NpcAiStyleOf(type)` 分发表 + `RunNpcAi(npc)` 分派 +
+  各 aiStyle 实现 + 共用物理步 `StepNpcPhysics`。顺序与原版一致：**AI 只设速度/ai → 物理步走重力与图格碰撞**。
+- 未移植的 aiStyle 走 `AiFallback`（简化追击），Boss 仍走 `SimulateBossStep`（自移动）。
+
+**已移植：aiStyle 1（Slimes，原版 `AI_001_Slimes`）** —— 逐条对照原版源码：
+
+- 初始化：`ai[2] == 0` → `ai[0] = -100`、`ai[2] = 1`、选定目标方向。
+- 贴地：`ai[2]` 递减；`ai[3] == position.X` → 卡住 → `direction *= -1`、`ai[2] = 200`；
+  地面摩擦 `velocity.X *= 0.8`（|vx| < 0.1 归零）；`ai[0]++`（有目标额外 +1）；
+  按 `ai[0]` 与门限 `num54 = -1000` 的三档窗口得 `phase = 1/2/3`。
+- 起跳：1/2 档 `velocity.Y = -6`、`velocity.X += 2 * direction`、`ai[0] = -120 + num54(×2)`；
+  3 档（强跳）`velocity.Y = -8`、`velocity.X += 3 * direction`、`ai[0] = -200`、`ai[3] = position.X`。
+- 空中：朝 `direction` 水平加速 0.2、上限 ±3（原版 `0.93` 阻尼分支）。
+
+**包 23 下发 `ai[0..3]`**：`bitsA bit2..5` 置位并写出 4 个 float（位于 `bitsB` 之后、`netId` 之前，
+已按客户端 `MessageBuffer` 读取顺序核对）；解码侧读取并保留；同步的「变化才发」判定纳入 ai 与 direction。
+理由：客户端对未置位的 ai 位会**显式置 0**，不下发则依赖 ai 的 aiStyle 表现必然与服务端不一致。
+
+**测试**：+1（**289 / 289 通过**）—— `Vanilla_NpcSync_Carries_Vanilla_Ai_State`（包 23 携带 4 个 ai）；
+既有的史莱姆跳跃用例（`Enemy_Hops_WithGroundedWait_InsteadOfGroundGliding`）在**原版节拍**下继续通过。
+
+**本轮继续移植（同一轮内完成）**：
+
+- **aiStyle 3（Fighters，type 26 哥布林工兵）**：贴地加速 0.07 / 上限 1.5；`velocity.X == 0 && 贴地` → `ai[0]++`，累计 2 掉头；
+  前方 2~3 格实心 → 起跳 `-8`、1 格 → `-6`、台阶 → `-5`（原版 68784-69139 / 71518-71575）。type 26 无弹幕（攻击 = 接触伤害）。
+- **aiStyle 7（TownEntities，type 22 向导）**：走速上限 1 / 加速 0.07；离家 >25 格朝家走、家附近每 tick 1/80 概率掉头
+  （原版 64092-64278）；前方障碍起跳 `-6 / -5 / -4.4`（原版 64416-64463）。
+  重力改由**共用物理步**承担（原版 gravity = 0.3 属引擎侧）→ **向导不再卡在土里**（脚下图格实心即贴地站立）。
+  未移植：住房判定 / 坐下（`ai[0]=5`）/ 传送回家 / 远程攻击状态 / 微光状态机。
+- **aiStyle 4（Eye of Cthulhu，type 4）**：新增**飞行体物理**（`WorldNpc.NoGravity`：无重力、无图格碰撞，仅边界钳制）。
+  按原版节奏实现：`life < lifeMax*0.5` → 二阶段；`ai[1]=0` 追「玩家上方 200px」（加速 0.04 / 限速 5，600 帧转冲刺，
+  玩家在下方且距离 <500 时每 110 帧生成仆从 type 5）；`ai[1]=1` 蓄力 6.8；`ai[1]=2` 冲刺 40 帧后 `*=0.97`、130 帧计一次、连冲 3 次回落
+  （原版 24948-25480）。未移植：二阶段自旋（纯客户端 rotation）、专家预判冲刺、白天脱战上浮（简化为无目标上浮）。
+- **AI 内刷怪安全化**：新增 `_pendingNpcSpawns`，AI 期间产生的刷怪（如眼魔仆从）在遍历结束后统一入队，避免遍历中修改集合。
+
+**剩余清单**：本轮登记的 aiStyle 31 / 43 与「服务端弹幕推送框架」已在**第二十五轮**完成；
+后续项（弹幕行为表 / buff 表 / 粉尘音效 / 向导落位 / 接触判定圆心）见第二十五轮「剩余清单」。
+
+### 第二十三轮（2026-09-12）：敌怪改为**跳跃式移动**（恢复史莱姆的「跳」）
+
+**问题**（真机实测反馈）：原版史莱姆是**跳着走**的，改完同步频率后卡顿缓解，但**跳跃动作没了** —— 看着像贴地滑行。
+
+**根因（两侧证据）**：
+
+1. **服务端**：`SimulateEnemyStep` 每 tick `VelocityX = ±1` + 重力，**从不给 `VelocityY` 向上初速度**
+   → 权威运动本身就是「贴地滑行」，没有滞空阶段。
+2. **客户端**：[MessageBuffer.cs](Terraria/MessageBuffer.cs) 处理包 23 时
+   `npc.position = ...; npc.velocity = velocity; for (i<NPC.maxAI) npc.ai[i] = array2[i];`
+   —— **速度与 ai[] 都被覆盖**（未置位的 ai 位即 0）。所以 20Hz 的「地面速度 + ai 全零」
+   会把客户端本地史莱姆的跳跃状态每 50ms 冲掉一次，即使客户端自己起跳也会被立刻抹平。
+
+**已实施**：
+
+- **服务端跳跃式移动**：贴地时静止等待 `SlimeHopWaitMin(20) + rand(SlimeHopWaitSpan(25))` tick，
+  然后起跳 `VelocityY = -SlimeHopSpeed(6)`（配合 `Gravity = 0.4` ≈ 45px 高 / 30 tick 滞空）
+  并给朝玩家的水平速度 `SlimeHopHorizontalSpeed(2)`；空中只受重力，落地归零并重新计时。
+- **贴地判定用碰撞结果而非速度**：新增 `WorldNpc.Grounded`（由图格碰撞维护）。
+  用 `VelocityY == 0` 当「贴地」会让**悬空生成（速度为 0）的敌怪不落体**；同时贴地时必须**直接返回**
+  （不做重力积分），否则每 tick 都「重新落地」把等待计数清零，永远等不到起跳（实现过程中踩到并修正）。
+- **接触免伤用例解耦 AI**：`Vanilla_ContactDamage_Has_ImmunityWindow` 改为每 tick 把敌怪钉在玩家碰撞盒中心
+  （敌怪现在会跳离 32px 接触圈），用例只验证免伤窗口本身，不再隐含「敌怪必须贴地不动」。
+
+**测试**：+1（**288 / 288 通过**）—— `Enemy_Hops_WithGroundedWait_InsteadOfGroundGliding`
+（300 tick 内必须出现过 `VelocityY < 0` 的起跳帧 + 存在 ≥2 tick 的地面静止等待期；
+旧实现「贴地滑行」永远满足不了第一条）。
+
+### 第二十二轮（2026-09-12）：真机实测修复（一）—— NPC 同步 20Hz + AI 每 tick 步进
+
+**背景**：原版客户端真机进图后报告三条症状：①怪物移动卡顿；②向导卡在土里；③未碰怪却掉血。
+本轮只修 ①（NPC 同步与 AI 步进），并顺带修一个启动崩溃路径；②③ 见文末「仍未修」。
+
+**问题（代码依据）**：
+
+1. **NPC 同步只有 1Hz**：包 23 原先只在 1Hz 的世界同步循环里下发（`GameHost` 的 `BroadcastWorldStateAsync`），
+   客户端表现为「每秒被拽一次」。原版客户端自身也跑 NPC AI（`NPC.UpdateNPC` 无 netMode==1 提前返回），
+   于是「客户端 AI 走一段 ↔ 服务端位置每秒覆盖」互相打架 → 卡顿。
+2. **服务端 AI 每 4 tick 才步进**：`SimulateAi` 开头 `if ((_world.Tick & 3) != 0) return;`，
+   而步进量固定为 `npc.X += VelocityX`（±1px）→ **等效速度仅 0.25 px/tick**（原版史莱姆约 1–2 px/tick），
+   服务端位置本身就是「一跳一跳」，进一步放大卡顿与「服务端判定位置 vs 客户端画面」偏差。
+3. **启动崩溃掩盖真实原因**：端口被占用时 `MetricsHttpServer` 绑定失败，随后 `Dispose()` 抛
+   `ObjectDisposedException` 成为未处理异常 → 把「端口被占用」的真实错误盖掉（本轮实测踩到）。
+
+**已实施**：
+
+- **NPC 同步改到快照频率（默认 20Hz）**：新增 `GameHost.BroadcastNpcUpdatesAsync` 并由快照循环调用；
+  **状态变化才发**（X / Y / 速度 / 生命 / 存活），未变化按 `NpcSyncHeartbeatTicks = 60`（≈1s）**心跳补发**，
+  保证中途入服玩家也能看到静止 NPC。`BroadcastWorldStateAsync` 保留一次调用以兼容既有调用方
+  （变化检测会抑制该重复包）。
+- **AI 改为每 tick 步进**：去掉 `& 3` 门控；敌怪 1 px/tick + 每 tick 重力，Boss `BossSpeed = 2` px/tick
+  （语义即「像素 / tick」，与速度常量口径一致）。
+- **城镇 NPC 平滑化**：新增 `SimulateTownNpcStep` —— **方向持久 + 撞到住所 ±4 格边界才折返**
+  （原实现每步随机改向 + 随机步长，在 20Hz 同步下会变成原地抖动）；`WorldNpc.WanderDirection` 记录方向。
+- **启动崩溃修复**：`MetricsHttpServer.Dispose` 吞掉未成功启动时的 `ObjectDisposedException` /
+  `InvalidOperationException`，不再掩盖真实启动错误。
+
+**测试**：+2（**287 / 287 通过**）——
+`TownNpc_WalksSmoothly_WithoutPerTickDirectionFlip`（240 tick 内方向翻转 ≤ 4 次、不越出住所 ±4 格、单 tick 位移 ≤ 0.75px）、
+`Vanilla_NpcSync_SendsOnChange_AndSkipsUnchanged`（首次必发 / 未变化不重发 / 位置变化立刻发）。
+
+**仍未修（下一轮）**：
+
+- **向导落位**：生成时 `Y = (spawnGroundY - 2) * 16` 按碰撞盒左上角语义算，脚底比地面低 8px（陷进地表半格）；
+  且城镇 NPC 游走**只有 X、没有重力 / 图格落地**，出不来。
+- **未碰怪却掉血**：服务端用自己 1Hz / 断续的 NPC 位置判 32px 接触，与客户端画面不一致；
+  且史莱姆 `X`（格中心）与 `Y`（格顶边）语义混用，判定圆心偏移约 (8,8) px。另有 `fall_damage` 通路待复现区分。
 
 ### 第二十一轮（2026-09-12）：未建模包「拒绝但不计违规」+ 按 PacketId 统计（真机测试前置）
 
@@ -309,7 +723,7 @@ Listening on port 7778
 （断言矿脉 / 洞穴 / 草皮 / 地狱层 / 海水 / 宝箱数量与战利品）、
 `Vanilla_PlayerControls_Relay_Preserves_Mount_And_Camera`（包 13 中继保留挂载与相机）；
 另把两个受「世界生成变重」影响的既有用例等待窗口放宽（`KickAsync_...` 与 `AntiCheat_PacketFlood_...`）。
-该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 **285 / 285** 通过（第十九轮 283 + 第二十轮元数据回归 + 第二十一轮未建模包边界）。
+该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 **305 / 305** 通过（第十九轮 283 + 第二十轮元数据回归 + 第二十一轮未建模包边界 + 第二十二轮 NPC 同步 / AI 步进 + 第二十三轮敌怪跳跃 + 第二十四轮原版 aiStyle 重建地基与 ai 下发 + 第二十五轮 aiStyle 31/43 / 服务端弹幕推送 / 弹幕行为表 + 第二十六轮失效实体回收与 NPC 落位修正 + 第二十七轮实体碰撞盒按原版口径对齐 + 第二十八轮跳探针 / 落地判定 / 可疑带 + 第二十九轮 NPC 重力与终速对齐原版 + 第三十轮接触最小重叠与统一免伤帧 + 第三十一轮玩家位置外推 + 第三十二轮接触阈值 8px 与 NPC 水平阻挡）。
 
 ### 第十五轮（2026-09-12）：协议字段核对后落地（包 20 图格方阵 + 区块流送对齐 + NPC 同步细节）
 

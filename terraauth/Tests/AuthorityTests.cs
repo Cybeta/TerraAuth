@@ -86,6 +86,27 @@ public class AuthorityTests
             move.Validate(new PlayerPositionPacket(1, new Vector2(0.1f, 0f)), 1, commands).Decision);
     }
 
+    /// <summary>
+    /// 「可疑带」放行：受击击退 / 被挤出方块 / 斜坡校正会造成一帧十几~几十像素的合法位移，
+    /// 超过匀速上限但远没到瞬移量级 —— 必须放行，否则正常玩家被史莱姆打一下就会刷 speed_exceeded
+    /// （并累计违规被踢）。
+    /// </summary>
+    [Fact]
+    public void MovementAuthority_Accepts_KnockbackScale_Step()
+    {
+        var enforcers = new AuthorityEnforcers(
+            new RateLimits(), new NoOpAuditLogger(), new WorldState(),
+            new MovementLimits(MaxSpeed: 8.0f, TeleportTolerance: 4.0f));
+        var move = enforcers.Movement;
+        var commands = new CommandQueue();
+
+        move.Validate(new PlayerControlsPacket(1, new Vector2(0, 0)), 1, commands); // 建立基准
+
+        // 匀速上限 = 8*60*(1/60)+4 = 12px；一帧 20px 属于「击退级」位移
+        Assert.Equal(AuthorityDecision.Accept,
+            move.Validate(new PlayerControlsPacket(1, new Vector2(20f, 0f)), 1, commands).Decision);
+    }
+
     [Fact]
     public void MovementAuthority_Validates_PlayerControls_Packet13()
     {

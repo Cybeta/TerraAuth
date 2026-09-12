@@ -310,14 +310,30 @@ public sealed class GameHost : IDisposable
                 await FlushPlayerHurtAsync(ct).ConfigureAwait(false);
                 // 服务端主动生成的掉落物（Boss 掉落等）→ 包 21
                 await FlushNewItemsAsync(ct).ConfigureAwait(false);
+                // 新增弹幕（客户端上报 / Boss AI 发射）→ 包 27
+                await FlushNewProjectilesAsync(ct).ConfigureAwait(false);
                 // 按玩家位置流送其周边图格区块（仅跨区块时补发，跳过已发过的区块）
                 await Network.StreamSectionsForPlayersAsync(ct).ConfigureAwait(false);
                 await Task.Delay(1000 / Math.Max(1, Config.Current.SnapshotRateHz), ct);
             }
         }, ct);
 
-        // 4. 世界状态同步循环：时间（包 18）与 NPC（包 23）定期下发
-        //    1Hz 足够：客户端自身按 tick 推进时间，这里只做周期性对账；NPC 位置变化平缓
+        // 3.5 NPC 同步（包 23）单独跑在 **tick 频率（60Hz）**：
+        //     客户端收到包 23 后会按原版自行推进 NPC，同步越稀疏、双方位置差越大；
+        //     而**接触判定用的是服务端位置**，差值一大就会出现「看着离史莱姆很远却在掉血」
+        //     （原版服务端在 netUpdate 时几乎每 tick 都发，这里对齐该节奏；NPC 数量少，带宽可接受）。
+        //     仍是「变化才发 + 心跳补发」，静止 NPC 不占额外带宽。
+        var npcSyncTask = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await BroadcastNpcUpdatesAsync(ct).ConfigureAwait(false);
+                await Task.Delay(1000 / 60, ct);
+            }
+        }, ct);
+
+        // 4. 世界状态同步循环：时间（包 18）与进度（包 7）定期下发
+        //    1Hz 足够：客户端自身按 tick 推进时间，这里只做周期性对账
         var worldSyncTask = Task.Run(async () =>
         {
             while (!ct.IsCancellationRequested)
@@ -333,7 +349,7 @@ public sealed class GameHost : IDisposable
             }
         }, ct);
 
-        await Task.WhenAll(simTask, netTask, snapTask, worldSyncTask).ConfigureAwait(false);
+        await Task.WhenAll(simTask, netTask, snapTask, npcSyncTask, worldSyncTask).ConfigureAwait(false);
 
         // 停机：把待落盘的世界改动冲刷干净（单批上限决定每轮吞吐，故循环到排空；
         // 极端情况下（曾降级为全图扫描）最多多跑一遍全图，轮数有上限，不会挂死）
@@ -823,8 +839,10 @@ public sealed class GameHost : IDisposable
     }
 
     /// <summary>
-    /// 把世界时间与 NPC 状态同步给所有在线玩家（包 18 / 23）。
+    /// 把世界时间与世界进度同步给所有在线玩家（包 18 / 7），并顺带下发一次 NPC 状态（包 23）。
     /// 布局依据：原版客户端（协议 326）包 18 / 包 23 的字段顺序。
+    /// 生产路径下 NPC 由快照循环（<see cref="BroadcastNpcUpdatesAsync"/>，20Hz）高频下发；
+    /// 这里保留一次调用仅为兼容既有调用方（变化检测会抑制重复包）。
     /// </summary>
     public async Task BroadcastWorldStateAsync(CancellationToken ct = default)
     {
@@ -842,38 +860,7 @@ public sealed class GameHost : IDisposable
         await Network.BroadcastAsync(PacketId.Time,
             new TimePacket(world.DayTime, (int)world.Time, SunModY: 0, MoonModY: 0), ct).ConfigureAwait(false);
 
-        // NPC 索引上限 199（原版 Main.npc[200]）
-        // 视口裁剪：只发给视野半径内的玩家，避免把全世界 NPC 推给所有人
-        var radius = Math.Max(1, Config.Current.ViewportRadius);
-        var radiusSq = (float)radius * radius;
-
-        // 先在锁内取一致快照（仿真线程会增删 NPC），再在锁外逐个下发（不在持锁期间做 I/O）
-        WorldNpc[] npcs;
-        lock (world.NpcsLock)
-        {
-            npcs = world.Npcs.Count <= byte.MaxValue + 1
-                ? world.Npcs.ToArray()
-                : world.Npcs.GetRange(0, byte.MaxValue + 1).ToArray();
-        }
-
-        for (var i = 0; i < npcs.Length; i++)
-        {
-            var npc = npcs[i];
-            var packet = new NpcUpdatePacket(
-                Index: (byte)i,
-                Generation: npc.Generation,
-                Position: new Vector2(npc.X, npc.Y),
-                Velocity: new Vector2(npc.VelocityX, npc.VelocityY),
-                // 255 = 显式「无目标」：客户端侧 NPC AI 以 target==255（部分 AI 还含 <=0）判为无目标并自行 TargetClosest。
-                // 若发 0，会被当作「目标 = 玩家槽位 0」，客户端 AI 会去追那个玩家（通常是错的）。
-                Target: 255,
-                NetId: npc.NetId == 0 ? (short)npc.Type : npc.NetId,
-                Life: npc.Active ? npc.Life : 0,   // 已死亡 → life=0，客户端据此移除
-                LifeMax: Math.Max(1, npc.LifeMax));
-
-            await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet,
-                playerId => IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq), ct).ConfigureAwait(false);
-        }
+        await BroadcastNpcUpdatesAsync(ct).ConfigureAwait(false);
 
         // 弹幕到期：服务端补发销毁包 29（客户端掉线 / 未发 29 时也避免幽灵弹幕）
         ProjectileEntity[] expired;
@@ -972,6 +959,120 @@ public sealed class GameHost : IDisposable
             {
                 recorder.Record(new GameEvent(world.Tick, null,
                     GameEventKinds.BroadcastFailed, "item_remove", GameEventCategory.Broadcast));
+            }
+        }
+    }
+
+    /// <summary>
+    /// NPC 状态同步（包 23）：位置 / 速度 / 生命。由快照循环按 20Hz 调用。
+    /// 原版客户端不做服务端专属 AI 的完整模拟，位置以服务端下发为准 —— 早期实现只在 1Hz 的世界同步里
+    /// 下发，客户端表现为「每秒被拽一次」的卡顿；现改为快照频率。
+    /// 带宽控制：**状态变化才发**（X/Y/速度/生命/存活），未变化时按 <see cref="NpcSyncHeartbeatTicks"/>
+    /// 补发一次心跳，保证中途入服的玩家也能看到静止 NPC。
+    /// </summary>
+    public async Task BroadcastNpcUpdatesAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+
+        // 视口裁剪：只发给视野半径内的玩家，避免把全世界 NPC 推给所有人
+        var radius = Math.Max(1, Config.Current.ViewportRadius);
+        var radiusSq = (float)radius * radius;
+
+        // 先在锁内取一致快照（仿真线程会增删 NPC），再在锁外逐个下发（不在持锁期间做 I/O）
+        // 索引上限 199（原版 Main.npc[200]）；下标即客户端认的 npcIndex
+        WorldNpc[] npcs;
+        lock (world.NpcsLock)
+        {
+            npcs = world.Npcs.Count <= byte.MaxValue + 1
+                ? world.Npcs.ToArray()
+                : world.Npcs.GetRange(0, byte.MaxValue + 1).ToArray();
+        }
+
+        for (var i = 0; i < npcs.Length; i++)
+        {
+            var npc = npcs[i];
+            var life = npc.Active ? npc.Life : 0;   // 已死亡 → life=0，客户端据此移除
+
+            var changed = npc.X != npc.SyncedX || npc.Y != npc.SyncedY
+                          || npc.VelocityX != npc.SyncedVelocityX || npc.VelocityY != npc.SyncedVelocityY
+                          || life != npc.SyncedLife || npc.Active != npc.SyncedActive
+                          || npc.Direction != npc.SyncedDirection
+                          || !npc.Ai.AsSpan().SequenceEqual(npc.SyncedAi);
+            var heartbeat = world.Tick - npc.SyncedTick >= NpcSyncHeartbeatTicks;
+            if (!changed && !heartbeat) continue;
+
+            npc.SyncedX = npc.X;
+            npc.SyncedY = npc.Y;
+            npc.SyncedVelocityX = npc.VelocityX;
+            npc.SyncedVelocityY = npc.VelocityY;
+            npc.SyncedLife = life;
+            npc.SyncedActive = npc.Active;
+            npc.SyncedDirection = npc.Direction;
+            npc.Ai.CopyTo(npc.SyncedAi, 0);
+            npc.SyncedTick = world.Tick;
+
+            var packet = new NpcUpdatePacket(
+                Index: (byte)i,
+                Generation: npc.Generation,
+                Position: new Vector2(npc.X, npc.Y),
+                Velocity: new Vector2(npc.VelocityX, npc.VelocityY),
+                // 255 = 显式「无目标」：客户端侧 NPC AI 以 target==255（部分 AI 还含 <=0）判为无目标并自行 TargetClosest。
+                // 若发 0，会被当作「目标 = 玩家槽位 0」，客户端 AI 会去追那个玩家（通常是错的）。
+                Target: 255,
+                NetId: npc.NetId == 0 ? (short)npc.Type : npc.NetId,
+                Life: life,
+                LifeMax: Math.Max(1, npc.LifeMax),
+                DirectionPositive: npc.Direction >= 0,
+                // 原版 ai[0..3]：依赖 ai 的 aiStyle（如史莱姆跳跃状态）必须下发，
+                // 否则客户端会把 ai 全置 0，表现与服务端不一致。
+                Ai: npc.Ai);
+
+            await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet,
+                playerId => IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq), ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>NPC 同步心跳（tick）：状态未变化也按该周期补发一次（≈1s @ 60Hz）。</summary>
+    private const long NpcSyncHeartbeatTicks = 60;
+
+    /// <summary>
+    /// 新增弹幕（包 27 / SyncProjectile）：客户端上报的弹幕转发给**其他**玩家；
+    /// Boss AI 发射的服务端弹幕（<see cref="ProjectileEntity.Owner"/> = -1）广播给所有人。
+    /// 发出成功后才置 <see cref="ProjectileEntity.NewNotified"/>，失败留待下一轮重试。
+    /// </summary>
+    public async Task FlushNewProjectilesAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+
+        ProjectileEntity[] pending;
+        lock (world.ProjectilesLock)
+            pending = world.Projectiles.Where(p => p.Active && !p.NewNotified).ToArray();
+
+        foreach (var p in pending)
+        {
+            var packet = new ProjectileNewPacket(p.Key, p.Position, p.Velocity, p.Type)
+            {
+                Damage = 0,   // 伤害由服务端权威结算，不下发客户端声明值
+            };
+
+            try
+            {
+                if (p.Owner >= 0)
+                {
+                    await Network.BroadcastWhereAsync(PacketId.ProjectileNew, packet,
+                        playerId => playerId != p.Owner, ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    await Network.BroadcastAsync(PacketId.ProjectileNew, packet, ct).ConfigureAwait(false);
+                }
+
+                p.NewNotified = true;
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                Simulator.Recorder.Record(new GameEvent(world.Tick, null,
+                    GameEventKinds.BroadcastFailed, "projectile_new", GameEventCategory.Broadcast));
             }
         }
     }

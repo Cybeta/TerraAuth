@@ -251,13 +251,16 @@ public static class WorldGenerator
 
         // ---- 7. 出生点旁放置一名城镇 NPC（向导），使 NPC 同步（包 23）具备可观测对象 ----
         int guideTileX = spawnX + 2;
+        var (guideW, guideH) = NpcSizes.Of(GuideNpcType);
         world.Npcs.Add(new WorldNpc
         {
             Type = GuideNpcType,
             NetId = GuideNpcType,
+            AiStyle = 7,            // 原版 aiStyle 7（TownEntities）
             GivenName = "Guide",
-            X = (guideTileX + 0.5f) * 16f,
-            Y = (spawnGroundY - 2) * 16f,
+            // 原版约定：X/Y = 碰撞盒左上角，脚底 = Y + height（向导 18×40）→ 脚底正好贴地表上沿
+            X = (guideTileX + 0.5f) * 16f - guideW / 2f,
+            Y = spawnGroundY * 16f - guideH,
             IsTownNpc = true,
             HomeTileX = guideTileX,
             HomeTileY = spawnGroundY,

@@ -932,6 +932,12 @@ public sealed class PlayerRuntime
     /// <summary>受击免伤帧剩余 tick：&gt;0 时不再结算接触伤害（约 1 秒）。</summary>
     public int HurtCooldown;
 
+    /// <summary>
+    /// 受击免伤帧（tick，60 ≈ 1 秒）。**所有伤害来源共用**（接触 / 敌对弹幕 / 客户端上报的包 117）——
+    /// 原版 `Player.immune` 也是跨来源的统一窗口；不共用会让同一次接触被服务端与客户端各记一次（双倍伤害）。
+    /// </summary>
+    public const int HurtImmunityTicks = 60;
+
     /// <summary>连续下落距离（像素），落地时用于结算下落伤害。</summary>
     public float FallDistance;
 
@@ -940,6 +946,37 @@ public sealed class PlayerRuntime
 
     /// <summary>本次进服是否由「会话恢复」接管：跳过出生点重定位、保留原坐标与状态。</summary>
     public bool Resumed;
+
+    /// <summary>最近两次位置包**观测**到的水平速度（像素 / tick，由 <c>MoveCommand</c> 更新）。</summary>
+    public float ObservedSpeedX;
+
+    /// <summary>最近一次收到位置包的 tick（0 = 尚未收到过）。</summary>
+    public long LastMoveTick;
+
+    /// <summary>
+    /// 「游戏判定用」的玩家位置（NPC 追击 / 接触 / 拾取范围都用它，每个 tick 由仿真刷新）。
+    /// 原版客户端**只在操作变化时**才发位置包（`Player.cs` 里 `SendData(13)` 的触发条件就是控制位变化），
+    /// 而原版服务端会按同步来的控制位**继续模拟玩家移动**；TerraAuth 不做玩家操作模拟，
+    /// 所以要按 <see cref="ObservedSpeedX"/> 外推 —— 否则不发包期间服务端坐标停在原地，
+    /// NPC 会去追一个玩家早已离开的位置（真机症状：看着没被碰到却在扣血）。
+    /// </summary>
+    public Vector2 AimPosition;
+
+    /// <summary>外推上限（tick）：超过则不再外推，避免长时间收不到包时位置跑飞。</summary>
+    public const int MaxExtrapolationTicks = 15;   // 0.25s @60Hz
+
+    /// <summary>可接受的观测速度上限（像素 / tick）：超过视为瞬移 / 传送，不做外推。</summary>
+    public const float MaxObservedSpeedX = 20f;
+
+    /// <summary>按观测速度把最后一次上报位置外推到「现在」（限制最多外推 <see cref="MaxExtrapolationTicks"/> tick）。</summary>
+    public Vector2 Extrapolate(long nowTick)
+    {
+        // 从未收到过位置包（出生前 / 测试直接构造的运行时）→ 不做外推，直接用真实位置
+        if (LastMoveTick == 0) return Position;
+
+        int ahead = (int)Math.Clamp(nowTick - LastMoveTick, 0, MaxExtrapolationTicks);
+        return ahead <= 0 ? Position : new Vector2(Position.X + ObservedSpeedX * ahead, Position.Y);
+    }
 }
 
 /// <summary>
@@ -1155,9 +1192,56 @@ public sealed class WorldNpc
     /// <summary>是否存活；false 时同步 <c>life=0</c> 让客户端移除。</summary>
     public bool Active = true;
 
+    /// <summary>原版 <c>noGravity</c> / <c>noTileCollide</c>：飞行体（Boss 等）不受重力、不做图格落地。</summary>
+    public bool NoGravity;
+
     /// <summary>是否为 Boss（服务端权威：击杀后记录世界进度，AI 为简化追击）。</summary>
     public bool IsBoss;
 
     /// <summary>死亡发生的 tick（用于延后清理，确保 life=0 已下发到客户端）。</summary>
     public long DeadTick;
+
+    // ---- 网络同步状态（不落盘）----
+
+    /// <summary>
+    /// 原版 <c>NPC.aiStyle</c>：决定走哪套 AI 实现（见 <c>WorldSimulator.RunNpcAi</c> 的分发表）。
+    /// 0 = 未指定（走简化兜底）。
+    /// </summary>
+    public int AiStyle;
+
+    /// <summary>
+    /// 原版 <c>NPC.ai[0..3]</c> 状态槽（与包 23 下发/接收的语义一致）。
+    /// 各 aiStyle 自行解释其含义；服务端权威持有，客户端据此对齐动画与状态。
+    /// </summary>
+    public readonly float[] Ai = new float[4];
+
+    /// <summary>原版 <c>NPC.localAI[0..1]</c>：不参与网络同步的本地计时/暂存槽（如弹幕发射节流）。</summary>
+    public readonly float[] LocalAi = new float[2];
+
+    /// <summary>朝向（原版 <c>NPC.direction</c>，1 = 右 / -1 = 左）。</summary>
+    public int Direction = 1;
+
+    /// <summary>上一帧是否贴地（由图格碰撞结果维护）：决定是否进入「等待 → 起跳」。</summary>
+    public bool Grounded;
+
+    /// <summary>上一次已下发的状态；用于「变化才发」（未变化时按心跳周期补发）。</summary>
+    public float SyncedX;
+    public float SyncedY;
+    public float SyncedVelocityX;
+    public float SyncedVelocityY;
+
+    /// <summary>上一次已下发的生命（<see cref="int.MinValue"/> = 从未下发 → 首次必然下发）。</summary>
+    public int SyncedLife = int.MinValue;
+
+    /// <summary>上一次已下发的存活状态。</summary>
+    public bool SyncedActive;
+
+    /// <summary>上一次已下发的朝向。</summary>
+    public int SyncedDirection = int.MinValue;
+
+    /// <summary>上一次已下发的 ai[0..3]（供「变化才发」比较）。</summary>
+    public readonly float[] SyncedAi = new float[4];
+
+    /// <summary>上一次下发所在 tick（心跳判定：未变化也每 1s 补发一次，保证新入服玩家能看到静止 NPC）。</summary>
+    public long SyncedTick;
 }

@@ -29,19 +29,21 @@ public enum AuthorityDecision
 /// 但不该把正常原版客户端判成作弊（否则正常游玩累计若干次即被误踢）。
 /// 作弊语义的拒绝（超速 / 超伤 / 洪水…）必须保持 true。
 /// </param>
+/// <param name="Detail">拒绝细节（量测值 / 阈值），用于服务端诊断输出；不影响判定。</param>
 public sealed record AuthorityResult(
     AuthorityDecision Decision,
     INetworkPacket? Packet,
     Command? Command = null,
     INetworkPacket? CorrectionPacket = null,
     string? Reason = null,
-    bool CountsAsViolation = true)
+    bool CountsAsViolation = true,
+    string? Detail = null)
 {
     public static AuthorityResult Accept(INetworkPacket? packet, Command? command = null)
         => new(AuthorityDecision.Accept, packet, command);
 
-    public static AuthorityResult Reject(string reason, bool countsAsViolation = true)
-        => new(AuthorityDecision.Reject, null, Reason: reason, CountsAsViolation: countsAsViolation);
+    public static AuthorityResult Reject(string reason, bool countsAsViolation = true, string? detail = null)
+        => new(AuthorityDecision.Reject, null, Reason: reason, CountsAsViolation: countsAsViolation, Detail: detail);
 
     public static AuthorityResult RejectSilent()
         => new(AuthorityDecision.RejectSilent, null);

@@ -878,6 +878,215 @@ public class VanillaFeatureTests
         Assert.Equal(0, slime.Life);
     }
 
+    /// <summary>
+    /// NPC 同步（包 23）：**状态变化才发**，未变化且心跳未到时不再重复下发（省带宽），
+    /// 位置变化后立刻下发。生产路径由快照循环按 20Hz 调用，保证客户端看到的移动是连续的。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_NpcSync_SendsOnChange_AndSkipsUnchanged()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        // 首次必然下发（向导 NPC 22）
+        await server.Host.BroadcastNpcUpdatesAsync();
+        var first = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(first, p => p is NpcUpdatePacket { NetId: 22 });
+
+        // 状态未变化 + 心跳（60 tick）未到 → 不重复下发
+        await server.Host.BroadcastNpcUpdatesAsync();
+        var none = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromMilliseconds(400));
+        Assert.DoesNotContain(none, p => p is NpcUpdatePacket);
+
+        // 位置变化 → 立刻下发
+        WorldNpc guide;
+        lock (world.NpcsLock)
+        {
+            guide = world.Npcs.First(n => n.IsTownNpc);
+            guide.X += 1f;
+        }
+
+        await server.Host.BroadcastNpcUpdatesAsync();
+        var moved = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(moved, p => p is NpcUpdatePacket { NetId: 22 });
+    }
+
+    /// <summary>
+    /// NPC 同步（包 23）必须携带原版 <c>ai[0..3]</c>：客户端对未置位的 ai 位会**显式置 0**，
+    /// 依赖 ai 的 aiStyle（如史莱姆的跳跃状态）不下发就会与服务端不一致。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_NpcSync_Carries_Vanilla_Ai_State()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+
+        // 先推进一 tick，让 aiStyle 1 初始化 ai[0..3]（-100 / 1 / 0 / 0）
+        server.Host.Simulator.Tick();
+        await server.Host.BroadcastNpcUpdatesAsync();
+
+        var got = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromSeconds(5));
+        var npc = Assert.Single(got.OfType<NpcUpdatePacket>());
+        Assert.NotNull(npc.Ai);
+        Assert.Equal(4, npc.Ai!.Length);
+    }
+
+    /// <summary>
+    /// 服务端弹幕（<see cref="ProjectileEntity.Owner"/> = -1，如 Boss AI 发射的）必须外发给客户端：
+    /// 此前服务端生成的弹幕从不推送（包 27 只转发客户端上报），其他玩家看不到 Boss 的弹幕。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_ServerProjectile_IsBroadcastToOtherPlayers()
+    {
+        using var server = VanillaServer.Start();
+        await using var alice = await server.ConnectAsync("Alice");
+        await using var bob = await server.ConnectAsync("Bob");
+        var world = server.Host.Simulator.State;
+
+        await StandAtAsync(server, alice, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        var pos = world.Players[1].Position;
+
+        // 服务端弹幕（Owner = -1，如 Boss AI 发射）→ 必须推送给客户端（含未归属的其他人）
+        lock (world.ProjectilesLock)
+        {
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = -7,
+                Owner = -1,
+                Type = 101,
+                Position = new Vector2(pos.X + 40f, pos.Y),
+                Velocity = new Vector2(6f, 0f),
+                Damage = 30,
+                TimeLeft = 60,
+                Active = true,
+                NewNotified = false,
+            });
+        }
+
+        await server.Host.FlushNewProjectilesAsync();
+
+        var got = await bob.ReadUntilAsync(p => p is ProjectileNewPacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p is ProjectileNewPacket { ProjectileType: 101 });
+    }
+
+    /// <summary>
+    /// 魔焰眼（126 / aiStyle 31）状态机：一阶段绕行发射 type 96 魔焰弹；<c>ai[2]</c> 累计到 600 后转冲刺（<c>ai[1] = 2</c>）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_Spazmatism_EmitsFireball_And_EntersCharge()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        var pos = world.Players[1].Position;
+
+        var boss = server.Host.Simulator.SpawnBoss(126, pos.X + 120f, pos.Y - 80f);
+
+        // 一阶段：绕行 60 帧后首枚魔焰弹
+        Assert.True(await TickUntilAsync(server,
+            () => world.Projectiles.Any(p => p.Type == 96), TimeSpan.FromSeconds(10)),
+            "一阶段未发射 type 96 魔焰弹");
+
+        // 绕行计时到 600 帧 → 转冲刺准备（下一 tick 进入 ai[1] = 2）
+        boss.Ai[2] = 599f;
+        Assert.True(await TickUntilAsync(server, () => boss.Ai[1] == 2f, TimeSpan.FromSeconds(5)),
+            "绕行计时期满后未转入冲刺（ai[1] != 2）");
+    }
+
+    /// <summary>
+    /// 蜂后（222 / aiStyle 43）攻击选择：<c>ai[0] = -1</c> 时随机选出下一招（0 / 2 / 3），
+    /// 且与 <c>localAI[0]</c> 记录的上一招不同。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_QueenBee_CyclesAttackChoice()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        var pos = world.Players[1].Position;
+
+        var boss = server.Host.Simulator.SpawnBoss(222, pos.X + 120f, pos.Y - 80f);
+        boss.Ai[0] = -1f;   // 触发攻击选择
+
+        Assert.True(await TickUntilAsync(server,
+            () => boss.Ai[0] is 0f or 2f or 3f, TimeSpan.FromSeconds(5)),
+            "蜂后未从 -1 选出攻击方式");
+    }
+
+    /// <summary>
+    /// 敌对弹幕（服务端发射，Owner = -1）命中玩家 → 服务端结算伤害（原版弹幕行为表：命中判定）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_HostileProjectile_Damages_Player()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        var player = world.Players[1];
+        int hpBefore = player.Hp;
+
+        // 把一枚敌对弹幕（type 96 魔焰弹）直接放在玩家碰撞盒中心
+        lock (world.ProjectilesLock)
+        {
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = -1,
+                Owner = -1,
+                Type = 96,
+                Position = new Vector2(player.Position.X + 10f, player.Position.Y + 21f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 25,
+                TimeLeft = 300,
+                Active = true,
+            });
+        }
+
+        Assert.True(await TickUntilAsync(server, () => player.Hp < hpBefore, TimeSpan.FromSeconds(5)),
+            "敌对弹幕未对玩家造成伤害");
+        Assert.Equal(hpBefore - 25, player.Hp);
+    }
+
+    /// <summary>
+    /// 原版弹幕行为表：登记类型（type 96 魔焰弹）<c>tileCollide = true</c> → 撞到实心图格即失效。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_Projectile_Stops_At_SolidTile()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+
+        ProjectileEntity proj;
+        lock (world.ProjectilesLock)
+        {
+            proj = new ProjectileEntity
+            {
+                Key = -2,
+                Owner = -1,
+                Type = 96,
+                Position = new Vector2(sx * 16f + 8f, (sy - 3) * 16f),
+                Velocity = new Vector2(0f, 8f),   // 朝地面飞
+                Damage = 25,
+                TimeLeft = 3600,
+                Active = true,
+            };
+            world.Projectiles.Add(proj);
+        }
+
+        Assert.True(await TickUntilAsync(server, () => !proj.Active, TimeSpan.FromSeconds(5)),
+            "弹幕未在图格处失效（tileCollide 未生效）");
+    }
+
     // ========================================================================
     // 十一、世界实体的服务端权威模拟（包 21 掉落物 / 包 27·29 弹幕）
     // ========================================================================
@@ -1706,6 +1915,19 @@ public class VanillaFeatureTests
         return slime;
     }
 
+    /// <summary>把敌怪钉在玩家碰撞盒中心（用于「接触伤害 / 免伤帧」用例，排除敌怪 AI 位移干扰）。</summary>
+    private static void PinSlimeToPlayer(WorldState world, WorldNpc slime, PlayerRuntime player)
+    {
+        lock (world.NpcsLock)
+        {
+            slime.X = player.Position.X;
+            slime.Y = player.Position.Y + 21f;
+            slime.VelocityX = 0f;
+            slime.VelocityY = 0f;
+            slime.Grounded = false;   // 钉住后按「悬空」处理，避免被 AI 当成贴地静止而不落体
+        }
+    }
+
     [Fact]
     public async Task Vanilla_EnemyContact_Damages_Player_And_Notifies()
     {
@@ -1736,6 +1958,10 @@ public class VanillaFeatureTests
         Assert.Contains(got, p => p is PlayerHealthPacket { Hp: 93 });
     }
 
+    /// <summary>
+    /// 接触伤害的**免伤帧**（60 tick）。用「每 tick 把敌怪钉在玩家碰撞盒中心」排除 AI 位移干扰
+    /// —— 敌怪现在是跳跃式移动（会起跳离开 32px 接触圈），本用例只验证免伤窗口本身。
+    /// </summary>
     [Fact]
     public async Task Vanilla_ContactDamage_Has_ImmunityWindow()
     {
@@ -1745,17 +1971,27 @@ public class VanillaFeatureTests
         await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
 
         var player = world.Players[1];
-        PlaceSlimeOn(server, player.Position.X, player.Position.Y + 21f);
+        var slime = PlaceSlimeOn(server, player.Position.X, player.Position.Y + 21f);
 
         Assert.True(await TickUntilAsync(server, () => player.Hp == 93, TimeSpan.FromSeconds(5)),
             "首次接触伤害未结算");
 
         // 免伤帧 60 tick：30 tick 内不应再受伤
-        for (int i = 0; i < 30; i++) server.Host.Simulator.Tick();
+        for (int i = 0; i < 30; i++)
+        {
+            PinSlimeToPlayer(world, slime, player);
+            server.Host.Simulator.Tick();
+        }
+
         Assert.Equal(93, player.Hp);
 
         // 超过免伤帧后应再次结算 7 点
-        for (int i = 0; i < 40; i++) server.Host.Simulator.Tick();
+        for (int i = 0; i < 40; i++)
+        {
+            PinSlimeToPlayer(world, slime, player);
+            server.Host.Simulator.Tick();
+        }
+
         Assert.Equal(86, player.Hp);
     }
 

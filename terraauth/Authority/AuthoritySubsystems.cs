@@ -278,6 +278,9 @@ internal sealed class MovementAuthority : IMovementAuthority
     // MaxSpeed 沿用 Terraria 原版量纲（像素/帧，60 FPS），而 dt 单位为秒，需乘帧率换算
     private const float FramesPerSecond = 60f;
 
+    // 「可疑带」倍数：见 Validate 中的说明 —— 匀速度上限 × 该倍数以内一律放行（原版击退 / 挤出方块等合法大位移）。
+    private const float SuspiciousBandMultiplier = 4f;
+
     // 世界尺寸与实体索引上限（与 Main.player[255] / Main.npc[200] / 大型世界一致）
     private const int WorldWidthTiles = 8400;
     private const int WorldHeightTiles = 2400;
@@ -377,12 +380,20 @@ internal sealed class MovementAuthority : IMovementAuthority
             var horizontal = maxSpeed * FramesPerSecond * (float)dt + _limits.TeleportTolerance;
             var vertical = verticalSpeed * FramesPerSecond * (float)dt + _limits.TeleportTolerance;
 
-            if (MathF.Abs(dx) > horizontal || MathF.Abs(dy) > vertical)
+            // 「可疑带」：匀速度上限不是硬边界 —— 原版客户端在**受击击退 / 被挤出方块 / 斜坡校正**
+            // 时会出现短促的大位移（一帧十几到几十像素），这类位移合法但超过匀速上限。
+            // 因此超过上限在 `SuspiciousBandMultiplier` 倍以内一律放行（只记审计），
+            // 只有远超量级的才是真瞬移 → 拒绝。宁可漏判一点，也不要误杀正常玩家
+            // （真机症状：站着不动被史莱姆打一下、或走下台阶就刷 speed_exceeded）。
+            if (MathF.Abs(dx) > horizontal * SuspiciousBandMultiplier ||
+                MathF.Abs(dy) > vertical * SuspiciousBandMultiplier)
             {
                 // 拒绝时保持权威基准不变：瞬移包不得污染服务端位置
+                var detail =
+                    $"dx={dx:F1} dy={dy:F1} 允许=({horizontal:F1},{vertical:F1}) dt={dt:F3}s 上限=({maxSpeed},{verticalSpeed})";
                 _audit.Log(AuditEvent.Now(playerId, "authority", "position_rejected", "speed_exceeded",
                     new { Dx = dx, Dy = dy, AllowedX = horizontal, AllowedY = vertical, MaxSpeed = maxSpeed, Dt = dt }));
-                return AuthorityResult.Reject("speed_exceeded");
+                return AuthorityResult.Reject("speed_exceeded", detail: detail);
             }
 
             state.LastPosition = reported;

@@ -613,6 +613,479 @@ public class WorldGeneratorTests
         Assert.Equal((short)expectedH, info.MaxTilesY);
     }
 
+    /// <summary>
+    /// 城镇 NPC（向导）：按原版 AI_007_TownEntities 的地面运动核心行走 ——
+    /// 速度上限 1f、加速度 0.07f、家附近每 tick 有 1/80 概率掉头（故方向不频繁翻转），
+    /// 且不会跑到离家 25 格之外（原版 leash）。
+    /// </summary>
+    [Fact]
+    public void TownNpc_WalksSmoothly_WithoutPerTickDirectionFlip()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        WorldNpc guide;
+        lock (world.NpcsLock) guide = world.Npcs.Single(n => n.IsTownNpc);
+
+        float homeX = (guide.HomeTileX + 0.5f) * 16f;
+        float leash = 25f * 16f;
+        float startX = guide.X;
+
+        int flips = 0;
+        float lastSign = 0f;
+        for (int i = 0; i < 240; i++)
+        {
+            float before = guide.X;
+            sim.Tick();
+            float delta = guide.X - before;
+
+            Assert.InRange(guide.X, homeX - leash - 1f, homeX + leash + 1f);   // 不离家 25 格以上
+            Assert.True(MathF.Abs(delta) <= 1.1f, $"单 tick 位移异常：{delta}");  // 原版走速上限 1f（+ 加速度）
+
+            if (MathF.Abs(delta) > 0.0001f)
+            {
+                float sign = MathF.Sign(delta);
+                if (lastSign != 0f && sign != lastSign) flips++;
+                lastSign = sign;
+            }
+        }
+
+        Assert.NotEqual(startX, guide.X);   // 确实在走动
+        Assert.True(flips <= 10, $"方向翻转 {flips} 次（原版为「家附近随机掉头」，不应逐 tick 抖动）");
+    }
+
+    /// <summary>
+    /// 向导生成时应**脚底贴地表上沿**。原版约定 <c>position</c> = 碰撞盒左上角、脚底 = <c>position.Y + height</c>，
+    /// 向导碰撞盒为 18×40（原版 <c>NPC.SetDefaults</c>），故 Y = 地表图格上沿 − 40。
+    /// 早期实现按「21 高的盒子」写（且用 (spawnGroundY − 2) × 16），与客户端尺寸不符 → 贴图陷地 + 抖动。
+    /// </summary>
+    [Fact]
+    public void Guide_Spawns_WithFeet_On_Ground()
+    {
+        var world = WorldGenerator.GenerateSmall();
+
+        WorldNpc guide;
+        lock (world.NpcsLock) guide = world.Npcs.Single(n => n.IsTownNpc);
+
+        var (guideW, guideH) = NpcSizes.Of(22);
+        Assert.Equal((18, 40), (guideW, guideH));   // 原版向导尺寸（NPC.SetDefaults type 22）
+
+        float groundTop = world.SpawnTileY * 16f;
+        Assert.Equal(groundTop, guide.Y + guideH, 3);   // 脚底正好压在地表上沿
+    }
+
+    /// <summary>
+    /// 向导在平坦地面上步行走动，不应不停起跳。
+    /// 障碍探测必须看**身体所在行**（支撑行上方），而不是脚下的支撑行 ——
+    /// 早期实现探支撑行，平地上「前方本来就有地面」→ 每 tick 都判成障碍 → 向导一直跳。
+    /// </summary>
+    [Fact]
+    public void Guide_DoesNotJump_OnFlatGround()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        WorldNpc guide;
+        lock (world.NpcsLock) guide = world.Npcs.Single(n => n.IsTownNpc);
+
+        // 出生点周围是被压平的，向导起点 +2 格、走速上限 1px/tick → 120 tick 内仍在平地上
+        int jumps = 0;
+        for (int i = 0; i < 120; i++)
+        {
+            sim.Tick();
+            if (guide.VelocityY < 0f) jumps++;
+        }
+
+        Assert.True(jumps <= 1, $"平地 120 tick 内起跳 {jumps} 次（应为 0）");
+    }
+
+    /// <summary>
+    /// NPC 物理必须用原版常数：<c>gravity = 0.3</c>、<c>maxFallSpeed = 10</c>
+    /// （原版 <c>NPC.UpdateNPC_UpdateGravity</c>）。用别的值（早期为 0.4 / 16）会让服务端的跳跃 /
+    /// 下落弧线与客户端按原版算出的位置持续发散 —— 客户端把 NPC 画在自己算出的位置（`netOffset` 平滑），
+    /// 而**碰撞判定用服务端位置** → 玩家看到「史莱姆没碰到我却在扣血」。
+    /// </summary>
+    [Fact]
+    public void Enemy_Fall_Uses_Vanilla_Gravity_And_TerminalSpeed()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        WorldNpc slime;
+        lock (world.NpcsLock)
+        {
+            slime = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                AiStyle = 1,
+                Active = true,
+                Life = 25,
+                LifeMax = 25,
+                X = world.SpawnTileX * 16f,
+                Y = 4 * 16f,        // 高空：60 tick 内不会落地
+                VelocityX = 0f,
+                VelocityY = 0f,
+            };
+            world.Npcs.Add(slime);
+        }
+
+        sim.Tick();
+        Assert.Equal(0.3f, slime.VelocityY, 4);   // 每 tick 加 0.3（原版 NPC 重力）
+
+        for (int i = 0; i < 60; i++) sim.Tick();
+        Assert.Equal(10f, slime.VelocityY, 4);    // 终端速度 10（原版 maxFallSpeed）
+    }
+
+    /// <summary>
+    /// 接触伤害要求明显重叠（≥8px，见 <c>WorldSimulator.ContactMinOverlap</c>）：
+    /// 史莱姆**擦着走**（水平只重叠 2~4px）不得判定为接触 —— 真机日志实测的「没碰到却在扣血」；
+    /// 而真正走进玩家身上（重叠十几像素）必须结算。
+    /// </summary>
+    [Fact]
+    public void ContactDamage_Requires_MinOverlap()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        float groundTop = world.SpawnTileY * 16f;
+        float px = world.SpawnTileX * 16f + 8f;
+        float py = groundTop - NpcSizes.PlayerHeight;          // 玩家站姿：脚底贴地表上沿
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(px, py),
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        WorldNpc slime;
+        lock (world.NpcsLock)
+        {
+            slime = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                AiStyle = 1,
+                Active = true,
+                Life = 25,
+                LifeMax = 25,
+                X = px + 16f,          // 水平重叠 = 玩家宽 20 − 16 = 4px（真机日志里的「擦着走」）
+                Y = py + 10f,          // 垂直完全落在玩家盒内（重叠 18px）
+            };
+            world.Npcs.Add(slime);
+        }
+
+        // 钉住「擦着走」的位置与速度：4px 重叠不应扣血
+        for (int i = 0; i < 5; i++)
+        {
+            lock (world.NpcsLock)
+            {
+                slime.X = px + 16f;
+                slime.Y = py + 10f;
+                slime.VelocityX = 0f;
+                slime.VelocityY = 0f;
+            }
+            sim.Tick();
+        }
+        Assert.Equal(100, player.Hp);
+
+        // 压深到 16px 水平重叠（= 真正走进玩家身上）→ 必须结算
+        bool damaged = false;
+        for (int i = 0; i < 10 && !damaged; i++)
+        {
+            lock (world.NpcsLock)
+            {
+                slime.X = px + 4f;
+                slime.Y = py + 10f;
+                slime.VelocityX = 0f;
+                slime.VelocityY = 0f;
+            }
+            sim.Tick();
+            damaged = player.Hp < 100;
+        }
+        Assert.True(damaged, "16px 重叠（走进玩家身上）未被结算");
+    }
+
+    /// <summary>
+    /// NPC 水平阻挡：前方是实心格时必须停下，不得"穿墙"。
+    /// 早期物理只做垂直落地、水平完全不阻挡 → 服务端 NPC 会穿过地形直线前进，
+    /// 而客户端有完整碰撞 → 两边位置持续发散（表现为「史莱姆一直朝某个方向走」「看着离得很远却在掉血」）。
+    /// </summary>
+    [Fact]
+    public void Enemy_Stops_At_Wall()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        int groundRow = world.SpawnTileY;
+        int wallCol = world.SpawnTileX + 3;
+
+        // 造一根 5 格高的土墙（把该列地表以上填实）
+        for (int y = groundRow - 4; y < groundRow; y++)
+        {
+            ref var tile = ref world.Tiles[wallCol, y];
+            tile.Active = true;
+            tile.Type = 0;   // Dirt
+        }
+
+        var (w, h) = NpcSizes.Of(1);
+        WorldNpc slime;
+        lock (world.NpcsLock)
+        {
+            slime = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                AiStyle = 1,
+                Active = true,
+                Life = 25,
+                LifeMax = 25,
+                X = wallCol * 16f - w - 4f,     // 右边缘距墙 4px
+                Y = groundRow * 16f - h,        // 脚底贴地表
+                VelocityX = 3f,                 // 朝右冲
+            };
+            world.Npcs.Add(slime);
+        }
+
+        for (int i = 0; i < 20; i++) sim.Tick();
+
+        Assert.True(slime.X + w <= wallCol * 16f + 0.5f,
+            $"史莱姆穿过了墙：右边缘 {slime.X + w} > 墙左边界 {wallCol * 16f}");
+    }
+
+    /// <summary>
+    /// 客户端上报的包 117 必须与接触伤害共用免伤帧（原版 <c>Player.immune</c> 也是跨来源统一窗口）：
+    /// 否则同一次接触会被服务端判定与客户端上报各记一次 → 双倍伤害
+    /// （真机日志实测：contact_damage 与 client_reported 交替出现，每秒扣 7+7）。
+    /// </summary>
+    [Fact]
+    public void ClientReportedDamage_Respects_ImmunityWindow()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime { Id = 1, Active = true, Hp = 100, HpMax = 100 };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new DamagePlayerCommand(1, 1, 10).Apply(world, rng).Applied);
+        Assert.Equal(90, player.Hp);
+
+        // 免伤帧内再来一次 → 拒绝，不扣血
+        Assert.False(new DamagePlayerCommand(2, 1, 10).Apply(world, rng).Applied);
+        Assert.Equal(90, player.Hp);
+    }
+
+    /// <summary>
+    /// 原版客户端**只在操作变化时**发位置包（`Player.cs` 中 `SendData(13)` 的触发条件就是控制位变化），
+    /// 原版服务端会按同步来的操作继续模拟玩家移动；TerraAuth 不做玩家操作模拟，
+    /// 因此必须按观测速度外推「游戏判定用」的位置（<see cref="PlayerRuntime.AimPosition"/>）——
+    /// 否则 NPC 会去追玩家早已离开的坐标，表现为「看着没被碰到却在扣血」。
+    /// </summary>
+    [Fact]
+    public void PlayerAimPosition_Extrapolates_Between_PositionPackets()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(1000f, 1000f),
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        // 第一包：只建立基准，不产生观测速度
+        world.Tick = 100;
+        new MoveCommand(100, 1, new Vector2(1000f, 1000f)) { Moving = true }.Apply(world, rng);
+        Assert.Equal(0f, player.ObservedSpeedX, 4);
+
+        // 第二包：20 tick 走了 60px（按住方向键）→ 观测速度 3px/tick
+        world.Tick = 120;
+        new MoveCommand(120, 1, new Vector2(1060f, 1000f)) { Moving = true }.Apply(world, rng);
+        Assert.Equal(3f, player.ObservedSpeedX, 4);
+
+        // 之后 10 tick 没有新包 → 判定位置外推到 1060 + 3×10
+        Assert.Equal(1090f, player.Extrapolate(130).X, 1);
+
+        // 松开方向键的那一包（Moving = false）→ 立刻停止外推
+        world.Tick = 131;
+        new MoveCommand(131, 1, new Vector2(1060f, 1000f)).Apply(world, rng);
+        Assert.Equal(0f, player.ObservedSpeedX, 4);
+        Assert.Equal(1060f, player.Extrapolate(131).X, 1);
+    }
+
+    /// <summary>
+    /// 站在地面上的玩家不得累积下落距离，更不得被结算下落伤害（真机症状：站着莫名掉血）。
+    /// 原版玩家碰撞盒为 20×42、<c>position</c> 为左上角 → 脚底 = <c>Position.Y + 42</c>；
+    /// 早期实现把 21（半高）当成**全高**判脚底，永远检测不到落地 → <c>FallDistance</c> 持续累积，
+    /// 而客户端每次位置包都会把 Velocity 清零（被当成「刚落地」）→ 凭空结算下落伤害。
+    /// </summary>
+    [Fact]
+    public void StandingPlayer_DoesNotAccumulate_FallDistance()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        float groundTop = world.SpawnTileY * 16f;
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(world.SpawnTileX * 16f + 8f, groundTop - NpcSizes.PlayerHeight),
+            };
+
+        for (int i = 0; i < 120; i++) sim.Tick();
+
+        var player = world.Players[1];
+        Assert.Equal(100, player.Hp);                                          // 没有被凭空扣血
+        Assert.Equal(0f, player.FallDistance);                                 // 没有累积下落距离
+        Assert.Equal(groundTop - NpcSizes.PlayerHeight, player.Position.Y, 3); // 站稳（脚下沉 21px 的旧行为会失败）
+    }
+
+    /// <summary>
+    /// 贴地 NPC 落地时**不得清零水平速度**（原版地面摩擦由各 aiStyle 自己处理：史莱姆 <c>×= 0.8</c>）。
+    /// 早期实现每 tick 清零 → 贴地 NPC 永远加不起速度，客户端按自己的 AI 跑到前面、再被服务端位置拉回 = 抖动。
+    /// </summary>
+    [Fact]
+    public void GroundedEnemy_Keeps_Horizontal_Velocity()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        var (_, slimeH) = NpcSizes.Of(1);
+        float groundTop = world.SpawnTileY * 16f;
+
+        WorldNpc slime;
+        lock (world.NpcsLock)
+        {
+            slime = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                AiStyle = 1,
+                Active = true,
+                Life = 25,
+                LifeMax = 25,
+                X = (world.SpawnTileX + 6) * 16f,
+                Y = groundTop - slimeH,
+                VelocityX = 1.5f,
+            };
+            world.Npcs.Add(slime);
+        }
+
+        float x0 = slime.X;
+        for (int i = 0; i < 3; i++) sim.Tick();
+
+        // 三 tick 内应保持水平位移（1.5 + 1.2 + 0.96）；若落地被清零则只会移动一 tick（1.5）
+        Assert.True(slime.X - x0 > 2.5f, $"贴地 NPC 水平速度被清零（3 tick 位移仅 {slime.X - x0}）");
+    }
+
+    /// <summary>
+    /// 失效实体回收：弹幕到期失效后，在「销毁包已下发」（<c>RemovalNotified</c>）后必须从世界列表移除，
+    /// 否则列表只增不减，长跑下每 tick 遍历与快照过滤会持续变慢。
+    /// </summary>
+    [Fact]
+    public void Expired_Projectiles_Are_Reclaimed_After_Removal_Notified()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 5,
+                Owner = 1,
+                Type = 1,
+                Position = new Vector2(100f, 100f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 1,
+                TimeLeft = 1,
+                Active = true,
+            });
+
+        // 到期 → 失效（此时销毁包尚未下发，必须保留）
+        sim.Tick();
+        lock (world.ProjectilesLock)
+            Assert.Contains(world.Projectiles, p => p.Key == 5 && !p.Active);
+
+        // 世界同步下发销毁包后置位 → 下一 tick 回收
+        lock (world.ProjectilesLock)
+            foreach (var p in world.Projectiles) p.RemovalNotified = true;
+
+        sim.Tick();
+        lock (world.ProjectilesLock)
+            Assert.DoesNotContain(world.Projectiles, p => p.Key == 5);
+    }
+
+    /// <summary>
+    /// 敌怪为**跳跃式移动**：落地后有静止等待期，起跳时 <c>VelocityY &lt; 0</c>（向上）。
+    /// 早期实现是「贴地每 tick 水平滑行 1px」，VelocityY 永不为负 —— 本用例钉住该差异。
+    /// </summary>
+    [Fact]
+    public void Enemy_Hops_WithGroundedWait_InsteadOfGroundGliding()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        // 放一名玩家（敌怪以最近玩家为水平目标）；贴地放置，避免先经历长距离落体
+        float px = (world.SpawnTileX + 12) * 16f;
+        float py = world.SpawnTileY * 16f - 8f;
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(px, py) };
+
+        WorldNpc slime;
+        lock (world.NpcsLock)
+        {
+            slime = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                Active = true,
+                Life = 25,
+                LifeMax = 25,
+                X = px - 64f,
+                Y = py,
+            };
+            world.Npcs.Add(slime);
+        }
+
+        bool jumped = false;
+        int stillRun = 0, maxStillRun = 0;
+        float lastX = slime.X;
+
+        for (int i = 0; i < 300; i++)
+        {
+            sim.Tick();
+
+            if (slime.VelocityY < 0f) jumped = true;
+
+            // 地面静止等待：竖直速度为 0 且本 tick 水平未移动
+            if (slime.VelocityY == 0f && slime.X == lastX)
+            {
+                stillRun++;
+                maxStillRun = Math.Max(maxStillRun, stillRun);
+            }
+            else
+            {
+                stillRun = 0;
+            }
+
+            lastX = slime.X;
+        }
+
+        Assert.True(jumped, "史莱姆从未起跳（VelocityY 始终 >= 0，说明仍是贴地滑行）");
+        Assert.True(maxStillRun >= 2, $"缺少地面静止等待期（最长连续仅 {maxStillRun} tick）");
+    }
+
     [Fact]
     public void Generate_Produces_Layered_Terrain_With_Ores_Caves_Ocean_And_Chests()
     {

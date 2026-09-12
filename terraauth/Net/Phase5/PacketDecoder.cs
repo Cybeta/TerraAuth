@@ -133,9 +133,16 @@ public sealed class PacketDecoder : IPacketDecoder
         var bitsA = r.ReadByte();
         var bitsB = r.ReadByte();
 
+        // ai[0..3]：按 bitsA bit2..5 的存在位读取；未置位视为 0（与原版客户端读取侧一致）
+        var ai = new float[4];
+        var hasAi = false;
         for (var i = 0; i < 4; i++)
         {
-            if ((bitsA & (1 << (i + 2))) != 0) r.ReadSingle(); // 各 ai 存在时才写入
+            if ((bitsA & (1 << (i + 2))) != 0)
+            {
+                ai[i] = r.ReadSingle();
+                hasAi = true;
+            }
         }
 
         var netId = r.ReadInt16();
@@ -147,7 +154,10 @@ public sealed class PacketDecoder : IPacketDecoder
             _ = r.ReadByte() switch { 2 => (int)r.ReadInt16(), 4 => r.ReadInt32(), _ => (int)r.ReadSByte() };
         }
 
-        return new NpcUpdatePacket(index, generation, position, velocity, target, netId);
+        return new NpcUpdatePacket(index, generation, position, velocity, target, netId)
+        {
+            Ai = hasAi ? ai : null,
+        };
     }
 
     /// <summary>

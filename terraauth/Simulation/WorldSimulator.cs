@@ -56,12 +56,15 @@ public partial class WorldSimulator : IWorldViewProvider
     {
         int life = BossLife.TryGetValue(npcType, out var hp) ? hp : 1000;
 
+        // 调用方给的是「希望 Boss 出现的位置」→ 换算成原版口径的碰撞盒左上角（X/Y = 左上角，脚底 = Y + height）
+        var (width, height) = NpcSizes.Of(npcType);
+
         var boss = new WorldNpc
         {
             Type = npcType,
             NetId = (short)npcType,
-            X = x,
-            Y = y,
+            X = x - width / 2f,
+            Y = y - height / 2f,
             IsTownNpc = false,
             IsBoss = true,
             Life = life,
@@ -191,12 +194,30 @@ public partial class WorldSimulator : IWorldViewProvider
 
     /// <summary>图格边长（像素）。</summary>
     private const float TileSize = 16f;
-    /// <summary>重力加速度（像素 / tick²）。</summary>
+    /// <summary>掉落物重力加速度（像素 / tick²）。</summary>
     private const float Gravity = 0.4f;
     /// <summary>终端下落速度（像素 / tick）。</summary>
     private const float MaxFallSpeed = 16f;
-    /// <summary>玩家碰撞盒半高（原版 42px）。</summary>
-    private const float PlayerHalfHeight = 21f;
+
+    /// <summary>玩家重力（像素 / tick²）。原版玩家 Y 由客户端上报，此处仅用于包间积分与落地判定。</summary>
+    private const float PlayerGravity = 0.4f;
+
+    /// <summary>玩家终端下落速度（原版 <c>Player.maxFallSpeed = 10</c>）。</summary>
+    private const float PlayerMaxFallSpeed = 10f;
+
+    /// <summary>
+    /// NPC 重力 / 终端下落速度：原版 <c>NPC.UpdateNPC_UpdateGravity</c> 的默认值
+    /// （<c>gravity = 0.3</c>、<c>maxFallSpeed = 10</c>；少数类型有覆盖，我们模拟的这些都没有）。
+    /// **必须与原版一致** —— 客户端会按原版值自行推进 NPC，服务端用别的值会让双方位置持续发散：
+    /// 客户端把 NPC 画在自己算出的位置（`netOffset` 平滑），而**碰撞判定用的是服务端位置**，
+    /// 于是出现「史莱姆没碰到我却在扣血」。
+    /// </summary>
+    private const float NpcGravity = 0.3f;
+    private const float NpcMaxFallSpeed = 10f;
+    /// <summary>玩家碰撞盒半高（原版 42px 的一半）：用于取玩家碰撞盒**中心**（<c>Position.Y + 21</c>）。</summary>
+    private const float PlayerHalfHeight = NpcSizes.PlayerHeight / 2f;
+    /// <summary>玩家碰撞盒高度（原版 42px）。原版约定 <c>Position</c> 为碰撞盒左上角 → 脚底 = <c>Position.Y + 42</c>。</summary>
+    private const float PlayerHeight = NpcSizes.PlayerHeight;
     /// <summary>超过该下落距离才结算下落伤害（像素）。</summary>
     private const float FallDamageThreshold = 25f * TileSize;
     /// <summary>一个白天的时间单位数（原版 15 分钟 @ 60Hz）。</summary>
@@ -261,6 +282,12 @@ public partial class WorldSimulator : IWorldViewProvider
                 }
                 item.Position = next;
             }
+
+            // 回收：已失效且销毁包已下发（或超过兜底宽限）的掉落物从列表移除，
+            // 否则列表只增不减，长跑下每 tick 遍历与快照过滤都会越来越慢。
+            // 「不在失效的同一 tick 移除」——留一 tick 让观察方（世界同步 / 事件 / 测试）看到失效态。
+            _world.Items.RemoveAll(item => !item.Active && _world.Tick > item.DeadTick
+                && (item.RemovalNotified || _world.Tick - item.DeadTick > EntityRemovalGraceTicks));
         }
 
         lock (_world.ProjectilesLock)
@@ -269,11 +296,22 @@ public partial class WorldSimulator : IWorldViewProvider
             {
                 if (!p.Active) continue;
 
-                p.Position = new Vector2(p.Position.X + p.Velocity.X, p.Position.Y + p.Velocity.Y);
+                // 原版字段驱动的行为（图格碰撞 / 重力 / extraUpdates / 生存期钳制）：
+                // 仅登记过的类型（服务端发射的 Boss 弹幕）生效，其余保持简化直线积分。
+                var behavior = ProjectileBehaviorOf(p.Type);
+                if (behavior.MaxLifetime > 0 && p.TimeLeft > behavior.MaxLifetime)
+                    p.TimeLeft = behavior.MaxLifetime;
 
-                // 命中判定（服务端权威）：弹幕与敌怪距离在命中半径内 → 结算伤害并销毁弹幕。
-                // 客户端上报的命中不再被信任；服务端自行判定，避免"空气命中"与免伤。
-                var hit = FindHitEnemy(p);
+                if (StepProjectile(p, in behavior))
+                {
+                    p.Active = false;
+                    p.DeadTick = _world.Tick; // 撞图格 / 出界 → 由世界同步补发包 29
+                    continue;
+                }
+
+                // 命中判定（服务端权威）：仅**玩家弹幕**结算敌怪伤害；敌对弹幕（Owner = -1）
+                // 打玩家，见 SimulateCombat。
+                var hit = p.Owner >= 0 ? FindHitEnemy(p) : null;
                 if (hit is not null)
                 {
                     int damage = Math.Max(1, p.Damage);
@@ -297,11 +335,18 @@ public partial class WorldSimulator : IWorldViewProvider
                     p.DeadTick = _world.Tick; // 由世界同步补发包 29（客户端掉线时也能清理）
                 }
             }
+
+            // 回收：同掉落物 —— 销毁包下发成功后移除，避免弹幕列表只增不减。
+            _world.Projectiles.RemoveAll(p => !p.Active && _world.Tick > p.DeadTick
+                && (p.RemovalNotified || _world.Tick - p.DeadTick > EntityRemovalGraceTicks));
         }
     }
 
-    /// <summary>命中半径（像素）：弹幕中心与敌怪中心距离小于该值即判定命中。</summary>
-    private const float ProjectileHitRadius = 32f;
+    /// <summary>
+    /// 已失效掉落物 / 弹幕的回收宽限（tick）：销毁包下发成功（<c>RemovalNotified</c>）即可移除；
+    /// 若下发持续失败（无连接 / 瞬时错误），最多保留该时长作为兜底，避免客户端留下幽灵实体。
+    /// </summary>
+    private const long EntityRemovalGraceTicks = 600;   // 10s @60Hz
 
     /// <summary>每 tick 处理的液体格数上限（限制大范围流动对 tick 的占用）。</summary>
     private const int MaxLiquidStepsPerTick = 2000;
@@ -486,32 +531,43 @@ public partial class WorldSimulator : IWorldViewProvider
     private static bool IsLiquidBlocking(in Tile tile)
         => tile.Active && TileIdSets.IsTileSolid(tile.Type) && !tile.InActive;
 
-    /// <summary>查找被弹幕命中的存活敌怪（不含城镇 NPC）。</summary>
+    /// <summary>
+    /// 查找被弹幕命中的存活敌怪（不含城镇 NPC）：弹幕碰撞盒与 NPC 碰撞盒（原版逐类型尺寸）求交。
+    /// </summary>
     private WorldNpc? FindHitEnemy(ProjectileEntity p)
     {
-        float radiusSq = ProjectileHitRadius * ProjectileHitRadius;
         lock (_world.NpcsLock)
         {
             foreach (var npc in _world.Npcs)
             {
                 if (!npc.Active || npc.IsTownNpc) continue;
-                float dx = npc.X - p.Position.X;
-                float dy = npc.Y - p.Position.Y;
-                if (dx * dx + dy * dy <= radiusSq) return npc;
+
+                var (width, height) = NpcSizes.Of(npc.Type);
+                if (BoxesOverlap(p.Position.X, p.Position.Y, ProjectileHitBoxSize, ProjectileHitBoxSize,
+                                 npc.X, npc.Y, width, height))
+                    return npc;
             }
         }
         return null;
     }
 
-    /// <summary>
-    /// 阶段 2：AI。城镇 NPC 在住所附近确定性游走；敌怪朝最近玩家水平移动并受重力。
-    /// 刷怪与 AI 全部走 <see cref="_rng"/>，保持确定性。
-    /// </summary>
+    /// <summary>弹幕命中判定用的碰撞盒边长（像素）：原版弹幕宽度多为 6~16，统一取 16 作为宽容近似。</summary>
+    private const int ProjectileHitBoxSize = 16;
+
+    /// <summary>AI 执行期间产生的刷怪请求（遍历结束后统一入队，避免遍历中修改集合）。</summary>
+    private readonly List<WorldNpc> _pendingNpcSpawns = new();
+
+    /// <summary>AI 执行期间产生的弹幕请求（遍历结束后统一入队，避免遍历中修改集合）。</summary>
+    private readonly List<ProjectileEntity> _pendingProjectiles = new();
+
+    /// <summary>阶段 2：AI。城镇 NPC 在住所附近平滑游走；敌怪朝最近玩家水平移动并受重力。</summary>
     private void SimulateAi()
     {
-        // 每 4 tick 决策一次：降低随机消耗，同时保持移动平滑
-        if ((_world.Tick & 3) != 0)
-            return;
+        // 刷新「游戏判定用」的玩家位置（按观测速度外推，见 PlayerRuntime.AimPosition）：
+        // NPC 追击 / 接触判定都读它 —— 原版服务端会自己按同步来的操作继续模拟玩家，
+        // 我们不做操作模拟，只能外推，否则 NPC 会去追玩家早已离开的位置。
+        foreach (var p in _world.Players.Values)
+            p.AimPosition = p.Extrapolate(_world.Tick);
 
         lock (_world.NpcsLock)
         {
@@ -523,24 +579,31 @@ public partial class WorldSimulator : IWorldViewProvider
                     !n.IsTownNpc && !n.Active && _world.Tick - n.DeadTick > EnemyRemovalDelayTicks);
             }
 
+            _pendingNpcSpawns.Clear();
+            _pendingProjectiles.Clear();
+
             foreach (var npc in _world.Npcs)
             {
                 if (!npc.Active) continue;
 
-                if (npc.IsTownNpc)
-                {
-                    // 城镇 NPC：夹在住所中心 ±4 格内确定性游走
-                    float direction = (_rng.NextUInt32() & 1) == 0 ? -1f : 1f;
-                    float step = 0.5f + (float)_rng.NextDouble() * 0.5f;
-                    float homeX = (npc.HomeTileX + 0.5f) * TileSize;
-                    npc.X = Math.Clamp(npc.X + direction * step, homeX - 4f * TileSize, homeX + 4f * TileSize);
-                    continue;
-                }
+                // 全部 NPC（含城镇 NPC）统一走 aiStyle 分派 + 共用物理步；
+                // Boss 例外：仍为自移动的简化追击（见 RunNpcAi）
+                RunNpcAi(npc);
+            }
 
-                if (npc.IsBoss)
-                    SimulateBossStep(npc);
-                else
-                    SimulateEnemyStep(npc);
+            // AI 期间产生的刷怪 / 弹幕请求在遍历结束后入队，避免遍历中修改集合
+            if (_pendingNpcSpawns.Count > 0)
+            {
+                _world.Npcs.AddRange(_pendingNpcSpawns);
+                _pendingNpcSpawns.Clear();
+            }
+
+            if (_pendingProjectiles.Count > 0)
+            {
+                lock (_world.ProjectilesLock)
+                    _world.Projectiles.AddRange(_pendingProjectiles);
+
+                _pendingProjectiles.Clear();
             }
         }
     }
@@ -556,8 +619,8 @@ public partial class WorldSimulator : IWorldViewProvider
             return;
         }
 
-        float dx = target.Position.X - npc.X;
-        float dy = target.Position.Y - npc.Y;
+        float dx = target.AimPosition.X - npc.X;
+        float dy = target.AimPosition.Y - npc.Y;
         float len = MathF.Sqrt(dx * dx + dy * dy);
         if (len > 1f)
         {
@@ -605,7 +668,7 @@ public partial class WorldSimulator : IWorldViewProvider
             var bossTarget = PickPlayer();
             if (bossTarget is not null)
             {
-                SpawnBoss(EyeOfCthulhuType, bossTarget.Position.X, bossTarget.Position.Y - 8f * TileSize);
+                SpawnBoss(EyeOfCthulhuType, bossTarget.AimPosition.X, bossTarget.AimPosition.Y - 8f * TileSize);
                 return;
             }
         }
@@ -618,7 +681,7 @@ public partial class WorldSimulator : IWorldViewProvider
         var target = PickPlayer();
         if (target is null) return;
 
-        int spawnTileX = (int)(target.Position.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
+        int spawnTileX = (int)(target.AimPosition.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
         if (spawnTileX < 1 || spawnTileX >= _world.MaxTilesX - 1) return;
 
         // 自上而下找第一个实心格作为落脚点
@@ -627,12 +690,14 @@ public partial class WorldSimulator : IWorldViewProvider
             ref var tile = ref _world.Tiles[spawnTileX, y];
             if (!tile.Active || !TileIdSets.IsTileSolid(tile.Type)) continue;
 
+            var (slimeW, slimeH) = NpcSizes.Of(BlueSlimeType);
             _world.Npcs.Add(new WorldNpc
             {
                 Type = BlueSlimeType,
                 NetId = BlueSlimeType,
-                X = (spawnTileX + 0.5f) * TileSize,
-                Y = (y - 1) * TileSize,
+                AiStyle = 1,            // 原版 aiStyle 1（Slimes）
+                X = (spawnTileX + 0.5f) * TileSize - slimeW / 2f,   // 原版：X/Y = 碰撞盒左上角
+                Y = y * TileSize - slimeH,                          // 脚底贴地表上沿（脚底 = Y + height）
                 IsTownNpc = false,
                 Life = BlueSlimeLife,
                 LifeMax = BlueSlimeLife,
@@ -649,7 +714,7 @@ public partial class WorldSimulator : IWorldViewProvider
         var target = PickPlayer();
         if (target is null) return false;
 
-        int spawnTileX = (int)(target.Position.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
+        int spawnTileX = (int)(target.AimPosition.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
         if (spawnTileX < 1 || spawnTileX >= _world.MaxTilesX - 1) return false;
 
         for (int y = 1; y < _world.MaxTilesY - 1; y++)
@@ -657,12 +722,14 @@ public partial class WorldSimulator : IWorldViewProvider
             ref var tile = ref _world.Tiles[spawnTileX, y];
             if (!tile.Active || !TileIdSets.IsTileSolid(tile.Type)) continue;
 
+            var (goblinW, goblinH) = NpcSizes.Of(GoblinPeonType);
             _world.Npcs.Add(new WorldNpc
             {
                 Type = GoblinPeonType,
                 NetId = GoblinPeonType,
-                X = (spawnTileX + 0.5f) * TileSize,
-                Y = (y - 1) * TileSize,
+                AiStyle = 3,            // 原版 aiStyle 3（Fighters）
+                X = (spawnTileX + 0.5f) * TileSize - goblinW / 2f,   // 原版：X/Y = 碰撞盒左上角
+                Y = y * TileSize - goblinH,                          // 脚底贴地表上沿
                 IsTownNpc = false,
                 Life = GoblinPeonLife,
                 LifeMax = GoblinPeonLife,
@@ -681,32 +748,6 @@ public partial class WorldSimulator : IWorldViewProvider
         return false;
     }
 
-    /// <summary>敌怪一帧：朝最近玩家水平移动 + 重力 + 图格落地。</summary>
-    private void SimulateEnemyStep(WorldNpc npc)
-    {
-        var target = NearestPlayer(npc.X, npc.Y);
-        npc.VelocityX = target is null ? 0f : MathF.Sign(target.Position.X - npc.X);
-        npc.VelocityY = Math.Min(npc.VelocityY + Gravity, MaxFallSpeed);
-
-        var nextX = npc.X + npc.VelocityX;
-        var nextY = npc.Y + npc.VelocityY;
-
-        int tileX = (int)(nextX / TileSize);
-        int tileY = (int)((nextY + PlayerHalfHeight) / TileSize);
-        if (tileX >= 0 && tileX < _world.Tiles.Width && tileY >= 0 && tileY < _world.Tiles.Height)
-        {
-            ref var tile = ref _world.Tiles[tileX, tileY];
-            if (tile.Active && TileIdSets.IsTileSolid(tile.Type))
-            {
-                nextY = tileY * TileSize - PlayerHalfHeight;
-                npc.VelocityY = 0f;
-            }
-        }
-
-        npc.X = nextX;
-        npc.Y = nextY;
-    }
-
     /// <summary>距 (x, y) 最近的在线玩家；无在线玩家时返回 <c>null</c>。</summary>
     private PlayerRuntime? NearestPlayer(float x, float y)
     {
@@ -715,8 +756,8 @@ public partial class WorldSimulator : IWorldViewProvider
         foreach (var p in _world.Players.Values)
         {
             if (!p.Active || p.Dead) continue;
-            var dx = p.Position.X - x;
-            var dy = p.Position.Y - y;
+            var dx = p.AimPosition.X - x;
+            var dy = p.AimPosition.Y - y;
             var d = dx * dx + dy * dy;
             if (d < bestSq)
             {
@@ -735,10 +776,10 @@ public partial class WorldSimulator : IWorldViewProvider
             if (!player.Active || player.Dead)
                 continue;
 
-            // 重力积分（终端速度封顶）
+            // 重力积分（终端速度封顶；原版玩家 maxFallSpeed = 10）
             player.Velocity = new Vector2(
                 player.Velocity.X,
-                Math.Min(player.Velocity.Y + Gravity, MaxFallSpeed));
+                Math.Min(player.Velocity.Y + PlayerGravity, PlayerMaxFallSpeed));
 
             var next = new Vector2(
                 player.Position.X + player.Velocity.X,
@@ -748,21 +789,19 @@ public partial class WorldSimulator : IWorldViewProvider
             if (_world.MaxTilesX > 1)
                 next = new Vector2(Math.Clamp(next.X, TileSize, (_world.MaxTilesX - 1) * TileSize), next.Y);
 
-            // 垂直碰撞：检测脚底图格是否实心
-            int tileX = (int)(next.X / TileSize);
-            int tileY = (int)((next.Y + PlayerHalfHeight) / TileSize);
+            // 垂直碰撞：脚底图格是否实心（原版：脚底 = Position.Y + 碰撞盒高度 42）。
+            // 玩家碰撞盒宽 20，站立时可能跨两列；只探左列会在「站在台阶边缘 / 地形拐角」时漏判落地，
+            // 进而让 FallDistance 一直累积 → 站/走在平地上也会被结算下落伤害。
+            int leftX = (int)(next.X / TileSize);
+            int rightX = (int)((next.X + NpcSizes.PlayerWidth - 1) / TileSize);
+            int tileY = (int)((next.Y + PlayerHeight) / TileSize);
             bool landed = false;
 
-            if (tileX >= 0 && tileX < _world.Tiles.Width &&
-                tileY >= 0 && tileY < _world.Tiles.Height)
+            if (NpcTileSolid(leftX, tileY) || NpcTileSolid(rightX, tileY))
             {
-                ref var tile = ref _world.Tiles[tileX, tileY];
-                if (tile.Active && TileIdSets.IsTileSolid(tile.Type))
-                {
-                    landed = true;
-                    next = new Vector2(next.X, tileY * TileSize - PlayerHalfHeight); // 脚底贴合图格上沿
-                    player.Velocity = new Vector2(player.Velocity.X, 0f);
-                }
+                landed = true;
+                next = new Vector2(next.X, tileY * TileSize - PlayerHeight); // 脚底贴合图格上沿
+                player.Velocity = new Vector2(player.Velocity.X, 0f);
             }
 
             // 未落地时累计下落距离（供战斗阶段结算下落伤害）
@@ -773,11 +812,8 @@ public partial class WorldSimulator : IWorldViewProvider
         }
     }
 
-    /// <summary>接触半径（像素）：玩家碰撞盒中心与敌怪中心距离小于该值即判定接触。</summary>
-    private const float ContactRadius = 32f;
-
-    /// <summary>玩家受击后的免伤帧（tick，60 ≈ 1 秒）。</summary>
-    private const int HurtImmunityTicks = 60;
+    /// <summary>玩家受击后的免伤帧（tick，60 ≈ 1 秒；与 <see cref="DamagePlayerCommand"/> 共用同一窗口）。</summary>
+    private const int HurtImmunityTicks = PlayerRuntime.HurtImmunityTicks;
 
     /// <summary>
     /// 阶段 4：战斗结算（服务端权威）。下落伤害 + 敌怪 / Boss 接触伤害。
@@ -797,7 +833,10 @@ public partial class WorldSimulator : IWorldViewProvider
                 {
                     int damage = (int)((player.FallDistance - FallDamageThreshold) / TileSize);
                     if (damage > 0)
+                    {
                         ApplyPlayerDamage(player, damage, "fall_damage");
+                        LogPlayerDamage(player, damage, "fall_damage", $"下落距离={player.FallDistance:F0}");
+                    }
                 }
 
                 player.FallDistance = 0f;
@@ -812,11 +851,31 @@ public partial class WorldSimulator : IWorldViewProvider
                 continue;
             }
 
-            int contact = FindContactDamage(player);
+            int contact = FindContactDamage(player, out var contactNpc);
             if (contact > 0)
+            {
                 ApplyPlayerDamage(player, contact, "contact_damage");
+                LogPlayerDamage(player, contact, "contact_damage",
+                    $"NPC {contactNpc!.Type}@{contactNpc.X:F0},{contactNpc.Y:F0} " +
+                    $"玩家判定={player.AimPosition.X:F0},{player.AimPosition.Y:F0}（上报={player.Position.X:F0},{player.Position.Y:F0}）");
+                continue;
+            }
+
+            // 4.3 敌对弹幕伤害（Boss 弹幕）：同样受免伤帧约束
+            int projectile = FindHostileProjectileDamage(player);
+            if (projectile > 0)
+                ApplyPlayerDamage(player, projectile, "projectile_damage");
         }
     }
+
+    /// <summary>诊断输出：玩家受伤来源（含接触方位置），用于定位「没碰到却掉血」。</summary>
+    private void LogPlayerDamage(PlayerRuntime player, int damage, string kind, string detail)
+    {
+        if (Interlocked.Increment(ref _damageLogCount) > 500) return;
+        Console.WriteLine($"[Damage] 玩家 #{player.Id} -{damage}（{kind}）HP={player.Hp} {detail}");
+    }
+
+    private int _damageLogCount;
 
     /// <summary>敌怪 / Boss 接触伤害表（简化：按类型固定值，未收录按普通敌怪计）。</summary>
     private static int ContactDamageOf(int npcType) => npcType switch
@@ -828,13 +887,17 @@ public partial class WorldSimulator : IWorldViewProvider
         _ => 7,     // 史莱姆等普通敌怪
     };
 
-    /// <summary>查找与玩家接触的敌怪伤害（取接触者中的最大值）；无接触返回 0。</summary>
-    private int FindContactDamage(PlayerRuntime player)
+    /// <summary>
+    /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。
+    /// 原版用 AABB 求交（<c>Collision.CheckAABBvAABBCollision</c>），此处按原版尺寸做同一判定，
+    /// 避免「点 + 半径」在矮身 / 大体积 NPC 上误判（玩家莫名受伤或漏判）。
+    /// <paramref name="contactNpc"/> 回传实际接触的 NPC（诊断输出用）。
+    /// </summary>
+    private int FindContactDamage(PlayerRuntime player, out WorldNpc? contactNpc)
     {
-        float px = player.Position.X;
-        float py = player.Position.Y + PlayerHalfHeight; // 玩家碰撞盒中心（Position 为头顶）
-        float radiusSq = ContactRadius * ContactRadius;
+        float px = player.AimPosition.X, py = player.AimPosition.Y;
         int best = 0;
+        contactNpc = null;
 
         lock (_world.NpcsLock)
         {
@@ -842,16 +905,54 @@ public partial class WorldSimulator : IWorldViewProvider
             {
                 if (!npc.Active || npc.IsTownNpc) continue;
 
-                float dx = npc.X - px;
-                float dy = npc.Y - py;
-                if (dx * dx + dy * dy > radiusSq) continue;
+                var (width, height) = NpcSizes.Of(npc.Type);
+                if (!BoxesOverlap(px, py, NpcSizes.PlayerWidth, NpcSizes.PlayerHeight,
+                                  npc.X, npc.Y, width, height, ContactMinOverlap))
+                {
+                    // 诊断：有重叠但不足阈值（「擦着走」）—— 限频打印，用于确认阈值收得是否合适
+                    if (BoxesOverlap(px, py, NpcSizes.PlayerWidth, NpcSizes.PlayerHeight, npc.X, npc.Y, width, height)
+                        && Interlocked.Increment(ref _contactNearMissLogCount) <= 30)
+                        Console.WriteLine($"[Contact] 擦边未计入 NPC {npc.Type}@{npc.X:F1},{npc.Y:F1} " +
+                                          $"玩家={px:F1},{py:F1}（需两轴重叠 ≥{ContactMinOverlap:F0}px）");
+                    continue;
+                }
 
-                best = Math.Max(best, ContactDamageOf(npc.Type));
+                int damage = ContactDamageOf(npc.Type);
+                if (damage > best)
+                {
+                    best = damage;
+                    contactNpc = npc;
+                }
             }
         }
 
         return best;
     }
+
+    /// <summary>
+    /// 两个轴对齐碰撞盒是否重叠（像素坐标，X/Y 为左上角）。
+    /// <paramref name="minOverlap"/> 要求两轴上的重叠都达到该像素数 —— 用于吸收服务端 NPC 位置
+    /// 与客户端画面之间几像素的偏差：只擦到 1~2px 的「掠过」不应判定成接触
+    /// （真机症状：史莱姆从头顶擦过、看着没碰到却在扣血）。
+    /// </summary>
+    private static bool BoxesOverlap(
+        float ax, float ay, int aw, int ah,
+        float bx, float by, int bw, int bh,
+        float minOverlap = 0f)
+        => ax < bx + bw - minOverlap && bx < ax + aw - minOverlap
+        && ay < by + bh - minOverlap && by < ay + ah - minOverlap;
+
+    /// <summary>
+    /// 接触伤害要求的最小重叠（像素）。用途：吸收服务端 NPC 位置与客户端画面之间的几像素偏差，
+    /// 并排除「擦着走」——真机日志实测：史莱姆贴着你走过时**水平只重叠 3~4px**，
+    /// 玩家看到的是"没碰到"却在掉血；而真正走进你身上的接触，重叠是十几到二十像素
+    /// （史莱姆盒 24 宽 / 玩家盒 20 宽，走穿时重叠可达 20px）。
+    /// 取 8（半格）即「只有明显压到才算接触」，宁可少判一点也不误伤。
+    /// </summary>
+    private const float ContactMinOverlap = 8f;
+
+    /// <summary>「擦边未计入」诊断输出的计数上限（限频，避免刷屏）。</summary>
+    private int _contactNearMissLogCount;
 
     /// <summary>
     /// 服务端结算玩家伤害：扣血 → 必要时置死亡态 → 登记受击通知（包 117 表现 + 包 16 权威血量）。

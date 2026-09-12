@@ -189,7 +189,11 @@ public sealed class TerminalStage : IPipelineStage
     private static Command? CreateCommand(INetworkPacket packet, IPacketContext context) => packet switch
     {
         // 包 13 PlayerControls（真实线格式）→ 移动指令
-        PlayerControlsPacket controls => new MoveCommand(context.Tick, context.PlayerId, controls.Position),
+        //   ControlBits bit2 = 左 / bit3 = 右（与客户端 Player.cs 的 controlLeft/controlRight 位一致）
+        PlayerControlsPacket controls => new MoveCommand(context.Tick, context.PlayerId, controls.Position)
+        {
+            Moving = (controls.ControlBits & 0x0C) != 0,
+        },
         // 包 65 TeleportEntity：本玩家带落点的传送 → 移动指令（bit2 无位置时由服务端自持位置，不生成）
         TeleportEntityPacket teleport when !teleport.NoPosition
             && teleport.EntityId == context.PlayerId

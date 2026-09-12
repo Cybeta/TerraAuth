@@ -60,4 +60,7 @@ public sealed class ProjectileEntity
 
     /// <summary>失效是否已下发客户端（由世界同步线程置位，避免重复发包）。</summary>
     public bool RemovalNotified;
+
+    /// <summary>生成是否已下发客户端（包 27）：false → 世界同步循环负责推送新增弹幕。</summary>
+    public bool NewNotified;
 }

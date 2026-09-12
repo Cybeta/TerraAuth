@@ -184,7 +184,14 @@ public sealed class MetricsHttpServer : IDisposable
     public void Dispose()
     {
         _cts.Cancel();
-        _listener.Stop();
-        _listener.Close();
+
+        // 绑定失败时（端口占用 / 无 urlacl 权限）Start() 已提前返回，此时 Stop/Close 会抛
+        // ObjectDisposedException —— 必须吞掉，否则会把「启动失败的真实原因」盖成未处理异常。
+        try
+        {
+            _listener.Stop();
+            _listener.Close();
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException) { /* 未成功启动 */ }
     }
 }
