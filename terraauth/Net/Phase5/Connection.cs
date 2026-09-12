@@ -38,12 +38,23 @@ public sealed class Connection : IAsyncDisposable
 {
     private readonly Stream _stream;
     private readonly PipeReader _reader;
-    private readonly Channel<OutboundFrame> _outbound = Channel.CreateUnbounded<OutboundFrame>(
-        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    private readonly Channel<OutboundFrame> _outbound = Channel.CreateBounded<OutboundFrame>(
+        new BoundedChannelOptions(2048)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            AllowSynchronousContinuations = false,
+        });
     private readonly IPacketDecoder _decoder;
     private readonly IPacketEncoder _encoder;
     private readonly DecodeContext _decodeContext;
     private readonly WorkerPool _workers;
+    private readonly CancellationTokenSource _lifetimeCts = new();
+    private readonly TaskCompletionSource _runCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _disposeStarted;
+    private int _closeRequested;
 
     /// <summary>写循环退出信号：供"等待落盘"的调用方判断"已不可能落盘"，避免依赖固定超时。</summary>
     private readonly TaskCompletionSource _writeLoopExited =
@@ -87,15 +98,24 @@ public sealed class Connection : IAsyncDisposable
         Func<INetworkPacket, Connection, CancellationToken, Task> onPacket,
         CancellationToken ct)
     {
+        using var connectionCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetimeCts.Token);
+        var loopCt = connectionCts.Token;
         try
         {
-            var readTask = ReadLoopAsync(onPacket, ct);
-            var writeTask = WriteLoopAsync(ct);
+            var readTask = ReadLoopAsync(onPacket, loopCt);
+            var writeTask = WriteLoopAsync(loopCt);
 
-            // 任一结束即整体结束
+            // 任一循环结束即取消另一循环，并观察两个任务的最终异常。
             await Task.WhenAny(readTask, writeTask).ConfigureAwait(false);
+            if (Volatile.Read(ref _closeRequested) == 0)
+            {
+                connectionCts.Cancel();
+                _outbound.Writer.TryComplete();
+            }
+
+            await Task.WhenAll(readTask, writeTask).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested || connectionCts.IsCancellationRequested)
         {
             // 正常关闭
         }
@@ -106,6 +126,8 @@ public sealed class Connection : IAsyncDisposable
         finally
         {
             State = ConnectionState.Disconnected;
+            _outbound.Writer.TryComplete();
+            _runCompleted.TrySetResult();
             Console.WriteLine($"[Net] 断开 {RemoteEndPoint} 玩家 #{PlayerId}");
         }
     }
@@ -170,9 +192,9 @@ public sealed class Connection : IAsyncDisposable
                     await _stream.FlushAsync(ct).ConfigureAwait(false);
                     frame.Flushed?.TrySetResult(); // 该帧已落盘
                 }
-                catch (IOException)
+                catch (Exception ex) when (ex is IOException or OperationCanceledException)
                 {
-                    frame.Flushed?.TrySetResult(); // 写失败也要唤醒等待方，避免其挂起
+                    frame.Flushed?.TrySetException(ex);
                     break; // 断开
                 }
             }
@@ -208,12 +230,28 @@ public sealed class Connection : IAsyncDisposable
     /// </remarks>
     public async Task SendEncodedAndFlushedAsync(PacketId type, INetworkPacket packet, CancellationToken ct)
     {
+        if (type == PacketId.Disconnect)
+            Volatile.Write(ref _closeRequested, 1);
+
         var flushed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await SendEncodedAsync(type, packet, ct, flushed).ConfigureAwait(false);
 
         var finished = await Task.WhenAny(flushed.Task, _writeLoopExited.Task).WaitAsync(ct).ConfigureAwait(false);
         if (finished == flushed.Task)
+        {
             await flushed.Task.ConfigureAwait(false); // 展开写入侧异常（若有）
+            if (type == PacketId.Disconnect)
+            {
+                // 当前帧已写入后才关闭通道和读写循环；否则 RemoveAsync/DisposeAsync
+                // 会在写循环取出包 2 前关闭 socket，或让 RunAsync 永久等待未完成的通道。
+                _outbound.Writer.TryComplete();
+                _lifetimeCts.Cancel();
+            }
+
+            return;
+        }
+
+        throw new IOException("连接写循环已退出，Disconnect 包未写入");
     }
 
     private ValueTask SendEncodedAsync(
@@ -226,8 +264,19 @@ public sealed class Connection : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        State = ConnectionState.Disconnected;
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+        {
+            await _runCompleted.Task.ConfigureAwait(false);
+            return;
+        }
+
+        _lifetimeCts.Cancel();
         _outbound.Writer.TryComplete();
+
+        // 先等待读写循环退出，再释放底层流和生命周期 CTS，避免循环继续访问已释放资源。
+        await _runCompleted.Task.ConfigureAwait(false);
+        State = ConnectionState.Disconnected;
         await _stream.DisposeAsync().ConfigureAwait(false);
+        _lifetimeCts.Dispose();
     }
 }

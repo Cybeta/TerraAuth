@@ -76,13 +76,11 @@ public sealed class ConnectionManager
         var conn = Get(playerId);
         if (conn is null) return;
 
-        // 先置为断开：该玩家后续入站包不再进入权威管线
-        conn.State = ConnectionState.Disconnected;
-
         try
         {
-            // 等待包 2 真正写入 socket 后再关闭：投递到出站通道不等于已发出，
-            // 直接关闭会丢帧（客户端看不到踢出原因）
+            // 先等待包 2 真正写入 socket，再改变连接状态并关闭。
+            // 提前置为 Disconnected 会让 Connection.ReadLoop 结束并联动取消 WriteLoop，
+            // 从而可能在包 2 从出站队列取出前丢失踢出原因。
             await conn.SendEncodedAndFlushedAsync(PacketId.Disconnect, DisconnectPacket.WithReason(reason), ct)
                 .ConfigureAwait(false);
         }
@@ -95,7 +93,8 @@ public sealed class ConnectionManager
             Console.WriteLine($"[Net] 踢出玩家 #{playerId} 时下发包 2 失败: {ex.Message}");
         }
 
-        await RemoveAsync(playerId).ConfigureAwait(false);
+        conn.State = ConnectionState.Disconnected;
+        await RemoveAsync(playerId, conn).ConfigureAwait(false);
         Console.WriteLine($"[Net] 已踢出玩家 #{playerId}：{reason}");
     }
 
@@ -115,7 +114,7 @@ public sealed class ConnectionManager
         }
     }
 
-    /// <summary>广播到除指定玩家外的所有活跃连接（用于把某玩家的状态转发给其他人）。</summary>
+    /// <summary>广播到除指定玩家外的所有活跃连接（用于把某玩家的状态转发给其他人，不等待发送完成）。</summary>
     public async Task BroadcastExceptAsync(
         int excludePlayerId,
         PacketId type,

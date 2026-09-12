@@ -247,7 +247,7 @@ public class PluginModTests
     {
         var detector = new ModDetector(new ModPolicy { Mode = ModPolicyMode.Whitelist, BlockOnUnlistedMod = true,
             AllowedMods = new[] { new ModEntry { Name = "MagicStorage" } } }, new TestLogger());
-        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()));
+        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()), enabled: true);
 
         var modList = BuildModListPayload("MagicStorage", "RecipeBrowser");
         var request = new ConnectionRequest { ClientVersion = "tModLoader v2024.1", ProtocolVersion = 326 };
@@ -263,7 +263,7 @@ public class PluginModTests
     public async Task TModLoader_Handshake_AllowAll_Accepts_And_Parses_Mods()
     {
         var detector = new ModDetector(new ModPolicy { Mode = ModPolicyMode.AllowAll }, new TestLogger());
-        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()));
+        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()), enabled: true);
 
         var result = await compat.HandleHandshakeAsync(
             new ConnectionRequest { ClientVersion = "tModLoader v2024.1", ProtocolVersion = 326 },
@@ -279,7 +279,7 @@ public class PluginModTests
     public async Task TModLoader_ParseModList_Tolerates_Truncated_Payload()
     {
         var detector = new ModDetector(new ModPolicy { Mode = ModPolicyMode.AllowAll }, new TestLogger());
-        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()));
+        var compat = new TModLoaderCompat(detector, new TestLogger(), new CustomPacketHandler(new TestLogger()), enabled: true);
 
         var payload = BuildModListPayload("MagicStorage", "RecipeBrowser");
         var truncated = payload[..(payload.Length - 3)]; // 截断最后一个名字
@@ -297,6 +297,7 @@ public class PluginModTests
         var sent = new List<(int From, int To, int PacketId)>();
         var compat = new TModLoaderCompat(
             new ModDetector(new ModPolicy(), new TestLogger()), new TestLogger(), new CustomPacketHandler(new TestLogger()),
+            enabled: true,
             forward: (from, to, id, _) => { sent.Add((from, to, id)); return Task.CompletedTask; });
 
         await compat.ForwardModPacketAsync(1, 2, 250, new byte[] { 0x01 }); // 区间内 → 转发
@@ -344,7 +345,7 @@ public class PluginModTests
     }
 
     [Fact]
-    public void Bootstrap_Applies_ModPolicy_From_Config_And_Wires_TModLoader()
+    public async Task Bootstrap_Applies_ModPolicy_From_Config_And_Wires_TModLoader()
     {
         var dir = Path.Combine(Path.GetTempPath(), $"terraauth-mod-{Guid.NewGuid():N}");
         Directory.CreateDirectory(dir);
@@ -358,11 +359,18 @@ public class PluginModTests
         {
             using var host = GameHost.Bootstrap(Path.Combine(dir, "state.db"), configPath, metricsPort: 0, port: 0);
 
-            // 组合根装配：TModLoader 兼容层存在，250-255 自定义包区间已注册
+            // 生产装配为 Vanilla-only：不注册 250-255，也不开放 Mod 握手/转发。
             Assert.NotNull(host.TModLoader);
-            Assert.True(host.CustomPackets.IsPacketAllowed(250, "tModLoader"));
+            Assert.False(host.CustomPackets.IsPacketAllowed(250, "tModLoader"));
+            Assert.False(host.CustomPackets.IsPacketAllowed(255, "tModLoader"));
+            var handshake = await host.TModLoader.HandleHandshakeAsync(
+                new ConnectionRequest { ClientVersion = "tModLoader v2024.1", ProtocolVersion = 326 },
+                BuildModListPayload("MagicStorage"));
+            Assert.False(handshake.Success);
+            Assert.Equal("mod_support_disabled", handshake.RejectReason);
+            await host.TModLoader.ForwardModPacketAsync(1, 2, 250, new byte[] { 1 });
 
-            // 策略来自 server.json：未列出的 Mod 被拒
+            // 策略对象仍按 server.json 装配，用于未来兼容层启用时的单元契约。
             var caps = new ClientCapabilities
             {
                 Type = ClientType.TModLoader,

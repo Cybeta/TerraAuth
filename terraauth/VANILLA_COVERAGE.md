@@ -17,7 +17,7 @@
 | 请求出生区块 | 8 | 回包 9（进度）+ 逐块 10 + 49（出生） | `Vanilla_LoginChain_...` |
 | **区块流送（离开出生点后的地形）** | 10 | 服务端**主动按玩家位置补发**（快照循环 20Hz）：以玩家所在区块为中心取 **3×3**，**逐连接去重**（已发过的区块不重复编码），有新块时先发包 9（进度）再逐块发包 10 | `Vanilla_TileSections_Stream_As_Player_Moves` |
 | **服务端驱动的图格改动** | 20 | 执行器翻转 / 液体混合等少量图格改动走**包 20（TileSquare）**：未压缩小矩形 + 逐格位标志与可选段，按视口下发给附近玩家；矩形宽度超 Byte 上限（255）自动切分 | `Vanilla_Actuate_Pushes_Tile_Update_To_Client` / `Encode_TileSquare_Writes_Vanilla_Layout` |
-| **未建模包中继** | （任意） | 未结构化的客户端包**默认中继**给其他玩家（握手 / 世界请求 / 自身属性 / 服务端自持等例外除外），修掉「表情 / 告示牌 / 家具等他人不可见」 | `Vanilla_UnmodeledPacket_Is_Relayed_To_OtherPlayers` |
+| **未建模包处理** | （任意） | 当前 Vanilla-only 生产路径对未结构化包默认拒绝，不进行即时中继；状态包仅在仿真提交后由服务端生成同步包 | `Vanilla_UnmodeledPacket_Is_Rejected_And_Not_Relayed` |
 | 进入世界 | 12 | 置 Playing → 包 129 + 广播外观 4 / 激活 14 | `Vanilla_Join_Marks_Self_Active` |
 | 玩家激活在线 / 离线 | 14 | 进服广播激活；断线广播 `Active=false` | `Vanilla_PlayerDisconnect_Broadcasts_Inactive` |
 | **断线会话保留 + 槽位回收** | 14 | 断线不销毁运行时：按玩家名保留位置 / 血量 / 增益（`SessionResumeGraceSeconds`，默认 60s），宽限期内同身份重连**认回原运行时**并下发**携带恢复坐标**的出生包（12）；超期 / 被顶号回收。断开时释放连接槽位与并发容量，新连接复用**最小空闲 ID**（与原版一致）。注：原版客户端断线即回主菜单，故为「手动重进的会话接管」而非自动重连 | `Vanilla_SessionResume_Restores_Position_And_Hp` / `..._Off_When_Grace_Is_Zero` / `SessionResume_Expires_After_Grace` |

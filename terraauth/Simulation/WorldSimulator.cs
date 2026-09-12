@@ -123,13 +123,14 @@ public partial class WorldSimulator : IWorldViewProvider
 
     private void ApplyCommandsForTick(long tick)
     {
-        // 从 CommandQueue 取出本 tick 的命令，按 (tick, playerId) 稳定排序后应用
-        // Command.Apply 是唯一允许变更 WorldState 的地方
-        while (_commands.TryPeek(out var cmd) && cmd is not null && cmd.Tick <= tick)
+        // 取出不晚于当前 tick 的命令，Command.Apply 是唯一允许变更 WorldState 的地方。
+        foreach (var cmd in _commands.DrainThrough(tick))
         {
-            _commands.Dequeue();
-            cmd.Apply(_world, _rng);
-            _recorder.Record(new GameEvent(tick, cmd.PlayerId, cmd.Kind, null));
+            var result = cmd.Apply(_world, _rng);
+            if (result.Applied)
+                _recorder.Record(new GameEvent(tick, cmd.PlayerId, cmd.Kind, null));
+            else
+                _recorder.Record(new GameEvent(tick, cmd.PlayerId, "command_failed", result.Reason));
         }
     }
 

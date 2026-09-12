@@ -1,10 +1,11 @@
 // TerraAuth — Phase 3: Command 命令模型
 // 架构 §4.3：所有状态变更经 Command → WorldSimulator.Tick 应用
 
-using System.Collections.Concurrent;
 using TerraAuth.Protocol;
 
 namespace TerraAuth.Simulation;
+
+public readonly record struct CommandApplyResult(bool Applied, string? Reason = null);
 
 /// <summary>命令基类。客户端意图 → Authority 接受 → Command → 仿真。</summary>
 public abstract record Command(
@@ -13,17 +14,17 @@ public abstract record Command(
     string Kind)     // "move" / "use_item" / "place_tile" / "attack"
 {
     /// <summary>应用命令到世界状态。这是唯一允许变更 WorldState 的地方。</summary>
-    public abstract void Apply(WorldState world, IRng rng);
+    public abstract CommandApplyResult Apply(WorldState world, IRng rng);
 }
 
 /// <summary>移动命令：移动权威接受位置包后生成，由仿真在目标 tick 应用。</summary>
 public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     : Command(Tick, PlayerId, "move")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return;
+            return new(false, "missing_player");
 
         PlayerRuntime player;
         lock (world.PlayersLock)
@@ -38,12 +39,14 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
 
         // 死亡期间不接受移动：复活点由服务端在复活命令中划定，避免"死后瞬移"
         if (player.Dead)
-            return;
+            return new(false, "not_applied");
 
         // 权威位置赋值：服务端校验通过后直接生效，并清零速度（避免与物理阶段积分叠加）
         player.Position = Position;
         player.Velocity = new Vector2(0, 0);
         player.Active = true;
+        world.MarkPlayerChanged(id);
+        return new(true);
     }
 }
 
@@ -51,16 +54,16 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
 public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
     : Command(Tick, PlayerId, "damage_player")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id || Damage <= 0)
-            return;
+            return new(false, "not_applied");
 
         PlayerRuntime? player;
         lock (world.PlayersLock)
             world.Players.TryGetValue(id, out player);
         if (player is null || player.Dead)
-            return;
+            return new(false, "not_applied");
 
         player.Hp -= Damage;
         if (player.Hp <= 0)
@@ -71,6 +74,7 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
             player.Velocity = new Vector2(0, 0);
             player.DeathNotified = false;  // 世界同步线程据此补发死亡包 118
         }
+        return new(true);
     }
 }
 
@@ -78,16 +82,16 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
 public sealed record KillPlayerCommand(long Tick, int? PlayerId)
     : Command(Tick, PlayerId, "kill_player")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return;
+            return new(false, "not_applied");
 
         PlayerRuntime? player;
         lock (world.PlayersLock)
             world.Players.TryGetValue(id, out player);
         if (player is null)
-            return;
+            return new(false, "not_applied");
 
         player.Hp = 0;
         player.FallDistance = 0f;
@@ -98,6 +102,7 @@ public sealed record KillPlayerCommand(long Tick, int? PlayerId)
             player.Dead = true;
             player.DeathNotified = false; // 首次死亡才下发死亡包，重复声明不重复广播
         }
+        return new(true);
     }
 }
 
@@ -108,24 +113,26 @@ public sealed record KillPlayerCommand(long Tick, int? PlayerId)
 public sealed record RespawnCommand(long Tick, int? PlayerId)
     : Command(Tick, PlayerId, "respawn")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return;
+            return new(false, "not_applied");
 
         PlayerRuntime? player;
         lock (world.PlayersLock)
             world.Players.TryGetValue(id, out player);
         if (player is null || !player.Dead)
-            return; // 未死亡 → 非复活请求，忽略
+            return new(false, "not_applied"); // 未死亡 → 非复活请求，忽略
 
         player.Hp = player.HpMax;
         player.Dead = false;
         player.FallDistance = 0f;
         player.Position = new Vector2((world.SpawnTileX + 0.5f) * 16f, world.SpawnTileY * 16f);
         player.Velocity = new Vector2(0, 0);
+        world.MarkPlayerChanged(id);
         player.DeathNotified = true;
         player.RespawnNotified = false; // 世界同步线程据此补发复活包 12 / 16
+        return new(true);
     }
 }
 
@@ -133,21 +140,50 @@ public sealed record RespawnCommand(long Tick, int? PlayerId)
 public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotIndex)
     : Command(Tick, PlayerId, "pickup_item")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
-        lock (world.ItemsLock)
-        {
-            foreach (var item in world.Items)
-            {
-                if (item.Slot != ItemSlotIndex || !item.Active) continue;
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
 
-                item.Active = false;
-                item.OwnedBy = PlayerId ?? -1;
-                item.DeadTick = Tick;
-                item.RemovalNotified = false; // 由世界同步下发包 21（stack=0）通知其他客户端移除
-                return;
+        if (world.InventoryLedger is null)
+            return new(false, "inventory_unavailable");
+
+        lock (world.PlayersLock)
+        {
+            if (!world.Players.TryGetValue(playerId, out var player)
+                || !player.Active
+                || player.Dead)
+                return new(false, "player_not_active");
+
+            lock (world.ItemsLock)
+            {
+                foreach (var item in world.Items)
+                {
+                    if (item.Slot != ItemSlotIndex || !item.Active) continue;
+
+                    var dx = player.Position.X - item.Position.X;
+                    var dy = player.Position.Y - item.Position.Y;
+                    if (dx * dx + dy * dy > 160f * 160f)
+                        return new(false, "out_of_reach");
+
+                    if (!world.InventoryLedger.TryAddItemExactly(
+                            playerId,
+                            item.ItemId,
+                            item.Stack))
+                    {
+                        return new(false, "inventory_full");
+                    }
+
+                    item.Active = false;
+                    item.OwnedBy = playerId;
+                    item.DeadTick = Tick;
+                    item.RemovalNotified = false; // 由世界同步下发包 21（stack=0）通知其他客户端移除
+                    return new(true);
+                }
             }
         }
+
+        return new(false, "item_not_found");
     }
 }
 
@@ -159,23 +195,48 @@ public sealed record SyncChestItemCommand(
     long Tick, int? PlayerId, int ChestIndex, int Slot, int Stack, byte Prefix, int ItemType)
     : Command(Tick, PlayerId, "sync_chest_item")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
-        lock (world.ChestsLock)
-        {
-            var chest = world.FindChestByIndex(ChestIndex);
-            if (chest is null || Slot < 0 || Slot >= chest.Items.Length) return;
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
 
-            chest.Items[Slot] = new ChestItem
+        lock (world.PlayersLock)
+        {
+            if (!world.Players.TryGetValue(playerId, out var player)
+                || !player.Active
+                || player.Dead)
+                return new(false, "player_not_active");
+
+            lock (world.ChestsLock)
             {
-                Type = ItemType,
-                Stack = (short)Stack,
-                Prefix = Prefix,
-            };
+                if (!world.HasChestSession(playerId, ChestIndex))
+                    return new(false, "chest_not_open");
+
+                var chest = world.FindChestByIndex(ChestIndex);
+                if (chest is null)
+                    return new(false, "chest_not_found");
+
+                if (Slot < 0 || Slot >= chest.Items.Length)
+                    return new(false, "invalid_slot");
+
+                var dx = player.Position.X - chest.X * 16f - 8f;
+                var dy = player.Position.Y - chest.Y * 16f - 8f;
+                if (dx * dx + dy * dy > 160f * 160f)
+                    return new(false, "out_of_reach");
+
+                chest.Items[Slot] = new ChestItem
+                {
+                    Type = ItemType,
+                    Stack = (short)Stack,
+                    Prefix = Prefix,
+                };
+            }
         }
 
-        // 服务端重启后回放：登记该箱子（内容已变更）
+        // 服务端重启后回放：登记该箱子（内容已变更），并在提交后通知已打开该箱子的客户端。
         world.MarkPersistChest(ChestIndex);
+        world.MarkChestChanged(ChestIndex, Slot);
+        return new(true);
     }
 }
 
@@ -185,7 +246,7 @@ public sealed record SyncChestItemCommand(
 public sealed record LiquidEditCommand(long Tick, int? PlayerId, IReadOnlyList<LiquidChange> Changes)
     : Command(Tick, PlayerId, "liquid_edit")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         foreach (var change in Changes)
         {
@@ -210,6 +271,8 @@ public sealed record LiquidEditCommand(long Tick, int? PlayerId, IReadOnlyList<L
 
             world.MarkLiquidChanged(change.X, change.Y);
         }
+
+        return new(true);
     }
 }
 
@@ -217,16 +280,18 @@ public sealed record LiquidEditCommand(long Tick, int? PlayerId, IReadOnlyList<L
 public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, byte Action, int TileType)
     : Command(Tick, PlayerId, "tile_break")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
-            return;
+return new(false, "not_applied");
 
         // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
+        bool changed = false;
         world.Sections.EnterWrite(X, Y);
         try
         {
             ref var tile = ref world.Tiles[X, Y];
+            var before = tile;
 
             // 包 17 的 action 语义（0..19）：
             //   0 KillTile / 1 PlaceTile / 2 KillWall / 3 PlaceWall / 4 KillTileNoItem
@@ -280,13 +345,15 @@ public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, by
                 default:
                     break;
             }
+            changed = !tile.Equals(before);
         }
         finally
         {
             world.Sections.ExitWrite(X, Y);
         }
 
-        world.MarkPersistTile(X, Y); // 客户端发起的图格改动同样要落盘（重启后回放）
+        if (changed) world.MarkTileChanged(X, Y);
+        return changed ? new(true) : new(false, "no_change");
     }
 }
 
@@ -304,15 +371,16 @@ public sealed record ActuateCommand(long Tick, int? PlayerId, int X, int Y)
     /// <summary>单次触发的最大传播格数（防大面积线网拖慢 tick）。</summary>
     private const int MaxCircuitTiles = 2000;
 
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
-            return;
+return new(false, "not_applied");
 
         var visited = new HashSet<int> { Y * Stride + X };
         var queue = new Queue<(int X, int Y)>();
         queue.Enqueue((X, Y));
 
+        bool toggledAny = false;
         while (queue.Count > 0 && visited.Count <= MaxCircuitTiles)
         {
             var (cx, cy) = queue.Dequeue();
@@ -336,7 +404,7 @@ public sealed record ActuateCommand(long Tick, int? PlayerId, int X, int Y)
             }
 
             // 服务端驱动的图格变更 → 排队推送客户端（包 10 小矩形）
-            if (toggled) world.MarkTileChanged(cx, cy);
+            if (toggled) { toggledAny = true; world.MarkTileChanged(cx, cy); }
 
             if (!hasWire) continue;
 
@@ -358,6 +426,8 @@ public sealed record ActuateCommand(long Tick, int? PlayerId, int X, int Y)
                     queue.Enqueue((nx, ny));
             }
         }
+
+        return toggledAny ? new(true) : new(false, "no_change");
     }
 }
 
@@ -365,16 +435,21 @@ public sealed record ActuateCommand(long Tick, int? PlayerId, int X, int Y)
 public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, int TileType, int Style)
     : Command(Tick, PlayerId, "tile_place")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
-            return;
+return new(false, "not_applied");
 
-        // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
+        if (PlayerId is not int playerId || world.InventoryLedger is null)
+return new(false, "not_applied");
+
+        // 图格和背包必须在同一提交单元中处理。先占住图格写锁，再确认目标仍为空并扣除物品。
         world.Sections.EnterWrite(X, Y);
         try
         {
             ref var tile = ref world.Tiles[X, Y];
+            if (tile.Active || !world.InventoryLedger.ConsumeItem(playerId, TileType))
+                return new(false, "not_applied");
             tile.Active = true;
             tile.Type = (ushort)TileType;
             tile.Wall = 0;
@@ -384,7 +459,8 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
             world.Sections.ExitWrite(X, Y);
         }
 
-        world.MarkPersistTile(X, Y); // 客户端发起的图格改动同样要落盘（重启后回放）
+        world.MarkTileChanged(X, Y);
+        return new(true);
     }
 }
 
@@ -392,16 +468,16 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
 public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, int Damage)
     : Command(Tick, PlayerId, "npc_strike")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         lock (world.NpcsLock)
         {
             if (NpcIndex < 0 || NpcIndex >= world.Npcs.Count)
-                return;
+                return new(false, "not_applied");
 
             var npc = world.Npcs[NpcIndex];
             if (!npc.Active)
-                return;
+                return new(false, "not_applied");
 
             npc.Life -= Damage;
             if (npc.Life <= 0)
@@ -409,9 +485,11 @@ public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, in
                 npc.Life = 0;
                 npc.Active = false; // 由世界同步下发 life=0，客户端据此移除
                 npc.DeadTick = Tick;
-                world.NotifyNpcKilled(npc.Type, npc.X, npc.Y); // Boss 击杀 → 世界进度 + 掉落
+                world.NotifyNpcKilled(npc.Type, npc.X, npc.Y); // Boss 击杀 → 世界进度与掉落 // Boss 击杀 → 世界进度 + 掉落
             }
         }
+
+        return new(true);
     }
 }
 
@@ -423,12 +501,12 @@ public sealed record SpawnItemCommand(
     /// <summary>世界掉落物槽位上限（与原版 <c>Main.item[400]</c> 一致）。</summary>
     private const int MaxSlots = 400;
 
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         lock (world.ItemsLock)
         {
             if (world.Items.Count >= MaxSlots)
-                return;
+                return new(false, "not_applied");
 
             int slot = 0;
             while (world.Items.Any(i => i.Slot == slot)) slot++;
@@ -444,6 +522,8 @@ public sealed record SpawnItemCommand(
                 OwnedBy = PlayerId ?? -1,
             });
         }
+
+        return new(true);
     }
 }
 
@@ -452,7 +532,7 @@ public sealed record SpawnProjectileCommand(
     long Tick, int? PlayerId, int Key, int Type, Vector2 Position, Vector2 Velocity, int Damage)
     : Command(Tick, PlayerId, "spawn_projectile")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         lock (world.ProjectilesLock)
         {
@@ -464,7 +544,7 @@ public sealed record SpawnProjectileCommand(
                 existing.Velocity = Velocity;
                 existing.Active = true;
                 existing.RemovalNotified = false;
-                return;
+                return new(true);
             }
 
             world.Projectiles.Add(new ProjectileEntity
@@ -477,6 +557,8 @@ public sealed record SpawnProjectileCommand(
                 Damage = Damage,
             });
         }
+
+        return new(true);
     }
 }
 
@@ -484,7 +566,7 @@ public sealed record SpawnProjectileCommand(
 public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Vector2 Position)
     : Command(Tick, PlayerId, "kill_projectile")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         lock (world.ProjectilesLock)
         {
@@ -493,15 +575,17 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
                 if (p.Key != Key || !p.Active) continue;
 
                 // 服务端权威：只有归属者能销毁自己的弹幕（防伪造他人弹幕消失）
-                if (PlayerId is int owner && p.Owner != owner) return;
+                if (PlayerId is int owner && p.Owner != owner) return new(false, "not_owner");
 
                 p.Position = Position;
                 p.Active = false;
                 p.DeadTick = Tick;
                 p.RemovalNotified = true; // 客户端已发起销毁，无需服务端再补发
-                return;
+                return new(true);
             }
         }
+
+        return new(false, "projectile_not_found");
     }
 }
 
@@ -509,19 +593,20 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
 public sealed record SetManaCommand(long Tick, int? PlayerId, int Mana, int MaxMana)
     : Command(Tick, PlayerId, "set_mana")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id || MaxMana <= 0)
-            return;
+            return new(false, "not_applied");
 
         PlayerRuntime? player;
         lock (world.PlayersLock)
             world.Players.TryGetValue(id, out player);
         if (player is null)
-            return;
+            return new(false, "not_applied");
 
         player.MpMax = MaxMana;
         player.Mp = Math.Clamp(Mana, 0, MaxMana);
+        return new(true);
     }
 }
 
@@ -532,18 +617,19 @@ public sealed record SetManaCommand(long Tick, int? PlayerId, int Mana, int MaxM
 public sealed record HealPlayerCommand(long Tick, int? PlayerId, int Amount)
     : Command(Tick, PlayerId, "heal_player")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id || Amount <= 0)
-            return;
+            return new(false, "not_applied");
 
         PlayerRuntime? player;
         lock (world.PlayersLock)
             world.Players.TryGetValue(id, out player);
         if (player is null || player.Dead)
-            return;
+            return new(false, "not_applied");
 
         player.Hp = Math.Min(player.Hp + Amount, player.HpMax);
+        return new(true);
     }
 }
 
@@ -551,65 +637,92 @@ public sealed record HealPlayerCommand(long Tick, int? PlayerId, int Amount)
 public sealed record SetBuffsCommand(long Tick, int? PlayerId, IReadOnlyList<int> Buffs)
     : Command(Tick, PlayerId, "set_buffs")
 {
-    public override void Apply(WorldState world, IRng rng)
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
-            return;
+            return new(false, "not_applied");
 
         PlayerRuntime? player;
         lock (world.PlayersLock)
             world.Players.TryGetValue(id, out player);
         if (player is null)
-            return;
+            return new(false, "not_applied");
 
         player.Buffs.Clear();
         player.Buffs.AddRange(Buffs);
+        world.MarkPlayerChanged(id);
+        return new(true);
     }
 }
 
-/// <summary>命令队列：按 tick 分组、线程安全、稳定排序。</summary>
+/// <summary>命令队列：按 (tick, sequence) 线程安全、稳定排序。</summary>
 public sealed class CommandQueue
 {
-    // (tick, playerId) 稳定排序 → 确定性
-    private readonly ConcurrentQueue<Command> _queue = new();
+    private readonly object _gate = new();
+    private readonly PriorityQueue<QueuedCommand, (long Tick, long Sequence)> _queue = new();
+    private long _nextSequence;
 
-    public int Count => _queue.Count;
-    public bool IsEmpty => _queue.IsEmpty;
+    public int Count
+    {
+        get { lock (_gate) return _queue.Count; }
+    }
 
-    public void Enqueue(Command command) => _queue.Enqueue(command);
+    public bool IsEmpty
+    {
+        get { lock (_gate) return _queue.Count == 0; }
+    }
+
+    public void Enqueue(Command command)
+    {
+        ArgumentNullException.ThrowIfNull(command);
+        lock (_gate)
+        {
+            var sequence = _nextSequence++;
+            _queue.Enqueue(new QueuedCommand(command, sequence), (command.Tick, sequence));
+        }
+    }
 
     public bool TryPeek(out Command? command)
     {
-        if (_queue.TryPeek(out var cmd))
+        lock (_gate)
         {
-            command = cmd;
-            return true;
+            if (_queue.TryPeek(out var queued, out _))
+            {
+                command = queued.Command;
+                return true;
+            }
         }
+
         command = null;
         return false;
     }
 
     public Command Dequeue()
     {
-        _queue.TryDequeue(out var cmd);
-        return cmd ?? throw new InvalidOperationException("Queue empty");
+        lock (_gate)
+        {
+            if (_queue.TryDequeue(out var queued, out _))
+                return queued.Command;
+        }
+
+        throw new InvalidOperationException("Queue empty");
     }
 
-    /// <summary>取出指定 tick 的所有命令，按 (tick, playerId) 排序。</summary>
+    /// <summary>取出不晚于指定 tick 的所有命令，按 (tick, sequence) 排序。</summary>
     public IReadOnlyList<Command> DrainThrough(long tick)
     {
         var result = new List<Command>();
-        while (_queue.TryPeek(out var cmd) && cmd!.Tick <= tick)
+        lock (_gate)
         {
-            _queue.TryDequeue(out _);
-            result.Add(cmd!);
+            while (_queue.TryPeek(out var queued, out var priority) && priority.Tick <= tick)
+            {
+                _queue.Dequeue();
+                result.Add(queued.Command);
+            }
         }
-        result.Sort((a, b) =>
-        {
-            var t = a.Tick.CompareTo(b.Tick);
-            if (t != 0) return t;
-            return (a.PlayerId ?? -1).CompareTo(b.PlayerId ?? -1);
-        });
+
         return result;
     }
+
+    private sealed record QueuedCommand(Command Command, long Sequence);
 }

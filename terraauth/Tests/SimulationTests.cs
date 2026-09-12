@@ -3,6 +3,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using TerraAuth.Protocol;
 using TerraAuth.Simulation;
 using Xunit;
 
@@ -96,6 +97,32 @@ public class SimulationTests
     }
 
     [Fact]
+    public void MoveCommand_MarksPlayerUpdateOnlyWhenApplied()
+    {
+        var world = new WorldState { Tiles = new TileMap(2, 2), MaxTilesX = 2, MaxTilesY = 2 };
+        var commands = new CommandQueue();
+        commands.Enqueue(new MoveCommand(1, 7, new Vector2(32, 48)));
+        var sim = new WorldSimulator(world, commands, new EventRecorder(), new SnapshotStore());
+
+        sim.Tick();
+
+        Assert.Equal(new[] { 7 }, world.DrainPlayerUpdates(10));
+        Assert.Equal(new Vector2(16, 48.4f), world.Players[7].Position);
+    }
+
+    [Fact]
+    public void TilePlaceCommand_DoesNotMarkUpdateWhenInventoryCannotBeConsumed()
+    {
+        var world = new WorldState { Tiles = new TileMap(2, 2), MaxTilesX = 2, MaxTilesY = 2,
+            InventoryLedger = new RejectingInventoryLedger() };
+        var command = new TilePlaceCommand(1, 7, 1, 1, 3, 0);
+        command.Apply(world, new XoshiroRng(1));
+
+        Assert.Empty(world.DrainTileUpdates(10));
+        Assert.False(world.Tiles[1, 1].Active);
+    }
+
+    [Fact]
     public void CommandQueue_Drains_InStableOrder()
     {
         var q = new CommandQueue();
@@ -106,6 +133,35 @@ public class SimulationTests
         Assert.Equal(2, drained.Count);
         Assert.Equal("a", drained[0].Kind); // 按 tick 排序
         Assert.Equal("b", drained[1].Kind);
+    }
+
+    [Fact]
+    public void CommandQueue_FutureTick_DoesNotBlockReadyCommand()
+    {
+        var q = new CommandQueue();
+        q.Enqueue(new TestCommand(10, 1, "future"));
+        q.Enqueue(new TestCommand(2, 1, "ready"));
+
+        var drained = q.DrainThrough(2);
+
+        var command = Assert.Single(drained);
+        Assert.Equal("ready", command.Kind);
+        Assert.True(q.TryPeek(out var remaining));
+        Assert.Equal("future", remaining!.Kind);
+    }
+
+    [Fact]
+    public void CommandQueue_SameTick_PreservesEnqueueOrder()
+    {
+        var q = new CommandQueue();
+        q.Enqueue(new TestCommand(3, 1, "first"));
+        q.Enqueue(new TestCommand(3, 2, "second"));
+
+        var drained = q.DrainThrough(3);
+
+        Assert.Collection(drained,
+            command => Assert.Equal("first", command.Kind),
+            command => Assert.Equal("second", command.Kind));
     }
 
     [Fact]
@@ -131,7 +187,14 @@ public class SimulationTests
 
     private sealed record TestCommand(long Tick, int? PlayerId, string Kind) : Command(Tick, PlayerId, Kind)
     {
-        public override void Apply(WorldState world, IRng rng) { }
+        public override CommandApplyResult Apply(WorldState world, IRng rng) => new(true);
+    }
+
+    private sealed class RejectingInventoryLedger : IInventoryLedger
+    {
+        public bool ConsumeItem(int playerId, int itemId) => false;
+        public bool TryAddItem(int playerId, int itemId, int stack) => false;
+        public bool TryAddItemExactly(int playerId, int itemId, int stack) => false;
     }
 }
 

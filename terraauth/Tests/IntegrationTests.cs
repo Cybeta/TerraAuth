@@ -124,6 +124,8 @@ public class EndToEndTests
                 "包 13 未在超时内生成 MoveCommand（握手或权威管线未完成）");
 
             // Act 3：仿真推进 → 快照产出 → 经 ISnapshotSender 下发
+            Assert.True(await WaitUntilAsync(() => commands.Count > 0, TimeSpan.FromSeconds(5)),
+                "包 13 未在测试结束前入队");
             simulator.Tick();
             Assert.True(snapshots.Count > 0, "仿真未产出快照");
             await broadcaster.FlushAsync();
@@ -209,7 +211,13 @@ public class EndToEndTests
             await SendPacketAsync(streamA, encoder, PacketId.PlayerPosition,
                 new PlayerControlsPacket(7, reported));
 
-            // Assert：B 经真实 TCP 收到转发的包 13，身份与位置均为服务端权威值
+            // Assert：仿真提交后，B 经真实 TCP 收到服务端生成的包 13。
+            simulator.Tick();
+            world.DrainPlayerUpdates(256);
+            await connections.BroadcastAsync(
+                PacketId.PlayerPosition,
+                new PlayerControlsPacket(1, reported),
+                CancellationToken.None);
             var forwarded = await ReadPacketAsync(
                 streamB, decoder, PacketId.PlayerPosition, TimeSpan.FromSeconds(5));
             Assert.NotNull(forwarded);

@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**259 用例**（默认 SQLite 后端与 `-p:NoSqlite=true` 兜底后端均全绿）
+> 生成日期：2026-09-12 ｜ 当前测试：**263 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
 
 ---
 
@@ -75,14 +75,14 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **命令子系统**：`Authority/CommandService.cs`（注册 / 解析 / 分发，命令名不区分大小写、处理器异常转失败结果），
   内置 `say` / `who` / `kick` / `help`；`IServerApi.ExecuteCommand` 由「仅落审计」改为真实分发。
 
-### 6. Mod 兼容
+### 6. Vanilla-only 生产边界
 
-- `ModPolicy` 从 `server.json` 读取（枚举以字符串读写）；`TModLoaderCompat` 装配：
-  Mod 名称清单解析 + 自定义包 250-255 转发（绑定网络层单播）。
+- 当前生产版本仅支持原版 Terraria 客户端（协议 326）。
+- MOD / TModLoader 握手、自定义包 250-255 注册与未知包透传均已关闭；未来 MOD 兼容层单独立项。
 
 ### 7. 测试与对抗自动化
 
-- 套件 **259 用例**，默认后端与 `-p:NoSqlite=true` 兜底后端均全绿。
+- 套件 **263 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -123,8 +123,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **正常坠落会被判超速并被踢**：移动权威原先只用水平上限（8 px/帧）判定，而原版下落终速约 20 px/帧，
   必然超标 → 服务端位置停在原处（后续挖 / 放 / 开箱全部 out_of_reach）+ 违规累计到 10 次即踢。
   现改为**分轴判定**：水平用 `MaxSpeed`，垂直用 `max(MaxSpeed, MaxFallSpeed)`（`MaxFallSpeed` 由配置注入）。
-- **未建模的客户端包被静默丢弃**：`RelayToOthersAsync` 无 default 分支，表情 / 告示牌 / 家具 / NetModule 其他模块等
-  「他人可见性」全部丢失。现在**未建模包默认中继**（握手 / 世界请求 / 自身属性 / 服务端自持等例外不中继）。
+- **当前生产采用 Vanilla-only 白名单**：未知或未建模包默认拒绝，不进入即时中继；玩家、图格、实体、箱子等状态包必须经仿真提交后由服务端重新生成同步包。
 
 **随后通过协议字段核对，把三项「待确认」落实到位**：
 
@@ -199,7 +198,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | 文件 | 行数 | 说明 |
 |---|---|---|
 | `VanillaFeatureTests.cs` | +1029 | 原版功能端到端 + Phase 7 对抗自动化 |
-| `PluginModTests.cs` | +182 | 插件 / Mod 兼容（含 TModLoader 转发通道） |
+| `PluginModTests.cs` | +182 | 插件与未来 MOD 兼容层禁用边界测试（含 TModLoader 拒绝与包范围关闭） |
 | `IntegrationTests.cs` | +71 | 集成与去重 / 校验 |
 | `NetworkTests.cs` | +28 | 网络编解码回归 |
 | `TerraAuth.Tests.csproj` | +1 | 新增测试文件纳入编译 |
@@ -242,7 +241,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Config/ServerConfig.cs` | 新增 `WorldPath` / `WorldSize` / `WorldExportPath` / `WorldExportIntervalSeconds` / `SessionResumeGraceSeconds` |
 | `terraauth/Simulation/World/WorldState.cs` | 待落盘集合上限 + 溢出降级全图扫描 + `HasPendingPersist`；离线会话表 + `MarkPlayerOffline` / `TryResumePlayer` / `ReapOfflineSessions`；`PlayerRuntime` 新增 `ResumeKey` / `Resumed` |
 | `terraauth/Tests/WorldFileTests.cs` | +3 用例（特征世界逐格 round-trip / 世界旗标 round-trip / 按协议顺序的严格分段走查） |
-| `terraauth/Tests/VanillaFeatureTests.cs` | +19 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 世界尺寸配置（中世界生成）/ 会话恢复（位置·血量续回、宽限期 0 关闭、越期回收）/ 箱子内容重启存活 / 区块流送 / 未建模包中继 / **包 13 中继保留挂载与相机**）；偶发用例等待窗口 5s → 15s |
+| `terraauth/Tests/VanillaFeatureTests.cs` | +19 用例（法力 / 治疗 / 增益 / 弹幕生成 / 世界改动重启回放 / 世界文件加载 / 世界导出 / 世界尺寸配置（中世界生成）/ 会话恢复 / 箱子内容重启存活 / 区块流送 / 未建模包拒绝 / **包 13 字段保真**）；偶发用例等待窗口 5s → 15s |
 | `terraauth/Simulation/World/WorldGenerator.cs` | **重写为分层地形生成**：噪声地表 / 洞穴 / 按深度分带矿脉 / 海滩+海水 / 地狱层 / 2×2 宝箱+战利品；层高比例与图格 ID 经协议行为验证（`WorldSize` 三档保留） |
 | `terraauth/Tests/SimulationTests.cs` | +4 用例（三档世界尺寸生成 / **分层地形内容：矿脉·洞穴·草皮·地狱层·海水·宝箱**） |
 | `terraauth/Protocol/Types.cs` | `PlayerControlsPacket` 新增 `MountType` / `PotionReturnOriginal` / `PotionReturnHome` / `CameraTarget`（包 13 可选尾随段） |
@@ -263,7 +262,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Authority/ShardedInboundPipeline.cs` | `InboundWork.IsReset` + 重置投递到同一分片 / 队列（保证在途包先处理完） |
 | `terraauth/Plugins/HookIntegration.cs` | `HookedPipeline.ResetPlayer` 转发 |
 | `terraauth/Net/Phase5/Connection.cs` | 新增 `SyncedSections` / `LastStreamSection`（区块流送去重 + 跨区块判定） |
-| `terraauth/Net/Phase5/NetworkHost.cs` | 包 8 在 **Playing 阶段也处理**；`StreamSectionsForPlayersAsync`（跨区块补发周边 **3×3** + 先发包 9 进度）；未建模包**默认中继**（`IsSelfOnlyPacket` 例外表） |
+| `terraauth/Net/Phase5/NetworkHost.cs` | 包 8 在 **Playing 阶段同样处理**；`StreamSectionsForPlayersAsync` 按连接去重，跨区块补发周边 **3×3**，并先发包 9（进度）；未建模包默认拒绝，状态包不走即时中继 |
 | `terraauth/Authority/AuthoritySubsystems.cs` | 移动校验改**分轴**（垂直用 `max(MaxSpeed, MaxFallSpeed)`）；`MovementLimits` 新增 `MaxFallSpeed` |
 | `terraauth/Protocol/PacketId.cs` | 新增 `TileSquare = 20` |
 | `terraauth/Simulation/World/Tile.cs` | 新增 `TileSquarePacket`（包 20 契约：未压缩小矩形 + 逐格位标志/可选段） |
@@ -279,8 +278,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test TerraAuth.sln -c Release` | **259 / 259 通过** |
-| 兜底后端 | `dotnet test TerraAuth.sln -c Release -p:NoSqlite=true` | **259 / 259 通过** |
+| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **263 / 263 通过** |
+| Vanilla-only 网络与集成过滤 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore --filter "FullyQualifiedName~IntegrationTests|FullyQualifiedName~VanillaFeatureTests"` | **92 / 92 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 
@@ -288,31 +287,32 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ## 五、已知限制（简化模型，非原版全量）
 
-### 第十七轮：架构与权威链路检查（待修正项 / 风险）
+### 第十七轮：架构与权威链路检查（修正进度）
 
-本轮仅记录静态架构检查结论，**不表示相关问题已修复**。以下按风险严重程度与建议修复顺序排列：
+本轮已完成第一批高风险修正；尚未完成项仍保留为待办：
 
-1. **高：权威提交与状态一致性**
-   - Authority 验证阶段可能直接修改背包；若后续放砖失败，存在已扣物品但世界未提交的风险。
-   - 拾取与箱子转移缺少统一的原子提交边界，背包、实体 / 箱子状态及持久化之间可能出现部分成功。
-   - 客户端原始包可能在仿真提交前广播，其他客户端可能先观察到尚未被权威状态确认的结果。
-2. **高：未知包与权限边界**
-   - `UnknownPacket` 当前默认中继权限过宽，应改为显式白名单；未知包应默认拒绝或隔离，按包类型和上下文授予中继权限。
-3. **高：时序、取消与失败传播**
-   - `CommandQueue` 的 FIFO 队头逻辑不能保证 Tick / Sequence 顺序，可能导致跨来源命令乱序应用；需要明确排序键和提交规则。
-   - 连接读写任务的取消、等待和异常传播不完整，`Flush` 失败存在被标记为成功的风险；应统一生命周期、失败状态和收尾语义。
-4. **中高：容量与并发控制**
-   - 出站、入站、审计队列均无界，缺少背压、容量上限和过载策略，突发流量可能造成内存持续增长。
-   - `WorldState` 的并发锁契约不统一，调用方对持锁范围、可重入性和快照一致性的假设不一致，存在竞态和死锁风险。
-   - `WorkerPool` 存在两套设计，调度、生命周期和错误处理语义不一致，应收敛为单一模型。
-5. **中：协议输入与配置完整性**
-   - 液体条目在解码前的数量 / 长度限额不足，恶意输入可能先触发过量读取或分配；应在读取条目之前完成帧级和条目级限额校验。
-   - 配置映射与热重载覆盖不完整，部分运行时参数可能无法从配置进入实际组件，或热重载后不会生效；需要建立配置项到消费者的完整映射表。
-6. **中：快照与协议架构**
-   - `SnapshotStore` 目前不是高效环形缓冲，`MaxEntitiesPerPacket` 尚未使用；高频快照路径存在可避免的搬移 / 批量限制缺口。
-   - 协议包元数据分散在多个位置，单程序集结构无法有效约束分层依赖和包契约边界；后续应集中元数据并明确分层约束。
-
-以上项目均属于**待修正项 / 风险**，当前不应按“已修复”或“已完成”统计。
+1. **已修正：权威提交基础链路**
+   - `CommandQueue` 改为 `(Tick, Sequence)` 优先队列，未来 Tick 不再阻塞已到期命令。
+   - 放砖 Authority 校验改为只读，库存扣除与图格写入统一放入仿真提交阶段。
+   - 入站管线注入实际仿真 Tick，避免所有客户端命令落在 Tick 0。
+   - 拾取、箱子转移及客户端状态包的完整提交后广播仍待继续收敛。
+2. **已修正：未知包边界**
+   - 未登记 `UnknownPacket` 默认由 Authority 拒绝，不再作为正常客户端包中继。
+   - Mod 包显式注册表仍待建立。
+3. **已修正：连接时序与失败传播**
+   - 出站 Channel 改为容量 2048 的有界队列。
+   - 读写循环联动取消并观察双方异常；写入 / Flush 失败会传递给等待者。
+   - Kick 与认证失败路径等待 Disconnect 包刷新后再关闭连接。
+4. **已修正：协议输入限额**
+   - 液体模块在分配列表前校验条目上限（128）与 payload 剩余长度，避免输入放大与过量读取。
+5. **仍待修正：提交后广播与完整原子性**
+   - 新增玩家提交后广播基础链路；
+   - 拾取改为仿真提交阶段库存与掉落物原子结算；
+   - 箱子操作增加玩家打开会话、在线状态和距离复核；
+   - 相关原版回归测试已迁移并通过；
+   - 明确当前不支持 MOD，MOD 后续单独立项。
+6. **仍待修正：容量与架构边界**
+   - 入站 / 审计队列容量、慢客户端策略、WorldState 并发契约、WorkerPool 收敛、SnapshotStore / 实体分包、协议元数据集中及程序集拆分仍在后续计划中。
 
 
 - **程序化世界生成**：支持原版三档尺寸（小 / 中 / 大），并生成**分层地形**（草皮 / 泥土 / 岩层 / 地狱层、

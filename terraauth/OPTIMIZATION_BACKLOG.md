@@ -61,8 +61,8 @@
 
 ### A. 高优先级：权威提交、未知包与时序
 
-1. **背包与世界状态缺少原子提交**：Authority 验证阶段修改背包时，后续放砖失败可能出现物品已扣除而世界未提交；拾取、箱子转移也缺少统一的原子提交边界，背包、实体 / 箱子状态及持久化可能部分成功。
-2. **未知包默认权限过宽**：`UnknownPacket` 默认中继应改为显式白名单，未知包默认拒绝或隔离，并按包类型与上下文授予中继权限。
+1. **背包与世界状态缺少原子提交**：放砖已改为仿真提交阶段扣除库存；拾取已改为同一提交内先入库、成功后移除掉落物；箱子写入要求玩家先建立打开会话，并在提交时再次校验在线状态与距离。仍需继续扩展到更多实体转移和提交事件。
+2. **未知包权限已收紧**：当前生产采用 Vanilla-only 白名单，`UnknownPacket` 默认拒绝，不提供即时中继或原始包透传。未来 MOD 兼容层不得绕过该边界。
 3. **命令顺序不充分**：`CommandQueue` 的 FIFO 队头逻辑不能保证 Tick / Sequence 顺序，需要明确排序键、入队来源和提交规则。
 4. **提交前广播**：客户端原包可能在仿真提交前广播，造成其他客户端先观察到尚未被权威状态确认的结果；广播应绑定已提交状态。
 5. **连接失败传播不完整**：连接读写任务的取消、等待和异常传播不完整，`Flush` 失败存在被标记为成功的风险；应统一任务生命周期、失败状态和收尾语义。
@@ -117,11 +117,11 @@
 **未包含（明确边界）**：树木（需要 tree 的 frame-important 图集帧映射）、生命水晶、
 生物群系（雪原 / 沙漠 / 丛林 / 腐化）、地牢 / 神庙等结构体。
 
-**测试**：+2（**259 通过**）—— `Generate_Produces_Layered_Terrain_With_Ores_Caves_Ocean_And_Chests`
+**历史测试记录**：+2（当时 **259 通过**）—— `Generate_Produces_Layered_Terrain_With_Ores_Caves_Ocean_And_Chests`
 （断言矿脉 / 洞穴 / 草皮 / 地狱层 / 海水 / 宝箱数量与战利品）、
 `Vanilla_PlayerControls_Relay_Preserves_Mount_And_Camera`（包 13 中继保留挂载与相机）；
 另把两个受「世界生成变重」影响的既有用例等待窗口放宽（`KickAsync_...` 与 `AntiCheat_PacketFlood_...`）。
-默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过（套件耗时由 ~26s 增至 ~40s，主要来自逐格噪声）。
+该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 263/263 通过。
 
 ### 第十五轮（2026-09-12）：协议字段核对后落地（包 20 图格方阵 + 区块流送对齐 + NPC 同步细节）
 
@@ -171,9 +171,7 @@
    而原版下落终速 `MaxFallSpeed ≈ 20 px/帧` 必然超出。拒绝时又**不更新基准、也不生成 MoveCommand**
    → 服务端位置停在原处（后续挖 / 放 / 开箱 / 拾取的 `IsWithinReach` 全部判 out_of_reach），
    且每次 Reject 计入违规窗口 → 默认 **10 次 / 60s 直接踢出** ⇒ **从高处掉落即被踢**。
-3. **未建模包被静默丢弃**：解码器只结构化约 35 个包，其余统一 `UnknownPacket`；
-   而 `RelayToOthersAsync` 的 switch **没有 default 分支** → 未建模包既不中继也不处理，
-   表情 / 告示牌 / 家具 / NetModule 其他模块等「他人可见性」全部丢失。
+3. **未建模包按 Vanilla-only 边界拒绝**：解码器无法结构化的包统一进入 `UnknownPacket`，由 Authority 拒绝；当前不开放未知包中继。
 
 **已实施**：
 
@@ -183,12 +181,11 @@
   包 8 在 Playing 阶段也被处理（按请求点补发）。登录期出生区块路径复用同一去重逻辑。
 - **移动权威分轴判定**：`MovementLimits` 新增 `MaxFallSpeed`（默认 20，由 `ServerConfig.MaxFallSpeed` 注入）；
   水平用 `MaxSpeed`，**垂直用 `max(MaxSpeed, MaxFallSpeed)`**；拒绝时仍保持基准不变（防瞬移污染）。
-- **未建模包默认中继**：`RelayToOthersAsync` 增加 default 分支 —— `UnknownPacket` 默认转发给其他玩家；
-  `IsSelfOnlyPacket` 列出「握手 / 世界与区块请求 / 自身属性上报 / 服务端自持（库存 / 箱子 / 拾取）」等不中继的包。
+- **未建模包不进入生产中继**：已删除 `RelayToOthersAsync` 即时中继路径；未知包默认由 Authority 拒绝，状态包统一等待仿真提交后生成服务端同步包。
 
-**测试**：+3（**256 通过**）——`Vanilla_TileSections_Stream_As_Player_Moves`（移动后补发区块、位置未变不重复下发）、
+**历史测试记录**：+3（当时 **256 通过**）——`Vanilla_TileSections_Stream_As_Player_Moves`（移动后补发区块、位置未变不重复下发）、
 `MovementAuthority_Accepts_FastFall_But_Still_Rejects_HorizontalTeleport`（垂直放宽但水平瞬移仍拒）、
-`Vanilla_UnmodeledPacket_Is_Relayed_To_OtherPlayers`（未建模包到达其他玩家）。
+`Vanilla_UnmodeledPacket_Is_Relayed_To_OtherPlayers`（历史中继行为，已被当前 Vanilla-only 默认拒绝策略取代）。
 顺带把既有偶发用例 `AntiCheat_PacketFlood_...` 的等待窗口 5s → 15s（全量并行跑时踢出会变慢）。
 默认后端与 `-p:NoSqlite=true` 兜底后端均 256/256 通过。
 
@@ -469,7 +466,7 @@ NPC 类型 ID（眼魔 4 / 世界吞噬者 13·14·15 / 骷髅王 35 / 史莱姆
 - **战斗 / 生存权威**：新增 `DamagePlayerCommand` / `KillPlayerCommand` / `RespawnCommand`；`PlayerHurtV2`（包 117）非负校验后结算服务端生命，归零置死亡态；`PlayerDeathV2`（118）结算死亡；Playing 阶段的包 12 视为复活请求，**复活点由服务端固定为世界出生点**（忽略客户端坐标）；死亡 / 复活由世界同步补发包 118 / 12+16。`PlayerRuntime` 拆出 `Dead`（死亡态）与 `Active`（在线），死亡不再冻结在线状态。
 - **掉落物拾取（包 22）**：`ItemPickupPacket` + 解码 / 编码；`WorldAuthority.ValidatePickup` 做槽位对账（真实存活实体）+ 拾取半径（64px）+ SSC 入库（`IInventoryAuthority.TryAddItem`），成功后 `PickupItemCommand` 移除世界实体并由世界同步下发包 21（stack=0）。
 - **弹幕命中判定**：仿真层按弹幕 / 敌怪中心距离（32px）判定命中并扣血，不再采信客户端。
-- **Mod 策略配置化**：`ServerConfig` 新增 `ModPolicy` 节（枚举以字符串读写）；`GameHost.Bootstrap` 从配置构造 `ModDetector` 并装配 `TModLoaderCompat`（Mod 名称清单解析 + 250-255 自定义包转发，转发通道绑定 `NetworkHost.SendRawAsync`）。
+- **MOD 兼容层暂缓**：`ModCompat` 代码保留但当前生产显式 `enabled: false`；不接受 TModLoader 握手、不注册 250-255、不转发自定义或未知包，未来单独立项。
 - **`.wld` 解析修复**：定位并修复 `LoadWorldTiles` 中 `int run = (b4 & 0xC0) >> 6 switch { ... }` 的**运算符优先级缺陷**——`switch` 实际约束 `6`，导致每个图格无条件执行 `_ => reader.ReadInt16()` 多读 2 字节，**任何 `.wld` 都无法解析**；改为显式括号后恢复正常。
 - **测试**：+20（192 通过）——受伤 / 致死 / 负数伤害、死亡广播、复活点权威、拾取成功 / 超距拒绝、弹幕命中、包 73 接受与限频、ModPolicy 配置反序列化与组合根注入、TModLoader 握手 / 截断容忍 / 转发通道、`.wld` 最小合法世界 + 版本 / 魔数 / footer 拒绝路径。
 

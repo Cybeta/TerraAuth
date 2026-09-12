@@ -165,7 +165,13 @@ public sealed class PacketDecoder : IPacketDecoder
         if (moduleId == netLiquidModuleId)
         {
             // 液体：UInt16 条目数 + 条目 ×（Int16 X + Int16 Y + Byte 液体量 + Byte 液体类型）
+            const int maxChanges = 128;
+            const int changeSize = sizeof(short) + sizeof(short) + sizeof(byte) + sizeof(byte);
             int count = r.ReadUInt16();
+            int remaining = checked(payload.Length - sizeof(ushort) - sizeof(ushort));
+            if (count > maxChanges || count > remaining / changeSize)
+                throw new InvalidDataException("Liquid module change count exceeds packet bounds");
+
             var changes = new List<LiquidChange>(count);
             for (int i = 0; i < count; i++)
                 changes.Add(new LiquidChange(r.ReadInt16(), r.ReadInt16(), r.ReadByte(), r.ReadByte()));

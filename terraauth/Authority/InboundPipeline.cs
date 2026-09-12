@@ -238,10 +238,12 @@ public sealed class TerminalStage : IPipelineStage
 public sealed class InboundPipeline : IInboundPipeline
 {
     private readonly IPipelineStage[] _stages;
+    private readonly Func<long> _currentTick;
 
-    public InboundPipeline(IEnumerable<IPipelineStage> stages)
+    public InboundPipeline(IEnumerable<IPipelineStage> stages, Func<long>? currentTick = null)
     {
         _stages = stages.OrderBy(s => s.Order).ToArray();
+        _currentTick = currentTick ?? (() => 0);
     }
 
     /// <summary>连接结束：把「按玩家重置」转发给实现了 <see cref="IResettableStage"/> 的阶段。</summary>
@@ -260,7 +262,7 @@ public sealed class InboundPipeline : IInboundPipeline
         CommandQueue commands,
         CancellationToken ct = default)
     {
-        var context = new PacketContext(playerId, Tick: 0, DateTimeOffset.UtcNow);
+        var context = new PacketContext(playerId, _currentTick(), DateTimeOffset.UtcNow);
         var index = 0;
 
         async Task<AuthorityResult> Next(INetworkPacket p)

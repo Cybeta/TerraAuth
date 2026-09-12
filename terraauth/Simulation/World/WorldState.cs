@@ -11,8 +11,17 @@ using TerraAuth.Protocol;
 namespace TerraAuth.Simulation;
 
 /// <summary>世界全局状态：元数据 + 图格矩阵 + 实体列表。</summary>
+public interface IInventoryLedger
+{
+    bool ConsumeItem(int playerId, int itemId);
+    bool TryAddItem(int playerId, int itemId, int stack);
+    bool TryAddItemExactly(int playerId, int itemId, int stack);
+}
+
 public sealed class WorldState
 {
+    public IInventoryLedger? InventoryLedger { get; set; }
+
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
 
@@ -45,6 +54,7 @@ public sealed class WorldState
 
         runtime.Active = false;
         runtime.Velocity = new Vector2(0, 0);
+        CloseChestSession(playerId);
 
         if (graceTicks <= 0 || string.IsNullOrEmpty(resumeKey)) return;
 
@@ -274,6 +284,60 @@ public sealed class WorldState
     /// </summary>
     public object ChestsLock { get; } = new();
 
+    /// <summary>玩家当前打开的箱子会话；会话状态由权威层读写。</summary>
+    private readonly Dictionary<int, int> _openChests = new();
+
+    public void OpenChestSession(int playerId, int chestIndex)
+    {
+        lock (ChestsLock)
+            _openChests[playerId] = chestIndex;
+    }
+
+    public bool HasChestSession(int playerId, int chestIndex)
+    {
+        lock (ChestsLock)
+            return _openChests.TryGetValue(playerId, out var current)
+                && current == chestIndex;
+    }
+
+    public void CloseChestSession(int playerId)
+    {
+        lock (ChestsLock)
+            _openChests.Remove(playerId);
+    }
+
+    public object ChestUpdatesLock { get; } = new();
+    private readonly HashSet<(int ChestIndex, int Slot)> _pendingChestUpdates = new();
+
+    public void MarkChestChanged(int chestIndex, int slot)
+    {
+        lock (ChestUpdatesLock)
+            _pendingChestUpdates.Add((chestIndex, slot));
+    }
+
+    public List<(int ChestIndex, int Slot)> DrainChestUpdates(int max)
+    {
+        if (max <= 0)
+            return new List<(int ChestIndex, int Slot)>();
+
+        lock (ChestUpdatesLock)
+        {
+            var result = new List<(int ChestIndex, int Slot)>(
+                Math.Min(max, _pendingChestUpdates.Count));
+            foreach (var update in _pendingChestUpdates)
+            {
+                result.Add(update);
+                if (result.Count >= max)
+                    break;
+            }
+
+            foreach (var update in result)
+                _pendingChestUpdates.Remove(update);
+
+            return result;
+        }
+    }
+
     /// <summary>按图格坐标查找箱子（不存在返回 null）。调用方需持 <see cref="ChestsLock"/>。</summary>
     public Chest? FindChestAt(int x, int y)
     {
@@ -325,6 +389,9 @@ public sealed class WorldState
     /// <summary>取出至多 <paramref name="max"/> 格待仿真液体（并从待处理集合移除）。</summary>
     public List<(int X, int Y)> TakeLiquidDirty(int max)
     {
+        if (max <= 0)
+            return new List<(int X, int Y)>();
+
         lock (LiquidsLock)
         {
             var result = new List<(int X, int Y)>(Math.Min(max, _liquidDirty.Count));
@@ -344,6 +411,9 @@ public sealed class WorldState
     /// <summary>取出至多 <paramref name="max"/> 条待下发的液体变更。</summary>
     public List<(int X, int Y)> DrainLiquidSync(int max)
     {
+        if (max <= 0)
+            return new List<(int X, int Y)>();
+
         lock (LiquidsLock)
         {
             if (_liquidPendingSync.Count == 0) return new List<(int X, int Y)>();
@@ -351,6 +421,34 @@ public sealed class WorldState
             int take = Math.Min(max, _liquidPendingSync.Count);
             var result = _liquidPendingSync.GetRange(0, take);
             _liquidPendingSync.RemoveRange(0, take);
+            return result;
+        }
+    }
+
+    // ---- 玩家状态变更推送（仿真提交后生成原版包 13）----
+
+    public object PlayerUpdatesLock { get; } = new();
+    private readonly HashSet<int> _pendingPlayerUpdates = new();
+
+    public void MarkPlayerChanged(int playerId)
+    {
+        lock (PlayerUpdatesLock) _pendingPlayerUpdates.Add(playerId);
+    }
+
+    public List<int> DrainPlayerUpdates(int max)
+    {
+        if (max <= 0)
+            return new List<int>();
+
+        lock (PlayerUpdatesLock)
+        {
+            var result = new List<int>(Math.Min(max, _pendingPlayerUpdates.Count));
+            foreach (var playerId in _pendingPlayerUpdates)
+            {
+                result.Add(playerId);
+                if (result.Count >= max) break;
+            }
+            foreach (var playerId in result) _pendingPlayerUpdates.Remove(playerId);
             return result;
         }
     }
@@ -380,6 +478,9 @@ public sealed class WorldState
     /// <summary>取出至多 <paramref name="max"/> 格待推送图格（并从待推送集合移除）。</summary>
     public List<(int X, int Y)> DrainTileUpdates(int max)
     {
+        if (max <= 0)
+            return new List<(int X, int Y)>();
+
         lock (TileUpdatesLock)
         {
             if (_pendingTileUpdates.Count == 0) return new List<(int X, int Y)>();

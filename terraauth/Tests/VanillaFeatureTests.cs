@@ -558,7 +558,7 @@ public class VanillaFeatureTests
     // ========================================================================
 
     [Fact]
-    public async Task Vanilla_Projectile_Is_Relayed_To_OtherPlayers()
+    public async Task Vanilla_Projectile_Is_Committed_By_Server()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
@@ -567,13 +567,19 @@ public class VanillaFeatureTests
         await a.SendAsync(PacketId.ProjectileNew,
             new ProjectileNewPacket(7, new Vector2(320f, 460f), new Vector2(1f, 0f), 1));
 
-        var got = await b.ReadUntilAsync(p => p is ProjectileNewPacket, TimeSpan.FromSeconds(5));
-        var proj = Assert.Single(got.OfType<ProjectileNewPacket>());
-        Assert.Equal(7, proj.ProjectileKey);
+        var applied = await TickUntilAsync(server,
+            () => server.Host.Simulator.State.Projectiles.Any(p => p.Key == 7 && p.Active),
+            TimeSpan.FromSeconds(5));
+        Assert.True(applied, "弹幕生成命令未在仿真 Tick 中提交");
+
+        // 生成包不由网络层即时中继；世界广播只负责服务端生成/生命周期通知。
+        await server.Host.BroadcastWorldStateAsync();
+        var got = await b.ReadUntilAsync(p => p is ProjectileNewPacket, TimeSpan.FromMilliseconds(500));
+        Assert.DoesNotContain(got, p => p is ProjectileNewPacket { ProjectileKey: 7 });
     }
 
     [Fact]
-    public async Task Vanilla_ProjectileDestroy_Is_Relayed()
+    public async Task Vanilla_ProjectileDestroy_Is_Committed_By_Server()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
@@ -581,40 +587,50 @@ public class VanillaFeatureTests
 
         await a.SendAsync(PacketId.ProjectileNew,
             new ProjectileNewPacket(9, new Vector2(320f, 460f), new Vector2(1f, 0f), 1));
-        await a.SendAsync(PacketId.ProjectileDestroy, new ProjectileDestroyPacket(9, new Vector2(400f, 460f)));
+        Assert.True(await TickUntilAsync(server,
+            () => server.Host.Simulator.State.Projectiles.Any(p => p.Key == 9 && p.Active),
+            TimeSpan.FromSeconds(5)), "弹幕生成命令未提交");
 
-        var got = await b.ReadUntilAsync(p => p is ProjectileDestroyPacket, TimeSpan.FromSeconds(5));
-        var destroy = Assert.Single(got.OfType<ProjectileDestroyPacket>());
-        Assert.Equal(9, destroy.ProjectileKey);
+        await a.SendAsync(PacketId.ProjectileDestroy, new ProjectileDestroyPacket(9, new Vector2(400f, 460f)));
+        Assert.True(await TickUntilAsync(server,
+            () => server.Host.Simulator.State.Projectiles.Any(p => p.Key == 9 && !p.Active),
+            TimeSpan.FromSeconds(5)), "弹幕销毁命令未提交");
+
+        await server.Host.BroadcastWorldStateAsync();
+        var got = await b.ReadUntilAsync(p => p is ProjectileDestroyPacket, TimeSpan.FromMilliseconds(500));
+        Assert.DoesNotContain(got, p => p is ProjectileDestroyPacket { ProjectileKey: 9 });
     }
 
     [Fact]
-    public async Task Vanilla_ItemDrop_Is_Relayed_To_OtherPlayers()
+    public async Task Vanilla_ItemDrop_Is_Committed_By_Server()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
         await using var b = await server.ConnectAsync("Bee");
 
         await a.SendAsync(PacketId.ItemDrop, new ItemDropPacket(1, 5));
+        var applied = await TickUntilAsync(server,
+            () => server.Host.Simulator.State.Items.Any(i => i.ItemId == 1 && i.Stack == 5 && i.Active),
+            TimeSpan.FromSeconds(5));
+        Assert.True(applied, "掉落物生成命令未在仿真 Tick 中提交");
 
-        var got = await b.ReadUntilAsync(p => p is ItemDropPacket, TimeSpan.FromSeconds(5));
-        var item = Assert.Single(got.OfType<ItemDropPacket>());
-        Assert.Equal(1, item.ItemId);
-        Assert.Equal(5, item.Stack);
+        await server.Host.FlushNewItemsAsync();
+        var got = await b.ReadUntilAsync(p => p is ItemDropPacket, TimeSpan.FromMilliseconds(500));
+        Assert.DoesNotContain(got, p => p is ItemDropPacket { ItemId: 1, Stack: 5 });
     }
 
     [Fact]
-    public async Task Vanilla_UnmodeledPacket_Is_Relayed_To_OtherPlayers()
+    public async Task Vanilla_UnmodeledPacket_Is_Rejected_And_Not_Relayed()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
         await using var b = await server.ConnectAsync("Bee");
 
-        // 包 99（表情类，未建模）：原版服务端会中继给其他人；此前被静默丢弃（他人完全看不到）
+        // 未登记包默认拒绝：协议层仍可保留原始载荷，但网络层不得直接中继。
         await a.SendRawAsync((PacketId)99, new byte[] { 7, 8, 9 });
 
-        var got = await b.ReadUntilAsync(p => p.Type == (PacketId)99, TimeSpan.FromSeconds(5));
-        Assert.Contains(got, p => p.Type == (PacketId)99);
+        var got = await b.ReadUntilAsync(p => p.Type == (PacketId)99, TimeSpan.FromMilliseconds(500));
+        Assert.DoesNotContain(got, p => p.Type == (PacketId)99);
     }
 
     [Fact]
@@ -653,7 +669,7 @@ public class VanillaFeatureTests
         await using var a = await server.ConnectAsync("Alice");
         await using var b = await server.ConnectAsync("Bee");
 
-        // 包 13 的可选尾随段（挂载 / 相机）此前被丢弃 → 他人看不到坐骑；现要求原样透传
+        // 包 13 的状态在仿真提交后才广播；客户端表现字段不再作为权威状态来源。
         await a.SendAsync(PacketId.PlayerPosition, new PlayerControlsPacket(
             PlayerId: 1,
             Position: new Vector2(300f, 400f),
@@ -666,45 +682,61 @@ public class VanillaFeatureTests
             CameraTarget = new Vector2(111f, 222f),
         });
 
-        var got = await b.ReadUntilAsync(p => p is PlayerControlsPacket { MountType: not null },
+        var applied = await TickUntilAsync(server,
+            () => server.Host.Simulator.State.Players.TryGetValue(1, out var player)
+                  && MathF.Abs(player.Position.X - 300f) < 2f,
+            TimeSpan.FromSeconds(5));
+        Assert.True(applied, "移动命令未在仿真 Tick 中提交");
+        await server.Host.FlushPlayerUpdatesAsync();
+
+        var got = await b.ReadUntilAsync(p => p is PlayerControlsPacket,
             TimeSpan.FromSeconds(5));
         var relayed = got.OfType<PlayerControlsPacket>().Last();
 
-        Assert.Equal((ushort)3, relayed.MountType);
-        Assert.Equal(111f, relayed.CameraTarget!.Value.X);
-        Assert.Equal(222f, relayed.CameraTarget.Value.Y);
         Assert.Equal(1, relayed.PlayerId);          // 身份由服务端覆盖
         Assert.Equal(300f, relayed.Position.X);
     }
 
     [Fact]
-    public async Task Vanilla_PlayerHurt_Is_Relayed_With_ServerPlayerId()
+    public async Task Vanilla_PlayerHurt_Is_Flushed_With_ServerPlayerId()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
         await using var b = await server.ConnectAsync("Bee");
 
-        // A 上报受击（客户端本地索引为 0）→ 服务端必须以分配的 #1 覆盖后再转发
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, a, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        var player = world.Players[1];
+        var hpBefore = player.Hp;
         await a.SendAsync(PacketId.PlayerHurtV2, new PlayerHurtV2Packet(0, 10));
 
-        var got = await b.ReadUntilAsync(p => p is PlayerHurtV2Packet, TimeSpan.FromSeconds(5));
-        var hurt = Assert.Single(got.OfType<PlayerHurtV2Packet>());
-        Assert.Equal(1, hurt.PlayerId);
+        Assert.True(await TickUntilAsync(server, () => player.Hp == hpBefore - 10,
+            TimeSpan.FromSeconds(5)), "受击命令未在仿真 Tick 中提交");
+        await server.Host.FlushPlayerHurtAsync();
+
+        var got = await b.ReadUntilAsync(p => p is PlayerHurtV2Packet, TimeSpan.FromMilliseconds(500));
+        Assert.DoesNotContain(got, p => p is PlayerHurtV2Packet { PlayerId: 1 });
+        Assert.Equal(hpBefore - 10, player.Hp);
     }
 
     [Fact]
-    public async Task Vanilla_PlayerBuffs_Is_Relayed_With_ServerPlayerId()
+    public async Task Vanilla_PlayerBuffs_Are_Committed_Server_Side()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
         await using var b = await server.ConnectAsync("Bee");
 
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, a, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
         await a.SendAsync(PacketId.PlayerBuffs, new PlayerBuffsPacket(0, new[] { 1, 2 }));
+        var player = world.Players[1];
+        Assert.True(await TickUntilAsync(server, () => player.Buffs.SequenceEqual(new[] { 1, 2 }),
+            TimeSpan.FromSeconds(5)), "增益命令未在仿真 Tick 中提交");
 
-        var got = await b.ReadUntilAsync(p => p is PlayerBuffsPacket, TimeSpan.FromSeconds(5));
-        var buffs = Assert.Single(got.OfType<PlayerBuffsPacket>());
-        Assert.Equal(1, buffs.PlayerId);
-        Assert.Equal(new[] { 1, 2 }, buffs.BuffTypes);
+        await server.Host.FlushPlayerUpdatesAsync();
+        var got = await b.ReadUntilAsync(p => p is PlayerBuffsPacket, TimeSpan.FromMilliseconds(500));
+        Assert.DoesNotContain(got, p => p is PlayerBuffsPacket { PlayerId: 1 });
+        Assert.Equal(new[] { 1, 2 }, player.Buffs);
     }
 
     // ========================================================================
@@ -1106,6 +1138,8 @@ public class VanillaFeatureTests
         await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
         int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY);
 
+        await s.SendAsync(PacketId.Chest,
+            new ChestPacket(world.SpawnTileX, world.SpawnTileY));
         await s.SendAsync(PacketId.SyncChestItem,
             new SyncChestItemPacket(index, ItemSlot: 3, Stack: 7, Prefix: 0, ItemType: 5));
 
@@ -1861,6 +1895,7 @@ public class VanillaFeatureTests
             Assert.True(world.Chests.Count > chestIndex, "追加的箱子未随世界文件载入");
 
             await StandAtAsync(server, s, cx * 16f + 8f, cy * 16f + 8f);
+            await s.SendAsync(PacketId.Chest, new ChestPacket(cx, cy));
             await s.SendAsync(PacketId.SyncChestItem,
                 new SyncChestItemPacket(chestIndex, ItemSlot: 5, Stack: 11, Prefix: 0, ItemType: 5));
 

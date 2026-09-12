@@ -1,5 +1,5 @@
 // TerraAuth — Mod 兼容层（需求 2：为 Mod 服务器支持预留接口）
-// 支持原版 / TModLoader / 自定义 Mod 客户端，通过 ModPolicy 控制白/黑名单
+// 未来 MOD 兼容层策略；当前生产路径由 TModLoaderCompat(enabled: false) 禁用
 
 using System;
 using System.Collections.Generic;
@@ -257,6 +257,7 @@ public sealed class CustomPacketHandler : ICustomPacketHandler
 /// <summary>TModLoader 兼容层：握手 + Mod 列表解析 + 包转发。</summary>
 public sealed class TModLoaderCompat
 {
+    private readonly bool _enabled;
     private readonly IModDetector _detector;
     private readonly ILogger _logger;
     private readonly ICustomPacketHandler _packets;
@@ -272,15 +273,25 @@ public sealed class TModLoaderCompat
         IModDetector detector,
         ILogger logger,
         ICustomPacketHandler packets,
-        Func<int, int, int, byte[], Task>? forward = null)
+        Func<int, int, int, byte[], Task>? forward = null,
+        bool enabled = false)
     {
+        _enabled = enabled;
         _detector = detector; _logger = logger; _packets = packets; _forward = forward;
-        _packets.RegisterPacketRange(PACKET_START, PACKET_END, "tModLoader");
+        if (_enabled)
+            _packets.RegisterPacketRange(PACKET_START, PACKET_END, "tModLoader");
     }
 
     /// <summary>处理 TModLoader 握手（解析 Mod 列表 + 策略校验）。</summary>
     public Task<HandshakeResult> HandleHandshakeAsync(ConnectionRequest request, byte[]? modListData)
     {
+        if (!_enabled)
+            return Task.FromResult(new HandshakeResult
+            {
+                Success = false,
+                RejectReason = "mod_support_disabled",
+            });
+
         var caps = _detector.Detect(request);
         if (modListData != null && caps.Type == ClientType.TModLoader)
         {
@@ -298,6 +309,12 @@ public sealed class TModLoaderCompat
     /// <summary>转发 Mod 包给目标玩家（仅放行已注册区间，其余丢弃并告警）。</summary>
     public async Task ForwardModPacketAsync(int fromPlayerId, int toPlayerId, int packetId, byte[] data)
     {
+        if (!_enabled)
+        {
+            _logger.Warn("Blocked Mod packet {PacketId} while Mod support is disabled", packetId);
+            return;
+        }
+
         if (!_packets.IsPacketAllowed(packetId, "tModLoader"))
         {
             _logger.Warn("Blocked unauthorized mod packet {PacketId} from player {PlayerId}", packetId, fromPlayerId);

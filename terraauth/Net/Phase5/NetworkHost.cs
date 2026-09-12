@@ -278,16 +278,13 @@ public sealed class NetworkHost : IAsyncDisposable
                     await BroadcastChatAsync(PlayerChatLine(connection.PlayerId, chat.Text), ct: ct)
                         .ConfigureAwait(false);
                 }
-                else
+                else if (packet is ChestPacket chestOpen)
                 {
-                    // 打开箱子（包 31）权威通过 → 把服务端持有的箱子内容逐槽下发（包 34 + 32）
-                    if (packet is ChestPacket chestOpen)
-                        await SendChestContentsAsync(connection, chestOpen, ct).ConfigureAwait(false);
-
-                    // 权威通过 → 转发给其他玩家：原版客户端依赖这些原版包渲染他人状态
-                    // （TerraAuth 专用快照包 15 会被原版客户端忽略，故玩家间可见性必须靠原版包）
-                    await RelayToOthersAsync(packet, connection, ct).ConfigureAwait(false);
+                    // 打开箱子（包 31）权威通过 → 把服务端持有的箱子内容逐槽下发（包 34 + 32）。
+                    await SendChestContentsAsync(connection, chestOpen, ct).ConfigureAwait(false);
                 }
+                // 其他已接受的状态包只进入命令队列；仿真提交后由 GameHost
+                // 从服务端最终状态生成原版同步包，不存在客户端原包即时中继路径。
                 break;
 
             case AuthorityDecision.Correct:
@@ -318,7 +315,7 @@ public sealed class NetworkHost : IAsyncDisposable
                     await _connections.KickAsync(
                         connection.PlayerId,
                         $"Too many violations: {result.Reason}",
-                        ct).ConfigureAwait(false);
+                        CancellationToken.None).ConfigureAwait(false);
                 }
                 break;
         }
@@ -354,109 +351,6 @@ public sealed class NetworkHost : IAsyncDisposable
         public DateTime StartUtc;
         public int Count;
     }
-
-    /// <summary>
-    /// 权威通过后把该包转发给其他 Playing 连接（原版语义：服务端中继客户端状态变更）。
-    /// <para>
-    /// 身份覆盖：凡携带玩家字段的包，一律以服务端分配的 PlayerId 覆盖客户端上报值，
-    /// 防止伪造他人身份驱动其移动 / 受伤 / 增益。
-    /// </para>
-    /// <para>
-    /// 原样转发：包 21（掉落物槽位）/ 27（抛射物索引）中的索引为全局量，原版即原样中继；
-    /// 包 32（箱子内物品）无玩家字段。
-    /// </para>
-    /// </summary>
-    private async Task RelayToOthersAsync(INetworkPacket packet, Connection sender, CancellationToken ct)
-    {
-        switch (packet)
-        {
-            case PlayerControlsPacket controls:      // 13 移动 / 控制（含速度等可选字段）
-                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerPosition,
-                    controls with { PlayerId = (byte)sender.PlayerId }, ct).ConfigureAwait(false);
-                break;
-
-            case TileBreakPacket brk:                // 17 挖砖
-                await _connections.BroadcastExceptAsync(
-                    sender.PlayerId, PacketId.TileBreak, brk, ct).ConfigureAwait(false);
-                break;
-
-            case TilePlacePacket place:              // 79 放砖
-                await _connections.BroadcastExceptAsync(
-                    sender.PlayerId, PacketId.TilePlace, place, ct).ConfigureAwait(false);
-                break;
-
-            case ProjectileNewPacket proj:           // 27 抛射物
-                await _connections.BroadcastExceptAsync(
-                    sender.PlayerId, PacketId.ProjectileNew, proj, ct).ConfigureAwait(false);
-                break;
-
-            case ProjectileDestroyPacket destroy:    // 29 弹幕销毁（不中继会导致他人视角弹幕永不消失）
-                await _connections.BroadcastExceptAsync(
-                    sender.PlayerId, PacketId.ProjectileDestroy, destroy, ct).ConfigureAwait(false);
-                break;
-
-            case ItemDropPacket drop:                // 21 世界掉落物
-                await _connections.BroadcastExceptAsync(
-                    sender.PlayerId, PacketId.ItemDrop, drop, ct).ConfigureAwait(false);
-                break;
-
-            case PlayerHurtV2Packet hurt:            // 117 受伤（他人可见受击表现）
-                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerHurtV2,
-                    hurt with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
-                break;
-
-            // 注：118 死亡不在此中继 —— 死亡已由服务端结算（KillPlayerCommand），
-            // 统一由世界同步线程按下发（避免同一次死亡发出两遍 118）。
-
-            case PlayerHealPacket heal:              // 35 治疗
-                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerHeal,
-                    heal with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
-                break;
-
-            case SyncPlayerZonePacket zone:          // 36 生物群系 / 城镇状态
-                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.SyncPlayerZone,
-                    zone with { PlayerId = (byte)sender.PlayerId }, ct).ConfigureAwait(false);
-                break;
-
-            case PlayerBuffsPacket buffs:            // 50 增益 / 减益列表
-                await _connections.BroadcastExceptAsync(sender.PlayerId, PacketId.PlayerBuffs,
-                    buffs with { PlayerId = sender.PlayerId }, ct).ConfigureAwait(false);
-                break;
-
-            case SyncChestItemPacket chestItem:      // 32 箱子内物品（无玩家字段）
-                await _connections.BroadcastExceptAsync(
-                    sender.PlayerId, PacketId.SyncChestItem, chestItem, ct).ConfigureAwait(false);
-                break;
-
-            default:
-                // 未建模的客户端包（UnknownPacket）：原版服务端默认把客户端状态变更中继给其他人，
-                // 否则表情 / 告示牌 / 家具 / NetModule 其他模块等「他人可见性」全部静默丢失。
-                // 少数「握手 / 世界请求 / 自身状态 / 服务端自持」类包不中继（见 IsSelfOnlyPacket）。
-                if (packet is UnknownPacket unknown && !IsSelfOnlyPacket(unknown.Type))
-                {
-                    await _connections.BroadcastExceptAsync(
-                        sender.PlayerId, unknown.Type, unknown, ct).ConfigureAwait(false);
-                }
-                break;
-        }
-    }
-
-    /// <summary>
-    /// 「只与该连接自身有关」的包：不应中继给其他玩家。
-    /// 覆盖握手 / 世界与区块请求 / 自身属性上报 / 服务端自持（库存 / 箱子 / 拾取）等。
-    /// 其余未建模包一律按原版语义中继（他人可见性依赖它）。
-    /// </summary>
-    private static bool IsSelfOnlyPacket(PacketId id) => id switch
-    {
-        PacketId.ConnectionRequest or PacketId.Disconnect or PacketId.ContinueConnecting
-            or PacketId.PlayerInfo or PacketId.InventorySlot or PacketId.RequestWorldInfo
-            or PacketId.WorldInfo or PacketId.TileGetSection or PacketId.StatusText
-            or PacketId.TileSendSection or PacketId.TileFrameSection or PacketId.PlayerSpawn
-            or PacketId.Snapshot or PacketId.PlayerHealth or PacketId.PlayerMana
-            or PacketId.ItemPickup or PacketId.Chest or PacketId.SyncPlayerChestIndex
-            or PacketId.InitialSpawn or PacketId.FinishedConnecting => true,
-        _ => false,
-    };
 
     /// <summary>
     /// 打开箱子（包 31）权威通过后，把服务端持有的箱子内容逐槽下发：
@@ -550,18 +444,6 @@ public sealed class NetworkHost : IAsyncDisposable
 
         await conn.SendEncodedAsync(PacketId.NetModule,
             new NetTextPacket(text) { AuthorId = byte.MaxValue, Color = ParseColor(color) }, ct).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// 向单个玩家发送一个未结构化包（Mod 自定义包转发用）：包号按 <see cref="PacketId"/> 原样写出，
-    /// 载荷原样透传，客户端按自定义包 ID 区间处理。
-    /// </summary>
-    public async Task SendRawAsync(int playerId, PacketId type, byte[] payload, CancellationToken ct = default)
-    {
-        var conn = _connections.Get(playerId);
-        if (conn is null || conn.State != ConnectionState.Playing) return;
-
-        await conn.SendEncodedAsync(type, new UnknownPacket(type, payload), ct).ConfigureAwait(false);
     }
 
     /// <summary>拼「名字: 文本」聊天行（服务端下行不带作者解析，需自行带名）。</summary>
@@ -948,8 +830,18 @@ public sealed class NetworkHost : IAsyncDisposable
 
     private static async Task KickAsync(Connection connection, string reason, CancellationToken ct)
     {
-        await connection.SendEncodedAsync(
-            PacketId.Disconnect, DisconnectPacket.WithReason(reason), ct).ConfigureAwait(false);
+        try
+        {
+            // 先等待包 2 写入 socket，再切换状态，避免认证阶段踢出丢失原因。
+            await connection.SendEncodedAndFlushedAsync(
+                PacketId.Disconnect,
+                DisconnectPacket.WithReason(reason),
+                ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // 连接已取消时直接进入关闭流程。
+        }
 
         connection.State = ConnectionState.Disconnected;
     }

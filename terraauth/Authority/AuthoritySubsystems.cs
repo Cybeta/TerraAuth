@@ -610,7 +610,7 @@ internal sealed class CombatAuthority : ICombatAuthority
 
 // ---------- 库存权威 ----------
 
-internal sealed class InventoryAuthority : IInventoryAuthority
+internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
 {
     /// <summary>Terraria 物品表规模上限（1.4 约 5000+，留余量）。</summary>
     private const int MaxItemId = 6000;
@@ -702,34 +702,47 @@ internal sealed class InventoryAuthority : IInventoryAuthority
     }
 
     public bool TryAddItem(int playerId, int itemId, int stack)
+        => TryAddItemInternal(playerId, itemId, stack, requireExact: false);
+
+    public bool TryAddItemExactly(int playerId, int itemId, int stack)
+        => TryAddItemInternal(playerId, itemId, stack, requireExact: true);
+
+    private bool TryAddItemInternal(int playerId, int itemId, int stack, bool requireExact)
     {
         if (!IsValidItem(itemId) || stack <= 0) return false;
 
         var inv = _inventories.GetOrAdd(playerId, _ => new ConcurrentDictionary<int, SlotState>());
         lock (inv)
         {
-            // 1) 优先并入同物品未满堆叠
+            var remaining = stack;
+            var changes = new List<(int Slot, int Stack)>();
+
             foreach (var kv in inv)
             {
-                if (kv.Value.ItemId == itemId && kv.Value.Stack > 0 && kv.Value.Stack < _limits.MaxStackSize)
-                {
-                    var add = Math.Min(stack, _limits.MaxStackSize - kv.Value.Stack);
-                    inv[kv.Key] = new SlotState(itemId, kv.Value.Stack + add);
-                    return true;
-                }
+                if (kv.Value.ItemId != itemId || kv.Value.Stack <= 0 || kv.Value.Stack >= _limits.MaxStackSize)
+                    continue;
+
+                var add = Math.Min(remaining, _limits.MaxStackSize - kv.Value.Stack);
+                changes.Add((kv.Key, kv.Value.Stack + add));
+                remaining -= add;
+                if (remaining == 0) break;
             }
 
-            // 2) 占用空槽：客户端已上报过的空槽，或尚未上报的槽位（SSC 下均按空处理）
-            for (int slot = 0; slot < InventoryLimits.MaxSlots; slot++)
+            for (int slot = 0; remaining > 0 && slot < InventoryLimits.MaxSlots; slot++)
             {
-                if (!inv.TryGetValue(slot, out var cur) || cur.Stack == 0)
-                {
-                    inv[slot] = new SlotState(itemId, Math.Min(stack, _limits.MaxStackSize));
-                    return true;
-                }
+                if (inv.TryGetValue(slot, out var cur) && cur.Stack > 0) continue;
+                var add = Math.Min(remaining, _limits.MaxStackSize);
+                changes.Add((slot, add));
+                remaining -= add;
             }
+
+            if (requireExact && remaining > 0) return false;
+            if (changes.Count == 0) return false;
+
+            foreach (var (slot, newStack) in changes)
+                inv[slot] = new SlotState(itemId, newStack);
+            return true;
         }
-        return false;
     }
 
     public void ApplyAuthorizedChange(int playerId, int slot, int delta)
@@ -774,6 +787,7 @@ internal sealed class WorldAuthority : IWorldAuthority
         ChestPacket chest => ValidateChestOpen(chest, playerId),
         SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId),
         LiquidModulePacket liquid => ValidateLiquid(liquid, playerId),
+        UnknownPacket => AuthorityResult.Reject("unknown_packet"),
         _ => AuthorityResult.Accept(packet),
     };
 
@@ -833,12 +847,17 @@ internal sealed class WorldAuthority : IWorldAuthority
         if (!IsWithinReach(playerId, chest.X, chest.Y, ChestReachPx))
             return Deny(playerId, "chest_rejected", "out_of_reach", new { chest.X, chest.Y });
 
+        int chestIndex;
         lock (_world.ChestsLock)
         {
-            if (_world.FindChestAt(chest.X, chest.Y) is null)
+            var existing = _world.FindChestAt(chest.X, chest.Y);
+            if (existing is null)
                 return Deny(playerId, "chest_rejected", "chest_not_found", new { chest.X, chest.Y });
+
+            chestIndex = existing.Index;
         }
 
+        _world.OpenChestSession(playerId, chestIndex);
         return AuthorityResult.Accept(chest);
     }
 
@@ -867,6 +886,9 @@ internal sealed class WorldAuthority : IWorldAuthority
 
         if (!IsWithinReach(playerId, chest.X, chest.Y, ChestReachPx))
             return Deny(playerId, "chest_rejected", "out_of_reach", new { item.ChestIndex });
+
+        if (!_world.HasChestSession(playerId, item.ChestIndex))
+            return Deny(playerId, "chest_rejected", "chest_not_open", new { item.ChestIndex });
 
         return AuthorityResult.Accept(item);
     }
@@ -898,11 +920,7 @@ internal sealed class WorldAuthority : IWorldAuthority
         if (dx * dx + dy * dy > (float)PickupReachPx * PickupReachPx)
             return Deny(playerId, "pickup_rejected", "out_of_reach", new { pickup.ItemSlotIndex });
 
-        // 服务端权威背包入库（SSC）：入不了（背包满）则拒绝，且不移除世界实体
-        if (!_inv.TryAddItem(playerId, item.ItemId, item.Stack))
-            return Deny(playerId, "pickup_rejected", "inventory_full",
-                new { item.ItemId, item.Stack });
-
+        // 这里只做只读校验；库存入库与实体移除必须在仿真提交阶段原子完成。
         return AuthorityResult.Accept(pickup);
     }
 
@@ -949,20 +967,17 @@ internal sealed class WorldAuthority : IWorldAuthority
         if (place.TileType < 0 || place.TileType > 556)
             return Deny(playerId, "tile_rejected", "invalid_tile_type", new { place.TileType });
 
-        // 背包物品校验：Terraria tile/item 同 ID，放砖需背包至少有 1 个对应物品。
-        // CE 空放（背包无此物品）或放非背包物品 → 拒绝。
-        // 校验通过后立即扣减服务端权威背包，保持 SSC 一致。
-        if (!_inv.ConsumeItem(playerId, place.TileType))
-            return Deny(playerId, "tile_rejected", "item_not_in_inventory",
-                new { place.TileType, Reason = "backpack missing item or not synced yet" });
-
-        // 放置目标必须为空：已有 Active 砖 → 客户端正常流程不会发，CE 伪造直接拒
-        // 区块读锁内取一份图格副本（同上）
+        // 先检查放置目标，再检查背包。验证阶段不得产生副作用，避免目标格已占用时扣除物品。
         Tile tile;
         using (_world.Sections.EnterRead(place.X, place.Y, place.X, place.Y))
             tile = _world.Tiles[place.X, place.Y];
         if (tile.Active)
             return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y });
+
+        // 背包物品校验只读；实际扣除必须随放置命令一起提交。
+        if (!_inv.HasItem(playerId, place.TileType))
+            return Deny(playerId, "tile_rejected", "item_not_in_inventory",
+                new { place.TileType, Reason = "backpack missing item or not synced yet" });
 
         return AuthorityResult.Accept(place);
     }

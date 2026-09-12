@@ -158,8 +158,10 @@ public sealed class GameHost : IDisposable
         var enforcers = new AuthorityEnforcers(thresholds.Rate, auditLogger, world,
             thresholds.Movement, thresholds.Player, thresholds.Combat,
             thresholds.Inventory, thresholds.World);
+        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
 
         // 管线阶段顺序（越早拒绝成本越低）
+        // 管线阶段按“先解析、再校验、后执行业务”的顺序组装，确保非法帧尽早拒绝
         var pipeline = new InboundPipeline(new IPipelineStage[]
         {
             new FrameStage(),
@@ -171,7 +173,7 @@ public sealed class GameHost : IDisposable
             new PlayerAuthorityStage(enforcers.Player, auditLogger),
             new WorldAuthorityStage(enforcers.World, auditLogger),
             new TerminalStage(),
-        });
+        }, currentTick: () => world.Tick);
 
         // ---- 扩展层初始化（插件 / Mod 兼容 / 并行）----
         // 1. 并行基础设施（需求：多 CPU 线程优化）
@@ -182,8 +184,8 @@ public sealed class GameHost : IDisposable
         var logger = new CoreLogger();
         var hooks = new HookRegistry(logger);
 
-        // 3. Mod 兼容层（需求 2：Mod 服务器支持）
-        // ModPolicy 取自 server.json 的 ModPolicy 节（未配置时默认 VanillaOnly = 仅原版客户端）
+        // 3. 当前生产版本仅支持 Vanilla；Mod 兼容层保留为后续独立立项，不注册 250-255，
+        // 不开放 TModLoader 握手、自定义包或未知包转发。
         var modPolicy = config.Current.ModPolicy;
         var modDetector = new ModDetector(modPolicy, logger);
         var customPackets = new CustomPacketHandler(logger);
@@ -215,12 +217,11 @@ public sealed class GameHost : IDisposable
             sessionResumeGraceSeconds: config.Current.SessionResumeGraceSeconds);
         networkForNames = network; // HookedPipeline 的玩家名解析延迟绑定到此
 
-        // 6.5 TModLoader 兼容层：Mod 列表解析 + 自定义包转发
-        // 转发通道绑定到网络层单播发送（包号 250-255 原样透传，其余被 CustomPackets 拦截）
+        // 6.5 保留未来兼容层对象，但不进入当前 Vanilla-only 生产能力。
         var tmodLoader = new TModLoaderCompat(
             modDetector, logger, customPackets,
-            forward: (_, toPlayerId, packetId, data) =>
-                network.SendRawAsync(toPlayerId, (PacketId)packetId, data));
+            forward: null,
+            enabled: false);
 
         // 7. 插件上下文 + 加载器
         // 必须在网络层之后：ServerApi 需要连接管理（踢出/在线查询）与封禁管理器才能真实生效
@@ -300,6 +301,10 @@ public sealed class GameHost : IDisposable
                 await FlushLiquidAsync(ct).ConfigureAwait(false);
                 // 服务端驱动的图格变更（电路翻转执行器等）同样按快照频率推送
                 await FlushTileUpdatesAsync(ct).ConfigureAwait(false);
+                // 客户端状态变更仅在仿真 Apply 成功后，按服务端最终状态生成包 13
+                await FlushPlayerUpdatesAsync(ct).ConfigureAwait(false);
+                // 箱子改动只在仿真提交后同步给当前打开该箱子的玩家
+                await FlushChestUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端判定的玩家受击（接触 / 下落伤害）→ 包 117 + 包 16
                 await FlushPlayerHurtAsync(ct).ConfigureAwait(false);
                 // 服务端主动生成的掉落物（Boss 掉落等）→ 包 21
@@ -583,6 +588,29 @@ public sealed class GameHost : IDisposable
         }, ct).ConfigureAwait(false);
     }
 
+    /// <summary>单批玩家状态通知上限。</summary>
+    private const int MaxPlayerUpdatesPerFlush = 256;
+
+    /// <summary>
+    /// 下发仿真已提交的玩家最终状态。客户端上报的位置不直接中继，避免在 Apply 前看到未提交状态。
+    /// </summary>
+    public async Task FlushPlayerUpdatesAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var playerIds = world.DrainPlayerUpdates(MaxPlayerUpdatesPerFlush);
+        foreach (var playerId in playerIds)
+        {
+            PlayerRuntime? player;
+            lock (world.PlayersLock)
+                world.Players.TryGetValue(playerId, out player);
+            if (player is null || !player.Active) continue;
+
+            await Network.BroadcastAsync(PacketId.PlayerPosition,
+                new PlayerControlsPacket((byte)playerId, player.Position, player.Velocity), ct)
+                .ConfigureAwait(false);
+        }
+    }
+
     /// <summary>单批受击通知上限。</summary>
     private const int MaxHurtNotifiesPerFlush = 64;
 
@@ -644,6 +672,37 @@ public sealed class GameHost : IDisposable
                     Prefix = item.Prefix,
                 },
                 playerId => IsPlayerWithin(world, playerId, item.Position.X, item.Position.Y, radiusSq),
+                ct).ConfigureAwait(false);
+        }
+    }
+
+    private const int MaxChestUpdatesPerFlush = 256;
+
+    public async Task FlushChestUpdatesAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var updates = world.DrainChestUpdates(MaxChestUpdatesPerFlush);
+
+        foreach (var (chestIndex, slot) in updates)
+        {
+            ChestItem item;
+            lock (world.ChestsLock)
+            {
+                var chest = world.FindChestByIndex(chestIndex);
+                if (chest is null || slot < 0 || slot >= chest.Items.Length)
+                    continue;
+                item = chest.Items[slot];
+            }
+
+            await Network.BroadcastWhereAsync(
+                PacketId.SyncChestItem,
+                new SyncChestItemPacket(
+                    chestIndex,
+                    slot,
+                    item.Stack,
+                    item.Prefix,
+                    item.Type),
+                playerId => world.HasChestSession(playerId, chestIndex),
                 ct).ConfigureAwait(false);
         }
     }
