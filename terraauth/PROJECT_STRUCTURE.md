@@ -36,7 +36,7 @@
 | `PackageReference` | 无（`System.IO.Pipelines` 自 .NET 10 起内置于共享框架） | `PipeReader` 分帧 |
 | `InternalsVisibleTo` | `TerraAuth.Tests` | 测试可访问 `internal`（原分散在 Simulation/Net，现集中一处） |
 
-**测试工程配置**：`Microsoft.NET.Test.Sdk 18.10.0` + `xunit 2.9.3` + `xunit.runner.visualstudio 3.1.5`，显式 `Compile` 列表（7 个测试文件），单一 `ProjectReference` → `..\TerraAuth.csproj`。
+**测试工程配置**：`Microsoft.NET.Test.Sdk 18.10.0` + `xunit 2.9.3` + `xunit.runner.visualstudio 3.1.5`，显式 `Compile` 列表（9 个测试文件），单一 `ProjectReference` → `..\TerraAuth.csproj`。
 
 ---
 
@@ -68,6 +68,7 @@ terraauth/
 │   ├── ShardedInboundPipeline.cs #   分片装饰器（单包→按玩家分片并行）
 │   ├── AuthorityEnforcers.cs     #   校验执行器
 │   ├── AuthoritySubsystems.cs    #   六子系统默认实现（Inventory/Movement/Combat/Player/World/Rate）
+│   ├── CommandService.cs         #   服务器命令子系统（注册 / 解析 / 分发）
 │   ├── AuditLogger.cs            #   审计实现
 │   └── IAuditLogger.cs
 │
@@ -81,12 +82,15 @@ terraauth/
 │   ├── SnapshotFrame.cs          #   快照帧
 │   ├── EventRecorder.cs          #   事件溯源
 │   ├── Determinism.cs            #   IRng + 确定性
+│   ├── WorldEntities.cs          #   世界实体（掉落物 / 弹幕 / NPC / 箱子）
 │   └── World/                    #   世界数据模型
-│       ├── Tile.cs               #     Tile / TileMap
+│       ├── Tile.cs               #     Tile / TileMap（含包 20 TileSquare 契约）
 │       ├── TileIdSets.cs         #     瓦片 ID 集合（FrameImportant 等）
 │       ├── WorldState.cs         #     世界状态
 │       ├── SectionLocks.cs       #     区块分区锁（图格读写互斥）
-│       └── WorldFileReader.cs    #     .wld 解析器
+│       ├── WorldGenerator.cs     #     程序化分层地形生成（三档尺寸）
+│       ├── WorldFileReader.cs    #     .wld 解析器
+│       └── WorldFileWriter.cs    #     .wld 写出器（写后读回校验 / 原子替换 / .bak）
 │
 ├── Net/                          # Phase 4/5 网络层 ── namespace TerraAuth.Net.Phase4 / Phase5
 │   ├── Phase4/
@@ -111,7 +115,7 @@ terraauth/
 │
 ├── Persistence/                  # 持久化          ── namespace TerraAuth.Persistence
 │   ├── IPersistence.cs
-│   ├── SqlitePersistence.cs      #   SqliteImpl（骨架）/ LiteDbPersistence（内嵌可用）
+│   ├── SqlitePersistence.cs      #   SqliteImpl（完整实装）/ LiteDbPersistence（内嵌兜底）
 │   └── PersistenceAuditLogger.cs
 │
 ├── Monitoring/                   # 监控            ── namespace TerraAuth.Monitoring
@@ -199,16 +203,16 @@ TerraAuth                     ← 组合根（Program / GameHost）
 
 | 模块 | 状态 | 说明 / 待办 |
 |------|------|-------------|
-| `Protocol/` | 部分 | 已定义 39 个 `PacketId` 常量与对应包契约（握手链 + 权威白名单 + 快照包 15 等）；原版 200+ 包按需补充 |
+| `Protocol/` | 部分 | 已定义 41 个 `PacketId` 常量与对应包契约（握手链 + 权威白名单 + 快照包 15 等）；原版 200+ 包按需补充 |
 | `Authority/` | 已实现 | 六子系统 + `InboundPipeline` 阶段链 |
 | `Simulation/`（核心） | 已实现 | `GameLoop` / `CommandQueue` / `SnapshotStore` / `EventRecorder` / 确定性 RNG |
-| `Simulation/World/` | 部分 | `Tile`/`TileMap`、`TileIdSets`（含 `tileFrameImportant`）、`WorldState`、`.wld` **解析 + 写出**（写出带写后读回校验 / 原子替换 / `.bak`）、包 10 `TileSection` 编码均已实现；世界可在 `ServerConfig.WorldPath` 指定为基准世界；**程序化生成支持三档尺寸**（小 / 中 / 大，`ServerConfig.WorldSize`）并生成**分层地形**（噪声地表 / 洞穴 / 深度分带矿脉 / 海滩与海水 / 地狱层 / 2×2 宝箱+战利品） |
+| `Simulation/World/` | 部分 | `Tile`/`TileMap`、`TileIdSets`（含 `tileFrameImportant`）、`WorldState`、`WorldGenerator`、`.wld` **解析 + 写出**（写出带写后读回校验 / 原子替换 / `.bak`）、包 10 `TileSection` 与**包 20 `TileSquare`** 编码均已实现；世界可在 `ServerConfig.WorldPath` 指定为基准世界；**程序化生成支持三档尺寸**（小 / 中 / 大，`ServerConfig.WorldSize`）并生成**分层地形**（噪声地表 / 洞穴 / 深度分带矿脉 / 海滩与海水 / 地狱层 / 2×2 宝箱+战利品） |
 | `Simulation/WorldSimulator` | 已实现 | 六阶段 tick + 扩展阶段：AI（城镇 NPC / 敌怪 / 入侵怪 / Boss 追击）/ 物理（重力 + 图格碰撞 + 边界钳制）/ 战斗（下落伤害 + 敌怪·Boss 接触伤害（含 60tick 免伤帧）+ 弹幕命中 + Boss 击杀记进度 + 玩家死亡态 + 受击通知入队）/ 世界（昼夜 + 月相 + 简化事件：血月 · 日食）/ 实体（掉落物、弹幕）/ 液体（逐格简化流动，下发按视口裁剪）/ 电路（受限 BFS 翻转执行器 + 图格变更推送）；为简化模型，非原版全量物理 |
 | `Net/Phase4` | 部分 | 快照广播框架 + `BuildDelta`（实体提取 / 增量 / `Removed` / xxHash32 校验和）+ `SubmitInputs` Command 生成 + `ShadowPredictor` 影子预测（输入重放/速度钳制/偏差阈值）+ 每玩家分桶（`BuildFrameFor`）+ 视野裁剪（`ViewportRadius`）已实现 |
 | `Net/Phase5`（协议） | 部分 | `Framing` / `Connection` / 握手链已实现 |
-| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 32 类出站包（握手链 3/7/9/8/10/12/49/129 + 2/4/5/13/14/16/17/20/21/22/27/28/31/32/34/35/36/42/50/65/73/79/117/118 + 包 82 的 NetText / NetLiquid 模块）；包 10 `TileSection`、**包 20 `TileSquare`（未压缩小矩形）**、包 13 可选尾随段（挂载 / 回城 / 相机）、包 15 `Snapshot` 已实现 |
-| `Net/Phase5` `PacketDecoder` | 部分 | 已解析 31 个入站包（握手链 + 权威白名单 13 包 + 拾取 / 箱子 / 伤害 / 死亡 / 治疗 / 法力 / 增益 / 传送等 + 包 82 模块 0/1）+ 包 15 `Snapshot`；其余统一 `UnknownPacket` 透传 |
-| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10，且**在 Playing 阶段也处理**；**按玩家位置流送区块**（3×3，跨区块才补发、下发前先发包 9）；包 7 下发真实世界元数据；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接；**断线走宽限期会话保留并在连接结束时回收槽位**；未知包默认拒绝，状态包不走即时中继 |
+| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 **37 类出站包**（握手链 2/3/4/7/8/9/10/12/49/129 + 权威与状态 5/13/14/16/17/18/20/21/22/23/27/28/29/31/32/34/35/36/42/50/65/73/79/117/118 + 包 82 的 NetText / NetLiquid 模块 + 包 15 `Snapshot`）；包 10 `TileSection`、**包 20 `TileSquare`（未压缩小矩形）**、包 13 可选尾随段（挂载 / 回城 / 相机）已实现 |
+| `Net/Phase5` `PacketDecoder` | 部分 | 已解析 **35 个入站包**（握手链 + 权威白名单 13 包 + 拾取 / 箱子 / 伤害 / 死亡 / 治疗 / 法力 / 增益 / 传送 / 时间 / NPC / 聊天与液体模块等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket`，由 Vanilla-only 权威层默认拒绝 |
+| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10，且**在 Playing 阶段也处理**；**按玩家位置流送区块**（3×3，跨区块才补发、下发前先发包 9）；包 7 下发真实世界元数据；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**未建模包等「行为噪声」拒绝不计入**）；**未建模包按 `PacketId` 统计**（`UnmodeledPacketCounts` + 首次/每 100 次/停机汇总）；**断线走宽限期会话保留并在连接结束时回收槽位**；未知包默认拒绝，状态包不走即时中继 |
 | `Config/` | 已实现 | `ServerConfig`（含 `ModPolicy` 节 + `WorldPath` / `WorldSize`（小 / 中 / 大三档）/ `WorldExportPath`）+ `FileSystemWatcher` 热重载；枚举以字符串读写 |
 | `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认）五表落盘（玩家 / 审计 / 封禁 / **WorldTiles 世界改动** / **WorldChests 箱子内容**）；`-p:NoSqlite=true` 降级到内嵌 `LiteDbPersistence`（JSON，同样五类数据落盘） |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `/metrics`（`SetGauge` 支持自定义指标名与标签） |
@@ -216,7 +220,7 @@ TerraAuth                     ← 组合根（Program / GameHost）
 | `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息 / `ExecuteCommand`（经 `CommandService` 分发，内置 say / who / kick / help；`Broadcast` / `SendMessage` 经包 82（NetTextModule）真实下发）；`EventStore.QueryAsync` 已接持久化审计查询；示例插件见 `Examples/TerraAuth.ExamplePlugins/` |
 | `ModCompat/` | 暂停 | 未来兼容层代码保留但默认禁用；当前生产仅 Vanilla，不注册 250-255、不接受 TModLoader 握手或自定义包透传 |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
-| `Tests/` | 部分 | 9 组验收测试（263 用例通过）；`VanillaFeatureTests` 以真实权威管线 + 真实 TCP 覆盖原版功能（含箱子内容（含持久化重启存活） / 液体（视口裁剪 + 混合反应）/ 电路（图格推送**包 20**）/ Boss·事件（含掉落与已核对 ID 映射）/ 受伤→死亡→复活 / 服务端接触伤害（含免伤帧）/ 法力跟踪 / 治疗钳制 / 增益持有 / 弹幕生成校验 / **世界改动持久化（重启回放）** / **世界文件加载与导出** / **世界尺寸配置（中世界生成）** / **断线会话保留（宽限期重连续回状态）** / **区块流送（离开出生点后地形）** / **未建模包拒绝** / **包 13 中继保留挂载与相机** / 掉落物拾取 / 弹幕命中 / 高熵区块拆分 / Phase 7 对抗自动化 / 时间与 NPC 同步 / 聊天，矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)）；`WorldFileTests` 覆盖 `.wld` 解析；包 10 / **包 20 线格式逐字段** / 包 15 / 新增包编解码回归、`WorldGenerator` 三档尺寸 / **分层地形内容（矿脉·洞穴·草皮·地狱层·海水·宝箱）** / 确定性、**移动权威分轴（快速坠落 / 水平瞬移）**、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、命令子系统、Hook 参数填充包数据、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、指标导出、插件事件查询、实体视图发布、区块分区锁并发安全（真实 TCP）、持久化往返（玩家 / 审计 / 封禁重启读回）已补 |
+| `Tests/` | 部分 | 9 组验收测试（**285 用例通过**）；`VanillaFeatureTests` 以真实权威管线 + 真实 TCP 覆盖原版功能（含箱子内容（含持久化重启存活） / 液体（视口裁剪 + 混合反应）/ 电路（图格推送**包 20**）/ Boss·事件（含掉落与已核对 ID 映射）/ 受伤→死亡→复活 / 服务端接触伤害（含免伤帧）/ 法力跟踪 / 治疗钳制 / 增益持有 / 弹幕生成校验 / **世界改动持久化（重启回放）** / **世界文件加载与导出** / **世界尺寸配置（中世界生成）** / **断线会话保留（宽限期重连续回状态）** / **区块流送（离开出生点后地形）** / **未建模包拒绝** / **包 13 中继保留挂载与相机** / 掉落物拾取 / 弹幕命中 / 高熵区块拆分 / Phase 7 对抗自动化 / 时间与 NPC 同步 / 聊天，矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)）；`WorldFileTests` 覆盖 `.wld` 解析；包 10 / **包 20 线格式逐字段** / 包 15 / 新增包编解码回归、`WorldGenerator` 三档尺寸 / **分层地形内容（矿脉·洞穴·草皮·地狱层·海水·宝箱）** / 确定性、**移动权威分轴（快速坠落 / 水平瞬移）**、踢出与违规阈值触发、纠正包类型、插件 API 踢出与封禁、命令子系统、Hook 参数填充包数据、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、指标导出、插件事件查询、实体视图发布、区块分区锁并发安全（真实 TCP）、持久化往返（玩家 / 审计 / 封禁重启读回）已补 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 部分 | 对抗测试手册（M/P/R 清单）+ **服务端可自动化部分已落地为测试**（`VanillaFeatureTests.AntiCheat_*`） |
 
@@ -234,7 +238,7 @@ dotnet build TerraAuth.csproj -p:NoSqlite=true
 # 运行
 dotnet run --project TerraAuth.csproj -- --config server.json --port 7777
 
-# 测试（283 用例，当前全量通过）
+# 测试（285 用例，当前全量通过）
 dotnet test Tests/TerraAuth.Tests.csproj
 
 # 无 SDK 环境静态校验（大括号平衡 / ProjectReference 路径 / 接口实现 / TODO 统计）

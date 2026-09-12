@@ -62,6 +62,15 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>诊断：权威层拒绝计数器（PersistenceAuditLogger 只落库不打印，拒绝原因需在控制台可见）。</summary>
     private long _rejectCount;
 
+    /// <summary>
+    /// 未建模包统计：PacketId → 收到次数。用于「真机客户端实际发了哪些包」的数据驱动决策
+    /// （决定哪些包需要登记为中继 / 需要权威建模）。这些包被拒绝但**不计违规**。
+    /// </summary>
+    private readonly ConcurrentDictionary<PacketId, long> _unmodeledPackets = new();
+
+    /// <summary>未建模包统计快照（按 PacketId）。</summary>
+    public IReadOnlyDictionary<PacketId, long> UnmodeledPacketCounts => _unmodeledPackets;
+
     /// <summary>违规处置阈值（滑动窗口 + 阈值 → 踢出）。</summary>
     private readonly ViolationKickLimits _violationKick;
 
@@ -148,6 +157,9 @@ public sealed class NetworkHost : IAsyncDisposable
 
         foreach (var conn in _connections.All())
             await conn.DisposeAsync().ConfigureAwait(false);
+
+        // 真机测试收尾：把「客户端实际发了哪些未建模包」打出来（决定中继 / 建模优先级）
+        LogUnmodeledPacketSummary();
     }
 
     // ---------- Accept 循环 ----------
@@ -288,6 +300,10 @@ public sealed class NetworkHost : IAsyncDisposable
             ct,
             connection.SessionId).ConfigureAwait(false);
 
+        // 未建模包统计（真机测试数据来源）：这些包会被拒绝，但不计入违规窗口。
+        if (packet is UnknownPacket unmodeled)
+            RecordUnmodeledPacket(unmodeled.Type);
+
         switch (result.Decision)
         {
             case AuthorityDecision.Accept:
@@ -326,7 +342,9 @@ public sealed class NetworkHost : IAsyncDisposable
                     Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}");
 
                 // 处置：窗口内拒绝累计达阈值 → 踢出（先发包 2 说明原因，再关闭连接）
-                if (RecordViolation(connection.PlayerId, connection.SessionId))
+                // 仅「计入违规」的拒绝参与累计；未建模包等客户端行为噪声只统计不惩罚。
+                if (result.CountsAsViolation
+                    && RecordViolation(connection.PlayerId, connection.SessionId))
                 {
                     if (_violations.TryGetValue(connection.PlayerId, out var violation)
                         && violation.SessionId == connection.SessionId)
@@ -388,6 +406,33 @@ public sealed class NetworkHost : IAsyncDisposable
         public DateTime StartUtc;
         public int Count;
     }
+
+    /// <summary>
+    /// 记录一个未建模包（PacketId → 次数）。首次出现必打印（用于发现「客户端到底发了什么」），
+    /// 之后每 100 次打印一次（用于观察量级）；停机时再打印完整汇总。
+    /// </summary>
+    private void RecordUnmodeledPacket(PacketId type)
+    {
+        var count = _unmodeledPackets.AddOrUpdate(type, 1, static (_, c) => c + 1);
+        if (count == 1)
+            Console.WriteLine($"[Unmodeled] 首次收到未建模包 {DescribePacketId(type)}：已拒绝（不计违规，仅统计）");
+        else if (count % 100 == 0)
+            Console.WriteLine($"[Unmodeled] {DescribePacketId(type)} 累计 {count} 次");
+    }
+
+    /// <summary>停机汇总未建模包统计（按次数倒序），供真机测试后决定「中继 / 建模」优先级。</summary>
+    private void LogUnmodeledPacketSummary()
+    {
+        if (_unmodeledPackets.IsEmpty) return;
+
+        Console.WriteLine($"[Unmodeled] 未建模包汇总（{_unmodeledPackets.Count} 种，按次数倒序）：");
+        foreach (var (type, count) in _unmodeledPackets.OrderByDescending(static kv => kv.Value))
+            Console.WriteLine($"[Unmodeled]   {DescribePacketId(type)} × {count}");
+    }
+
+    /// <summary>包号显示：已登记常量显示「名字(号)」，未登记（枚举未定义）只显示号。</summary>
+    private static string DescribePacketId(PacketId type)
+        => Enum.IsDefined(type) ? $"{type}({(byte)type})" : $"#{(byte)type}";
 
     /// <summary>
     /// 打开箱子（包 31）权威通过后，把服务端持有的箱子内容逐槽下发：

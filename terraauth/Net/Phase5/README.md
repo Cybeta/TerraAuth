@@ -60,7 +60,7 @@ NetworkHost.AcceptLoop
 
 - **单帧一个包**：每个 `INetworkPacket` 独立走管线，**不在网络层攒批**
 - **异常隔离**：单个包处理异常 → 关闭该连接，**不影响其他玩家**
-- **背压**：`CommandQueue` 满 → 丢弃最旧输入并告警（防恶意洪水）
+- **背压**：出站为每连接**有界** `Channel`（容量 2048，`FullMode = Wait`，满时发送方等待）；入站 `CommandQueue` 当前为无界 `(Tick, Sequence)` 优先队列。入站 / 审计队列的容量上限与过载策略仍为待办（见 `OPTIMIZATION_BACKLOG.md` §三 第 6 条）
 
 ---
 
@@ -147,9 +147,17 @@ PacketId（真实 Terraria 包号）:
   129 → FinishedConnecting
 ```
 
+> 上表为**代表性**包（非全集）。编解码实际覆盖：包 18 `Time`、20 `TileSquare`、22 `ItemPickup`（SyncItemOwner）、
+> 23 `NpcUpdate`（SyncNPC）、29 `ProjectileDestroy`（KillProjectile）、34 `SyncPlayerChestIndex`、
+> 42 `PlayerMana`、82 `NetModule`（NetLiquid=0 / NetText=1）等亦已结构化 —— 共 **35 个入站包 / 37 类出站包**。
 > 完整映射参考 tModLoader `MessageID` / TShock `PacketTypes`。
-> **权威白名单已全部可解码**：`ITerrariaProtocol.RequiresAuthority` 列出的包（5 / 13 / 17 / 21 / 27 / 28 / 31 / 65 / 73 / 79）均已有 Decoder / Encoder 实现。
-> **其余包透明透传**：未结构化建模的包统一解码为 `UnknownPacket`（保留原始 PacketId + payload），编码侧原样写回——编解码层对本版本全部包「无缺口」，无需逐包建模；仅权威校验所需的包按需增量结构化。
+
+> **权威白名单已全部可解码**：`ITerrariaProtocol.RequiresAuthority` 列出的 **13 包**
+> （5 / 13 / 17 / 21 / 27 / 28 / 31 / 35 / 42 / 50 / 65 / 73 / 79）均已有 Decoder / Encoder 实现。
+> **未建模包默认拒绝（Vanilla-only）**：未结构化建模的包统一解码为 `UnknownPacket`（保留原始 PacketId + payload），
+> 由权威层默认拒绝，**不再即时中继 / 原样写回**；仅权威校验与状态同步所需的包按需增量结构化。
+> 该拒绝**不计入违规窗口**（正常客户端会发不少未建模包，计入会导致误踢），并按 `PacketId` 统计（`NetworkHost.UnmodeledPacketCounts`
+> + 首次出现 / 每 100 次 / 停机汇总打印），用于决定「哪些包该登记为中继、哪些该权威建模」。
 > **每个新版本 Terraria 更新客户端，只需修改本文件 + Phase 2 对应包处理**——协议变更的影响被隔离在网络层。
 
 ### 5.2 编解码规则
@@ -237,8 +245,8 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 
 | 场景 | 策略 |
 |---|---|
-| 入站洪水 | `CommandQueue` 容量上限，超限丢弃最旧 + 告警 |
-| 出站堆积 | 每连接 `Channel` 满 → 跳过增量快照，等待追赶 |
+| 入站洪水 | 出站为有界 `Channel`（2048，满时等待）；入站 / 审计队列容量上限与过载策略待补 |
+| 出站堆积 | 每连接有界 `Channel`（2048）满 → 发送方等待（`FullMode = Wait`），不做丢弃 |
 | 恶意连接 | 握手超时（默认 10s）自动断开 |
 
 ---
@@ -283,7 +291,7 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 5. ✅ `ISnapshotSender` 的 TCP 实现（对接 Phase 4）
 
 **P1（完善）**：
-- ✅ 包编解码：权威白名单 10 包已结构化（含传送反作弊 `TeleportEntity(65)` / `RequestTeleportationByServer(73)`）；其余包统一 `UnknownPacket` 透明透传（编解码层无缺口）；⚠️ 按需增量结构化
+- ✅ 包编解码：权威白名单 **13 包** + 状态同步包已结构化（含传送 `TeleportEntity(65)` / `RequestTeleportationByServer(73)`、治疗 35 / 法力 42 / 增益 50、时间 18 / NPC 23 / 弹幕销毁 29 / 拾取 22 / 箱子索引 34 等，共 **35 个入站包 / 37 类出站包**）；未建模包统一 `UnknownPacket` 且**默认拒绝**（Vanilla-only），不再透传；⚠️ 按需增量结构化
 - ✅ 变长整数（`Read/Write7BitEncodedInt`）；⚠️ 特殊类型：`Vector2` / 图格 `Color` 已覆盖，独立 `Rectangle` 读写器待补
 - ✅ 连接认证白名单（`NetworkHost` 按 `PlayerWhitelist` 踢出）；⏳ SteamTicket 未实现
 - ⏳ 性能基准（单服 100 玩家，带宽/CPU 预算）

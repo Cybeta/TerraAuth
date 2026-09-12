@@ -333,6 +333,26 @@ public class WorldFileTests
     }
 
     /// <summary>
+    /// 原版 <c>FileMetadata.Read</c> 要求元数据 UInt64 的**最高字节 = FileType**（World = 2），
+    /// 否则抛 <c>Found invalid file type.</c> 而拒绝加载。本服务端读取器只校验低 56 位魔数，
+    /// round-trip 覆盖不到该字节 —— 故单独钉住（曾被原版服务端实测拒绝）。
+    /// </summary>
+    [Fact]
+    public void Wld_Written_Metadata_Carries_WorldFileType()
+    {
+        var bytes = WorldFileWriter.Serialize(BuildFeatureWorld());
+
+        using var ms = new MemoryStream(bytes);
+        using var r = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
+
+        _ = r.ReadInt32();                     // 版本
+        ulong metadata = r.ReadUInt64();       // 元数据：低 56 位魔数 + 最高字节文件类型
+
+        Assert.Equal(0x6369676F6C6572uL, metadata & 0x00FFFFFFFFFFFFFFuL); // "relogic"
+        Assert.Equal(2, (byte)(metadata >> 56));                           // FileType.World
+    }
+
+    /// <summary>
     /// 严格分段走查：按**原版加载器**的顺序与位置断言逐段校验写出文件。
     /// 本服务端读取器会直接跳到 footer（跳过 5..9 段），因此 round-trip 覆盖不到这些段；
     /// 而原版加载器会逐段读取并要求「读完正好落在下一段起点」。本用例正是补上这一层。

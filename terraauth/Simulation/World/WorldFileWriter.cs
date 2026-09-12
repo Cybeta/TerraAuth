@@ -28,6 +28,9 @@ public static class WorldFileWriter
     /// <summary>文件元数据魔数低 56 位（与读取器校验一致）。</summary>
     private const ulong MetadataMagicLow56 = 0x6369676F6C6572uL;
 
+    /// <summary>元数据最高字节 = 文件类型；原版 <c>FileType.World</c> = 2。</summary>
+    private const byte MetadataWorldFileType = 2;
+
     /// <summary>
     /// 写出世界文件：临时文件 → 读回校验 → 原子替换（旧文件滚动为 <c>.bak</c>）。
     /// </summary>
@@ -64,8 +67,9 @@ public static class WorldFileWriter
     {
         w.Write(WriteVersion);
 
-        // ---- 文件元数据（版本 >= 135 才有）：魔数 + 修订号 + 旗标 ----
-        w.Write(MetadataMagicLow56);
+        // ---- 文件元数据（版本 >= 135 才有）：UInt64（低 56 位魔数 + 最高字节文件类型）+ 修订号 + 旗标 ----
+        // 最高字节必须为 FileType.World(=2)，否则原版 FileMetadata.Read 会抛 "Found invalid file type."
+        w.Write(MetadataMagicLow56 | ((ulong)MetadataWorldFileType << 56));
         w.Write(0u);      // Revision
         w.Write(0UL);     // Flags
 

@@ -29,7 +29,7 @@
 
 | 模块 | 原因 |
 |------|------|
-| CommandQueue 排序 | 必须按 (tick, playerId) 稳定排序 |
+| CommandQueue 排序 | 必须按 (tick, sequence) 稳定排序 |
 | Tick 推进（GameLoop） | 固定 timestep 时序锚点 |
 
 ## 二、推荐线程模型

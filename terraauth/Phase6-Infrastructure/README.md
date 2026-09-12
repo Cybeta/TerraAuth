@@ -7,7 +7,7 @@
 | 模块 | 接口 | 说明 |
 |---|---|---|
 | 配置 | `IConfigurationService` / `ServerConfig` | 所有反作弊阈值的唯一来源（JSON + 热重载） |
-| 持久化 | `IPlayerRepository` / `IAuditRepository` | SSC 存档 + 审计日志（默认内嵌 `LiteDbPersistence`；定义 `USE_SQLITE` 后走 SQLite） |
+| 持久化 | `IPlayerRepository` / `IAuditRepository` | SSC 存档 + 审计日志（默认 `SqliteImpl`；`-p:NoSqlite=true` 降级到内嵌 `LiteDbPersistence`） |
 | 监控 | `IMetrics` | Prometheus 指标（包耗时/拦截数/在线人数） |
 | 封禁 | `IBanManager` / `IBanStore` | 违规累计 → 自动封禁 + IP 黑名单 |
 
@@ -54,7 +54,7 @@
 
 ## §6. P0 优先级
 
-1. ✅ SqlitePersistence 审计异步化（无界 `Channel` + `DrainAuditLoop` 每 250ms / 100 条批量落盘）；真实 `SqliteImpl` 的 SQL 仍为骨架
+1. ✅ SqlitePersistence 审计异步化（无界 `Channel` + `DrainAuditLoop` 每 250ms / 100 条批量落盘）；`SqliteImpl` 已完整实装（玩家 / 审计 / 封禁 / WorldTiles / WorldChests 五表）
 2. ✅ 真实 IBanStore（`SqliteBanStore` 复用同一 `IDbExecutor`）
 3. ✅ PrometheusMetrics.ExportAsText + `HttpListener` /metrics 端点
 4. ✅ GameHost 注入真实实现（`Bootstrap` 组装 Phase 2/3/4/5 + 基础设施 + 扩展层）

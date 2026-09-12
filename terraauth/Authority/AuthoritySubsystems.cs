@@ -822,7 +822,9 @@ internal sealed class WorldAuthority : IWorldAuthority
         ChestPacket chest => ValidateChestOpen(chest, playerId, sessionId),
         SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId, sessionId),
         LiquidModulePacket liquid => ValidateLiquid(liquid, playerId),
-        UnknownPacket => AuthorityResult.Reject("unknown_packet"),
+        // 未建模包：拒绝（不进权威链路），但**不计违规** —— 正常原版客户端会发不少未建模包
+        // （表情 / 家具 / 告示牌 / 部分 NetModule…），计入违规会让正常玩家被误踢。
+        UnknownPacket => AuthorityResult.Reject("unknown_packet", countsAsViolation: false),
         _ => AuthorityResult.Accept(packet),
     };
 

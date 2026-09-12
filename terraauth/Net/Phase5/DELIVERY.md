@@ -67,10 +67,11 @@
 ## 下一步优先级
 
 ### P0（先打通端到端）
-1. ◐ **跑通第一条完整链路**：原版 Terraria 客户端已实测「连接 → 协议协商 → 进入世界」（2026-09-09，见下）；位置包 → Phase 2 → Phase 3 → 快照下发的真实 TCP 往返仍待补（`IntegrationTests` 已覆盖简化闭环）
+1. ✅ **跑通第一条完整链路**：原版 Terraria 客户端已实测「连接 → 协议协商 → 进入世界」（2026-09-09）；位置包 → Phase 2 → Phase 3 → 快照下发的真实 TCP 往返已由 `IntegrationTests.TcpRoundTrip_Packet13_Reaches_SnapshotOverWire` 覆盖
 2. ✅ `Framing` 已完成（半包/粘包测试通过）
-3. ✅ `PacketDecoder` 已解析 28 个入站包（握手链 + 权威白名单 10 包 + 伤害/死亡/传送等）；包 15 `Snapshot` 解码已补（含 `BaseTick`/`Removed`）
-4. ⚠️ **补齐剩余 200+ 包解析**（参考 terraria-protocol 各 Message 的 read 实现）
+3. ✅ `PacketDecoder` 已解析 **35 个入站包**（握手链 + 权威白名单 **13 包** + 拾取 / 箱子 / 伤害 / 死亡 / 治疗 / 法力 / 增益 / 传送 / 时间 / NPC / 聊天与液体模块等）；包 15 `Snapshot` 解码已补（含 `BaseTick`/`Removed`）
+4. ⚠️ **未建模包默认拒绝（Vanilla-only）**：解码为 `UnknownPacket` 后由权威层拒绝，不再即时中继 / 原样透传；
+   该拒绝**不计违规**并按 `PacketId` 统计（`NetworkHost.UnmodeledPacketCounts`），仅在需要新权威校验时按需增量结构化（不再以「补齐 200+ 包」为目标）
 5. ✅ `NetworkHost` Accept 循环 + 管线贯通
 
 ### P1（完善）
@@ -103,15 +104,17 @@
 | 5.3 | 半包/粘包 | ✅ Framing 四测试 |
 | 5.4 | 管线贯通 | ✅ 解码可达 + `IntegrationTests` 简化闭环 + 真实 TCP 往返（包 13 → MoveCommand）+ 双客户端包 13/14 转发 + 原版客户端进世界 |
 | 5.5 | 快照下发 | ✅ `SnapshotBroadcaster_SendsEncodedFrames` + 包 15 字段断言 + 编解码往返 + 真实 TCP 往返（客户端收到包 15） |
-| 5.6 | 连接隔离 | ⏳ 需集成测试 |
-| 5.7 | 背压 | ⏳ CommandQueue 满策略 |
+| 5.6 | 连接隔离 | ◐ 恶意包只关闭该连接（`MalformedPacket_ClosesConnection`）；旧连接踢出 / 移除不影响复用槽位的新连接（真实 TCP 集成测试） |
+| 5.7 | 背压 | ◐ 出站有界 `Channel`（2048，`FullMode = Wait`）已落地；入站 / 审计队列容量上限与过载策略待补 |
 | 5.8 | 版本校验 | ◐ 协议 326 客户端握手通过；错误版本拒绝待测 |
 
 ---
 
 ## ⚠️ 必须认知的约束
 
-> **原版 Terraria 客户端兼容性（已实测）**：2026-09-09 原版客户端（协议 326）已实测连接 → 握手 → 进入世界，无异常。编解码严格遵循 terraria-protocol。但**完整游玩链路（移动/挖掘/战斗 → 权威校验 → 仿真 → 快照回传）仍待验证**，深度测试前建议保留自定义测试客户端回归。
+> **原版 Terraria 客户端兼容性（已实测）**：2026-09-09 原版客户端（协议 326）已实测连接 → 握手 → 进入世界，无异常。编解码严格遵循 terraria-protocol。
+> **游玩链路已大幅补全**：挖掘 / 放置 / 战斗 / 箱子 / 液体 / 电路 / 拾取等经真实权威管线 + 真实 TCP 的端到端用例覆盖（见 `Tests/VanillaFeatureTests.cs` 与 `VANILLA_COVERAGE.md`）；
+> 当前生产为 **Vanilla-only**（未建模包默认拒绝）；深度回归仍建议保留自定义测试客户端。
 
 > **协议版本跟进**：每次 Terraria 更新客户端，本文件的包 ID 映射 + Phase 2 对应包处理都要更新。这是架构文档反复强调的持续成本。
 
@@ -140,13 +143,13 @@ terraauth/
 │   ├── Phase4/               # 快照广播 + ShadowPredictor 影子预测
 │   └── Phase5/               # ★ 网络层（Framing / 编解码 / NetworkHost）
 ├── Config/                   # 配置（JSON + 热重载）
-├── Persistence/              # 持久化（默认内嵌 LiteDb / 可选 SQLite）
+├── Persistence/              # 持久化（默认 SQLite / 可降级内嵌 LiteDb）
 ├── Monitoring/               # Prometheus 指标 + /metrics 端点
 ├── Security/                 # 封禁（滑动窗口 + 持久化）
 ├── Plugins/                  # 插件系统（Hook / 加载器 / 管线装饰）
 ├── ModCompat/                # Mod 兼容层（策略 / 检测 / 自定义包）
 ├── Concurrency/              # 并行优化（WorkerPool / 分片 / 快照并行）
-├── Tests/                    # 验收测试（7 个测试文件）
+├── Tests/                    # 验收测试（9 个测试文件）
 ├── Examples/                 # 示例插件工程
 ├── Phase6-Infrastructure/    # 基础设施设计文档
 └── Phase7-RedTeam/           # 红队对抗测试手册

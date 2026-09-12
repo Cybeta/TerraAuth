@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第十七轮：架构与权威链路检查；仅记录待修正项）
+> 最后更新：2026-09-12（第二十一轮：未建模包「拒绝但不计违规」+ 按 PacketId 统计）
 
 ---
 
@@ -12,8 +12,8 @@
 `ServerConfig.WorldPath` 指定世界文件即可开服（为空仍程序化生成）；并新增 `.wld` **写出器**与导出开关
 （`WorldExportPath` / `WorldExportIntervalSeconds`，停机 + 空服导出）。详见第十轮回溯。
 
-**遗留**：写出文件已通过**逐格 round-trip** + **严格分段走查**；
-但**完整客户端互操作性验证尚未完成**（当前沙箱无法运行目标服务端）。
+**遗留**：写出文件已通过**逐格 round-trip** + **严格分段走查** + **原版服务端实测加载**（第二十轮）；
+**双向 `.wld` 格式互操作性均已确认**（导出 → 原版；原版 → TerraAuth）；「原版客户端进图」仍待验证。
 
 ---
 
@@ -55,36 +55,155 @@
 
 ---
 
-## 三、第十七轮：架构与权威链路检查（待修正项 / 风险）
+## 三、第十七轮：架构与权威链路检查（现状：部分已修正）
 
-本轮为静态架构检查记录，以下结论均为**待修正项 / 风险**，不表示已经修复。按风险严重程度与建议修复顺序排列：
+本轮为静态架构检查记录。**第十八 ~ 十九轮已核对代码并修正其中若干项**，下表按当前代码实际状态重新标注：
 
-### A. 高优先级：权威提交、未知包与时序
+### 已修正（第十八轮，已与代码核对）
 
-1. **背包与世界状态缺少原子提交**：放砖已改为仿真提交阶段扣除库存；拾取已改为同一提交内先入库、成功后移除掉落物；箱子写入要求玩家先建立打开会话，并在提交时再次校验在线状态与距离。仍需继续扩展到更多实体转移和提交事件。
-2. **未知包权限已收紧**：当前生产采用 Vanilla-only 白名单，`UnknownPacket` 默认拒绝，不提供即时中继或原始包透传。未来 MOD 兼容层不得绕过该边界。
-3. **命令顺序不充分**：`CommandQueue` 的 FIFO 队头逻辑不能保证 Tick / Sequence 顺序，需要明确排序键、入队来源和提交规则。
-4. **提交前广播**：客户端原包可能在仿真提交前广播，造成其他客户端先观察到尚未被权威状态确认的结果；广播应绑定已提交状态。
-5. **连接失败传播不完整**：连接读写任务的取消、等待和异常传播不完整，`Flush` 失败存在被标记为成功的风险；应统一任务生命周期、失败状态和收尾语义。
+1. **命令顺序**：`CommandQueue` 已改为 `(Tick, Sequence)` **优先队列**；`DrainThrough(tick)` 只取到期命令，未来 Tick 不再阻塞已到期命令。
+2. **连接失败传播**：出站改为**有界** `Channel`（容量 2048，`FullMode = Wait`）；读写循环联动取消并观察双方异常；写入 / `Flush` 失败经 `OutboundFrame.Flushed` 传递给等待者，不再被标记为成功。
+3. **液体输入限额**：液体模块在**分配列表之前**校验条目上限（128）与 payload 剩余长度（`PacketDecoder.DecodeNetModule`）。
+4. **未知包边界**：生产为 Vanilla-only 白名单，`UnknownPacket` 默认**拒绝**，不做即时中继 / 原样透传（Mod 兼容层不得绕过）；
+   该拒绝**不计入违规窗口**并按 `PacketId` 统计（第二十一轮，见 §附），供真机测试后决定「中继 / 建模」优先级。
 
-### B. 中高优先级：容量、并发与执行模型
+### 部分修正
 
-6. **缺少背压**：出站、入站、审计队列均无界，没有容量上限、背压和过载策略，突发流量可能导致内存持续增长。
-7. **锁契约不统一**：`WorldState` 的并发锁契约不统一，调用方对持锁范围、可重入性和快照一致性的假设不一致，存在竞态与死锁风险。
-8. **WorkerPool 设计分裂**：存在两套 WorkerPool 设计，调度、生命周期和错误处理语义不一致，应收敛为单一模型。
+5. **背包与世界状态原子提交**：放砖库存扣减、拾取（同一提交内入库 + 失效掉落物）、箱子写入（打开会话 + 在线 / 距离复核）均已在**仿真提交阶段**结算；仍需扩展到更多实体转移与提交事件。
 
-### C. 中优先级：输入、配置、快照与架构边界
+### 仍待修正（风险保留）
 
-9. **液体输入限额滞后**：液体条目解码前的数量 / 长度限额不足，恶意输入可能先触发过量读取或分配；应在读取条目之前完成帧级和条目级限额校验。
-10. **配置链路不完整**：配置映射 / 热重载覆盖不完整，部分运行时参数可能无法进入实际组件，或热重载后不会生效；需要建立配置项到消费者的完整映射表。
-11. **快照缓冲与批量限制未落地**：`SnapshotStore` 不是高效环形缓冲，`MaxEntitiesPerPacket` 尚未使用；高频快照路径存在可避免的搬移和批量限制缺口。
-12. **协议元数据与分层约束分散**：协议包元数据分散在多个位置，单程序集结构无法有效约束分层依赖和包契约边界；后续应集中元数据并明确分层约束。
+6. **提交前广播**：客户端原包仍可能在仿真提交前广播，其他客户端会先观察到未被权威状态确认的结果；广播应绑定已提交状态。
+7. **缺少背压**：出站已有界；**入站 `CommandQueue`（无界优先队列）、分片入站队列与审计 `Channel`（均无界）仍无容量上限 / 过载策略**。
+8. **锁契约不统一**：`WorldState` 的锁契约（持锁范围 / 可重入性 / 快照一致性）与调用方假设不一致，存在竞态与死锁风险。
+9. **WorkerPool 设计分裂**：两套 WorkerPool 的调度、生命周期与错误处理语义不一致，应收敛为单一模型。
+10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效。
+11. **快照缓冲与批量限制未落地**：`SnapshotStore` 仍为 `List` + `RemoveAt/RemoveRange`（非环形缓冲）；`SnapshotConfig.MaxEntitiesPerPacket` **已定义但未被引用**（无实体分包）。
+12. **协议元数据与分层约束分散**：包元数据分散多处，单程序集结构无法有效约束分层依赖与包契约边界。
 
-以上十二项当前均应保留为未完成风险，不应计入已修复或已完成项。
+> 结论：第 1~4 项已落地（依据见 §附第十九轮「代码侧核对结论」）；第 5 项部分落地；第 6~12 项仍为未完成风险，不应计入已完成。
 
 ---
 
 ## 附：本轮回溯
+
+### 第二十一轮（2026-09-12）：未建模包「拒绝但不计违规」+ 按 PacketId 统计（真机测试前置）
+
+**问题**（为「原版客户端真机进图游玩」做的前置修正）：踢出判定对**所有**权威拒绝一视同仁 ——
+`NetworkHost` 在 `Reject/RejectSilent` 分支无条件累计违规窗口（默认 **10 次 / 60 分钟** → 踢出）。
+而 [AuthoritySubsystems.cs](../terraauth/Authority/AuthoritySubsystems.cs) 对**未建模包**统一 `Reject("unknown_packet")`，
+正常原版客户端会持续发这类包（表情 / 家具 / 告示牌 / 部分 NetModule / 物品使用…）→ **正常玩家累计 10 次即被误踢**。
+这不只是测试障碍，更是线上误判风险。
+
+**已实施**：
+
+- **`AuthorityResult.CountsAsViolation`（默认 true）**：显式标注该拒绝是否参与违规累计；
+  `Reject(reason, countsAsViolation: false)` 供「客户端行为噪声」使用。
+  `UnknownPacket` → `Reject("unknown_packet", countsAsViolation: false)`。
+  语义边界：作弊语义（超速 / 超伤 / 洪水 / 非法堆叠…）**必须保持 true**，未建模包才置 false。
+- **`NetworkHost` 提按 `PacketId` 统计**：`UnmodeledPacketCounts`（并发字典）+ 首次出现必打印 / 每 100 次打印 / **停机汇总**（按次数倒序），
+  用于真机测试后拿到「客户端实际发了哪些未建模包」的清单，据此决定哪些登记为中继、哪些需要权威建模。
+
+**测试**：+1（**285 / 285 通过**）—— `Vanilla_UnmodeledPackets_Are_Counted_But_DoNotCause_Kick`
+（25 个未建模包：被统计 25 次、运行时仍在线、后续合法移动仍被权威应用）。
+**反向验证过**：临时把 `countsAsViolation` 改回 true 重跑，用例如预期失败（计数停在 10 —— 第 10 个包即踢出），
+证明用例确实守住该边界；`AntiCheat_PacketFlood_IsRateLimited_AndEventuallyKicked` 仍通过（真实违规照旧踢出）。
+
+### 第二十轮（2026-09-12）：原版服务端实测 —— 修掉「导出 `.wld` 被原版拒绝」的真实缺陷
+
+**背景**：此前文档把 `.wld` 的互操作性验证记为「沙箱无法运行目标服务端」而搁置。本轮先解决原版服务端运行问题，再做**导出 → 原版加载**的实测。
+
+**环境结论（此前判断有误，需更正）**：原版 `TerrariaServer.exe` **可以在本机运行**。所谓「启动即崩、零输出」实际是
+**存档目录写入被系统拒绝**：Terraria 默认写 `%USERPROFILE%\Documents\My Games\Terraria`，被系统（受控文件夹访问 / 杀软 / 只读属性）
+拦截 → `UnauthorizedAccessException` → 世界文件写不出来、进程停在交互菜单，表现类似崩溃。
+**绕开办法**：用 `-savedirectory` 指到非受保护目录，例如
+
+```
+TerrariaServer.exe -autocreate 1 -savedirectory "<dir>" ^
+  -world "<dir>\Worlds\w.wld" -worldname w -port 7778
+```
+
+（`-worldname` 单独用不设世界路径，必须配 `-world`；`-autocreate 1/2/3` = 小 / 中 / 大。）
+
+**发现并修复的缺陷**：原版加载本服务端导出的世界时报
+
+```
+System.FormatException: Found invalid file type.
+   at Terraria.IO.WorldFileData.SetAsActive()
+```
+
+根因：`.wld` 的 20 字节文件元数据实际是 **`UInt64`（低 56 位 = 魔数 `"relogic"`，**最高字节 = 文件类型**）+ `UInt32` Revision + `UInt64` 旗标**；
+原版要求最高字节为 `FileType.World = 2`。写出器此前把整个 `UInt64` 写成低 56 位魔数（最高字节 = 0 → `FileType.None`），
+而本服务端读取器只校验 `& 0x00FFFFFFFFFFFFFF`（只比较低 56 位）→ **自测 round-trip 永远发现不了**。
+
+**已实施**：`WorldFileWriter` 写出 `MetadataMagicLow56 | ((ulong)FileType.World << 56)`；
+新增回归用例 `Wld_Written_Metadata_Carries_WorldFileType`（钉住最高字节 = 2）。
+
+**实测结果**：修正后原版 `TerrariaServer.exe` 直接加载本服务端导出的世界（11,175,496 字节，Small 4200×1200）：
+
+```
+Resetting game objects 100%
+Loading world data: 100%     ← 11 段指针全部通过（LoadWorld_Version2 逐段位置断言）
+Settling liquids 50%
+Listening on port 7778
+: Server started
+```
+
+即 **「导出 → 原版加载」方向的 `.wld` 互操作性已确认**（此前仅有 round-trip + 分段走查）。
+
+**反向验证（原版 `.wld` → TerraAuth）**：把原版服务端自建的世界（`autotest.wld`，Small 4200×1200，3,003,995 字节）配到
+`ServerConfig.WorldPath` 开服：
+
+```
+[World] 已加载世界文件 .../autotest.wld：autotest 4200×1200，出生点 (2102,283)
+```
+
+无异常。**且这是强校验**：本服务端读取器对每段做**位置指针断言**
+（`Expect(reader, positions[i])`：header → tiles → chests → signs → npcs → tile entities），并在 footer 校验标记 / 世界名 / WorldId。
+全部通过意味着：**图格段（含原版 RLE 行程压缩）消耗的字节数与分段指针精确一致**，箱子 / 告示牌 / NPC 段也对齐 ——
+若图格解码错一个字节，后续段的指针断言必然失败。
+
+**据此确认：`.wld` 双向格式互操作性均已通过。**
+
+**保真限制（新记录）**：读取器**跳过段 6..10**（图格实体 / 加权压力板 / 城镇管理 / 图鉴 / 创造之力），直接跳到 footer。
+因此「原版世界 → TerraAuth → 再导出」会把这些段写成**合法空编码** —— 新生成世界这些段通常本就是空，但**玩过的世界会丢该数据**。
+
+**仍未验证**：原版**客户端**进入本服务端并正常游玩。
+
+**测试**：+1（**284 / 284 通过**）—— `Wld_Written_Metadata_Carries_WorldFileType`。
+
+### 第十九轮（2026-09-12）：文档与代码一致性核对（进度修正）
+
+**做法**：逐份核对全部文档中的「数字 / 状态 / 行为」声明与当前代码，修正过期项；**不改动运行代码**。
+
+**文档偏差（已修正）**：
+
+- **测试数量**：`PROJECT_STRUCTURE.md` 的「263 用例」→ **283**（实跑 `dotnet test TerraAuth.sln -c Release` = 283/283 通过，42s）。
+- **测试文件数**：多处「7 个测试文件 / 7 组」→ **9**（`Tests/TerraAuth.Tests.csproj` 显式 `Compile` 列表实为 9 项）。
+- **`PacketId` 常量数**：39 → **41**（`Protocol/PacketId.cs` 实际成员数）。
+- **编解码覆盖**：入站「31 / 28 个」→ **35 个**；出站「32 类」→ **37 类**（按 `PacketDecoder` / `PacketEncoder` 实际 case 统计）。
+- **持久化后端表述**：多处「默认内嵌 LiteDb / 可选 SQLite」→ **默认 SQLite（`USE_SQLITE`），`-p:NoSqlite=true` 降级 LiteDb**；删除 `SqliteImpl`「骨架」表述（第二轮已完整实装）。
+- **Vanilla-only 边界**：`Net/Phase5/README.md` 与 `DELIVERY.md` 中「未建模包透明透传 / 编码侧原样写回 / 编解码无缺口」→ 改为与代码一致（**未建模包默认拒绝**）。
+- **背压表述**：「`CommandQueue` 满 → 丢弃最旧」「`Channel` 满 → 跳过增量快照」→ 与代码一致（出站有界 `Channel(2048, FullMode = Wait)`；入站无界，上限仍为待办）。
+- **文件树**：补 `WorldGenerator.cs` / `WorldFileWriter.cs` / `WorldEntities.cs` / `Authority/CommandService.cs`。
+- **`OPTIMIZATION_BACKLOG.md` §三**：把第十七轮列出的 12 项按「已修正 / 部分修正 / 仍待修正」重新标注（此前全部标为待办，与代码不符）。
+
+**代码侧核对结论（未改动，作为上述标注的依据）**：
+
+- `CommandQueue` 确为 `PriorityQueue<Command, (long Tick, long Sequence)>`（无界）。
+- `Connection._outbound` 确为 `CreateBounded(2048)` + `FullMode = Wait`。
+- `PacketDecoder.DecodeNetModule` 确在 `new List<LiquidChange>(count)` **之前**校验 `maxChanges = 128` 与剩余长度。
+- `SnapshotConfig.MaxEntitiesPerPacket` 仅有定义，**全仓无引用**（仍为待办）。
+- `ShardedInboundPipeline._queue` 与 `SqlitePersistence._auditChannel` 均为 `CreateUnbounded`（仍为待办）。
+
+**下一步建议**（按收益 / 风险排序，均属 §三「仍待修正」）：
+
+1. **提交后广播一致性**（§三 第 6 项）：让实体 / 图格 / 箱子广播绑定「已提交状态」，避免客户端先看到未确认结果——与既有「发送成功后才置位」重试机制衔接。
+2. **入站 / 审计队列背压**（§三 第 7 项）：为分片入站队列与审计 `Channel` 加容量上限 + 过载策略（丢弃 / 合并 / 断连）。
+3. **快照实体分包**（§三 第 11 项）：落地 `MaxEntitiesPerPacket`，把大帧拆分为多包，配合 `SnapshotStore` 环形缓冲消除搬移。
+4. **玩法向补全**（`VANILLA_COVERAGE.md` §二）：树木 / 生命水晶 / 生物群系 / 结构体、液体压力模型、电路门·定时器·压力板、敌怪远程弹幕与更完整的掉落库。
+5. **`.wld` 双向互操作已通过**（第二十轮：导出 → 原版；原版 → TerraAuth），剩余为「原版**客户端**真的进图游玩」；
+   以及可选补全：读取段 6..10（图格实体 / 图鉴等）以避免「原版世界 → 再导出」丢段。
 
 ### 第十八轮（2026-09-12）：广播失败重试 · 箱子会话生命周期 · 拾取并发 · 事件模型
 
@@ -190,7 +309,7 @@
 （断言矿脉 / 洞穴 / 草皮 / 地狱层 / 海水 / 宝箱数量与战利品）、
 `Vanilla_PlayerControls_Relay_Preserves_Mount_And_Camera`（包 13 中继保留挂载与相机）；
 另把两个受「世界生成变重」影响的既有用例等待窗口放宽（`KickAsync_...` 与 `AntiCheat_PacketFlood_...`）。
-该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 283/283 通过。
+该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 **285 / 285** 通过（第十九轮 283 + 第二十轮元数据回归 + 第二十一轮未建模包边界）。
 
 ### 第十五轮（2026-09-12）：协议字段核对后落地（包 20 图格方阵 + 区块流送对齐 + NPC 同步细节）
 

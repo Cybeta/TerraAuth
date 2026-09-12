@@ -90,13 +90,13 @@ terraauth/
 │  └─ Phase5/                  # TCP 传输 + Framing + 编解码
 ├─ Protocol/            # Terraria 包 ID 与类型定义
 ├─ Config/              # 阈值配置 + FileSystemWatcher 热重载
-├─ Persistence/         # 持久化（默认内嵌 LiteDb / 可选 SQLite）
+├─ Persistence/         # 持久化（默认 SQLite / 可降级内嵌 LiteDb）
 ├─ Monitoring/          # Prometheus 指标 + /metrics 端点
 ├─ Security/            # 封禁（滑动窗口 + 存储）
 ├─ Plugins/             # 插件系统（Hook / 加载器 / 管线装饰）
 ├─ ModCompat/           # 未来 MOD 兼容层（当前生产禁用）
 ├─ Concurrency/         # 并行优化（Worker 池 / 分片 / 快照并行）
-├─ Tests/               # xUnit 验收测试（283 用例）
+├─ Tests/               # xUnit 验收测试（285 用例）
 └─ server.json          # 阈值配置
 ```
 
@@ -111,7 +111,7 @@ if (|dx| > allowedX || |dy| > allowedY) → Reject("speed_exceeded")，拒绝时
 
 - **分轴判定**：水平用 `MaxSpeed = MaxFlightSpeed = 8.0`（像素/帧）；**垂直用 `max(MaxSpeed, MaxFallSpeed)`**
   （`MaxFallSpeed = 20.0`）。原版下落终速约 20 px/帧，若垂直也按 8 判定，**任何一次正常坠落都会被误判超速**
-  → 服务端位置不再更新（后续挖 / 放 / 交互全部 out_of_reach）且累计违规被踢（默认 10 次 / 60s）。
+  → 服务端位置不再更新（后续挖 / 放 / 交互全部 out_of_reach）且累计违规被踢（默认 10 次 / 60 分钟）。
 - `TeleportTolerance = 4` 像素；长时静默（>10s）一律按 10s 计（水平上限 `4804px`），**不做无条件放行**（防穿墙 / 瞬移）
 - **已知限制**：客户端失焦时位置包间隔可达 4~7s（客户端降频），**水平**静默位移过大仍可能被误判；
   彻底解决需服务端权威移动 / 碰撞校验（Phase 3 世界权威落地后补齐）

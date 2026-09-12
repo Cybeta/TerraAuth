@@ -655,6 +655,56 @@ public class VanillaFeatureTests
         Assert.DoesNotContain(got, p => p.Type == (PacketId)99);
     }
 
+    /// <summary>
+    /// 未建模包：**拒绝 + 统计，但不计入违规窗口**。
+    /// 正常原版客户端会持续发未建模包（表情 / 家具 / 告示牌 / 部分 NetModule…），
+    /// 若计入违规（默认 10 次 / 60 分钟）会让正常玩家被误踢 —— 本用例钉住该边界。
+    /// （「仍被拒绝且不中继给他人」由 <see cref="Vanilla_UnmodeledPacket_Is_Rejected_And_Not_Relayed"/> 覆盖。）
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_UnmodeledPackets_Are_Counted_But_DoNotCause_Kick()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        // 先站定：确保运行时已建立，后续拒绝归属该玩家的真实会话
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 远超违规阈值（默认 10）的未建模包
+        const int count = 25;
+        for (var i = 0; i < count; i++)
+            await s.SendRawAsync((PacketId)99, new byte[] { 1, 2, 3 });
+
+        // 1) 被按 PacketId 统计 → 同时证明包确实到达并进入管线（未建模 ⇒ 被拒绝）
+        //    读取在独立读循环中异步进行，故轮询等待计数到齐
+        long seen = 0;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline
+               && (!server.Host.Network.UnmodeledPacketCounts.TryGetValue((PacketId)99, out seen) || seen < count))
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(count, (int)seen);
+
+        // 2) 未计入违规 → 未被踢：运行时仍在线，且后续合法移动仍被权威应用
+        Assert.True(world.Players.TryGetValue(1, out var runtime) && runtime.Active,
+            $"玩家运行时已离线（疑似被踢）：存在={world.Players.ContainsKey(1)}，统计种类={server.Host.Network.UnmodeledPacketCounts.Count}");
+
+        // 未建模包突发只花了数十毫秒，若立刻移动 32px 会被速度权威正确判为超速（非本用例关注点），
+        // 故先让 Δt 落到真实量级再移动
+        await Task.Delay(400);
+        var from = world.Players[1].Position;
+        var targetX = from.X + 32f;
+        await s.SendAsync(PacketId.PlayerPosition, new PlayerControlsPacket(1, new Vector2(targetX, from.Y)));
+        var moved = await TickUntilAsync(server,
+            () => world.Players.TryGetValue(1, out var p) && MathF.Abs(p.Position.X - targetX) < 2f,
+            TimeSpan.FromSeconds(3));
+        Assert.True(moved,
+            $"未建模包突发后合法移动未被应用：实际={world.Players[1].Position.X}，目标={targetX} | 指标={MetricsText(server)}");
+    }
+
     [Fact]
     public async Task Vanilla_TileSections_Stream_As_Player_Moves()
     {

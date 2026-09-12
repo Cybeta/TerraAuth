@@ -23,18 +23,25 @@ public enum AuthorityDecision
 }
 
 /// <summary>权威处理结果。</summary>
+/// <param name="CountsAsViolation">
+/// 该拒绝是否计入「违规窗口」（窗口内累计达阈值 → 踢出）。
+/// 仅「客户端行为噪声」类拒绝（如未建模包）置 false：这类包应被丢弃并统计，
+/// 但不该把正常原版客户端判成作弊（否则正常游玩累计若干次即被误踢）。
+/// 作弊语义的拒绝（超速 / 超伤 / 洪水…）必须保持 true。
+/// </param>
 public sealed record AuthorityResult(
     AuthorityDecision Decision,
     INetworkPacket? Packet,
     Command? Command = null,
     INetworkPacket? CorrectionPacket = null,
-    string? Reason = null)
+    string? Reason = null,
+    bool CountsAsViolation = true)
 {
     public static AuthorityResult Accept(INetworkPacket? packet, Command? command = null)
         => new(AuthorityDecision.Accept, packet, command);
 
-    public static AuthorityResult Reject(string reason)
-        => new(AuthorityDecision.Reject, null, Reason: reason);
+    public static AuthorityResult Reject(string reason, bool countsAsViolation = true)
+        => new(AuthorityDecision.Reject, null, Reason: reason, CountsAsViolation: countsAsViolation);
 
     public static AuthorityResult RejectSilent()
         => new(AuthorityDecision.RejectSilent, null);
