@@ -47,6 +47,7 @@ public sealed record AuthorityResult(
 public interface IPacketContext
 {
     int PlayerId { get; }
+    long SessionId { get; }
     long Tick { get; }
     DateTimeOffset ReceivedAt { get; }
 }
@@ -60,11 +61,20 @@ public interface IInboundPipeline
         CommandQueue commands,
         CancellationToken ct = default);
 
+    Task<AuthorityResult> ProcessAsync(
+        INetworkPacket packet,
+        int playerId,
+        CommandQueue commands,
+        CancellationToken ct,
+        long sessionId)
+        => ProcessAsync(packet, playerId, commands, ct);
+
     /// <summary>
     /// 连接结束：清理按玩家索引的权威状态（如移动基线），避免槽位复用串号。
     /// 默认无操作；包装型管线（Hook / 分片）需转发到内层。
     /// </summary>
     void ResetPlayer(int playerId) { }
+    void ResetPlayer(int playerId, long sessionId) => ResetPlayer(playerId);
 }
 
 // ---------- 六个权威子系统接口 ----------
@@ -87,6 +97,8 @@ public interface IMovementAuthority
     /// 使重连玩家的首个位置包被判超速而拒绝，甚至累计违规被踢。
     /// </summary>
     void ResetPlayer(int playerId);
+    void ResetPlayer(int playerId, long sessionId) => ResetPlayer(playerId);
+    void BindSession(int playerId, long sessionId) { }
 }
 
 public interface ICombatAuthority
@@ -114,6 +126,8 @@ public interface IInventoryAuthority
 public interface IWorldAuthority
 {
     AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands);
+    AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands, long sessionId)
+        => Validate(packet, playerId, commands);
     bool CanPlayerModifyTile(int playerId, int x, int y);
     int GetTileBreakThreshold(int playerId);
 }

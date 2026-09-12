@@ -71,10 +71,10 @@ public sealed class ConnectionManager
     /// 踢出指定玩家：先下发包 2（Disconnect，携带原因，客户端据此提示并主动断开），再关闭连接释放槽位。
     /// 关闭走 dispose 路径：读循环随 socket 释放退出，由 NetworkHost 触发 PlayerLeft 清理。
     /// </summary>
-    public async Task KickAsync(int playerId, string reason, CancellationToken ct = default)
+    public async Task KickAsync(int playerId, string reason, CancellationToken ct = default, Connection? expected = null)
     {
         var conn = Get(playerId);
-        if (conn is null) return;
+        if (conn is null || (expected is not null && !ReferenceEquals(conn, expected))) return;
 
         try
         {

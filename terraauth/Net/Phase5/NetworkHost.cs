@@ -51,12 +51,15 @@ public sealed class NetworkHost : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
 
     /// <summary>玩家外观（包 4）：PlayerId → SyncPlayer，进服后用于向其他玩家广播。</summary>
-    private readonly ConcurrentDictionary<int, PlayerInfoPacket> _playerAppearances = new();
+    private readonly ConcurrentDictionary<int, SessionAppearance> _playerAppearances = new();
 
     /// <summary>进服时间（用于 PlayerLeftArgs.SessionDuration）。</summary>
-    private readonly ConcurrentDictionary<int, DateTimeOffset> _sessionStart = new();
+    private readonly ConcurrentDictionary<int, SessionStart> _sessionStart = new();
 
-    /// <summary>诊断：权威层拒绝计数（PersistenceAuditLogger 只落库不打印，拒绝原因需在控制台可见）。</summary>
+    private sealed record SessionAppearance(long SessionId, PlayerInfoPacket Packet);
+    private sealed record SessionStart(long SessionId, DateTimeOffset StartedAt);
+
+    /// <summary>诊断：权威层拒绝计数器（PersistenceAuditLogger 只落库不打印，拒绝原因需在控制台可见）。</summary>
     private long _rejectCount;
 
     /// <summary>违规处置阈值（滑动窗口 + 阈值 → 踢出）。</summary>
@@ -84,9 +87,10 @@ public sealed class NetworkHost : IAsyncDisposable
     /// </summary>
     public bool TryGetPlayerName(int playerId, out string name)
     {
-        if (_playerAppearances.TryGetValue(playerId, out var info) && !string.IsNullOrEmpty(info.Name))
+        if (_playerAppearances.TryGetValue(playerId, out var appearance)
+            && !string.IsNullOrEmpty(appearance.Packet.Name))
         {
-            name = info.Name;
+            name = appearance.Packet.Name;
             return true;
         }
 
@@ -205,26 +209,37 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>连接结束：清理外观缓存并触发 PlayerLeft Hook。</summary>
     private void OnConnectionClosed(Connection connection)
     {
-        _playerAppearances.TryRemove(connection.PlayerId, out var info);
-        _violations.TryRemove(connection.PlayerId, out _); // 断开即清违规窗口，避免 ID 复用串号
-        var name = info?.Name ?? "";
+        var hasAppearance = _playerAppearances.TryGetValue(connection.PlayerId, out var appearance)
+            && appearance.SessionId == connection.SessionId;
+        if (hasAppearance)
+            _playerAppearances.TryRemove(
+                new KeyValuePair<int, SessionAppearance>(connection.PlayerId, appearance!));
+
+        if (_violations.TryGetValue(connection.PlayerId, out var violation)
+            && violation.SessionId == connection.SessionId)
+            _violations.TryRemove(connection.PlayerId, out _);
+
+        var name = hasAppearance ? appearance!.Packet.Name ?? "" : "";
 
         // 通知其他玩家该玩家已离线（包 14 置为未激活），否则原版客户端会残留幽灵玩家
         if (connection.PlayerId > 0)
         {
             // 权威侧：清掉该槽位上的按玩家状态（移动基线等）。否则槽位复用时，
             // 上一次会话的位置会被当作基准，使重连玩家的首个位置包被判超速。
-            _pipeline.ResetPlayer(connection.PlayerId);
+            _pipeline.ResetPlayer(connection.PlayerId, connection.SessionId);
 
             // 世界侧：移出在线集合并按宽限期保留会话（宽限期 0 即直接回收；同时修掉运行时不释放的泄漏）
-            _world.MarkPlayerOffline(connection.PlayerId, name, _sessionResumeGraceTicks);
-            _ = BroadcastLeaveAsync(connection.PlayerId);
+            _world.MarkPlayerOffline(connection.PlayerId, connection.SessionId, name, _sessionResumeGraceTicks);
+            _ = BroadcastLeaveAsync(connection);
         }
 
         if (_hooks is null) return;
 
-        var duration = _sessionStart.TryRemove(connection.PlayerId, out var start)
-            ? DateTimeOffset.UtcNow - start
+        var duration = _sessionStart.TryGetValue(connection.PlayerId, out var start)
+            && start.SessionId == connection.SessionId
+            && _sessionStart.TryRemove(
+                new KeyValuePair<int, SessionStart>(connection.PlayerId, start))
+            ? DateTimeOffset.UtcNow - start.StartedAt
             : TimeSpan.Zero;
 
         _hooks.Trigger(new PlayerLeftArgs
@@ -237,19 +252,23 @@ public sealed class NetworkHost : IAsyncDisposable
     }
 
     /// <summary>广播玩家离线（包 14 Active=false）给其余玩家。</summary>
-    private async Task BroadcastLeaveAsync(int playerId)
+    private async Task BroadcastLeaveAsync(Connection expected)
     {
         try
         {
+            var current = _connections.Get(expected.PlayerId);
+            if (current is not null && !ReferenceEquals(current, expected))
+                return;
+
             await _connections.BroadcastExceptAsync(
-                playerId,
+                expected.PlayerId,
                 PacketId.PlayerActive,
-                new PlayerActivePacket((byte)playerId, Active: false),
+                new PlayerActivePacket((byte)expected.PlayerId, Active: false),
                 CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[NetworkHost] 广播玩家 #{playerId} 离线失败: {ex.Message}");
+            Console.WriteLine($"[NetworkHost] 广播玩家 #{expected.PlayerId} 离线失败: {ex.Message}");
         }
     }
 
@@ -266,7 +285,8 @@ public sealed class NetworkHost : IAsyncDisposable
             packet,
             connection.PlayerId,
             _commands,
-            ct).ConfigureAwait(false);
+            ct,
+            connection.SessionId).ConfigureAwait(false);
 
         switch (result.Decision)
         {
@@ -306,16 +326,19 @@ public sealed class NetworkHost : IAsyncDisposable
                     Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}");
 
                 // 处置：窗口内拒绝累计达阈值 → 踢出（先发包 2 说明原因，再关闭连接）
-                if (RecordViolation(connection.PlayerId))
+                if (RecordViolation(connection.PlayerId, connection.SessionId))
                 {
-                    _violations.TryRemove(connection.PlayerId, out _);
+                    if (_violations.TryGetValue(connection.PlayerId, out var violation)
+                        && violation.SessionId == connection.SessionId)
+                        _violations.TryRemove(connection.PlayerId, out _);
                     Console.WriteLine(
                         $"[Authority] 玩家 #{connection.PlayerId} 违规累计达 " +
                         $"{_violationKick.MaxViolations}/{_violationKick.WindowSeconds}s，踢出：{result.Reason}");
                     await _connections.KickAsync(
                         connection.PlayerId,
                         $"Too many violations: {result.Reason}",
-                        CancellationToken.None).ConfigureAwait(false);
+                        CancellationToken.None,
+                        connection).ConfigureAwait(false);
                 }
                 break;
         }
@@ -325,10 +348,23 @@ public sealed class NetworkHost : IAsyncDisposable
     /// 记录一次权威拒绝，返回 true 表示该玩家在窗口内已达阈值（调用方应立即处置）。
     /// 窗口滚动：超出窗口则重置起点与计数；阈值触发后由调用方移除条目。
     /// </summary>
-    private bool RecordViolation(int playerId)
+    private bool RecordViolation(int playerId, long sessionId)
     {
         var now = DateTime.UtcNow;
-        var window = _violations.GetOrAdd(playerId, _ => new ViolationWindow { StartUtc = now });
+        var window = _violations.GetOrAdd(playerId, _ => new ViolationWindow
+        {
+            SessionId = sessionId,
+            StartUtc = now,
+        });
+
+        if (window.SessionId != sessionId)
+        {
+            _violations[playerId] = window = new ViolationWindow
+            {
+                SessionId = sessionId,
+                StartUtc = now,
+            };
+        }
 
         lock (window.Gate)
         {
@@ -348,6 +384,7 @@ public sealed class NetworkHost : IAsyncDisposable
     {
         /// <summary>每窗口独占的轻量锁（.NET 9+ Lock，替代 Monitor 对象锁）。</summary>
         public readonly Lock Gate = new();
+        public long SessionId;
         public DateTime StartUtc;
         public int Count;
     }
@@ -398,6 +435,26 @@ public sealed class NetworkHost : IAsyncDisposable
         {
             if (conn.State != ConnectionState.Playing || !shouldSend(conn.PlayerId)) continue;
             await conn.SendEncodedAsync(type, packet, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// 广播箱子槽位更新；会话在筛选后再次确认，避免关箱 / 断线后仍发送已失效会话的更新。
+    /// </summary>
+    public async Task BroadcastChestUpdateAsync(
+        INetworkPacket packet,
+        Func<Connection, bool> shouldSend,
+        CancellationToken ct = default)
+    {
+        foreach (var conn in _connections.All())
+        {
+            if (conn.State != ConnectionState.Playing || !shouldSend(conn))
+                continue;
+
+            await conn.SendEncodedAsync(
+                PacketId.SyncChestItem,
+                packet,
+                ct).ConfigureAwait(false);
         }
     }
 
@@ -722,9 +779,11 @@ public sealed class NetworkHost : IAsyncDisposable
     {
         if (_hooks is null) return;
 
-        _playerAppearances.TryGetValue(connection.PlayerId, out var info);
-        var name = info?.Name ?? "";
-        _sessionStart[connection.PlayerId] = DateTimeOffset.UtcNow;
+        _playerAppearances.TryGetValue(connection.PlayerId, out var appearance);
+        var name = appearance?.Packet.Name ?? "";
+        _sessionStart[connection.PlayerId] = new SessionStart(
+            connection.SessionId,
+            DateTimeOffset.UtcNow);
 
         _hooks.Trigger(new PlayerJoinedArgs
         {
@@ -756,7 +815,7 @@ public sealed class NetworkHost : IAsyncDisposable
         foreach (var kvp in _playerAppearances)
         {
             await connection.SendEncodedAsync(
-                PacketId.PlayerInfo, kvp.Value, ct).ConfigureAwait(false);
+                PacketId.PlayerInfo, kvp.Value.Packet, ct).ConfigureAwait(false);
 
             if (kvp.Key != selfId)
             {
@@ -776,7 +835,7 @@ public sealed class NetworkHost : IAsyncDisposable
                     continue;
 
                 await other.SendEncodedAsync(
-                    PacketId.PlayerInfo, selfInfo, ct).ConfigureAwait(false);
+                    PacketId.PlayerInfo, selfInfo.Packet, ct).ConfigureAwait(false);
                 await other.SendEncodedAsync(
                     PacketId.PlayerActive,
                     new PlayerActivePacket((byte)selfId, Active: true),
@@ -817,12 +876,32 @@ public sealed class NetworkHost : IAsyncDisposable
 
         // 会话恢复：同身份（玩家名）在宽限期内重连 → 接管原运行时（位置 / 血量 / 增益一并交还），
         // 而不是当作新玩家从出生点重新开始。超出宽限期 / 未开启则走常规新玩家流程。
-        bool resumed = _world.TryResumePlayer(connection.PlayerId, name);
+        bool resumed = _world.TryResumePlayer(
+            connection.PlayerId,
+            connection.SessionId,
+            name);
+
+        if (!resumed)
+        {
+            lock (_world.PlayersLock)
+            {
+                _world.Players[connection.PlayerId] = new PlayerRuntime
+                {
+                    Id = connection.PlayerId,
+                    SessionId = connection.SessionId,
+                    Active = true,
+                    Position = new Vector2(
+                        _world.SpawnTileX * 16f,
+                        _world.SpawnTileY * 16f),
+                };
+            }
+        }
 
         // Slot 以服务端分配的 PlayerId 覆盖：客户端上行的包 4 槽位是其本地索引（通常 0），
         // 直接透传会导致其他客户端把该外观画到自己的槽位上。
-        _playerAppearances[connection.PlayerId] =
-            info with { Name = name, Slot = (byte)connection.PlayerId };
+        _playerAppearances[connection.PlayerId] = new SessionAppearance(
+            connection.SessionId,
+            info with { Name = name, Slot = (byte)connection.PlayerId });
         Console.WriteLine(resumed
             ? $"[Net] 玩家 #{connection.PlayerId} 名称 \"{name}\"（会话已恢复）"
             : $"[Net] 玩家 #{connection.PlayerId} 名称 \"{name}\"");

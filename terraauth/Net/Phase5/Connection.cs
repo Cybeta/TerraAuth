@@ -60,6 +60,8 @@ public sealed class Connection : IAsyncDisposable
     private readonly TaskCompletionSource _writeLoopExited =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private static long _nextSessionId;
+    public long SessionId { get; } = Interlocked.Increment(ref _nextSessionId);
     public int PlayerId { get; internal set; }
     public ConnectionState State { get; internal set; } = ConnectionState.Handshaking;
     public bool IsConnected => State != ConnectionState.Disconnected;

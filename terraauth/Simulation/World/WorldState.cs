@@ -44,17 +44,21 @@ public sealed class WorldState
     /// <paramref name="graceTicks"/> &gt; 0 且恢复键非空时挂入离线会话，供同身份重连认回；否则直接丢弃。
     /// </summary>
     public void MarkPlayerOffline(int playerId, string resumeKey, long graceTicks)
+        => MarkPlayerOffline(playerId, 0, resumeKey, graceTicks);
+
+    public void MarkPlayerOffline(int playerId, long expectedSessionId, string resumeKey, long graceTicks)
     {
         PlayerRuntime? runtime;
         lock (PlayersLock)
         {
             if (!Players.TryGetValue(playerId, out runtime)) return;
+            if (expectedSessionId != 0 && runtime.SessionId != expectedSessionId) return;
             Players.Remove(playerId);
         }
 
         runtime.Active = false;
         runtime.Velocity = new Vector2(0, 0);
-        CloseChestSession(playerId);
+        CloseChestSession(playerId, expectedSessionId);
 
         if (graceTicks <= 0 || string.IsNullOrEmpty(resumeKey)) return;
 
@@ -68,6 +72,9 @@ public sealed class WorldState
     /// 并置 <see cref="PlayerRuntime.Resumed"/>（世界同步据此下发携原坐标的出生包，跳过出生点重定位）。
     /// </summary>
     public bool TryResumePlayer(int newPlayerId, string resumeKey)
+        => TryResumePlayer(newPlayerId, 0, resumeKey);
+
+    public bool TryResumePlayer(int newPlayerId, long expectedSessionId, string resumeKey)
     {
         if (string.IsNullOrEmpty(resumeKey)) return false;
 
@@ -78,6 +85,8 @@ public sealed class WorldState
             if (session.DeadlineTick <= Tick) return false;   // 已超宽限期 → 按新玩家处理
 
             var runtime = session.Runtime;
+            if (expectedSessionId != 0)
+                runtime.SessionId = expectedSessionId;
             runtime.Id = newPlayerId;
             runtime.Active = true;
             runtime.Resumed = true;
@@ -88,6 +97,17 @@ public sealed class WorldState
     }
 
     /// <summary>回收超过宽限期的离线会话（由世界同步循环调用）；返回回收数量。</summary>
+    public bool TryGetCurrentPlayer(int playerId, long expectedSessionId, out PlayerRuntime? player)
+    {
+        lock (PlayersLock)
+        {
+            if (Players.TryGetValue(playerId, out player)
+                && (expectedSessionId == 0 || player.SessionId == expectedSessionId)) return true;
+            player = null;
+            return false;
+        }
+    }
+
     public int ReapOfflineSessions()
     {
         lock (PlayersLock)
@@ -285,25 +305,45 @@ public sealed class WorldState
     public object ChestsLock { get; } = new();
 
     /// <summary>玩家当前打开的箱子会话；会话状态由权威层读写。</summary>
-    private readonly Dictionary<int, int> _openChests = new();
+    private readonly Dictionary<int, OpenChestSessionState> _openChests = new();
+
+    private readonly record struct OpenChestSessionState(
+        long SessionId,
+        int ChestIndex);
 
     public void OpenChestSession(int playerId, int chestIndex)
+        => OpenChestSession(playerId, 0, chestIndex);
+
+    public void OpenChestSession(int playerId, long sessionId, int chestIndex)
     {
         lock (ChestsLock)
-            _openChests[playerId] = chestIndex;
+            _openChests[playerId] = new OpenChestSessionState(sessionId, chestIndex);
     }
 
     public bool HasChestSession(int playerId, int chestIndex)
+        => HasChestSession(playerId, 0, chestIndex);
+
+    public bool HasChestSession(int playerId, long sessionId, int chestIndex)
     {
         lock (ChestsLock)
             return _openChests.TryGetValue(playerId, out var current)
-                && current == chestIndex;
+                && (sessionId == 0 || current.SessionId == sessionId)
+                && current.ChestIndex == chestIndex;
     }
 
     public void CloseChestSession(int playerId)
+        => CloseChestSession(playerId, 0);
+
+    public void CloseChestSession(int playerId, long expectedSessionId)
     {
         lock (ChestsLock)
+        {
+            if (!_openChests.TryGetValue(playerId, out var current)
+                || (expectedSessionId != 0 && current.SessionId != expectedSessionId))
+                return;
+
             _openChests.Remove(playerId);
+        }
     }
 
     public object ChestUpdatesLock { get; } = new();
@@ -846,6 +886,7 @@ public sealed class WorldState
 /// </summary>
 public sealed class PlayerRuntime
 {
+    public long SessionId;
     public int Id;
 
     /// <summary>世界坐标（像素）。</summary>

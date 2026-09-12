@@ -1149,6 +1149,52 @@ public class VanillaFeatureTests
     }
 
     [Fact]
+    public async Task Vanilla_ChestItem_Update_Is_Sent_Only_To_Openers()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await a.ReadUntilAsync(p => p is PlayerActivePacket, TimeSpan.FromSeconds(5));
+        await using var b = await server.ConnectAsync("Bee");
+        await b.ReadUntilAsync(p => p is PlayerActivePacket, TimeSpan.FromSeconds(5));
+        await a.ReadUntilAsync(p => p is PlayerActivePacket { PlayerId: 2 }, TimeSpan.FromSeconds(5));
+
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, a, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        await StandAtAsync(server, b, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY);
+
+        await a.SendAsync(PacketId.Chest,
+            new ChestPacket(world.SpawnTileX, world.SpawnTileY));
+        await a.ReadUntilAsync(
+            p => p is PlayerChestIndexPacket { ChestIndex: var chestIndex } && chestIndex == index,
+            TimeSpan.FromSeconds(5));
+        await b.ReadUntilAsync(
+            _ => false,
+            TimeSpan.FromMilliseconds(100));
+
+        await a.SendAsync(PacketId.SyncChestItem,
+            new SyncChestItemPacket(index, ItemSlot: 3, Stack: 7, Prefix: 0, ItemType: 5));
+
+        Assert.True(await TickUntilAsync(server,
+            () => world.Chests[index].Items[3] is { Stack: 7, Type: 5 },
+            TimeSpan.FromSeconds(5)), "箱子更新未提交到服务端");
+
+        var aUpdate = await a.ReadUntilAsync(
+            p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
+                 && chestIndex == index,
+            TimeSpan.FromSeconds(5));
+        Assert.Contains(aUpdate, p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
+                                      && chestIndex == index);
+
+        var bUpdate = await b.ReadUntilAsync(
+            p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
+                 && chestIndex == index,
+            TimeSpan.FromMilliseconds(300));
+        Assert.DoesNotContain(bUpdate, p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
+                                             && chestIndex == index);
+    }
+
+    [Fact]
     public async Task Vanilla_ChestItem_Invalid_Slot_Is_Rejected()
     {
         using var server = VanillaServer.Start();
@@ -2045,14 +2091,14 @@ public class VanillaFeatureTests
         Assert.True(await TickUntilAsync(server, () => world.Players.Count == 0, TimeSpan.FromSeconds(5)),
             "断线后在线运行时未释放");
 
-        // 宽限期 0 → 不保留会话：登录阶段不会凭空造出运行时（运行时由移动包惰性创建），
-        // 说明旧会话未被接管。
+        // 宽限期 0 → 不保留会话：登录阶段创建的是新 SessionId 运行时，旧会话不会被接管。
         await using var b = await server.ConnectAsync("Alice");
-        Assert.Empty(world.Players);
+        Assert.Single(world.Players);
 
         // 重连后是全新运行时：满血、而非断线前的 42
-        await StandAtAsync(server, b, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
-        Assert.Equal(100, world.Players.Values.Single().Hp);
+        var fresh = world.Players.Values.Single();
+        Assert.Equal(100, fresh.Hp);
+        Assert.NotEqual(42, fresh.Hp);
     }
 
     [Fact]

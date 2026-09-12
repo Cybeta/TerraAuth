@@ -13,6 +13,41 @@ public abstract record Command(
     int? PlayerId,   // 发起玩家（服务端命令为 null）
     string Kind)     // "move" / "use_item" / "place_tile" / "attack"
 {
+    public long SessionId { get; init; }
+
+    protected bool TryGetPlayer(
+        WorldState world,
+        int playerId,
+        out PlayerRuntime? player,
+        out CommandApplyResult failure)
+    {
+        lock (world.PlayersLock)
+            world.Players.TryGetValue(playerId, out player);
+
+        if (player is null)
+        {
+            failure = new(false, "player_not_active");
+            return false;
+        }
+
+        if (SessionId != 0 && player.SessionId == 0)
+            player.SessionId = SessionId;
+        else if (SessionId != 0 && player.SessionId != SessionId)
+        {
+            failure = new(false, "stale_session");
+            return false;
+        }
+
+        if (!player.Active)
+        {
+            failure = new(false, "player_not_active");
+            return false;
+        }
+
+        failure = default;
+        return true;
+    }
+
     /// <summary>应用命令到世界状态。这是唯一允许变更 WorldState 的地方。</summary>
     public abstract CommandApplyResult Apply(WorldState world, IRng rng);
 }
@@ -26,16 +61,24 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
         if (PlayerId is not int id)
             return new(false, "missing_player");
 
+        if (!float.IsFinite(Position.X) || !float.IsFinite(Position.Y))
+            return new(false, "invalid_position");
+
         PlayerRuntime player;
         lock (world.PlayersLock)
         {
             if (!world.Players.TryGetValue(id, out var existing))
             {
-                existing = new PlayerRuntime { Id = id };
+                if (SessionId != 0)
+                    return new(false, "player_not_active");
+                existing = new PlayerRuntime { Id = id, SessionId = SessionId };
                 world.Players[id] = existing;
             }
             player = existing;
         }
+
+        if (SessionId != 0 && player.SessionId != SessionId)
+            return new(false, "stale_session");
 
         // 死亡期间不接受移动：复活点由服务端在复活命令中划定，避免"死后瞬移"
         if (player.Dead)
@@ -59,10 +102,9 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
         if (PlayerId is not int id || Damage <= 0)
             return new(false, "not_applied");
 
-        PlayerRuntime? player;
-        lock (world.PlayersLock)
-            world.Players.TryGetValue(id, out player);
-        if (player is null || player.Dead)
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
+        if (player!.Dead)
             return new(false, "not_applied");
 
         player.Hp -= Damage;
@@ -87,13 +129,10 @@ public sealed record KillPlayerCommand(long Tick, int? PlayerId)
         if (PlayerId is not int id)
             return new(false, "not_applied");
 
-        PlayerRuntime? player;
-        lock (world.PlayersLock)
-            world.Players.TryGetValue(id, out player);
-        if (player is null)
-            return new(false, "not_applied");
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
 
-        player.Hp = 0;
+        player!.Hp = 0;
         player.FallDistance = 0f;
         player.Velocity = new Vector2(0, 0);
 
@@ -118,11 +157,10 @@ public sealed record RespawnCommand(long Tick, int? PlayerId)
         if (PlayerId is not int id)
             return new(false, "not_applied");
 
-        PlayerRuntime? player;
-        lock (world.PlayersLock)
-            world.Players.TryGetValue(id, out player);
-        if (player is null || !player.Dead)
-            return new(false, "not_applied"); // 未死亡 → 非复活请求，忽略
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
+        if (!player!.Dead)
+            return new(false, "not_applied");
 
         player.Hp = player.HpMax;
         player.Dead = false;
@@ -150,9 +188,11 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
 
         lock (world.PlayersLock)
         {
-            if (!world.Players.TryGetValue(playerId, out var player)
-                || !player.Active
-                || player.Dead)
+            if (!world.Players.TryGetValue(playerId, out var player))
+                return new(false, "player_not_active");
+            if (SessionId != 0 && player.SessionId != SessionId)
+                return new(false, "stale_session");
+            if (!player.Active || player.Dead)
                 return new(false, "player_not_active");
 
             lock (world.ItemsLock)
@@ -187,6 +227,33 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
     }
 }
 
+/// <summary>打开箱子命令：包 31 权威通过后生成，由仿真建立带连接会话的箱子会话。</summary>
+public sealed record OpenChestCommand(long Tick, int? PlayerId, int X, int Y)
+    : Command(Tick, PlayerId, "open_chest")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
+
+        if (!TryGetPlayer(world, playerId, out var player, out var failure))
+            return failure;
+        if (player!.Dead)
+            return new(false, "player_not_active");
+
+        Chest? chest;
+        lock (world.ChestsLock)
+        {
+            chest = world.FindChestAt(X, Y);
+        }
+        if (chest is null)
+            return new(false, "chest_not_found");
+
+        world.OpenChestSession(playerId, SessionId, chest.Index);
+        return new(true);
+    }
+}
+
 /// <summary>
 /// 箱子物品写入命令：包 32 权威通过后生成，由仿真把客户端上报的槽位内容写入服务端箱子。
 /// 服务端持有箱子内容唯一真相（客户端上报经校验后才落盘）。
@@ -202,14 +269,16 @@ public sealed record SyncChestItemCommand(
 
         lock (world.PlayersLock)
         {
-            if (!world.Players.TryGetValue(playerId, out var player)
-                || !player.Active
-                || player.Dead)
+            if (!world.Players.TryGetValue(playerId, out var player))
+                return new(false, "player_not_active");
+            if (SessionId != 0 && player.SessionId != SessionId)
+                return new(false, "stale_session");
+            if (!player.Active || player.Dead)
                 return new(false, "player_not_active");
 
             lock (world.ChestsLock)
             {
-                if (!world.HasChestSession(playerId, ChestIndex))
+                if (!world.HasChestSession(playerId, SessionId, ChestIndex))
                     return new(false, "chest_not_open");
 
                 var chest = world.FindChestByIndex(ChestIndex);
@@ -248,6 +317,11 @@ public sealed record LiquidEditCommand(long Tick, int? PlayerId, IReadOnlyList<L
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
+        if (!TryGetPlayer(world, playerId, out _, out var failure))
+            return failure;
+
         foreach (var change in Changes)
         {
             if (change.X < 0 || change.X >= world.MaxTilesX ||
@@ -282,6 +356,10 @@ public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, by
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
+        if (!TryGetPlayer(world, playerId, out _, out var failure))
+            return failure;
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
 return new(false, "not_applied");
 
@@ -376,6 +454,11 @@ public sealed record ActuateCommand(long Tick, int? PlayerId, int X, int Y)
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
 return new(false, "not_applied");
 
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
+        if (!TryGetPlayer(world, playerId, out _, out var failure))
+            return failure;
+
         var visited = new HashSet<int> { Y * Stride + X };
         var queue = new Queue<(int X, int Y)>();
         queue.Enqueue((X, Y));
@@ -440,7 +523,11 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
 return new(false, "not_applied");
 
-        if (PlayerId is not int playerId || world.InventoryLedger is null)
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
+        if (!TryGetPlayer(world, playerId, out _, out var failure))
+            return failure;
+        if (world.InventoryLedger is null)
 return new(false, "not_applied");
 
         // 图格和背包必须在同一提交单元中处理。先占住图格写锁，再确认目标仍为空并扣除物品。
@@ -470,6 +557,11 @@ public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, in
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
+        if (!TryGetPlayer(world, playerId, out _, out var failure))
+            return failure;
+
         lock (world.NpcsLock)
         {
             if (NpcIndex < 0 || NpcIndex >= world.Npcs.Count)
@@ -503,6 +595,9 @@ public sealed record SpawnItemCommand(
 
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
+        if (PlayerId is int playerId && !TryGetPlayer(world, playerId, out _, out var failure))
+            return failure;
+
         lock (world.ItemsLock)
         {
             if (world.Items.Count >= MaxSlots)
@@ -534,6 +629,11 @@ public sealed record SpawnProjectileCommand(
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
+        if (PlayerId is not int playerId)
+            return new(false, "missing_player");
+        if (!TryGetPlayer(world, playerId, out _, out var failure))
+            return failure;
+
         lock (world.ProjectilesLock)
         {
             // 同一 Key 视为同一弹幕的更新（原版 projectile 索引由归属者选定）
@@ -598,13 +698,10 @@ public sealed record SetManaCommand(long Tick, int? PlayerId, int Mana, int MaxM
         if (PlayerId is not int id || MaxMana <= 0)
             return new(false, "not_applied");
 
-        PlayerRuntime? player;
-        lock (world.PlayersLock)
-            world.Players.TryGetValue(id, out player);
-        if (player is null)
-            return new(false, "not_applied");
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
 
-        player.MpMax = MaxMana;
+        player!.MpMax = MaxMana;
         player.Mp = Math.Clamp(Mana, 0, MaxMana);
         return new(true);
     }
@@ -622,10 +719,9 @@ public sealed record HealPlayerCommand(long Tick, int? PlayerId, int Amount)
         if (PlayerId is not int id || Amount <= 0)
             return new(false, "not_applied");
 
-        PlayerRuntime? player;
-        lock (world.PlayersLock)
-            world.Players.TryGetValue(id, out player);
-        if (player is null || player.Dead)
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
+        if (player!.Dead)
             return new(false, "not_applied");
 
         player.Hp = Math.Min(player.Hp + Amount, player.HpMax);
@@ -642,13 +738,10 @@ public sealed record SetBuffsCommand(long Tick, int? PlayerId, IReadOnlyList<int
         if (PlayerId is not int id)
             return new(false, "not_applied");
 
-        PlayerRuntime? player;
-        lock (world.PlayersLock)
-            world.Players.TryGetValue(id, out player);
-        if (player is null)
-            return new(false, "not_applied");
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
 
-        player.Buffs.Clear();
+        player!.Buffs.Clear();
         player.Buffs.AddRange(Buffs);
         world.MarkPlayerChanged(id);
         return new(true);

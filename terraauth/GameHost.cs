@@ -683,8 +683,9 @@ public sealed class GameHost : IDisposable
         var world = Simulator.State;
         var updates = world.DrainChestUpdates(MaxChestUpdatesPerFlush);
 
-        foreach (var (chestIndex, slot) in updates)
+        for (int i = 0; i < updates.Count; i++)
         {
+            var (chestIndex, slot) = updates[i];
             ChestItem item;
             lock (world.ChestsLock)
             {
@@ -694,16 +695,37 @@ public sealed class GameHost : IDisposable
                 item = chest.Items[slot];
             }
 
-            await Network.BroadcastWhereAsync(
-                PacketId.SyncChestItem,
-                new SyncChestItemPacket(
-                    chestIndex,
-                    slot,
-                    item.Stack,
-                    item.Prefix,
-                    item.Type),
-                playerId => world.HasChestSession(playerId, chestIndex),
-                ct).ConfigureAwait(false);
+            try
+            {
+                await Network.BroadcastChestUpdateAsync(
+                    new SyncChestItemPacket(
+                        chestIndex,
+                        slot,
+                        item.Stack,
+                        item.Prefix,
+                        item.Type),
+                    conn => world.HasChestSession(
+                        conn.PlayerId,
+                        conn.SessionId,
+                        chestIndex),
+                    ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                for (int retry = i; retry < updates.Count; retry++)
+                    world.MarkChestChanged(
+                        updates[retry].ChestIndex,
+                        updates[retry].Slot);
+                throw;
+            }
+            catch (IOException)
+            {
+                world.MarkChestChanged(chestIndex, slot);
+            }
+            catch (ObjectDisposedException)
+            {
+                world.MarkChestChanged(chestIndex, slot);
+            }
         }
     }
 

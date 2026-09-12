@@ -41,8 +41,8 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
         _processor = new ShardedAuthorityProcessor<InboundWork, AuthorityResult>(
             shardCount,
             (_, work) => work.IsReset
-                ? ResetPlayerCore(work.PlayerId)
-                : inner.ProcessAsync(work.Packet!, work.PlayerId, work.Commands!, work.Ct)
+                ? ResetPlayerCore(work.PlayerId, work.SessionId)
+                : inner.ProcessAsync(work.Packet!, work.PlayerId, work.Commands!, work.Ct, work.SessionId)
                     .GetAwaiter().GetResult());
         _queue = Channel.CreateUnbounded<InboundWork>(new UnboundedChannelOptions { SingleReader = true });
         _dispatcher = Task.Run(() => DispatchLoopAsync(_cts.Token));
@@ -50,13 +50,17 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
 
     public Task<AuthorityResult> ProcessAsync(
         INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct = default)
+        => ProcessAsync(packet, playerId, commands, ct, 0);
+
+    public Task<AuthorityResult> ProcessAsync(
+        INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct, long sessionId)
     {
         if (ct.IsCancellationRequested)
             return Task.FromCanceled<AuthorityResult>(ct);
 
         var completion = new TaskCompletionSource<AuthorityResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_queue.Writer.TryWrite(new InboundWork(packet, playerId, commands, ct, completion)))
+        if (!_queue.Writer.TryWrite(new InboundWork(packet, playerId, commands, ct, completion, SessionId: sessionId)))
             completion.TrySetException(new ObjectDisposedException(nameof(ShardedInboundPipeline)));
         return completion.Task;
     }
@@ -65,11 +69,12 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
     /// 连接结束：把「按玩家重置」投递到**同一队列 / 同一分片**，保证该玩家在途包先处理完再清状态
     /// （否则在途的旧位置包会把基线重新写回，重连后仍被判超速）。
     /// </summary>
-    public void ResetPlayer(int playerId) => _queue.Writer.TryWrite(InboundWork.Reset(playerId));
+    public void ResetPlayer(int playerId) => ResetPlayer(playerId, 0);
+    public void ResetPlayer(int playerId, long sessionId) => _queue.Writer.TryWrite(InboundWork.Reset(playerId, sessionId));
 
-    private AuthorityResult ResetPlayerCore(int playerId)
+    private AuthorityResult ResetPlayerCore(int playerId, long sessionId)
     {
-        _inner.ResetPlayer(playerId);
+        _inner.ResetPlayer(playerId, sessionId);
         return AuthorityResult.Accept(null);
     }
 
@@ -145,9 +150,10 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
         CommandQueue? Commands,
         CancellationToken Ct,
         TaskCompletionSource<AuthorityResult>? Completion,
+        long SessionId = 0,
         bool IsReset = false)
     {
-        public static InboundWork Reset(int playerId)
-            => new(null, playerId, null, default, null, IsReset: true);
+        public static InboundWork Reset(int playerId, long sessionId = 0)
+            => new(null, playerId, null, default, null, SessionId: sessionId, IsReset: true);
     }
 }

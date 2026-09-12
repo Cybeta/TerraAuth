@@ -47,6 +47,10 @@ public sealed class HookedPipeline : IInboundPipeline
 
     public Task<AuthorityResult> ProcessAsync(
         INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct = default)
+        => ProcessAsync(packet, playerId, commands, ct, 0);
+
+    public Task<AuthorityResult> ProcessAsync(
+        INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct, long sessionId)
     {
         // 零分配短路：该类 Hook 无订阅者时**不构造 HookArgs**（无插件场景下每包省一次对象分配）
         if (HasSubscriberFor(packet))
@@ -67,11 +71,12 @@ public sealed class HookedPipeline : IInboundPipeline
         }
 
         // 调用原始管线（Phase 2 权威校验）
-        return _inner.ProcessAsync(packet, playerId, commands, ct);
+        return _inner.ProcessAsync(packet, playerId, commands, ct, sessionId);
     }
 
     /// <summary>连接结束：转发给内层管线，清理该玩家的权威状态（避免槽位复用串号）。</summary>
     public void ResetPlayer(int playerId) => _inner.ResetPlayer(playerId);
+    public void ResetPlayer(int playerId, long sessionId) => _inner.ResetPlayer(playerId, sessionId);
 
     /// <summary>
     /// 包类型 → 对应 HookArgs 类型是否有订阅者。<b>只做类型判断，不实例化</b>，

@@ -299,6 +299,33 @@ internal sealed class MovementAuthority : IMovementAuthority
     /// <summary>连接结束：丢弃该玩家的移动基线，使重连后的首个位置包重新建立基准。</summary>
     public void ResetPlayer(int playerId) => _motion.TryRemove(playerId, out _);
 
+    public void BindSession(int playerId, long sessionId)
+    {
+        if (sessionId == 0) return;
+        var state = _motion.GetOrAdd(playerId, _ => new PlayerMotion());
+        lock (state.Gate)
+        {
+            if (state.SessionId == 0)
+                state.SessionId = sessionId;
+        }
+    }
+
+    public void ResetPlayer(int playerId, long sessionId)
+    {
+        if (!_motion.TryGetValue(playerId, out var state)) return;
+        if (sessionId == 0)
+        {
+            _motion.TryRemove(playerId, out _);
+            return;
+        }
+
+        lock (state.Gate)
+        {
+            if (state.SessionId == sessionId)
+                _motion.TryRemove(playerId, out _);
+        }
+    }
+
     public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
     {
         // 传送类包：客户端只声明意图，落点 / 目标 / 频率由服务端判定
@@ -461,6 +488,7 @@ internal sealed class MovementAuthority : IMovementAuthority
         public Vector2 LastPosition;
         public DateTimeOffset LastSeenAt;
         public bool HasBaseline;
+        public long SessionId;
 
         /// <summary>传送频率窗口（包 65 / 73 共用）。</summary>
         public readonly TeleportWindow Teleports = new();
@@ -779,13 +807,20 @@ internal sealed class WorldAuthority : IWorldAuthority
     /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
     internal void UpdateLimits(WorldLimits limits) => _limits = limits;
 
-    public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands) => packet switch
+    public AuthorityResult Validate(INetworkPacket packet, int playerId, CommandQueue commands)
+        => Validate(packet, playerId, commands, 0);
+
+    public AuthorityResult Validate(
+        INetworkPacket packet,
+        int playerId,
+        CommandQueue commands,
+        long sessionId) => packet switch
     {
         TileBreakPacket brk => ValidateBreak(brk, playerId),
         TilePlacePacket place => ValidatePlace(place, playerId),
         ItemPickupPacket pickup => ValidatePickup(pickup, playerId),
-        ChestPacket chest => ValidateChestOpen(chest, playerId),
-        SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId),
+        ChestPacket chest => ValidateChestOpen(chest, playerId, sessionId),
+        SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId, sessionId),
         LiquidModulePacket liquid => ValidateLiquid(liquid, playerId),
         UnknownPacket => AuthorityResult.Reject("unknown_packet"),
         _ => AuthorityResult.Accept(packet),
@@ -839,7 +874,10 @@ internal sealed class WorldAuthority : IWorldAuthority
     /// 打开箱子（包 31）：坐标必须落在世界内、存在箱子、且玩家在交互距离内。
     /// 通过后由网络层把服务端持有的箱子内容逐槽下发（包 32）。
     /// </summary>
-    private AuthorityResult ValidateChestOpen(ChestPacket chest, int playerId)
+    private AuthorityResult ValidateChestOpen(
+        ChestPacket chest,
+        int playerId,
+        long sessionId)
     {
         if (!IsInWorld(chest.X, chest.Y))
             return Deny(playerId, "chest_rejected", "out_of_bounds", new { chest.X, chest.Y });
@@ -857,7 +895,6 @@ internal sealed class WorldAuthority : IWorldAuthority
             chestIndex = existing.Index;
         }
 
-        _world.OpenChestSession(playerId, chestIndex);
         return AuthorityResult.Accept(chest);
     }
 
@@ -865,7 +902,10 @@ internal sealed class WorldAuthority : IWorldAuthority
     /// 箱子内物品写入（包 32）：箱子索引 / 槽位 / 堆叠 / 物品合法性 + 玩家在交互距离内。
     /// 通过后由 <see cref="SyncChestItemCommand"/> 落盘到服务端箱子（服务端持有唯一真相）。
     /// </summary>
-    private AuthorityResult ValidateChestItem(SyncChestItemPacket item, int playerId)
+    private AuthorityResult ValidateChestItem(
+        SyncChestItemPacket item,
+        int playerId,
+        long sessionId)
     {
         if (item.Stack < 0 || item.Stack > _inv.MaxStackSize)
             return Deny(playerId, "chest_rejected", "invalid_stack",
@@ -887,9 +927,8 @@ internal sealed class WorldAuthority : IWorldAuthority
         if (!IsWithinReach(playerId, chest.X, chest.Y, ChestReachPx))
             return Deny(playerId, "chest_rejected", "out_of_reach", new { item.ChestIndex });
 
-        if (!_world.HasChestSession(playerId, item.ChestIndex))
-            return Deny(playerId, "chest_rejected", "chest_not_open", new { item.ChestIndex });
-
+        // 箱子会话由 OpenChestCommand 在仿真提交阶段建立；此处只做只读边界校验，
+        // 最终会话一致性由 SyncChestItemCommand.Apply 再次确认，避免同一批包因提交尚未发生而被提前拒绝。
         return AuthorityResult.Accept(item);
     }
 

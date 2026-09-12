@@ -21,7 +21,7 @@ public sealed class RateLimits
 
 // ---------- 包上下文 ----------
 
-public sealed record PacketContext(int PlayerId, long Tick, DateTimeOffset ReceivedAt) : IPacketContext;
+public sealed record PacketContext(int PlayerId, long Tick, DateTimeOffset ReceivedAt, long SessionId = 0) : IPacketContext;
 
 // ---------- 管线阶段 ----------
 
@@ -39,6 +39,7 @@ public interface IPipelineStage
 public interface IResettableStage
 {
     void ResetPlayer(int playerId);
+    void ResetPlayer(int playerId, long sessionId) => ResetPlayer(playerId);
 }
 
 public sealed class FrameStage : IPipelineStage
@@ -107,10 +108,14 @@ public sealed class MovementAuthorityStage : IPipelineStage, IResettableStage
         => (_move, _audit) = (move, audit);
 
     public void ResetPlayer(int playerId) => _move.ResetPlayer(playerId);
+    public void ResetPlayer(int playerId, long sessionId) => _move.ResetPlayer(playerId, sessionId);
+
+    public void BindSession(int playerId, long sessionId) => _move.BindSession(playerId, sessionId);
 
     public async Task<AuthorityResult> ExecuteAsync(INetworkPacket packet, IPacketContext context,
         Func<INetworkPacket, Task<AuthorityResult>> next, CancellationToken ct)
     {
+        _move.BindSession(context.PlayerId, context.SessionId);
         var result = _move.Validate(packet, context.PlayerId, null!);
         if (result.Decision != AuthorityDecision.Accept) return result;
         return await next(packet).ConfigureAwait(false);
@@ -162,7 +167,7 @@ public sealed class WorldAuthorityStage : IPipelineStage
     public async Task<AuthorityResult> ExecuteAsync(INetworkPacket packet, IPacketContext context,
         Func<INetworkPacket, Task<AuthorityResult>> next, CancellationToken ct)
     {
-        var result = _world.Validate(packet, context.PlayerId, null!);
+        var result = _world.Validate(packet, context.PlayerId, null!, context.SessionId);
         if (result.Decision != AuthorityDecision.Accept) return result;
         return await next(packet).ConfigureAwait(false);
     }
@@ -177,6 +182,7 @@ public sealed class TerminalStage : IPipelineStage
     {
         // 管线通过 → 生成 Command（由 InboundPipeline 写入 CommandQueue）
         var command = CreateCommand(packet, context);
+        if (command is not null) command = command with { SessionId = context.SessionId };
         return Task.FromResult(AuthorityResult.Accept(packet, command));
     }
 
@@ -205,6 +211,8 @@ public sealed class TerminalStage : IPipelineStage
             drop.ItemId, drop.Stack, drop.Position, drop.Velocity, drop.Prefix),
         // 包 22 SyncItemOwner → 物品拾取（服务端移除世界实体并入库）
         ItemPickupPacket pickup => new PickupItemCommand(context.Tick, context.PlayerId, pickup.ItemSlotIndex),
+        // 包 31 Chest → 建立服务端箱子会话
+        ChestPacket chest => new OpenChestCommand(context.Tick, context.PlayerId, chest.X, chest.Y),
         // 包 32 SyncChestItem → 箱子内物品写入（服务端持有箱子内容唯一真相）
         SyncChestItemPacket chestItem => new SyncChestItemCommand(context.Tick, context.PlayerId,
             chestItem.ChestIndex, chestItem.ItemSlot, chestItem.Stack, chestItem.Prefix, chestItem.ItemType),
@@ -247,22 +255,32 @@ public sealed class InboundPipeline : IInboundPipeline
     }
 
     /// <summary>连接结束：把「按玩家重置」转发给实现了 <see cref="IResettableStage"/> 的阶段。</summary>
-    public void ResetPlayer(int playerId)
+    public void ResetPlayer(int playerId) => ResetPlayer(playerId, 0);
+
+    public void ResetPlayer(int playerId, long sessionId)
     {
         foreach (var stage in _stages)
         {
             if (stage is IResettableStage resettable)
-                resettable.ResetPlayer(playerId);
+                resettable.ResetPlayer(playerId, sessionId);
         }
     }
+
+    public Task<AuthorityResult> ProcessAsync(
+        INetworkPacket packet,
+        int playerId,
+        CommandQueue commands,
+        CancellationToken ct = default)
+        => ProcessAsync(packet, playerId, commands, ct, 0);
 
     public async Task<AuthorityResult> ProcessAsync(
         INetworkPacket packet,
         int playerId,
         CommandQueue commands,
-        CancellationToken ct = default)
+        CancellationToken ct,
+        long sessionId)
     {
-        var context = new PacketContext(playerId, _currentTick(), DateTimeOffset.UtcNow);
+        var context = new PacketContext(playerId, _currentTick(), DateTimeOffset.UtcNow, sessionId);
         var index = 0;
 
         async Task<AuthorityResult> Next(INetworkPacket p)

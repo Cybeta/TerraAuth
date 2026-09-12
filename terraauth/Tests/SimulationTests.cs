@@ -111,6 +111,58 @@ public class SimulationTests
     }
 
     [Fact]
+    public void SessionBoundCommands_RejectStaleSession()
+    {
+        var world = new WorldState { Tiles = new TileMap(2, 2), MaxTilesX = 2, MaxTilesY = 2,
+            InventoryLedger = new RejectingInventoryLedger() };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 22, Active = true };
+
+        Assert.Equal("stale_session", new MoveCommand(1, 1, new Vector2(1, 1)) { SessionId = 11 }.Apply(world, new XoshiroRng(1)).Reason);
+        Assert.Equal("stale_session", new PickupItemCommand(1, 1, 0) { SessionId = 11 }.Apply(world, new XoshiroRng(1)).Reason);
+        Assert.Equal("stale_session", new SyncChestItemCommand(1, 1, 0, 0, 1, 0, 1) { SessionId = 11 }.Apply(world, new XoshiroRng(1)).Reason);
+    }
+
+    [Fact]
+    public void SessionConditionedOfflineCleanup_DoesNotRemoveReplacement()
+    {
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 22, Active = true };
+
+        world.MarkPlayerOffline(1, 11, "old", 10);
+
+        Assert.True(world.TryGetCurrentPlayer(1, 22, out _));
+        Assert.False(world.TryGetCurrentPlayer(1, 11, out _));
+    }
+
+    [Fact]
+    public void ChestSession_RejectsStaleConnectionAndPreservesReplacement()
+    {
+        var world = new WorldState();
+        world.OpenChestSession(1, 22, 3);
+        world.OpenChestSession(1, 33, 4);
+
+        Assert.False(world.HasChestSession(1, 22, 3));
+        Assert.True(world.HasChestSession(1, 33, 4));
+
+        world.CloseChestSession(1, 22);
+        Assert.True(world.HasChestSession(1, 33, 4));
+    }
+
+    [Fact]
+    public void SessionConditionedOfflineCleanup_RemovesMatchingPlayer()
+    {
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 22, Active = true };
+
+        world.MarkPlayerOffline(1, 22, "old", 10);
+
+        Assert.False(world.TryGetCurrentPlayer(1, 22, out _));
+    }
+
+    [Fact]
     public void TilePlaceCommand_DoesNotMarkUpdateWhenInventoryCannotBeConsumed()
     {
         var world = new WorldState { Tiles = new TileMap(2, 2), MaxTilesX = 2, MaxTilesY = 2,
@@ -120,6 +172,99 @@ public class SimulationTests
 
         Assert.Empty(world.DrainTileUpdates(10));
         Assert.False(world.Tiles[1, 1].Active);
+    }
+
+    [Fact]
+    public void ChestUpdates_CanBeRequeued_AfterBroadcastFailure()
+    {
+        var world = new WorldState();
+        world.MarkChestChanged(3, 7);
+
+        var firstAttempt = world.DrainChestUpdates(10);
+        Assert.Contains((3, 7), firstAttempt);
+
+        world.MarkChestChanged(3, 7);
+        var retry = world.DrainChestUpdates(10);
+        Assert.Contains((3, 7), retry);
+    }
+
+    [Fact]
+    public void ChestUpdates_AreNotDrained_WhenLimitIsZero()
+    {
+        var world = new WorldState();
+        world.MarkChestChanged(3, 7);
+
+        Assert.Empty(world.DrainChestUpdates(0));
+        Assert.Contains((3, 7), world.DrainChestUpdates(10));
+    }
+
+    [Fact]
+    public void ClosedChestSession_RejectsAuthoritativeWrite()
+    {
+        var world = new WorldState
+        {
+            Tiles = new TileMap(2, 2),
+            MaxTilesX = 2,
+            MaxTilesY = 2,
+        };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Position = new Vector2(8, 8),
+            };
+        }
+        world.Chests.Add(new Chest
+        {
+            Index = 0,
+            X = 0,
+            Y = 0,
+            Items = new ChestItem[40],
+        });
+
+        var result = new SyncChestItemCommand(
+            1, 1, 0, 2, 4, 0, 5).Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal("chest_not_open", result.Reason);
+        Assert.Equal(0, world.Chests[0].Items[2].Stack);
+        Assert.Empty(world.DrainChestUpdates(10));
+    }
+
+    [Fact]
+    public void SwitchingChestSession_InvalidatesPreviousChest()
+    {
+        var world = new WorldState();
+        world.OpenChestSession(1, 3);
+        world.OpenChestSession(1, 4);
+
+        Assert.False(world.HasChestSession(1, 3));
+        Assert.True(world.HasChestSession(1, 4));
+
+        world.CloseChestSession(1);
+        Assert.False(world.HasChestSession(1, 4));
+    }
+
+    [Fact]
+    public void GoingOffline_ClosesChestSession()
+    {
+        var world = new WorldState();
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+            };
+        }
+
+        world.OpenChestSession(1, 3);
+        world.MarkPlayerOffline(1, string.Empty, 0);
+
+        Assert.False(world.HasChestSession(1, 3));
+        Assert.False(world.Players.ContainsKey(1));
     }
 
     [Fact]
