@@ -880,44 +880,116 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 原版客户端**只在操作变化时**发位置包（`Player.cs` 中 `SendData(13)` 的触发条件就是控制位变化），
-    /// 原版服务端会按同步来的操作继续模拟玩家移动；TerraAuth 不做玩家操作模拟，
-    /// 因此必须按观测速度外推「游戏判定用」的位置（<see cref="PlayerRuntime.AimPosition"/>）——
-    /// 否则 NPC 会去追玩家早已离开的坐标，表现为「看着没被碰到却在扣血」。
+    /// 清一条水平走廊（上方留空、地面铺平），让玩家物理的断言不受地形影响。
+    /// </summary>
+    private static void ClearCorridor(WorldState world, int centerTileX, int span)
+    {
+        int gy = world.SpawnTileY;
+        for (int x = centerTileX - 4; x <= centerTileX + span; x++)
+        {
+            for (int y = gy - 4; y < gy; y++)
+                world.Tiles[x, y].Active = false;
+
+            ref var ground = ref world.Tiles[x, gy];
+            ground.Active = true;
+            ground.Type = 0;   // Dirt
+        }
+    }
+
+    /// <summary>
+    /// 玩家物理按包 13 的**控制位**在服务端推进（对齐原版 <c>Player.Update</c>，见 <c>WorldSimulator.StepPlayerPhysics</c>）。
+    /// 客户端只在操作变化时发位置包，只信位置包会让服务端坐标长时间停在原地
+    /// → NPC 追/打的是玩家早已离开的位置（真机症状：看着没被碰到却在扣血）。
+    /// 原版数值：runAcceleration 0.08 / runSlowdown 0.2 / maxRunSpeed 3。
     /// </summary>
     [Fact]
-    public void PlayerAimPosition_Extrapolates_Between_PositionPackets()
+    public void PlayerPhysics_Accelerates_WithControlBits_AndStops_OnRelease()
     {
         var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        ClearCorridor(world, world.SpawnTileX, 40);
+
         var player = new PlayerRuntime
         {
             Id = 1,
             Active = true,
             Hp = 100,
             HpMax = 100,
-            Position = new Vector2(1000f, 1000f),
+            Position = new Vector2(world.SpawnTileX * 16f, world.SpawnTileY * 16f - NpcSizes.PlayerHeight),
         };
         lock (world.PlayersLock) world.Players[1] = player;
-        var rng = new XoshiroRng(1);
 
-        // 第一包：只建立基准，不产生观测速度
-        world.Tick = 100;
-        new MoveCommand(100, 1, new Vector2(1000f, 1000f)) { Moving = true }.Apply(world, rng);
-        Assert.Equal(0f, player.ObservedSpeedX, 4);
+        float startX = player.Position.X;
 
-        // 第二包：20 tick 走了 60px（按住方向键）→ 观测速度 3px/tick
-        world.Tick = 120;
-        new MoveCommand(120, 1, new Vector2(1060f, 1000f)) { Moving = true }.Apply(world, rng);
-        Assert.Equal(3f, player.ObservedSpeedX, 4);
+        // 按住右键：每 tick +0.08（原版 runAcceleration）
+        player.ControlBits = PlayerRuntime.ControlRight;
+        for (int i = 0; i < 10; i++) sim.Tick();
+        Assert.Equal(0.8f, player.Velocity.X, 3);
+        Assert.True(player.Position.X > startX + 3f,
+            $"按住右键 10 tick 只前进了 {player.Position.X - startX:F1}px");
 
-        // 之后 10 tick 没有新包 → 判定位置外推到 1060 + 3×10
-        Assert.Equal(1090f, player.Extrapolate(130).X, 1);
+        // 继续按住：收敛到原版 maxRunSpeed = 3
+        for (int i = 0; i < 40; i++) sim.Tick();
+        Assert.Equal(3f, player.Velocity.X, 3);
 
-        // 松开方向键的那一包（Moving = false）→ 立刻停止外推
-        world.Tick = 131;
-        new MoveCommand(131, 1, new Vector2(1060f, 1000f)).Apply(world, rng);
-        Assert.Equal(0f, player.ObservedSpeedX, 4);
-        Assert.Equal(1060f, player.Extrapolate(131).X, 1);
+        // 松开方向键：每 tick 减 0.2（原版 runSlowdown）直到 0
+        player.ControlBits = 0;
+        for (int i = 0; i < 20; i++) sim.Tick();
+        Assert.Equal(0f, player.Velocity.X, 3);
+
+        float stoppedX = player.Position.X;
+        for (int i = 0; i < 5; i++) sim.Tick();
+        Assert.Equal(stoppedX, player.Position.X, 3);   // 停下后不再漂移
+    }
+
+    /// <summary>
+    /// 起跳：原版 <c>jumpSpeed = 5.01</c>；且必须是「松开后再按」（原版 <c>releaseJump</c>，按住不放不连跳）。
+    /// </summary>
+    [Fact]
+    public void PlayerPhysics_Jumps_OnFreshPress_Only()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        ClearCorridor(world, world.SpawnTileX, 20);
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(world.SpawnTileX * 16f, world.SpawnTileY * 16f - NpcSizes.PlayerHeight),
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        float groundY = player.Position.Y;
+        player.ControlBits = PlayerRuntime.ControlJump;
+
+        sim.Tick();
+        Assert.True(player.Velocity.Y < 0f, "按下跳跃键后应向上运动");
+        Assert.False(player.Grounded);
+
+        // 按住不放：不得反复起跳（上升期间垂直速度必须逐 tick 受重力衰减）
+        float previousVy = player.Velocity.Y;
+        for (int i = 0; i < 3; i++)
+        {
+            sim.Tick();
+            Assert.True(player.Velocity.Y > previousVy, "按住跳跃键不应反复起跳");
+            previousVy = player.Velocity.Y;
+        }
+
+        // 升到最高点：原版 ≈ 2 格（jumpSpeed 5.01 / gravity 0.4）
+        float minY = player.Position.Y;
+        for (int i = 0; i < 20; i++)
+        {
+            sim.Tick();
+            minY = Math.Min(minY, player.Position.Y);
+        }
+        Assert.True(groundY - minY > 20f, $"跳跃高度只有 {groundY - minY:F1}px");
+
+        // 落回地面
+        for (int i = 0; i < 60; i++) sim.Tick();
+        Assert.True(player.Grounded, "应已落回地面");
     }
 
     /// <summary>

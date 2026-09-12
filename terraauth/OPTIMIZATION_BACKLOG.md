@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第三十二轮：接触阈值收到 8px + NPC 水平阻挡（不再穿墙））
+> 最后更新：2026-09-12（第三十三轮：玩家移动改为「服务端按控制位模拟」，对齐原版 Player.Update）
 
 ---
 
@@ -24,7 +24,7 @@
 | 11 | 史莱姆一直朝一个方向走 | NPC 物理**没有水平碰撞** → 服务端 NPC 穿墙直线前进，与客户端发散 | 加 `NpcBlockedHorizontally` 水平阻挡 | 32 |
 | 12 | 擦着走仍扣血 | 3~4px 贴边算接触 | 接触阈值收到 **8px**（半格） | 32 |
 
-> 未解决/待观察（见文末「剩余清单」）：擦边阈值是否收得过紧；玩家移动仍未做服务端操作模拟（现为外推近似）。
+> 未解决/待观察（见文末「剩余清单」）：擦边阈值是否收得过紧；接触判定与免伤帧的原版对齐（第三十三轮已把玩家移动换成控制位模拟）。
 
 ---
 
@@ -110,6 +110,55 @@
 
 ## 附：本轮回溯
 
+### 第三十三轮（2026-09-12）：玩家移动改为「服务端按控制位模拟」（对齐原版做法）
+
+**原版依据**：`Main.Update` 对**所有 active 玩家（含远端）**调用 `player[i].Update(i)`；而客户端只在
+**操作变化**时发位置包（`SendData(13)` 的触发条件就是控制位变化）—— 所以原版服务端能靠**自己模拟**与客户端保持一致。
+第三十一轮的「观测速度外推」只是近似，本轮换成真正的控制位模拟。
+
+原版数值（`Player` 的 `ResetEffects` 与移动/跳跃分支，逐条核对）：
+
+| 项 | 值 |
+|---|---|
+| `originalRunSpeed`（→ `maxRunSpeed`） | **3** |
+| `runAcceleration` | **0.08** |
+| `runSlowdown` | **0.2** |
+| `defaultGravity` / `maxFallSpeed` | **0.4** / **10** |
+| `jumpSpeed` / `jumpHeight` | **5.01** / 15 |
+
+```csharp
+// 水平（无装备时 accRunSpeed == maxRunSpeed）
+if (controlLeft  && vx > -maxRunSpeed) { if (vx >  runSlowdown) vx -= runSlowdown; vx -= runAcceleration; }
+else if (controlRight && vx < maxRunSpeed) { if (vx < -runSlowdown) vx += runSlowdown; vx += runAcceleration; }
+else if (贴地 && 无方向输入) { 按 runSlowdown 收敛到 0 }
+// 起跳：releaseJump 保证「松开后再按」才算一次（按住不连跳）
+if (controlJump && releaseJump && 贴地 && !controlDown) velocity.Y = -jumpSpeed;
+```
+
+**实现**：
+
+- `PlayerRuntime` 新增 `ControlBits`（与原版 `control*` 同一位序）/ `JumpHeld` / `Grounded` / `Direction`；
+  `MoveCommand` 携带控制位与（可选的）上报速度，`InboundPipeline` 从包 13 填充。
+- 新增 `WorldSimulator.StepPlayerPhysics`（原 `SimulatePhysics` 的玩家分支）：水平加速 / 摩擦 / 起跳 / 重力 /
+  **水平阻挡** / 落地（脚底 = `Y + 42`、左右两列），并把结果写入 `AimPosition`
+  （NPC 追击 / 接触伤害 / 敌对弹幕 / 刷怪点都读它）。
+- **删除**外推近似（`ObservedSpeedX` / `LastMoveTick` / `Extrapolate` / `MaxObservedSpeedX`）与 `MoveCommand.Moving`。
+- 位置仍以客户端上报为权威（原版服务端同样直接赋值）；速度若随包上报则采纳（`StateBits` bit2），
+  使服务端状态与客户端对齐 —— 这也是本机测试里"转发位置比上报值大 1~2px"的原因（服务端在包间继续推进）。
+
+**测试**：**306 / 306 通过**。新增 `PlayerPhysics_Accelerates_WithControlBits_AndStops_OnRelease`、
+`PlayerPhysics_Jumps_OnFreshPress_Only`；`Vanilla_PlayerControls_Relay_Preserves_Mount_And_Camera` 改为容差断言。
+
+**遗留（下一轮候选）**：
+
+1. **免伤帧对齐原版**：接触攻击 `GiveImmuneTimeForCollisionAttack(30)`（十字项链 60）、通用 `Hurt` 的
+   `immuneTime = pvp ? 8 : (伤害≠1 ? 40/80 : 20/40)` —— 我们目前统一 60。
+2. **玩家物理的其余分支**：可变跳跃高度（按住跳更高）、冲刺 / 坐骑 / 翅膀 / 水中 / 蜂蜜 / 斜坡与台阶自动上抬、
+   抓钩与传送 —— 当前只实现了平地行走 / 跳跃 / 落地 / 水平阻挡。
+3. **NPC 同步节奏**：可考虑从 60Hz 回落到原版令牌桶（普通 ≈3 包/1.5s、Boss ≈12Hz，`netSpamPacketLimit = 3`）。
+4. **接触判定**：原版用 `npc.position + netOffset`（渲染位置）做 AABB 相交且无最小重叠；我们取 8px 半格阈值。
+5. **框架**：buff 表（施加 debuff 通道）、粉尘 / 音效、外观包 40 建模、弹幕逐类型碰撞盒。
+
 ### 第三十二轮（2026-09-12）：接触阈值收到 8px + NPC 水平阻挡（不再穿墙）
 
 **真机日志**（第三十一轮修复后重测，第一段 15s / 第二段 39.7s）：
@@ -139,8 +188,8 @@
 
 **剩余清单（后续各轮）**：
 
-1. **玩家移动的服务端模拟（对齐原版做法）**：当前用「观测速度外推」近似原版「服务端按控制位模拟玩家」，
-   外推上限 15 tick。彻底的做法是按包 13 的控制位（左/右/上跳）+ 图格碰撞在服务端跑玩家物理。
+1. ~~**玩家移动的服务端模拟**~~ —— ✅ **已在第三十三轮完成**：`StepPlayerPhysics` 按包 13 的控制位跑
+   水平加速 / 摩擦 / 跳跃 / 落地 / 水平阻挡，外推近似已删除。
 2. **框架：buff 表**（施加 debuff 通道 + 剩余时间）。
 3. **框架：粉尘 / 音效**（纯客户端表现，最后补齐）。
 4. **NPC 逐类型物理覆盖**（`gravity` / `maxFallSpeed` 的少数类型覆盖，如 258、576/577）。
@@ -723,7 +772,7 @@ Listening on port 7778
 （断言矿脉 / 洞穴 / 草皮 / 地狱层 / 海水 / 宝箱数量与战利品）、
 `Vanilla_PlayerControls_Relay_Preserves_Mount_And_Camera`（包 13 中继保留挂载与相机）；
 另把两个受「世界生成变重」影响的既有用例等待窗口放宽（`KickAsync_...` 与 `AntiCheat_PacketFlood_...`）。
-该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 **305 / 305** 通过（第十九轮 283 + 第二十轮元数据回归 + 第二十一轮未建模包边界 + 第二十二轮 NPC 同步 / AI 步进 + 第二十三轮敌怪跳跃 + 第二十四轮原版 aiStyle 重建地基与 ai 下发 + 第二十五轮 aiStyle 31/43 / 服务端弹幕推送 / 弹幕行为表 + 第二十六轮失效实体回收与 NPC 落位修正 + 第二十七轮实体碰撞盒按原版口径对齐 + 第二十八轮跳探针 / 落地判定 / 可疑带 + 第二十九轮 NPC 重力与终速对齐原版 + 第三十轮接触最小重叠与统一免伤帧 + 第三十一轮玩家位置外推 + 第三十二轮接触阈值 8px 与 NPC 水平阻挡）。
+该历史阶段默认后端与 `-p:NoSqlite=true` 兜底后端均 259/259 通过；当前全量测试为 **306 / 306** 通过（第十九轮 283 + 第二十轮元数据回归 + 第二十一轮未建模包边界 + 第二十二轮 NPC 同步 / AI 步进 + 第二十三轮敌怪跳跃 + 第二十四轮原版 aiStyle 重建地基与 ai 下发 + 第二十五轮 aiStyle 31/43 / 服务端弹幕推送 / 弹幕行为表 + 第二十六轮失效实体回收与 NPC 落位修正 + 第二十七轮实体碰撞盒按原版口径对齐 + 第二十八轮跳探针 / 落地判定 / 可疑带 + 第二十九轮 NPC 重力与终速对齐原版 + 第三十轮接触最小重叠与统一免伤帧 + 第三十一轮玩家位置外推 + 第三十二轮接触阈值 8px 与 NPC 水平阻挡 + 第三十三轮玩家移动改为控制位模拟）。
 
 ### 第十五轮（2026-09-12）：协议字段核对后落地（包 20 图格方阵 + 区块流送对齐 + NPC 同步细节）
 

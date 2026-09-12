@@ -766,7 +766,10 @@ public class VanillaFeatureTests
         var relayed = got.OfType<PlayerControlsPacket>().Last();
 
         Assert.Equal(1, relayed.PlayerId);          // 身份由服务端覆盖
-        Assert.Equal(300f, relayed.Position.X);
+        // 位置以**服务端模拟值**为准：上报速度 (1,0) 会被采纳并在两次上报之间继续推进
+        // （原版服务端对远端玩家同样自行跑 Player.Update），因此转发位置可能比上报值大 1~2px。
+        Assert.True(MathF.Abs(relayed.Position.X - 300f) <= 2f,
+            $"转发位置偏离上报值过多：{relayed.Position.X}");
     }
 
     [Fact]

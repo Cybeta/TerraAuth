@@ -199,11 +199,23 @@ public partial class WorldSimulator : IWorldViewProvider
     /// <summary>终端下落速度（像素 / tick）。</summary>
     private const float MaxFallSpeed = 16f;
 
-    /// <summary>玩家重力（像素 / tick²）。原版玩家 Y 由客户端上报，此处仅用于包间积分与落地判定。</summary>
+    /// <summary>玩家重力（像素 / tick²）。原版 <c>Player.defaultGravity = 0.4</c>；服务端按控制位模拟玩家（见 StepPlayerPhysics）。</summary>
     private const float PlayerGravity = 0.4f;
 
     /// <summary>玩家终端下落速度（原版 <c>Player.maxFallSpeed = 10</c>）。</summary>
     private const float PlayerMaxFallSpeed = 10f;
+
+    /// <summary>玩家水平最大速度（原版 <c>Player.originalRunSpeed = 3</c>，即 <c>maxRunSpeed</c>）。</summary>
+    private const float PlayerRunSpeed = 3f;
+
+    /// <summary>玩家水平加速度（原版 <c>Player.runAcceleration = 0.08</c>）。</summary>
+    private const float PlayerRunAcceleration = 0.08f;
+
+    /// <summary>玩家水平减速 / 反向刹车（原版 <c>Player.runSlowdown = 0.2</c>）。</summary>
+    private const float PlayerRunSlowdown = 0.2f;
+
+    /// <summary>玩家起跳初速（原版 <c>Player.jumpSpeed = 5.01</c>）。</summary>
+    private const float PlayerJumpSpeed = 5.01f;
 
     /// <summary>
     /// NPC 重力 / 终端下落速度：原版 <c>NPC.UpdateNPC_UpdateGravity</c> 的默认值
@@ -563,12 +575,6 @@ public partial class WorldSimulator : IWorldViewProvider
     /// <summary>阶段 2：AI。城镇 NPC 在住所附近平滑游走；敌怪朝最近玩家水平移动并受重力。</summary>
     private void SimulateAi()
     {
-        // 刷新「游戏判定用」的玩家位置（按观测速度外推，见 PlayerRuntime.AimPosition）：
-        // NPC 追击 / 接触判定都读它 —— 原版服务端会自己按同步来的操作继续模拟玩家，
-        // 我们不做操作模拟，只能外推，否则 NPC 会去追玩家早已离开的位置。
-        foreach (var p in _world.Players.Values)
-            p.AimPosition = p.Extrapolate(_world.Tick);
-
         lock (_world.NpcsLock)
         {
             if (_world.Tick % SpawnIntervalTicks == 0)
@@ -776,40 +782,103 @@ public partial class WorldSimulator : IWorldViewProvider
             if (!player.Active || player.Dead)
                 continue;
 
-            // 重力积分（终端速度封顶；原版玩家 maxFallSpeed = 10）
-            player.Velocity = new Vector2(
-                player.Velocity.X,
-                Math.Min(player.Velocity.Y + PlayerGravity, PlayerMaxFallSpeed));
-
-            var next = new Vector2(
-                player.Position.X + player.Velocity.X,
-                player.Position.Y + player.Velocity.Y);
-
-            // 水平边界钳制（Vector2 为只读结构，需重建值）
-            if (_world.MaxTilesX > 1)
-                next = new Vector2(Math.Clamp(next.X, TileSize, (_world.MaxTilesX - 1) * TileSize), next.Y);
-
-            // 垂直碰撞：脚底图格是否实心（原版：脚底 = Position.Y + 碰撞盒高度 42）。
-            // 玩家碰撞盒宽 20，站立时可能跨两列；只探左列会在「站在台阶边缘 / 地形拐角」时漏判落地，
-            // 进而让 FallDistance 一直累积 → 站/走在平地上也会被结算下落伤害。
-            int leftX = (int)(next.X / TileSize);
-            int rightX = (int)((next.X + NpcSizes.PlayerWidth - 1) / TileSize);
-            int tileY = (int)((next.Y + PlayerHeight) / TileSize);
-            bool landed = false;
-
-            if (NpcTileSolid(leftX, tileY) || NpcTileSolid(rightX, tileY))
-            {
-                landed = true;
-                next = new Vector2(next.X, tileY * TileSize - PlayerHeight); // 脚底贴合图格上沿
-                player.Velocity = new Vector2(player.Velocity.X, 0f);
-            }
-
-            // 未落地时累计下落距离（供战斗阶段结算下落伤害）
-            if (!landed && player.Velocity.Y > 0f)
-                player.FallDistance += player.Velocity.Y;
-
-            player.Position = next;
+            StepPlayerPhysics(player);
         }
+    }
+
+    /// <summary>
+    /// 阶段 3.1：玩家物理 —— **按包 13 的控制位在服务端模拟玩家**（对齐原版 <c>Player.Update</c>）。
+    /// 原版服务端在 <c>Main.Update</c> 里对所有 active 玩家（含远端）执行 <c>Player.Update</c> —— 这才是
+    /// 「服务端坐标与客户端一致」的根本原因；而客户端只在**操作变化**时发位置包，只信位置包会让服务端坐标
+    /// 长时间停在原地，NPC 于是去追/打玩家早已离开的位置（真机症状：看着没被碰到却在扣血）。
+    /// 常数取自原版 <c>Player</c>：maxRunSpeed 3 / runAcceleration 0.08 / runSlowdown 0.2 /
+    /// gravity 0.4 / maxFallSpeed 10 / jumpSpeed 5.01。
+    /// </summary>
+    private void StepPlayerPhysics(PlayerRuntime player)
+    {
+        bool left = player.PressingLeft, right = player.PressingRight;
+
+        // 起跳 / 地面摩擦都要看「当前是否贴地」：先用当前位置探一次脚底 ——
+        // 首次 tick（Grounded 还是默认值）与从空中落地的那一 tick 都靠它。
+        player.Grounded = PlayerFeetOnGround(player.Position);
+
+        // ---- 水平：原版 runAcceleration / runSlowdown 分支（无装备时 accRunSpeed == maxRunSpeed）----
+        float vx = player.Velocity.X;
+        if (left && vx > -PlayerRunSpeed)
+        {
+            if (vx > PlayerRunSlowdown) vx -= PlayerRunSlowdown;   // 反向时先刹车
+            vx -= PlayerRunAcceleration;
+        }
+        else if (right && vx < PlayerRunSpeed)
+        {
+            if (vx < -PlayerRunSlowdown) vx += PlayerRunSlowdown;
+            vx += PlayerRunAcceleration;
+        }
+        else if (player.Grounded && !left && !right)
+        {
+            // 无输入且贴地：按 runSlowdown 收敛到 0（原版同一分支）
+            if (vx > PlayerRunSlowdown) vx -= PlayerRunSlowdown;
+            else if (vx < -PlayerRunSlowdown) vx += PlayerRunSlowdown;
+            else vx = 0f;
+        }
+        vx = Math.Clamp(vx, -PlayerRunSpeed, PlayerRunSpeed);
+
+        // ---- 垂直：起跳（要求「松开后再按」，原版 releaseJump）+ 重力 ----
+        float vy = player.Velocity.Y;
+        bool jumpPressed = player.PressingJump && !player.JumpHeld;
+        player.JumpHeld = player.PressingJump;
+        if (jumpPressed && player.Grounded && !player.PressingDown)
+        {
+            vy = -PlayerJumpSpeed;
+            player.Grounded = false;
+        }
+        vy = Math.Min(vy + PlayerGravity, PlayerMaxFallSpeed);
+
+        var next = new Vector2(player.Position.X + vx, player.Position.Y + vy);
+
+        // ---- 水平阻挡：前进方向的边缘格是实心则停在原地 ----
+        if (vx != 0f)
+        {
+            int col = (int)((vx > 0f ? next.X + NpcSizes.PlayerWidth : next.X) / TileSize);
+            int midRow = (int)((next.Y + PlayerHalfHeight) / TileSize);
+            int lowRow = (int)((next.Y + PlayerHeight - 1f) / TileSize);
+            if (NpcTileSolid(col, midRow) || NpcTileSolid(col, lowRow))
+            {
+                next = new Vector2(player.Position.X, next.Y);
+                vx = 0f;
+            }
+        }
+
+        // ---- 落地：脚底（Y + 42）左右两列任一实心（玩家宽 20 会跨两列，只探左列会在台阶边缘漏判）----
+        int feetRow = (int)((next.Y + PlayerHeight) / TileSize);
+        bool landed = PlayerFeetOnGround(next);
+        if (landed)
+        {
+            next = new Vector2(next.X, feetRow * TileSize - PlayerHeight);   // 脚底贴合图格上沿
+            vy = 0f;
+        }
+        else if (vy > 0f)
+        {
+            player.FallDistance += vy;   // 下落伤害在战斗阶段按此结算
+        }
+
+        if (_world.MaxTilesX > 1)
+            next = new Vector2(Math.Clamp(next.X, TileSize, (_world.MaxTilesX - 1) * TileSize), next.Y);
+
+        player.Velocity = new Vector2(vx, vy);
+        player.Grounded = landed;
+        if (vx != 0f) player.Direction = vx > 0f ? 1 : -1;
+        player.Position = next;
+        player.AimPosition = next;   // 「游戏判定用」位置 = 模拟位置
+    }
+
+    /// <summary>给定位置的脚底（<c>Y + 42</c>）是否踩在实心格上（宽 20 跨两列，任一列实心即算）。</summary>
+    private bool PlayerFeetOnGround(Vector2 position)
+    {
+        int leftCol = (int)(position.X / TileSize);
+        int rightCol = (int)((position.X + NpcSizes.PlayerWidth - 1) / TileSize);
+        int feetRow = (int)((position.Y + PlayerHeight) / TileSize);
+        return NpcTileSolid(leftCol, feetRow) || NpcTileSolid(rightCol, feetRow);
     }
 
     /// <summary>玩家受击后的免伤帧（tick，60 ≈ 1 秒；与 <see cref="DamagePlayerCommand"/> 共用同一窗口）。</summary>

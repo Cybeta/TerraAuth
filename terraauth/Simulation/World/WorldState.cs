@@ -947,36 +947,40 @@ public sealed class PlayerRuntime
     /// <summary>本次进服是否由「会话恢复」接管：跳过出生点重定位、保留原坐标与状态。</summary>
     public bool Resumed;
 
-    /// <summary>最近两次位置包**观测**到的水平速度（像素 / tick，由 <c>MoveCommand</c> 更新）。</summary>
-    public float ObservedSpeedX;
+    /// <summary>
+    /// 包 13 上报的控制位（与原版 <c>Player.control*</c> 的位序一致）：
+    /// bit0 上 / bit1 下 / bit2 左 / bit3 右 / bit4 跳 / bit5 用物品 …
+    /// 服务端据此**自己推进玩家物理**（原版做法），无需依赖连续的位置包。
+    /// </summary>
+    public byte ControlBits;
 
-    /// <summary>最近一次收到位置包的 tick（0 = 尚未收到过）。</summary>
-    public long LastMoveTick;
+    /// <summary>上一 tick 是否按住跳跃键。原版用 <c>releaseJump</c> 要求「松开后再按」才算一次起跳。</summary>
+    public bool JumpHeld;
+
+    /// <summary>本 tick 是否贴地（由玩家物理的落地方程维护）。</summary>
+    public bool Grounded;
+
+    /// <summary>水平朝向（1 = 右 / -1 = 左）。</summary>
+    public int Direction = 1;
 
     /// <summary>
-    /// 「游戏判定用」的玩家位置（NPC 追击 / 接触 / 拾取范围都用它，每个 tick 由仿真刷新）。
-    /// 原版客户端**只在操作变化时**才发位置包（`Player.cs` 里 `SendData(13)` 的触发条件就是控制位变化），
-    /// 而原版服务端会按同步来的控制位**继续模拟玩家移动**；TerraAuth 不做玩家操作模拟，
-    /// 所以要按 <see cref="ObservedSpeedX"/> 外推 —— 否则不发包期间服务端坐标停在原地，
-    /// NPC 会去追一个玩家早已离开的位置（真机症状：看着没被碰到却在扣血）。
+    /// 「游戏判定用」的玩家位置（NPC 追击 / 接触伤害 / 敌对弹幕 / 刷怪点都用它）。
+    /// 原版服务端对远端玩家同样执行 <c>Player.Update</c>（按同步来的控制位继续模拟移动），
+    /// 所以服务端坐标与客户端始终一致；TerraAuth 现在同样按控制位跑玩家物理，
+    /// 该值就等于模拟后的 <see cref="Position"/>（见 <c>WorldSimulator.StepPlayerPhysics</c>）。
     /// </summary>
     public Vector2 AimPosition;
 
-    /// <summary>外推上限（tick）：超过则不再外推，避免长时间收不到包时位置跑飞。</summary>
-    public const int MaxExtrapolationTicks = 15;   // 0.25s @60Hz
+    public const byte ControlUp = 0x01;
+    public const byte ControlDown = 0x02;
+    public const byte ControlLeft = 0x04;
+    public const byte ControlRight = 0x08;
+    public const byte ControlJump = 0x10;
 
-    /// <summary>可接受的观测速度上限（像素 / tick）：超过视为瞬移 / 传送，不做外推。</summary>
-    public const float MaxObservedSpeedX = 20f;
-
-    /// <summary>按观测速度把最后一次上报位置外推到「现在」（限制最多外推 <see cref="MaxExtrapolationTicks"/> tick）。</summary>
-    public Vector2 Extrapolate(long nowTick)
-    {
-        // 从未收到过位置包（出生前 / 测试直接构造的运行时）→ 不做外推，直接用真实位置
-        if (LastMoveTick == 0) return Position;
-
-        int ahead = (int)Math.Clamp(nowTick - LastMoveTick, 0, MaxExtrapolationTicks);
-        return ahead <= 0 ? Position : new Vector2(Position.X + ObservedSpeedX * ahead, Position.Y);
-    }
+    public bool PressingLeft => (ControlBits & ControlLeft) != 0;
+    public bool PressingRight => (ControlBits & ControlRight) != 0;
+    public bool PressingJump => (ControlBits & ControlJump) != 0;
+    public bool PressingDown => (ControlBits & ControlDown) != 0;
 }
 
 /// <summary>

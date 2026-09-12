@@ -189,10 +189,14 @@ public sealed class TerminalStage : IPipelineStage
     private static Command? CreateCommand(INetworkPacket packet, IPacketContext context) => packet switch
     {
         // 包 13 PlayerControls（真实线格式）→ 移动指令
-        //   ControlBits bit2 = 左 / bit3 = 右（与客户端 Player.cs 的 controlLeft/controlRight 位一致）
+        //   ControlBits bit2 = 左 / bit3 = 右 / bit4 = 跳（与客户端 Player.cs 的 control* 位一致）；
+        //   控制位随指令带给仿真，由服务端自己推进玩家物理（原版服务端对远端玩家也跑 Player.Update）。
         PlayerControlsPacket controls => new MoveCommand(context.Tick, context.PlayerId, controls.Position)
         {
-            Moving = (controls.ControlBits & 0x0C) != 0,
+            ControlBits = controls.ControlBits,
+            ReportedVelocity = (controls.StateBits & PlayerControlsPacket.StateBitHasVelocity) != 0
+                ? controls.Velocity
+                : null,
         },
         // 包 65 TeleportEntity：本玩家带落点的传送 → 移动指令（bit2 无位置时由服务端自持位置，不生成）
         TeleportEntityPacket teleport when !teleport.NoPosition

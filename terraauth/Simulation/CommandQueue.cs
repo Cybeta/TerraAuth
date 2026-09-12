@@ -57,11 +57,14 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     : Command(Tick, PlayerId, "move")
 {
     /// <summary>
-    /// 该位置包是否伴随**水平移动操作**（包 13 的控制位里按着左/右）。
-    /// 用于判断「观测速度」是否可信：原版客户端只在操作变化时发包，只有按着方向键时才能据此外推，
-    /// 否则松开按键后的那一包会把行走速度的平均值继续外推下去。
+    /// 包 13 携带的控制位（bit0 上 / bit1 下 / bit2 左 / bit3 右 / bit4 跳 …）。
+    /// 服务端据此**自己推进玩家物理**（原版服务端对远端玩家也跑 <c>Player.Update</c>），
+    /// 这样两次位置包之间玩家坐标不会停住（客户端只在操作变化时发包）。
     /// </summary>
-    public bool Moving { get; init; }
+    public byte ControlBits { get; init; }
+
+    /// <summary>包 13 若携带速度（StateBits bit2）则一并采纳，使服务端状态与客户端对齐。</summary>
+    public Vector2? ReportedVelocity { get; init; }
 
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
@@ -91,28 +94,18 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
         if (player.Dead)
             return new(false, CommandFailures.NotApplied);
 
-        // 记录「观测速度」：原版客户端只在操作变化时发位置包，服务端必须据此外推玩家位置，
-        // 否则 NPC 会去追一个玩家已经离开的旧坐标（真机症状：没被碰到却扣血）。
-        // 仅在「按着方向键 + 有上一包 + 平均速度合理」时更新，避免松开按键 / 首次进服 / 传送把速度算飞。
-        long gap = world.Tick - player.LastMoveTick;
-        float reportedDx = Position.X - player.Position.X;
-        float averageSpeed = gap > 0 ? reportedDx / gap : 0f;
-        player.ObservedSpeedX =
-            Moving && player.LastMoveTick != 0 && gap > 0
-            && MathF.Abs(averageSpeed) <= PlayerRuntime.MaxObservedSpeedX
-                ? averageSpeed
-                : 0f;
-        player.LastMoveTick = world.Tick;
-
         // 客户端上报的 Y 与上一包持平 → 玩家处于站立 / 贴地状态，不可能在下落 → 清空下落累计。
-        // 这是**客户端权威信号**，不依赖服务端自己的落地判定（后者只探两列，台阶 / 边界处可能漏判，
-        // 漏判会让 FallDistance 一直累积 → 站着 / 走路也会被结算下落伤害，即「没碰到却掉血」）。
+        // 这是**客户端权威信号**，用于兜住服务端落地判定在台阶 / 边界处的偶发漏判。
         if (MathF.Abs(Position.Y - player.Position.Y) < 0.05f)
             player.FallDistance = 0f;
 
-        // 权威位置赋值：服务端校验通过后直接生效，并清零速度（避免与物理阶段积分叠加）
+        // 权威赋值：位置以客户端上报为准（原版服务端同样直接赋值），
+        // 速度若有上报则采纳、否则保留本地模拟值（不发包期间由控制位继续推进，见 StepPlayerPhysics）。
         player.Position = Position;
-        player.Velocity = new Vector2(0, 0);
+        player.AimPosition = Position;
+        if (ReportedVelocity is { } reported)
+            player.Velocity = reported;
+        player.ControlBits = ControlBits;
         player.Active = true;
         world.MarkPlayerChanged(id);
         return new(true);
