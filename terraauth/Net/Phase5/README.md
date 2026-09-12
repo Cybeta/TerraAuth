@@ -215,7 +215,7 @@ Client                    NetworkHost              Connection
 - `Playing`（原版 10）：已回 `FinishedConnecting(129)`，入站走管线，出站走快照
 - `Disconnected`：资源回收，CommandQueue 清理该玩家命令
 
-> 包 8 之后按原版 `MessageBuffer` case 8 的矩形规则逐块下发 `10 TileSection`（世界出生点 5×3 半开矩形 + 请求出生点 6×4 闭矩形，去重后逐块发送），随后发 `49 InitialSpawn`。
+> 包 8 之后按协议字段核对后的矩形规则逐块下发 `10 TileSection`（世界出生点 5×3 半开矩形 + 请求出生点 6×4 闭矩形，去重后逐块发送），随后发 `49 InitialSpawn`。
 > 包 10 编码（Deflate + 位标志 + RLE + 尾部宝箱/牌子列表）与解码回归测试已实现。
 
 ---
