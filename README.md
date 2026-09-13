@@ -86,8 +86,8 @@ terraauth/
 │  ├─ CommandQueue.cs          # Move / TileBreak / TilePlace 等
 │  └─ World/                   # Tile / TileIdSets / WorldState / .wld 解析
 ├─ Net/
-│  ├─ Phase4/                  # 快照构造 + 视野裁剪 + 影子预测
-│  └─ Phase5/                  # TCP 传输 + Framing + 编解码
+│  ├─ Snapshots/                  # 快照构造 + 视野裁剪 + 影子预测
+│  └─ Transport/                  # TCP 传输 + Framing + 编解码
 ├─ Protocol/            # Terraria 包 ID 与类型定义
 ├─ Config/              # 阈值配置 + FileSystemWatcher 热重载
 ├─ Persistence/         # 持久化（默认 SQLite / 可降级内嵌 LiteDb）

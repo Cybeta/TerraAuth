@@ -6,7 +6,7 @@ using System.Buffers;      // ArrayBufferWriter<byte>
 using TerraAuth.Protocol;   // PacketId
 using TerraAuth.Simulation; // SnapshotFrame
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// 快照发送器接口。

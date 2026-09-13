@@ -8,7 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TerraAuth.Authority;
 using TerraAuth.Config;
-using TerraAuth.Net.Phase5;
+using TerraAuth.Net.Transport;
 using TerraAuth.Plugins;
 using TerraAuth.ModCompat;
 using TerraAuth.Protocol;

@@ -11,7 +11,7 @@ using TerraAuth.Plugins;   // IHookRegistry / PlayerJoinedArgs / PlayerLeftArgs
 using TerraAuth.Protocol;  // INetworkPacket
 using TerraAuth.Simulation; // CommandQueue
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// 违规处置阈值：滑动窗口内权威拒绝次数达 <see cref="MaxViolations"/> → 踢出该连接。
@@ -341,6 +341,17 @@ public sealed class NetworkHost : IAsyncDisposable
                 if (rejectNo <= 50 || rejectNo % 1000 == 0)
                     Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}"
                         + (result.Detail is { Length: > 0 } d ? $"（{d}）" : ""));
+
+                // 客户端图格缓存与服务端不一致时，拒绝修改但立即补发权威单格，
+                // 让客户端停止重试旧 TileType；该类同步差异不计入违规。
+                if (packet is TileBreakPacket tileBreak
+                    && result.Reason == "tile_type_mismatch")
+                {
+                    await connection.SendEncodedAsync(
+                        PacketId.TileSquare,
+                        new TileSquarePacket(_world, tileBreak.X, tileBreak.Y, 1, 1),
+                        ct).ConfigureAwait(false);
+                }
 
                 // 处置：窗口内拒绝累计达阈值 → 踢出（先发包 2 说明原因，再关闭连接）
                 // 仅「计入违规」的拒绝参与累计；未建模包等客户端行为噪声只统计不惩罚。
@@ -937,6 +948,9 @@ public sealed class NetworkHost : IAsyncDisposable
                     SessionId = connection.SessionId,
                     Active = true,
                     Position = new Vector2(
+                        _world.SpawnTileX * 16f,
+                        _world.SpawnTileY * 16f),
+                    AimPosition = new Vector2(
                         _world.SpawnTileX * 16f,
                         _world.SpawnTileY * 16f),
                 };

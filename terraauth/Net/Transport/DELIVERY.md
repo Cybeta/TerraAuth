@@ -1,4 +1,4 @@
-# Phase 5 交付说明
+# Transport 交付说明
 
 > 完整接入 terraria-protocol，实现 TCP 监听 + 编解码 + 连接管理
 > 至此 Phase 2/3/4/5 全链路骨架完成，可编译、可测试
@@ -15,7 +15,7 @@
 | `PacketEncoder.cs` | SnapshotFrame/包 → 字节帧 |
 | `Connection.cs` | 单连接状态机（Handshake→Playing→Disconnected） |
 | `ConnectionManager.cs` | 连接池、超时、并发上限（默认 64） |
-| `ISnapshotSender.cs` | 出站抽象（Phase 4 SnapshotBroadcaster 依赖） |
+| `ISnapshotSender.cs` | 出站抽象（Snapshots SnapshotBroadcaster 依赖） |
 | `NetworkHost.cs` | **★ 核心**：TcpListener + Accept + 管线调度 |
 
 > 注：`TerraAuth.csproj` 为全工程合并后的单工程文件，非本 Phase 新增。
@@ -27,26 +27,26 @@
 ```
 客户端 bytes
    ↓
-[Framing] 解决半包/粘包
+SFraming] 解决半包/粘包
    ↓
-[PacketDecoder] bytes → INetworkPacket
+SPacketDecoder] bytes → INetworkPacket
    ↓
-[NetworkHost.OnPacketAsync]
+SNetworkHost.OnPacketAsync]
    ↓
-[IInboundPipeline] Phase 2 权威校验
-   ↓ Accept → [CommandQueue] Phase 3
+SIInboundPipeline] Phase 2 权威校验
+   ↓ Accept → SCommandQueue] Phase 3
                 ↓
-         [WorldSimulator.Tick] 确定性仿真
+         SWorldSimulator.Tick] 确定性仿真
                 ↓ Output
-         [SnapshotBuilder.Build] 强类型快照
+         SSnapshotBuilder.Build] 强类型快照
                 ↓
-         [SnapshotBroadcaster] Phase 4
+         SSnapshotBroadcaster] Phase 4
                 ↓
-         [ConnectionSnapshotSender] ISnapshotSender
+         SConnectionSnapshotSender] ISnapshotSender
                 ↓
-         [PacketEncoder] SnapshotFrame → bytes
+         SPacketEncoder] SnapshotFrame → bytes
                 ↓
-         [Framing.WriteFrame] 长度前缀
+         SFraming.WriteFrame] 长度前缀
                 ↓
          客户端 bytes
 ```
@@ -122,7 +122,7 @@
 
 ## 项目当前完整结构
 
-> 完整目录树与工程配置见 [`PROJECT_STRUCTURE.md`](../../PROJECT_STRUCTURE.md)。
+> 完整目录树与工程配置见 S`PROJECT_STRUCTURE.md`](../../PROJECT_STRUCTURE.md)。
 
 ```
 terraauth/
@@ -140,8 +140,8 @@ terraauth/
 ├── Authority/   (Phase 2)    # 权威层（含 ShardedInboundPipeline 分片装饰）
 ├── Simulation/  (Phase 3)    # 仿真层（含 World/ 世界模型 + .wld 解析）
 ├── Net/
-│   ├── Phase4/               # 快照广播 + ShadowPredictor 影子预测
-│   └── Phase5/               # ★ 网络层（Framing / 编解码 / NetworkHost）
+│   ├── Snapshots/               # 快照广播 + ShadowPredictor 影子预测
+│   └── Transport/               # ★ 网络层（Framing / 编解码 / NetworkHost）
 ├── Config/                   # 配置（JSON + 热重载）
 ├── Persistence/              # 持久化（默认 SQLite / 可降级内嵌 LiteDb）
 ├── Monitoring/               # Prometheus 指标 + /metrics 端点

@@ -3,6 +3,7 @@
 
 using System.Net;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading.Channels;
 using TerraAuth.Config;
@@ -12,8 +13,8 @@ using TerraAuth.Security;
 using TerraAuth.Authority;
 using TerraAuth.Simulation;
 using TerraAuth.Net;
-using TerraAuth.Net.Phase4;
-using TerraAuth.Net.Phase5;
+using TerraAuth.Net.Snapshots;
+using TerraAuth.Net.Transport;
 using TerraAuth.Plugins;
 using TerraAuth.ModCompat;
 using TerraAuth.Concurrency;
@@ -58,6 +59,7 @@ public sealed class GameHost : IDisposable
     public WorkerPool Workers { get; }
 
     private readonly List<IDisposable> _disposables = new();
+    private readonly ConcurrentDictionary<int, ConcurrentDictionary<(int Index, byte Generation), byte>> _npcBaselines = new();
     private readonly MetricsHttpServer? _metricsServer;
     private readonly IAsyncDisposable? _pipelineDisposable;
 
@@ -1006,16 +1008,11 @@ public sealed class GameHost : IDisposable
         {
             var npc = npcs[i];
             var life = npc.Active ? npc.Life : 0;   // 已死亡 → life=0，客户端据此移除
-
             var changed = npc.X != npc.SyncedX || npc.Y != npc.SyncedY
                           || npc.VelocityX != npc.SyncedVelocityX || npc.VelocityY != npc.SyncedVelocityY
                           || life != npc.SyncedLife || npc.Active != npc.SyncedActive
                           || npc.Direction != npc.SyncedDirection
                           || !npc.Ai.AsSpan().SequenceEqual(npc.SyncedAi);
-            var heartbeat = world.Tick - npc.SyncedTick >= NpcSyncHeartbeatTicks;
-            if (!changed && !heartbeat) continue;
-
-            // 降频档：本轮不下发，且**不更新 Synced\***（下一轮仍算「有变化」），等下一个 20Hz 窗口
             if (!fullRate && !IsNpcHighPriority(npc, players)) continue;
 
             npc.SyncedX = npc.X;
@@ -1044,16 +1041,28 @@ public sealed class GameHost : IDisposable
                 // 否则客户端会把 ai 全置 0，表现与服务端不一致。
                 Ai: npc.Ai);
 
-            await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet,
-                playerId => IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq), ct).ConfigureAwait(false);
+            var baselineKey = (Index: i, Generation: npc.Generation);
+            await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet, playerId =>
+            {
+                if (!IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq))
+                    return false;
+
+                var baselines = _npcBaselines.GetOrAdd(playerId,
+                    static _ => new ConcurrentDictionary<(int Index, byte Generation), byte>());
+                if (!changed && baselines.ContainsKey(baselineKey))
+                    return false;
+
+                baselines[baselineKey] = 0;
+                return true;
+            }, ct).ConfigureAwait(false);
         }
     }
 
     /// <summary>非高优先级 NPC 的降频倍数：60Hz / 3 = 20Hz。</summary>
     private const int NpcSyncRateDivisor = 3;
 
-    /// <summary>「近身」判定半径的平方（3 格 = 48px）：该范围内 NPC 可能与玩家接触，需逐 tick 对齐。</summary>
-    private const float NpcSyncNearRangeSq = 48f * 48f;
+    /// <summary>「近身」判定半径的平方（6 格 = 96px）：该范围内 NPC 可能与玩家接触，需逐 tick 对齐。</summary>
+    private const float NpcSyncNearRangeSq = 96f * 96f;
 
     /// <summary>是否需要逐 tick 下发：Boss，或与任一存活玩家近身（可能发生接触伤害）。</summary>
     private static bool IsNpcHighPriority(WorldNpc npc, PlayerRuntime[] players)
@@ -1062,8 +1071,8 @@ public sealed class GameHost : IDisposable
 
         foreach (var p in players)
         {
-            var dx = p.Position.X - npc.X;
-            var dy = p.Position.Y - npc.Y;
+            var dx = p.AimPosition.X - npc.X;
+            var dy = p.AimPosition.Y - npc.Y;
             if (dx * dx + dy * dy <= NpcSyncNearRangeSq) return true;
         }
         return false;
@@ -1114,12 +1123,12 @@ public sealed class GameHost : IDisposable
         }
     }
 
-    /// <summary>玩家当前位置是否落在 (x, y) 的视口半径内。</summary>
+    /// <summary>玩家瞄准位置是否落在 (x, y) 的视口半径内。</summary>
     private static bool IsPlayerWithin(WorldState world, int playerId, float x, float y, float radiusSq)
     {
         if (!world.Players.TryGetValue(playerId, out var player)) return true; // 位置未知 → 不裁剪，避免 NPC 不可见
-        var dx = player.Position.X - x;
-        var dy = player.Position.Y - y;
+        var dx = player.AimPosition.X - x;
+        var dy = player.AimPosition.Y - y;
         return dx * dx + dy * dy <= radiusSq;
     }
 

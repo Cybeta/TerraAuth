@@ -5,7 +5,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic; // ICollection<KeyValuePair<,>>（槽位回收的原子双匹配）
 using TerraAuth.Protocol; // PacketId, INetworkPacket
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// 连接管理器：追踪所有活跃连接，提供踢出 / 广播 / 容量控制。

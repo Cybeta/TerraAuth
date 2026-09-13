@@ -9,7 +9,7 @@
 
 | 模块 | 并行度 | 实装位置 |
 |------|--------|---------|
-| 网络 I/O（收/发包） | 每连接独立 | `Net/Phase5/NetworkHost.cs` |
+| 网络 I/O（收/发包） | 每连接独立 | `Net/Transport/NetworkHost.cs` |
 | 包解码（Decode） | 每包独立（纯函数） | `ParallelWorkers.WorkerPool` |
 | 快照序列化（Encode） | 每玩家独立 | `ParallelWorkers.ParallelSnapshotBroadcaster` |
 | 持久化落盘 | 后台线程 | `Persistence/SqlitePersistence.cs` |
@@ -23,7 +23,7 @@
 | 权威校验（Phase 2） | 需读玩家状态 | 按玩家分片 | `ShardedAuthorityProcessor` |
 | 世界仿真（Phase 3） | 确定性 + NPC 交互 | 空间分区（Chunk） | `WorldSimulator` 扩展点 |
 | 图格并发访问 | 仿真写 / 包 10 编码与权威校验读 | 区块分区锁 | `Simulation/World/SectionLocks` |
-| 快照生成（Phase 4） | 需读 WorldState | 发布不可变实体视图 | `DoubleBufferedWorldState` + `WorldEntityView` |
+| 快照生成（Snapshots） | 需读 WorldState | 发布不可变实体视图 | `DoubleBufferedWorldState` + `WorldEntityView` |
 
 ### ❌ 不可并行
 

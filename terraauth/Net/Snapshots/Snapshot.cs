@@ -6,11 +6,11 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using TerraAuth.Authority;
 using TerraAuth.Concurrency;   // ParallelSnapshotBroadcaster
-using TerraAuth.Net.Phase5;    // ISnapshotSender / IPacketEncoder（出站发送 + 编码抽象）
+using TerraAuth.Net.Transport;    // ISnapshotSender / IPacketEncoder（出站发送 + 编码抽象）
 using TerraAuth.Protocol;
 using TerraAuth.Simulation;
 
-namespace TerraAuth.Net.Phase4;
+namespace TerraAuth.Net.Snapshots;
 
 /// <summary>快照配置。</summary>
 public sealed record SnapshotConfig

@@ -84,7 +84,7 @@
    依赖 ai 的 aiStyle（如史莱姆跳跃状态）**必须下发**，否则客户端表现与服务端不一致。现以 `bitsA bit2..5` 承载 4 个 float，
    并把 ai / 朝向纳入「变化才发」判定。已补齐**同步锚点**（史莱姆王：位置 + 体型×锚点）并把目标字段改为 **255（显式无目标）**。
    遗留：NPC 的**增益**（buff）未同步；未登记 aiStyle 的 NPC 动作仍由客户端自身 AI 兜底。
-4. `SnapshotStore.Snapshot()` 每轮 `ToArray()` 复制 —— 见 `Net/Phase4/README.md`「后续可能优化」。
+4. `SnapshotStore.Snapshot()` 每轮 `ToArray()` 复制 —— 见 `Net/Snapshots/README.md`「后续可能优化」。
 5. 原版客户端**不支持预测协议**，延迟只能靠快照频率缓解（不影响防作弊，见 `architecture.md` 约束）。
 6. **玩家受伤：接触 / 下落伤害已改为服务端判定**（`SimulateCombat` + `ApplyPlayerDamage`，含原版免伤帧 —— 接触 / 弹幕 / 下落同档 40、伤害被压到 1 取 20，
    并下发包 117 表现 + 包 16 权威血量）；敌对弹幕（Boss 弹幕）同样由服务端结算玩家伤害（`projectile_damage`，共用免伤帧）；
@@ -107,7 +107,7 @@
     （与包 28 共用阈值）；原版伤害由武器 / 装备推导，此处未建模武器表。法力 / 增益已改为服务端跟踪与持有，
     但**增益的效果**仍由客户端计算（服务端只维护列表），属简化模型。
 13. **实体位置语义与物理常数已按原版对齐**：`position` = **碰撞盒左上角**，脚底 = `position.Y + height`；
-    玩家 20×42（原版 `Player.cs`），NPC 逐类型尺寸（见 `Simulation/NpcSizes.cs`，按原版 `NPC.SetDefaults` 核对：
+    玩家 20×42（原版 `Player.cs`），NPC 逐类型尺寸（见 `Simulation/NpcAI/NpcSizes.cs`，按原版 `NPC.SetDefaults` 核对：
     向导 18×40、蓝史莱姆 24×18、哥布林工兵 18×38、眼魔 / 魔焰眼 100×110、蜂后 66×66、黄蜂 12×12 / 8×8、
     史莱姆王 98×92、骷髅王 80×102）；NPC 物理常数取原版默认 **`gravity = 0.3` / `maxFallSpeed = 10`**
     （`NPC.UpdateNPC_UpdateGravity`）。**这些必须与客户端一致** —— 客户端收到包 23 后即按自己的尺寸 / 常数

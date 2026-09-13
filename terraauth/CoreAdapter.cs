@@ -10,7 +10,7 @@ using System.Text;
 using System.Threading.Tasks;
 using TerraAuth.Authority;       // IAuditLogger, AuditEvent
 using TerraAuth.Monitoring;      // IMetrics
-using TerraAuth.Net.Phase5;      // NetworkHost / ConnectionManager / ConnectionState
+using TerraAuth.Net.Transport;      // NetworkHost / ConnectionManager / ConnectionState
 using TerraAuth.Plugins;         // 插件适配器接口
 using TerraAuth.Security;        // IBanManager / PlayerIdentity
 using TerraAuth.Simulation;      // WorldState

@@ -213,7 +213,8 @@ public sealed class TerminalStage : IPipelineStage
         // 包 79 PlaceObject → 放砖指令
         TilePlacePacket place => new TilePlaceCommand(context.Tick, context.PlayerId, place.X, place.Y, place.TileType, place.Style),
         // 包 28 DamageNPC → NPC 受击指令（服务端扣血，生命归零即死亡）
-        NpcStrikePacket strike => new NpcStrikeCommand(context.Tick, context.PlayerId, strike.NpcId, strike.Damage),
+        NpcStrikePacket strike => new NpcStrikeCommand(
+            context.Tick, context.PlayerId, strike.NpcId, strike.Damage, strike.Generation),
         // 包 21 SyncItem → 掉落物生成（服务端分配槽位）
         ItemDropPacket drop => new SpawnItemCommand(context.Tick, context.PlayerId,
             drop.ItemId, drop.Stack, drop.Position, drop.Velocity, drop.Prefix),
@@ -230,7 +231,7 @@ public sealed class TerminalStage : IPipelineStage
         // 包 82 模块 0（NetLiquid）→ 客户端液体编辑（服务端权威落盘并触发流动）
         LiquidModulePacket { IsClientMessage: true } liquid =>
             new LiquidEditCommand(context.Tick, context.PlayerId, liquid.Changes),
-        // 包 117 PlayerHurtV2 → 服务端生命扣减（负伤害已在权威层拒绝）
+        // 包 117 PlayerHurtV2 → 客户端伤害报告仅校验并记录诊断，服务端不据此扣血
         PlayerHurtV2Packet hurt => new DamagePlayerCommand(context.Tick, context.PlayerId, hurt.Damage),
         // 包 118 PlayerDeathV2 → 服务端死亡结算
         PlayerDeathV2Packet => new KillPlayerCommand(context.Tick, context.PlayerId),

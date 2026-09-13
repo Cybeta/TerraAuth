@@ -12,7 +12,7 @@ using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using TerraAuth.Monitoring;
-using TerraAuth.Net.Phase5;
+using TerraAuth.Net.Transport;
 using TerraAuth.Protocol;
 using TerraAuth.Simulation;
 using Xunit;
@@ -720,7 +720,10 @@ public class VanillaFeatureTests
 
         // 把玩家挪到远处（直接改服务端权威位置，模拟「已走到别处」）
         lock (world.PlayersLock)
+        {
             world.Players[1].Position = new Vector2((world.SpawnTileX + 1200) * 16f, world.SpawnTileY * 16f);
+            world.Players[1].AimPosition = world.Players[1].Position;
+        }
 
         // 生产环境由快照循环（20Hz）驱动；测试显式调用
         await server.Host.Network.StreamSectionsForPlayersAsync();
@@ -773,7 +776,7 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task Vanilla_PlayerHurt_Is_Flushed_With_ServerPlayerId()
+    public async Task Vanilla_PlayerHurt_Report_DoesNotBroadcastServerHurt()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
@@ -785,13 +788,13 @@ public class VanillaFeatureTests
         var hpBefore = player.Hp;
         await a.SendAsync(PacketId.PlayerHurtV2, new PlayerHurtV2Packet(0, 10));
 
-        Assert.True(await TickUntilAsync(server, () => player.Hp == hpBefore - 10,
-            TimeSpan.FromSeconds(5)), "受击命令未在仿真 Tick 中提交");
+        Assert.True(await TickUntilAsync(server, () => player.Hp == hpBefore && !player.Dead,
+            TimeSpan.FromSeconds(5)), "包117报告不应改变服务端生命或死亡状态");
         await server.Host.FlushPlayerHurtAsync();
 
         var got = await b.ReadUntilAsync(p => p is PlayerHurtV2Packet, TimeSpan.FromMilliseconds(500));
         Assert.DoesNotContain(got, p => p is PlayerHurtV2Packet { PlayerId: 1 });
-        Assert.Equal(hpBefore - 10, player.Hp);
+        Assert.Equal(hpBefore, player.Hp);
     }
 
     [Fact]
@@ -874,7 +877,8 @@ public class VanillaFeatureTests
         // 包 28 击杀（史莱姆 25 血）→ 服务端扣血并置为死亡
         int index;
         lock (world.NpcsLock) index = world.Npcs.IndexOf(slime);
-        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 25));
+        await s.SendAsync(PacketId.NpcStrike,
+            new NpcStrikePacket(index, 25) { Generation = slime.Generation });
 
         Assert.True(await TickUntilAsync(server, () => !slime.Active, TimeSpan.FromSeconds(5)),
             "NPC 受击后未被击杀");
@@ -1180,7 +1184,7 @@ public class VanillaFeatureTests
     // ========================================================================
 
     [Fact]
-    public async Task Vanilla_Hurt_Reduces_ServerHealth()
+    public async Task Vanilla_PlayerHurt_Report_DoesNotReduceServerHealth()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
@@ -1190,8 +1194,8 @@ public class VanillaFeatureTests
         await s.SendAsync(PacketId.PlayerHurtV2, new PlayerHurtV2Packet(0, 30));
 
         Assert.True(await TickUntilAsync(server,
-            () => world.Players.TryGetValue(1, out var p) && p.Hp == 70 && !p.Dead,
-            TimeSpan.FromSeconds(5)), "受伤未在服务端结算（应为 100-30=70）");
+            () => world.Players.TryGetValue(1, out var p) && p.Hp == 100 && !p.Dead,
+            TimeSpan.FromSeconds(5)), "包117报告不应改变服务端生命或死亡状态");
     }
 
     [Fact]
@@ -1210,7 +1214,7 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task Vanilla_Lethal_Hurt_Kills_And_Broadcasts_Death()
+    public async Task Vanilla_LethalHurt_Report_DoesNotKillOrBroadcastDeath()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
@@ -1221,14 +1225,13 @@ public class VanillaFeatureTests
         await a.SendAsync(PacketId.PlayerHurtV2, new PlayerHurtV2Packet(0, 5000));
 
         Assert.True(await TickUntilAsync(server,
-            () => world.Players.TryGetValue(1, out var p) && p.Dead && p.Hp == 0,
-            TimeSpan.FromSeconds(5)), "致命伤害未在服务端置为死亡");
+            () => world.Players.TryGetValue(1, out var p) && !p.Dead && p.Hp == p.HpMax,
+            TimeSpan.FromSeconds(5)), "包117报告不应在服务端造成致命伤害");
 
-        // 服务端补发死亡包 118 给所有客户端（含旁观者）
         await server.Host.BroadcastWorldStateAsync();
-        var got = await b.ReadUntilAsync(p => p is PlayerDeathV2Packet, TimeSpan.FromSeconds(5));
-        var death = Assert.Single(got.OfType<PlayerDeathV2Packet>());
-        Assert.Equal(1, death.PlayerId);
+        var got = await b.ReadUntilAsync(p => p is PlayerDeathV2Packet, TimeSpan.FromMilliseconds(500));
+        Assert.DoesNotContain(got, p => p is PlayerDeathV2Packet { PlayerId: 1 });
+        Assert.Equal(100, world.Players[1].Hp);
     }
 
     [Fact]
@@ -1241,8 +1244,13 @@ public class VanillaFeatureTests
 
         await s.SendAsync(PacketId.PlayerHurtV2, new PlayerHurtV2Packet(0, 5000));
         Assert.True(await TickUntilAsync(server,
-            () => world.Players.TryGetValue(1, out var p) && p.Dead, TimeSpan.FromSeconds(5)),
-            "未进入死亡态");
+            () => world.Players.TryGetValue(1, out var p) && !p.Dead && p.Hp == p.HpMax, TimeSpan.FromSeconds(5)),
+            "包117报告不应使玩家进入死亡态");
+
+        await s.SendAsync(PacketId.PlayerDeathV2, new PlayerDeathV2Packet(0, 1));
+        Assert.True(await TickUntilAsync(server,
+            () => world.Players.TryGetValue(1, out var p) && p.Dead && p.Hp == 0, TimeSpan.FromSeconds(5)),
+            "服务端死亡路径未进入死亡态");
 
         // 客户端上报伪造复活点 → 服务端必须忽略，改用世界出生点
         await s.SendAsync(PacketId.PlayerSpawn,

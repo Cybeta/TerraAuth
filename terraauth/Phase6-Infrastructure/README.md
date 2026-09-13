@@ -19,7 +19,7 @@
    └─ Reject → IMetrics.IncrementBlockedCheat
              → IBanManager.ReportViolationAsync (达阈值→封禁记录)
              → IAuditRepository.AppendAsync (落库)
-             → Phase 5 NetworkHost 处置 (达阈值→发包 2 踢出连接)
+             → Transport NetworkHost 处置 (达阈值→发包 2 踢出连接)
                   ↓
             运营复核 → 误判标记 → IMetrics.IncrementFalsePositives
 ```

@@ -7,7 +7,7 @@ using System.IO;            // InvalidDataException
 using System.IO.Pipelines; // ReadOnlySequence<byte>
 using TerraAuth.Protocol;   // PacketId
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// 帧格式（与 Terraria 原版一致）：

@@ -89,6 +89,7 @@ public sealed class WorldState
                 runtime.SessionId = expectedSessionId;
             runtime.Id = newPlayerId;
             runtime.Active = true;
+            runtime.AimPosition = runtime.Position;
             runtime.Resumed = true;
             runtime.RespawnNotified = false;   // 世界同步据此下发包 12（携恢复后的坐标）
             Players[newPlayerId] = runtime;

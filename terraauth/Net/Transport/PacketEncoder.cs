@@ -8,7 +8,7 @@ using System.IO.Compression;
 using TerraAuth.Protocol;    // PacketId, INetworkPacket, ProtocolVersion, Vector2
 using TerraAuth.Simulation; // SnapshotFrame, TileSectionPacket
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// 编码器：将出站对象序列化为帧字节。

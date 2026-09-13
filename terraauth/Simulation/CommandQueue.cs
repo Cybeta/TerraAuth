@@ -112,7 +112,7 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     }
 }
 
-/// <summary>玩家受伤命令：包 117 权威通过后生成，由仿真结算服务端生命。</summary>
+/// <summary>玩家受伤命令：包 117 权威通过后生成，仅记录客户端伤害报告，不由仿真扣减服务端生命。</summary>
 public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
     : Command(Tick, PlayerId, "damage_player")
 {
@@ -126,25 +126,9 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
         if (player!.Dead)
             return new(false, CommandFailures.NotApplied);
 
-        // 免伤帧内忽略：本包是「客户端自己判定的受击」，而服务端对同一次接触也会自行判定并结算。
-        // 不共用免伤窗口就会出现双倍伤害（实测日志：contact_damage 与 client_reported 交替，
-        // 每秒扣 7+7）。原版 Player.immune 同样是跨来源的统一窗口。
-        if (player.HurtCooldown > 0)
-            return new(false, CommandFailures.NotApplied);
-
-        player.Hp -= Damage;
-        player.HurtCooldown = PlayerRuntime.GeneralImmunityTicks(Damage);   // 原版 Hurt 的 immuneTime（40 / 20）
-        // 诊断：客户端上报的包 117 是「扣血但没有服务端碰撞」的嫌疑来源之一，先记录出处。
-        Console.WriteLine($"[Damage] 玩家 #{id} -{Damage}（client_reported/包117）HP={player.Hp} " +
+        // 包 117 是客户端伤害报告，仅用于诊断；服务端不据此扣血，也不设置免伤帧或其他状态。
+        Console.WriteLine($"[Damage] 玩家 #{id} 上报伤害 {Damage}（包117，仅上报/未扣血）HP={player.Hp} " +
                           $"位置={player.Position.X:F0},{player.Position.Y:F0}");
-        if (player.Hp <= 0)
-        {
-            player.Hp = 0;
-            player.Dead = true;
-            player.FallDistance = 0f;
-            player.Velocity = new Vector2(0, 0);
-            player.DeathNotified = false;  // 世界同步线程据此补发死亡包 118
-        }
         return new(true);
     }
 }
@@ -195,6 +179,7 @@ public sealed record RespawnCommand(long Tick, int? PlayerId)
         player.Dead = false;
         player.FallDistance = 0f;
         player.Position = new Vector2((world.SpawnTileX + 0.5f) * 16f, world.SpawnTileY * 16f);
+        player.AimPosition = player.Position;
         player.Velocity = new Vector2(0, 0);
         world.MarkPlayerChanged(id);
         player.DeathNotified = true;
@@ -595,7 +580,8 @@ return new(false, CommandFailures.NotApplied);
 }
 
 /// <summary>NPC 受击命令：包 28 权威通过后生成，由仿真扣减 NPC 生命（生命归零即死亡）。</summary>
-public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, int Damage)
+public sealed record NpcStrikeCommand(
+    long Tick, int? PlayerId, int NpcIndex, int Damage, int Generation = 0)
     : Command(Tick, PlayerId, "npc_strike")
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
@@ -612,6 +598,8 @@ public sealed record NpcStrikeCommand(long Tick, int? PlayerId, int NpcIndex, in
 
             var npc = world.Npcs[NpcIndex];
             if (!npc.Active)
+                return new(false, CommandFailures.NotApplied);
+            if ((byte)Generation != npc.Generation)
                 return new(false, CommandFailures.NotApplied);
 
             npc.Life -= Damage;

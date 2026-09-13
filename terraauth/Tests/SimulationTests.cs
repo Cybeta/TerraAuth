@@ -862,25 +862,44 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 客户端上报的包 117 必须与接触伤害共用免伤帧（原版 <c>Player.immune</c> 也是跨来源统一窗口）：
-    /// 否则同一次接触会被服务端判定与客户端上报各记一次 → 双倍伤害
-    /// （真机日志实测：contact_damage 与 client_reported 交替出现，每秒扣 7+7）。
+    /// 客户端上报的包 117 仅作为伤害报告接受并记录诊断，不由服务端据此扣血或设置免伤帧；
+    /// 连续报告也必须保持玩家生命与受击状态不变。
     /// </summary>
     [Fact]
-    public void ClientReportedDamage_Respects_ImmunityWindow()
+    public void ClientReportedDamage_IsAccepted_WithoutServerDamage()
     {
         var world = WorldGenerator.GenerateSmall();
-        var player = new PlayerRuntime { Id = 1, Active = true, Hp = 100, HpMax = 100 };
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            HurtCooldown = 7,
+            FallDistance = 12.5f,
+            Velocity = new Vector2(3f, 4f),
+            DeathNotified = true,
+        };
         lock (world.PlayersLock) world.Players[1] = player;
 
         var rng = new XoshiroRng(1);
 
         Assert.True(new DamagePlayerCommand(1, 1, 10).Apply(world, rng).Applied);
-        Assert.Equal(90, player.Hp);
+        Assert.Equal(100, player.Hp);
+        Assert.Equal(7, player.HurtCooldown);
+        Assert.False(player.Dead);
+        Assert.Equal(12.5f, player.FallDistance);
+        Assert.Equal(new Vector2(3f, 4f), player.Velocity);
+        Assert.True(player.DeathNotified);
 
-        // 免伤帧内再来一次 → 拒绝，不扣血
-        Assert.False(new DamagePlayerCommand(2, 1, 10).Apply(world, rng).Applied);
-        Assert.Equal(90, player.Hp);
+        // 连续客户端报告仍接受，但不改变生命、免伤帧或其他受击状态。
+        Assert.True(new DamagePlayerCommand(2, 1, 10).Apply(world, rng).Applied);
+        Assert.Equal(100, player.Hp);
+        Assert.Equal(7, player.HurtCooldown);
+        Assert.False(player.Dead);
+        Assert.Equal(12.5f, player.FallDistance);
+        Assert.Equal(new Vector2(3f, 4f), player.Velocity);
+        Assert.True(player.DeathNotified);
     }
 
     /// <summary>

@@ -7,7 +7,7 @@ using System.IO;
 using System.IO.Compression;
 using System.IO.Pipelines;
 using TerraAuth.Protocol; // PacketId / PlayerPositionPacket
-using TerraAuth.Net.Phase5;
+using TerraAuth.Net.Transport;
 using TerraAuth.Simulation; // SnapshotFrame / EntityState / RemovedEntity
 using Xunit;
 

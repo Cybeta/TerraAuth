@@ -92,11 +92,11 @@ terraauth/
 │       ├── WorldFileReader.cs    #     .wld 解析器
 │       └── WorldFileWriter.cs    #     .wld 写出器（写后读回校验 / 原子替换 / .bak）
 │
-├── Net/                          # Phase 4/5 网络层 ── namespace TerraAuth.Net.Phase4 / Phase5
-│   ├── Phase4/
+├── Net/                          # Snapshots/Transport 网络层 ── namespace TerraAuth.Net.Snapshots / Transport
+│   ├── Snapshots/
 │   │   ├── Snapshot.cs           #   快照广播 + 客户端影子预测
 │   │   └── README.md
-│   └── Phase5/
+│   └── Transport/
 │       ├── ITerrariaProtocol.cs  #   协议抽象
 │       ├── Framing.cs            #   PipeReader 分帧
 │       ├── PacketEncoder.cs      #   出站编码
@@ -150,8 +150,8 @@ terraauth/
 │   ├── TerraAuth.Tests.csproj    #   xUnit 工程（引用主工程）
 │   ├── AuthorityTests.cs         #   Phase 2
 │   ├── SimulationTests.cs        #   Phase 3
-│   ├── SnapshotTests.cs          #   Phase 4
-│   ├── NetworkTests.cs           #   Phase 5
+│   ├── SnapshotTests.cs          #   Snapshots
+│   ├── NetworkTests.cs           #   Transport
 │   ├── IntegrationTests.cs       #   端到端
 │   ├── PluginModTests.cs         #   插件 / Mod（含 ModPolicy 配置化与 TModLoader 握手）
 │   ├── ConcurrencyTests.cs       #   并行组件
@@ -181,8 +181,8 @@ TerraAuth                     ← 组合根（Program / GameHost）
 ├── TerraAuth.Protocol        ← 协议契约与基础类型
 ├── TerraAuth.Authority       ← 权威层
 ├── TerraAuth.Simulation      ← 仿真层（含 World/ 世界模型）
-├── TerraAuth.Net.Phase4      ← 快照广播 / 客户端预测
-├── TerraAuth.Net.Phase5      ← 网络宿主 / 编解码 / 分帧
+├── TerraAuth.Net.Snapshots      ← 快照广播 / 客户端预测
+├── TerraAuth.Net.Transport      ← 网络宿主 / 编解码 / 分帧
 ├── TerraAuth.Plugins         ← 插件系统（含根目录 CoreAdapter.cs）
 ├── TerraAuth.ModCompat       ← Mod 兼容层
 ├── TerraAuth.Concurrency     ← 并行基础设施
@@ -208,11 +208,11 @@ TerraAuth                     ← 组合根（Program / GameHost）
 | `Simulation/`（核心） | 已实现 | `GameLoop` / `CommandQueue` / `SnapshotStore` / `EventRecorder` / 确定性 RNG |
 | `Simulation/World/` | 部分 | `Tile`/`TileMap`、`TileIdSets`（含 `tileFrameImportant`）、`WorldState`、`WorldGenerator`、`.wld` **解析 + 写出**（写出带写后读回校验 / 原子替换 / `.bak`）、包 10 `TileSection` 与**包 20 `TileSquare`** 编码均已实现；世界可在 `ServerConfig.WorldPath` 指定为基准世界；**程序化生成支持三档尺寸**（小 / 中 / 大，`ServerConfig.WorldSize`）并生成**分层地形**（噪声地表 / 洞穴 / 深度分带矿脉 / 海滩与海水 / 地狱层 / 2×2 宝箱+战利品） |
 | `Simulation/WorldSimulator` | 已实现 | 六阶段 tick + 扩展阶段：AI（城镇 NPC / 敌怪 / 入侵怪 / Boss 追击）/ 物理（重力 + 图格碰撞 + 边界钳制）/ 战斗（下落伤害 + 敌怪·Boss 接触伤害（原版整型 AABB、无最小重叠；免伤帧 40/20）+ 弹幕命中 + Boss 击杀记进度 + 玩家死亡态 + 受击通知入队）/ 世界（昼夜 + 月相 + 简化事件：血月 · 日食）/ 实体（掉落物、弹幕）/ 液体（逐格简化流动，下发按视口裁剪）/ 电路（受限 BFS 翻转执行器 + 图格变更推送）；为简化模型，非原版全量物理 |
-| `Net/Phase4` | 部分 | 快照广播框架 + `BuildDelta`（实体提取 / 增量 / `Removed` / xxHash32 校验和）+ `SubmitInputs` Command 生成 + `ShadowPredictor` 影子预测（输入重放/速度钳制/偏差阈值）+ 每玩家分桶（`BuildFrameFor`）+ 视野裁剪（`ViewportRadius`）已实现 |
-| `Net/Phase5`（协议） | 部分 | `Framing` / `Connection` / 握手链已实现 |
-| `Net/Phase5` `PacketEncoder` | 部分 | 已实现 **37 类出站包**（握手链 2/3/4/7/8/9/10/12/49/129 + 权威与状态 5/13/14/16/17/18/20/21/22/23/27/28/29/31/32/34/35/36/42/50/65/73/79/117/118 + 包 82 的 NetText / NetLiquid 模块 + 包 15 `Snapshot`）；包 10 `TileSection`、**包 20 `TileSquare`（未压缩小矩形）**、包 13 可选尾随段（挂载 / 回城 / 相机）已实现 |
-| `Net/Phase5` `PacketDecoder` | 部分 | 已解析 **35 个入站包**（握手链 + 权威白名单 13 包 + 拾取 / 箱子 / 伤害 / 死亡 / 治疗 / 法力 / 增益 / 传送 / 时间 / NPC / 聊天与液体模块等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket`，由 Vanilla-only 权威层默认拒绝 |
-| `Net/Phase5` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10，且**在 Playing 阶段也处理**；**按玩家位置流送区块**（3×3，跨区块才补发、下发前先发包 9）；包 7 下发真实世界元数据；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**未建模包等「行为噪声」拒绝不计入**）；**未建模包按 `PacketId` 统计**（`UnmodeledPacketCounts` + 首次/每 100 次/停机汇总）；**断线走宽限期会话保留并在连接结束时回收槽位**；未知包默认拒绝，状态包不走即时中继 |
+| `Net/Snapshots` | 部分 | 快照广播框架 + `BuildDelta`（实体提取 / 增量 / `Removed` / xxHash32 校验和）+ `SubmitInputs` Command 生成 + `ShadowPredictor` 影子预测（输入重放/速度钳制/偏差阈值）+ 每玩家分桶（`BuildFrameFor`）+ 视野裁剪（`ViewportRadius`）已实现 |
+| `Net/Transport`（协议） | 部分 | `Framing` / `Connection` / 握手链已实现 |
+| `Net/Transport` `PacketEncoder` | 部分 | 已实现 **37 类出站包**（握手链 2/3/4/7/8/9/10/12/49/129 + 权威与状态 5/13/14/16/17/18/20/21/22/23/27/28/29/31/32/34/35/36/42/50/65/73/79/117/118 + 包 82 的 NetText / NetLiquid 模块 + 包 15 `Snapshot`）；包 10 `TileSection`、**包 20 `TileSquare`（未压缩小矩形）**、包 13 可选尾随段（挂载 / 回城 / 相机）已实现 |
+| `Net/Transport` `PacketDecoder` | 部分 | 已解析 **35 个入站包**（握手链 + 权威白名单 13 包 + 拾取 / 箱子 / 伤害 / 死亡 / 治疗 / 法力 / 增益 / 传送 / 时间 / NPC / 聊天与液体模块等）+ 包 15 `Snapshot`；其余统一 `UnknownPacket`，由 Vanilla-only 权威层默认拒绝 |
+| `Net/Transport` `NetworkHost` | 部分 | 握手已实现；包 8 请求按出生点矩形逐块下发包 10，且**在 Playing 阶段也处理**；**按玩家位置流送区块**（3×3，跨区块才补发、下发前先发包 9）；包 7 下发真实世界元数据；纠正包按自身类型下发；权威拒绝在窗口内累计达阈值 → 踢出连接（**未建模包等「行为噪声」拒绝不计入**）；**未建模包按 `PacketId` 统计**（`UnmodeledPacketCounts` + 首次/每 100 次/停机汇总）；**断线走宽限期会话保留并在连接结束时回收槽位**；未知包默认拒绝，状态包不走即时中继 |
 | `Config/` | 已实现 | `ServerConfig`（含 `ModPolicy` 节 + `WorldPath` / `WorldSize`（小 / 中 / 大三档）/ `WorldExportPath`）+ `FileSystemWatcher` 热重载；枚举以字符串读写 |
 | `Persistence/` | 已实现 | 真实 SQLite（`SqliteImpl`，默认）五表落盘（玩家 / 审计 / 封禁 / **WorldTiles 世界改动** / **WorldChests 箱子内容**）；`-p:NoSqlite=true` 降级到内嵌 `LiteDbPersistence`（JSON，同样五类数据落盘） |
 | `Monitoring/` | 已实现 | Prometheus Counter/Gauge/Histogram + `/metrics`（`SetGauge` 支持自定义指标名与标签） |

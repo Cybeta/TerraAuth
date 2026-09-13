@@ -11,7 +11,7 @@
 ```bash
 dotnet new classlib -n MyPlugin
 cd MyPlugin
-dotnet add reference ../terraauth/TerraAuth.csproj
+dotnet add reference ../TerraAuth.csproj
 ```
 
 ### 2. 编写插件

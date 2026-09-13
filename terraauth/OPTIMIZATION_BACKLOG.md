@@ -54,7 +54,7 @@
 
 ### B-2 出站帧缓冲复用（`Connection.SendEncodedAsync`）
 
-- **位置**：`Net/Phase5/Connection.cs`
+- **位置**：`Net/Transport/Connection.cs`
 - **现状**：每次发送都 `new ArrayBufferWriter<byte>()` 再 `WrittenSpan.ToArray()` → 每帧两次分配；
   快照下发为 20Hz × 在线玩家数。
 - **方向**：改用 `ArrayPool<byte>` 租借 + 精确长度写入（或复用单个 writer）。
@@ -68,7 +68,7 @@
 - **现状**：容量 300；`Add` 超容量时走 `List.RemoveAt(0)`，`TrimBefore` 走 `RemoveRange(0, n)`，均为 O(n) 搬移。
 - **量级**：每 tick 约 2.4KB memmove，60Hz ≈ 144KB/s —— **可忽略**，故暂不实施。
 - **方向**：以「写入下标 + 逻辑长度」的环形缓冲替代 `List`，把移除降为 O(1)。
-- **关联**：`Net/Phase4/README.md` 已记录 `Snapshot()` 每轮 `ToArray()` 复制的问题，可与本项合并评估。
+- **关联**：`Net/Snapshots/README.md` 已记录 `Snapshot()` 每轮 `ToArray()` 复制的问题，可与本项合并评估。
 
 ### B-4 区块锁原语评估（`SectionLocks`）
 
@@ -423,7 +423,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 
 **修复**：
 
-- 新增 `Simulation/NpcSizes.cs`：玩家 20×42 + 上述 NPC 逐类型尺寸（**逐个类型按原版 `SetDefaults` 核对**，
+- 新增 `Simulation/NpcAI/NpcSizes.cs`：玩家 20×42 + 上述 NPC 逐类型尺寸（**逐个类型按原版 `SetDefaults` 核对**，
   不是估的；写进去之前逐条 grep 过 `width/height`）。
 - `SimulatePhysics`：玩家脚底改为 `Position.Y + 42`（落地判定与吸附都用全高）→ 站着不再累积下落距离 / 不再凭空掉血。
 - `StepNpcPhysics`：改用该 NPC 的 `width/height`（脚底 = `Y + height`，左右任一侧脚底实心即落地），
@@ -497,7 +497,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
   客户端弹幕发给**除归属者外**的玩家（`BroadcastWhereAsync`），服务端弹幕（`Owner < 0`）发给所有人；
   **发送成功才置位**，瞬时失败记 `broadcast_failed`（下轮重试）。
 
-**弹幕行为表（原版字段驱动）** —— 新增 `Simulation/WorldSimulator.Projectiles.cs`：
+**弹幕行为表（原版字段驱动）** —— 新增 `Simulation/Projectiles/WorldSimulator.Projectiles.cs`：
 
 - 按原版 `Projectile.SetDefaults` 的字段建立行为表 `ProjectileBehaviorOf(type)`（仅收录**服务端会发射**的三种）：
   **96** CursedFlameHostile（aiStyle 8）直线 / 图格碰撞 / `timeLeft = 3600`；
@@ -524,7 +524,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 **结构调整（对齐原版）**：
 
 - `WorldNpc` 新增 `AiStyle`（原版 `NPC.aiStyle`）、`Ai[0..3]`（原版 `NPC.ai[]`）、`Direction`（原版 `NPC.direction`）。
-- 新增 `Simulation/WorldSimulator.NpcAi.cs`：`NpcAiStyleOf(type)` 分发表 + `RunNpcAi(npc)` 分派 +
+- 新增 `Simulation/NpcAI/WorldSimulator.NpcAi.cs`：`NpcAiStyleOf(type)` 分发表 + `RunNpcAi(npc)` 分派 +
   各 aiStyle 实现 + 共用物理步 `StepNpcPhysics`。顺序与原版一致：**AI 只设速度/ai → 物理步走重力与图格碰撞**。
 - 未移植的 aiStyle 走 `AiFallback`（简化追击），Boss 仍走 `SimulateBossStep`（自移动）。
 
@@ -726,7 +726,7 @@ Listening on port 7778
 - **`PacketId` 常量数**：39 → **41**（`Protocol/PacketId.cs` 实际成员数）。
 - **编解码覆盖**：入站「31 / 28 个」→ **35 个**；出站「32 类」→ **37 类**（按 `PacketDecoder` / `PacketEncoder` 实际 case 统计）。
 - **持久化后端表述**：多处「默认内嵌 LiteDb / 可选 SQLite」→ **默认 SQLite（`USE_SQLITE`），`-p:NoSqlite=true` 降级 LiteDb**；删除 `SqliteImpl`「骨架」表述（第二轮已完整实装）。
-- **Vanilla-only 边界**：`Net/Phase5/README.md` 与 `DELIVERY.md` 中「未建模包透明透传 / 编码侧原样写回 / 编解码无缺口」→ 改为与代码一致（**未建模包默认拒绝**）。
+- **Vanilla-only 边界**：`Net/Transport/README.md` 与 `DELIVERY.md` 中「未建模包透明透传 / 编码侧原样写回 / 编解码无缺口」→ 改为与代码一致（**未建模包默认拒绝**）。
 - **背压表述**：「`CommandQueue` 满 → 丢弃最旧」「`Channel` 满 → 跳过增量快照」→ 与代码一致（出站有界 `Channel(2048, FullMode = Wait)`；入站无界，上限仍为待办）。
 - **文件树**：补 `WorldGenerator.cs` / `WorldFileWriter.cs` / `WorldEntities.cs` / `Authority/CommandService.cs`。
 - **`OPTIMIZATION_BACKLOG.md` §三**：把第十七轮列出的 12 项按「已修正 / 部分修正 / 仍待修正」重新标注（此前全部标为待办，与代码不符）。

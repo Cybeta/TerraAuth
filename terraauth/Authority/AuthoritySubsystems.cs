@@ -212,7 +212,7 @@ internal sealed class PlayerAuthority : IPlayerAuthority
     }
 
     /// <summary>
-    /// 玩家受伤（包 117）：伤害只允许为非负值，实际扣血由仿真层结算（DamagePlayerCommand）。
+    /// 玩家受伤（包 117）：客户端伤害报告仅做非负值校验，服务端不据此扣血。
     /// 负伤害等价于治疗（CE 改血的方向之一），直接拒绝。
     /// </summary>
     private AuthorityResult ValidateHurt(PlayerHurtV2Packet hurt, int playerId)
@@ -1003,8 +1003,10 @@ internal sealed class WorldAuthority : IWorldAuthority
                 return Deny(playerId, "tile_rejected", "tile_not_found", new { brk.X, brk.Y });
             // 类型对账：客户端声称挖 TileType，服务端实际是 tile.Type，不一致视为篡改
             if (brk.TileType >= 0 && brk.TileType != tile.Type)
-                return Deny(playerId, "tile_rejected", "tile_type_mismatch",
-                    new { Client = brk.TileType, Server = tile.Type });
+                return AuthorityResult.Reject(
+                    "tile_type_mismatch",
+                    countsAsViolation: false,
+                    detail: $"坐标=({brk.X},{brk.Y}) Action={brk.Action} ClientType={brk.TileType} ServerType={tile.Type} ServerActive={tile.Active} ServerWall={tile.Wall}");
         }
 
         return AuthorityResult.Accept(brk);

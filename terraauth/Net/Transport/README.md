@@ -1,6 +1,6 @@
-# Phase 5 — 网络层（Network Layer）
+# Transport — 网络层（Network Layer）
 
-> **依赖**：Phase 2（权威层）、Phase 3（仿真层）、Phase 4（快照广播）
+> **依赖**：Phase 2（权威层）、Phase 3（仿真层）、Snapshots（快照广播）
 > **目标**：实现 TCP 监听、连接生命周期、terraria-protocol 编解码、入站管线驱动、出站快照下发
 > **对应架构文档**：§3.1 接入层、§3.2 协议层、§4.1 基础设施
 
@@ -16,7 +16,7 @@
               → IInboundPipeline（Phase 2）→ CommandQueue（Phase 3）
 
 下行（Outbound）：
-  SnapshotBroadcaster（Phase 4）→ ISnapshotSender
+  SnapshotBroadcaster（Snapshots）→ ISnapshotSender
               → PacketEncoder → Framing → raw bytes → client
 ```
 
@@ -38,7 +38,7 @@
 | `Connection.cs` | 单连接状态机（Handshake / Playing / Disconnected） |
 | `ConnectionManager.cs` | 连接池、超时、踢出、并发上限 |
 | `NetworkHost.cs` ★ | TCP 监听 + Accept 循环 + Read/Write 调度 |
-| `ISnapshotSender.cs` | 出站抽象（由 Phase 4 `SnapshotBroadcaster` 实现） |
+| `ISnapshotSender.cs` | 出站抽象（由 Snapshots `SnapshotBroadcaster` 实现） |
 
 ---
 
@@ -66,7 +66,7 @@ NetworkHost.AcceptLoop
 
 ## 4. 下行链路：`SnapshotBroadcaster` → `ISnapshotSender`
 
-Phase 4 的 `SnapshotBroadcaster` 通过 `ISnapshotSender` 抽象下发快照。
+Snapshots 的 `SnapshotBroadcaster` 通过 `ISnapshotSender` 抽象下发快照。
 本 Phase 提供 **TCP 实现**：
 
 ```
@@ -284,11 +284,11 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 ## 10. 下一步
 
 **P0（先打通端到端）**：
-1. ✅ **跑通一条完整链路**：原版 Terraria 客户端已实测「连接 → 协议协商 → 进入世界」（2026-09-09）；位置包 13 → Phase 2 校验 → Phase 3 仿真 → Phase 4 快照 → 下发的真实 TCP 往返已由 `IntegrationTests.TcpRoundTrip_Packet13_Reaches_SnapshotOverWire` 覆盖（`NetworkHost` + `TcpClient` 走完整握手链至 Playing 后发包 13，断言收到包 15 且位置匹配）
+1. ✅ **跑通一条完整链路**：原版 Terraria 客户端已实测「连接 → 协议协商 → 进入世界」（2026-09-09）；位置包 13 → Phase 2 校验 → Phase 3 仿真 → Snapshots 快照 → 下发的真实 TCP 往返已由 `IntegrationTests.TcpRoundTrip_Packet13_Reaches_SnapshotOverWire` 覆盖（`NetworkHost` + `TcpClient` 走完整握手链至 Playing 后发包 13，断言收到包 15 且位置匹配）
 2. ✅ `NetworkHost` + `Connection` 的最小 Accept/Read/Write 循环
 3. ✅ `Framing` 长度前缀编解码
 4. ✅ 握手包编解码：ConnectionRequest(1) / ContinueConnecting(3) / PlayerInfo(4) / RequestWorldInfo(6) / WorldInfo(7) / TileGetSection(8) / StatusText(9) / PlayerSpawn(12) / InitialSpawn(49) / FinishedConnecting(129) / Disconnect(2)
-5. ✅ `ISnapshotSender` 的 TCP 实现（对接 Phase 4）
+5. ✅ `ISnapshotSender` 的 TCP 实现（对接 Snapshots）
 
 **P1（完善）**：
 - ✅ 包编解码：权威白名单 **13 包** + 状态同步包已结构化（含传送 `TeleportEntity(65)` / `RequestTeleportationByServer(73)`、治疗 35 / 法力 42 / 增益 50、时间 18 / NPC 23 / 弹幕销毁 29 / 拾取 22 / 箱子索引 34 等，共 **35 个入站包 / 37 类出站包**）；未建模包统一 `UnknownPacket` 且**默认拒绝**（Vanilla-only），不再透传；⚠️ 按需增量结构化
@@ -303,7 +303,7 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 > ⚠️ **协议版本跟进**：每次 Terraria 更新客户端，本文件的包 ID 映射 + Phase 2 对应包处理都要更新。这是架构文档反复强调的持续成本。
 
 > ✅ **原版客户端兼容性（已实测）**：2026-09-09 原版 Terraria 客户端（协议 326）连接 `127.0.0.1:7777`，握手成功 → 解析玩家名 → 进入世界（出生点 2100,352）→ 正常断开，全程无异常/畸形包。编解码严格遵循 terraria-protocol。
-> ✅ **移动链路已闭环**：位置包 13 → Phase 2 校验 → Phase 3 仿真 → Phase 4 快照 → TCP 下发的往返已由 `IntegrationTests.TcpRoundTrip_Packet13_Reaches_SnapshotOverWire` 覆盖。
+> ✅ **移动链路已闭环**：位置包 13 → Phase 2 校验 → Phase 3 仿真 → Snapshots 快照 → TCP 下发的往返已由 `IntegrationTests.TcpRoundTrip_Packet13_Reaches_SnapshotOverWire` 覆盖。
 > ✅ **移动权威限距（防作弊优先）**：Δt 上限 1.0s → 10.0s，覆盖客户端失焦/卡顿导致的 4~7s 稀疏发包；但**不做静默超时无条件放行**——超过 10s 的间隔一律按 10s 计，单包允许位移上限 `8.0 × 60 × 10 + 4 = 4804px`，长时静默后的大位移仍会被拒，防止其成为穿墙/瞬移缺口。
 > ⏳ **后续事项：失焦误杀**：客户端失焦 >30s 且激活后位置距基准 >4804px 时会被判 `speed_exceeded`，且拒绝不更新基准会导致后续包连续被拒（原「基准冻结」现象）。彻底解决需引入服务端权威移动/碰撞校验（见 `architecture.md` §9），当前按防作弊优先取舍，暂不实施。
 > ⚠️ **玩家间可见性**：原版客户端仅当 `Main.player[i].active == true` 时才绘制该玩家，故进服/断线必须下发包 14（`PlayerActive`，含 `Active=false` 反激活防幽灵）。仅发包 4（外观）不足以互相看见——这是「相互看不到」的根因。
@@ -318,7 +318,7 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 ```
 TCP bytes → Framing → Decoder → Pipeline(Phase 2) → Command(Phase 3)
                                                               ↓
-Snapshot(Phase 4) → Sender → Encoder → Framing → TCP bytes
+Snapshot(Snapshots) → Sender → Encoder → Framing → TCP bytes
 ```
 
 剩下 **Phase 7（对抗测试）** 和 **Phase 8（运营监控）**。

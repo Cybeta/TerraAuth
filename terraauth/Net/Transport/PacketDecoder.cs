@@ -7,7 +7,7 @@ using System.IO;
 using TerraAuth.Protocol;   // Phase 2 的 IPacket
 using TerraAuth.Simulation; // SnapshotFrame（Phase 3/4）
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// 解码上下文：一次连接内共享的读取状态。

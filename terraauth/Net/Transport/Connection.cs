@@ -7,7 +7,7 @@ using System.Threading.Channels;   // Channel<OutboundFrame>
 using TerraAuth.Concurrency;       // WorkerPool
 using TerraAuth.Protocol;          // INetworkPacket
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// 连接状态。

@@ -5,7 +5,37 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-12 ｜ 当前测试：**306 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
+> 生成日期：2026-09-13 ｜ 当前测试：**306 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
+
+---
+
+## 近期工作汇总（2026-09-13）
+
+### 目录与版本适配整理
+
+- 将 `Net/Phase4` 重命名为 `Net/Snapshots`，将 `Net/Phase5` 重命名为 `Net/Transport`。
+- 将 NPC AI 与尺寸数据归入 `Simulation/NpcAI`，将弹幕模拟归入 `Simulation/Projectiles`。
+- 将协议定义归入 `Protocol/Terraria/V326`，为后续 Terraria 版本并行适配预留清晰边界。
+- 同步更新 C# 命名空间、项目引用和相关 Markdown 路径；保留世界状态、Tile 和 `.wld` 文件处理的现有位置，降低重组风险。
+
+### NPC 与战斗权威修复
+
+- 包 28 的 NPC `Generation` 已从入站协议传递到服务端命令，并在扣血前校验，避免旧索引误伤当前 NPC。
+- AI 生成的 NPC 补齐 `Generation`，不再依赖默认值 `0`。
+- NPC 同步增加玩家级基线记录；玩家首次进入 NPC 视口时会收到完整 NPC 状态，减少“服务端已碰撞但客户端尚未显示”的视觉不同步。
+- 包 117 保持仅上报语义，不直接修改服务端 HP、免伤帧或死亡状态；接触伤害继续由服务端权威结算。
+
+### 客户端兼容与图格同步
+
+- `tile_type_mismatch` 仍拒绝不一致的图格修改，但不再累计违规踢出正常客户端。
+- 图格不一致时补发服务端权威图格，帮助客户端恢复本地缓存。
+- 保持原版客户端协议 326 的无 GUI 服务端运行方式。
+
+### 验证结果
+
+- 自动化测试：306/306 通过，失败 0，跳过 0。
+- Release 构建：成功，错误 0。
+- 本轮重点验证：NPC Generation、玩家级 NPC 同步基线、原版客户端连接兼容和项目目录整理。
 
 ---
 
@@ -247,14 +277,14 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 文件 | 说明 |
 |---|---|
-| `terraauth/Net/Phase5/Connection.cs` | 连接实例持有唯一 `SessionId` |
+| `terraauth/Net/Transport/Connection.cs` | 连接实例持有唯一 `SessionId` |
 | `terraauth/Authority/IAuthorityLayer.cs` | 权威 `Validate` 增加带 `SessionId` 的重载；`ResetPlayer` 增加带代数的重载 |
 | `terraauth/Authority/InboundPipeline.cs` | `PacketContext.SessionId` 贯通；包 31 → `OpenChestCommand`；命令落地前写入 `SessionId` |
 | `terraauth/Authority/ShardedInboundPipeline.cs` | 分片工作项携带 `SessionId`，`Reset` 按代数投递到同一分片 |
 | `terraauth/Authority/AuthoritySubsystems.cs` | 箱子打开 / 写入校验接入 `SessionId`；移动 `ResetPlayer` 按代数据收窄 |
 | `terraauth/GameHost.cs` | 箱子广播按 `Connection.SessionId` 筛选；发送失败重排保持 |
-| `terraauth/Net/Phase5/ConnectionManager.cs` | 移除 / 踢出按「键 + 实例」双匹配，不再误杀复用槽位的新连接 |
-| `terraauth/Net/Phase5/NetworkHost.cs` | 认证完成显式创建带 `SessionId` 的运行时；外观 / 会话时长 / 违规窗口与会话代数绑定；离开广播按连接实例校验；箱子广播改 `Func<Connection, bool>` |
+| `terraauth/Net/Transport/ConnectionManager.cs` | 移除 / 踢出按「键 + 实例」双匹配，不再误杀复用槽位的新连接 |
+| `terraauth/Net/Transport/NetworkHost.cs` | 认证完成显式创建带 `SessionId` 的运行时；外观 / 会话时长 / 违规窗口与会话代数绑定；离开广播按连接实例校验；箱子广播改 `Func<Connection, bool>` |
 | `terraauth/Simulation/CommandQueue.cs` | 新增 `OpenChestCommand`；命令基类统一 `stale_session` 判定 |
 | `terraauth/Simulation/World/WorldState.cs` | 箱子会话升级为 `(PlayerId, SessionId) → ChestIndex`；断线清理 / 恢复按代数收窄 |
 | `terraauth/Tests/SimulationTests.cs` | +6 用例（会话命令拒绝 `stale_session` / 箱子会话代数 / 离线清理代数 / 会话恢复续期） |
@@ -287,9 +317,9 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `ModCompat/ModPolicy.cs` | +78 | Mod 策略配置化 |
 | `Monitoring/IMetrics.cs` | +2 | `SetGauge` |
 | `Monitoring/PrometheusMetrics.cs` | +13 | Gauge 导出 |
-| `Net/Phase5/NetworkHost.cs` | +119 | 包 10 超帧二分拆分、按玩家定制广播、单播 / 原始包发送 |
-| `Net/Phase5/PacketDecoder.cs` | +46 | 新增入站包解析（拾取 / 箱子 / 伤害 / 死亡 / 传送 / 包 82 模块） |
-| `Net/Phase5/PacketEncoder.cs` | +26 | 新增出站包编码 |
+| `Net/Transport/NetworkHost.cs` | +119 | 包 10 超帧二分拆分、按玩家定制广播、单播 / 原始包发送 |
+| `Net/Transport/PacketDecoder.cs` | +46 | 新增入站包解析（拾取 / 箱子 / 伤害 / 死亡 / 传送 / 包 82 模块） |
+| `Net/Transport/PacketEncoder.cs` | +26 | 新增出站包编码 |
 | `Persistence/IPersistence.cs` | +2 | 审计近期查询接口 |
 | `Persistence/SqlitePersistence.cs` | +37 | `QueryRecentAsync` 实现 |
 | `Protocol/PacketId.cs` | +2 | 新增包常量 |
@@ -336,8 +366,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Simulation/CommandQueue.cs` | `SetManaCommand` / `HealPlayerCommand` / `SetBuffsCommand` |
 | `terraauth/Authority/AuthoritySubsystems.cs` | `ValidateMana` / `ValidateHeal` / `ValidateBuffs` / `ValidateProjectile`（含类型 / 伤害上界） |
 | `terraauth/Authority/InboundPipeline.cs` | 包 35 / 42 / 50 → Command 映射 |
-| `terraauth/Net/Phase5/PacketDecoder.cs`、`PacketEncoder.cs` | 包 42 编解码 |
-| `terraauth/Net/Phase5/ITerrariaProtocol.cs` | 权威白名单新增 35 / 42 / 50 |
+| `terraauth/Net/Transport/PacketDecoder.cs`、`PacketEncoder.cs` | 包 42 编解码 |
+| `terraauth/Net/Transport/ITerrariaProtocol.cs` | 权威白名单新增 35 / 42 / 50 |
 | `terraauth/CoreAdapter.cs` | 玩家快照回报真实 `Mp` / `MaxMp`（原恒为 0） |
 | `terraauth/Simulation/World/Tile.cs` | 图格 15 字节定长序列化（`Serialize` / `Deserialize`） |
 | `terraauth/Simulation/World/WorldState.cs` | 待落盘图格集合 + `MarkPersistTile` / `DrainPersistTiles` |
@@ -353,8 +383,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Simulation/World/WorldGenerator.cs` | **重写为分层地形生成**：噪声地表 / 洞穴 / 按深度分带矿脉 / 海滩+海水 / 地狱层 / 2×2 宝箱+战利品；层高比例与图格 ID 经协议行为验证（`WorldSize` 三档保留） |
 | `terraauth/Tests/SimulationTests.cs` | +4 用例（三档世界尺寸生成 / **分层地形内容：矿脉·洞穴·草皮·地狱层·海水·宝箱**） |
 | `terraauth/Protocol/Types.cs` | `PlayerControlsPacket` 新增 `MountType` / `PotionReturnOriginal` / `PotionReturnHome` / `CameraTarget`（包 13 可选尾随段） |
-| `terraauth/Net/Phase5/PacketDecoder.cs` | 包 13 尾随段**读取并保留**（不再读后即丢） |
-| `terraauth/Net/Phase5/PacketEncoder.cs` | 包 13 按字段存在性**校准可选位并写出尾随字段** |
+| `terraauth/Net/Transport/PacketDecoder.cs` | 包 13 尾随段**读取并保留**（不再读后即丢） |
+| `terraauth/Net/Transport/PacketEncoder.cs` | 包 13 按字段存在性**校准可选位并写出尾随字段** |
 | `terraauth/Simulation/World/WorldFileReader.cs` | 箱子去重后**按列表下标重排 `Index`**（修 `FindChestByIndex` 错位） |
 | `terraauth/Tests/IntegrationTests.cs` | 踢出用例等待窗口 5s → 10s（世界生成变重后的偶发） |
 | `terraauth/Simulation/World/WorldState.cs` | 箱子待落盘集合（`MarkPersistChest` / `DrainPersistChests`）+ `Chest.SerializeItems` / `DeserializeItems` |
@@ -362,19 +392,19 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 | `terraauth/Persistence/IPersistence.cs` | `IWorldRepository` 新增 `SaveChestChangesAsync` / `LoadChestChangesAsync` + `WorldChestRecord` |
 | `terraauth/Persistence/SqlitePersistence.cs` | 新增 `WorldChests` 表（SQLite）与内嵌后端箱子段 |
 | `terraauth/GameHost.cs` | 箱子内容启动回放（索引 + 坐标双校验）+ 1Hz 落盘（失败重新排队） |
-| `terraauth/Net/Phase5/NetworkHost.cs` | 断线走会话保留（`MarkPlayerOffline` + `ResetPlayer`）；登录时按玩家名 `TryResumePlayer`；连接结束回收槽位 |
-| `terraauth/Net/Phase5/ConnectionManager.cs` | `RemoveAsync` 支持「键 + 实例」双匹配（槽位复用时防误杀新连接） |
+| `terraauth/Net/Transport/NetworkHost.cs` | 断线走会话保留（`MarkPlayerOffline` + `ResetPlayer`）；登录时按玩家名 `TryResumePlayer`；连接结束回收槽位 |
+| `terraauth/Net/Transport/ConnectionManager.cs` | `RemoveAsync` 支持「键 + 实例」双匹配（槽位复用时防误杀新连接） |
 | `terraauth/Authority/IAuthorityLayer.cs` | `IMovementAuthority.ResetPlayer` + `IInboundPipeline.ResetPlayer` 默认实现 |
 | `terraauth/Authority/AuthoritySubsystems.cs` | `MovementAuthority.ResetPlayer`（清理移动校验基线） |
 | `terraauth/Authority/InboundPipeline.cs` | `IResettableStage` + 阶段转发 |
 | `terraauth/Authority/ShardedInboundPipeline.cs` | `InboundWork.IsReset` + 重置投递到同一分片 / 队列（保证在途包先处理完） |
 | `terraauth/Plugins/HookIntegration.cs` | `HookedPipeline.ResetPlayer` 转发 |
-| `terraauth/Net/Phase5/Connection.cs` | 新增 `SyncedSections` / `LastStreamSection`（区块流送去重 + 跨区块判定） |
-| `terraauth/Net/Phase5/NetworkHost.cs` | 包 8 在 **Playing 阶段同样处理**；`StreamSectionsForPlayersAsync` 按连接去重，跨区块补发周边 **3×3**，并先发包 9（进度）；未建模包默认拒绝，状态包不走即时中继 |
+| `terraauth/Net/Transport/Connection.cs` | 新增 `SyncedSections` / `LastStreamSection`（区块流送去重 + 跨区块判定） |
+| `terraauth/Net/Transport/NetworkHost.cs` | 包 8 在 **Playing 阶段同样处理**；`StreamSectionsForPlayersAsync` 按连接去重，跨区块补发周边 **3×3**，并先发包 9（进度）；未建模包默认拒绝，状态包不走即时中继 |
 | `terraauth/Authority/AuthoritySubsystems.cs` | 移动校验改**分轴**（垂直用 `max(MaxSpeed, MaxFallSpeed)`）；`MovementLimits` 新增 `MaxFallSpeed` |
 | `terraauth/Protocol/PacketId.cs` | 新增 `TileSquare = 20` |
 | `terraauth/Simulation/World/Tile.cs` | 新增 `TileSquarePacket`（包 20 契约：未压缩小矩形 + 逐格位标志/可选段） |
-| `terraauth/Net/Phase5/PacketEncoder.cs` | 新增**包 20 编码**（按协议字段核对逐字段实现）；NPC 同步**锚点偏移**（史莱姆王） |
+| `terraauth/Net/Transport/PacketEncoder.cs` | 新增**包 20 编码**（按协议字段核对逐字段实现）；NPC 同步**锚点偏移**（史莱姆王） |
 | `terraauth/GameHost.cs` | 图格改动由包 10 改为**包 20**（宽度超 255 切分）；NPC 目标字段改 **255（无目标）** |
 | `terraauth/Tests/NetworkTests.cs` | +1 用例（包 20 线格式逐字段断言） |
 | `terraauth/Tests/AuthorityTests.cs` | +1 用例（快速坠落接受 / 水平瞬移仍拒） |

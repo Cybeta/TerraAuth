@@ -5,7 +5,7 @@
 using System.Collections.Immutable;
 using TerraAuth.Protocol;
 
-namespace TerraAuth.Net.Phase5;
+namespace TerraAuth.Net.Transport;
 
 /// <summary>
 /// Terraria 协议版本声明。

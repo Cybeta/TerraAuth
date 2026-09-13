@@ -1,7 +1,7 @@
 // TerraAuth — Phase 4 验收测试
 
-using TerraAuth.Net.Phase4;
-using TerraAuth.Net.Phase5;
+using TerraAuth.Net.Snapshots;
+using TerraAuth.Net.Transport;
 using TerraAuth.Protocol;
 using TerraAuth.Simulation;
 using Xunit;

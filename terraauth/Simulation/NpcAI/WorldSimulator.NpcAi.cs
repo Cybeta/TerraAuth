@@ -562,6 +562,7 @@ public partial class WorldSimulator
             LifeMax = 20,
             VelocityX = 0f,
             VelocityY = -upwardSpeed,
+            Generation = (byte)(_rng.NextUInt32() & 0xFF),
         });
     }
 

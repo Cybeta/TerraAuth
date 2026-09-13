@@ -107,7 +107,7 @@
 | 设计基线模块 | 实际目录 / 命名空间 | 状态 |
 |---|---|---|
 | `TerraAuth.Server` | `Program.cs` / `GameHost.cs`（`TerraAuth`） | 已实现 |
-| `TerraAuth.Transport` | `Net/Phase5/`（`TerraAuth.Net.Phase5`） | 部分 |
+| `TerraAuth.Transport` | `Net/Transport/`（`TerraAuth.Net.Transport`） | 部分 |
 | `TerraAuth.Protocol` | `Protocol/`（`TerraAuth.Protocol`） | 部分 |
 | `TerraAuth.Authority` | `Authority/`（`TerraAuth.Authority`） | 已实现 |
 | `TerraAuth.Simulation` | `Simulation/`（`TerraAuth.Simulation`） | 部分 |
