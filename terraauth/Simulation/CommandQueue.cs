@@ -133,7 +133,7 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
             return new(false, CommandFailures.NotApplied);
 
         player.Hp -= Damage;
-        player.HurtCooldown = PlayerRuntime.HurtImmunityTicks;
+        player.HurtCooldown = PlayerRuntime.GeneralImmunityTicks(Damage);   // 原版 Hurt 的 immuneTime（40 / 20）
         // 诊断：客户端上报的包 117 是「扣血但没有服务端碰撞」的嫌疑来源之一，先记录出处。
         Console.WriteLine($"[Damage] 玩家 #{id} -{Damage}（client_reported/包117）HP={player.Hp} " +
                           $"位置={player.Position.X:F0},{player.Position.Y:F0}");

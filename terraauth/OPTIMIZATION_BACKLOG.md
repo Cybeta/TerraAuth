@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第三十三轮：玩家移动改为「服务端按控制位模拟」，对齐原版 Player.Update）
+> 最后更新：2026-09-12（第三十四轮：免伤帧按原版分来源 —— 接触 30 / 通用 40 / 弱伤害 20）
 
 ---
 
@@ -110,6 +110,32 @@
 
 ## 附：本轮回溯
 
+### 第三十四轮（2026-09-12）：免伤帧按原版**分来源**取值
+
+**原版依据**（此前统一 60 tick，偏长）：
+
+| 来源 | 原版 | 我们 |
+|---|---|---|
+| **接触攻击**（NPC 撞击） | `Player.GiveImmuneTimeForCollisionAttack(longInvince ? 60 : 30)` → **30 tick**（0.5s） | `PlayerRuntime.ContactImmunityTicks = 30` |
+| **通用受击**（包 117 / 下落 / 敌对弹幕） | `Player.Hurt`：`immuneTime = pvp ? 8 : (伤害 ≠ 1 ? (longInvince ? 80 : 40) : (longInvince ? 40 : 20))` | 伤害 > 1 → **40**；伤害被压到 1 → **20**（`GeneralImmunityTicks(damage)`） |
+| PvP | 8 | 未建模 PvP，暂不需 |
+
+**改动**：`PlayerRuntime` 用 `ContactImmunityTicks` / `HurtImmunityTicks` / `WeakHurtImmunityTicks` +
+`GeneralImmunityTicks(damage)` 取代原来的单一 `HurtImmunityTicks = 60`；
+`ApplyPlayerDamage` 增加 `immunityTicks` 参数，接触 / 下落 / 敌对弹幕各自传入；
+`DamagePlayerCommand`（包 117）改用 `GeneralImmunityTicks(Damage)`。
+跨来源仍共用同一个 `HurtCooldown` 窗口（原版 `Player.immune` 亦是统一窗口）→ 双倍伤害防护不变。
+
+**测试**：**306 / 306 通过**（无新增；`Vanilla_ContactDamage_Has_ImmunityWindow` 改为按「距首次受伤的总 tick 数」
+断言 ≈30 tick，并把首次受伤后的静止观察窗从 30 收到 20）。
+
+**遗留（下一轮候选）**：
+
+1. **玩家物理的其余分支**：可变跳跃高度、冲刺 / 坐骑 / 翅膀 / 水中 / 蜂蜜 / 斜坡与台阶自动上抬、抓钩与传送。
+2. **NPC 同步节奏**：可考虑从 60Hz 回落到原版令牌桶（普通 ≈3 包/1.5s、Boss ≈12Hz，`netSpamPacketLimit = 3`）。
+3. **接触判定**：原版用 `npc.position + netOffset`（渲染位置）做 AABB 相交且无最小重叠；我们取 8px 半格阈值。
+4. **框架**：buff 表（施加 debuff 通道 + 剩余时间 / 到期移除）、粉尘 / 音效、外观包 40 建模、弹幕逐类型碰撞盒。
+
 ### 第三十三轮（2026-09-12）：玩家移动改为「服务端按控制位模拟」（对齐原版做法）
 
 **原版依据**：`Main.Update` 对**所有 active 玩家（含远端）**调用 `player[i].Update(i)`；而客户端只在
@@ -151,8 +177,7 @@ if (controlJump && releaseJump && 贴地 && !controlDown) velocity.Y = -jumpSpee
 
 **遗留（下一轮候选）**：
 
-1. **免伤帧对齐原版**：接触攻击 `GiveImmuneTimeForCollisionAttack(30)`（十字项链 60）、通用 `Hurt` 的
-   `immuneTime = pvp ? 8 : (伤害≠1 ? 40/80 : 20/40)` —— 我们目前统一 60。
+1. ~~**免伤帧对齐原版**~~ —— ✅ **已在第三十四轮完成**：接触 30 / 通用 40 / 弱伤害 20。
 2. **玩家物理的其余分支**：可变跳跃高度（按住跳更高）、冲刺 / 坐骑 / 翅膀 / 水中 / 蜂蜜 / 斜坡与台阶自动上抬、
    抓钩与传送 —— 当前只实现了平地行走 / 跳跃 / 落地 / 水平阻挡。
 3. **NPC 同步节奏**：可考虑从 60Hz 回落到原版令牌桶（普通 ≈3 包/1.5s、Boss ≈12Hz，`netSpamPacketLimit = 3`）。

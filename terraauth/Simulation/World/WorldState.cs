@@ -929,14 +929,27 @@ public sealed class PlayerRuntime
     /// <summary>复活是否已广播（包 12 / 16），由世界同步线程置位。</summary>
     public bool RespawnNotified = true;
 
-    /// <summary>受击免伤帧剩余 tick：&gt;0 时不再结算接触伤害（约 1 秒）。</summary>
+    /// <summary>受击免伤帧剩余 tick：&gt;0 时不再结算任何来源的伤害（原版 <c>Player.immune</c> 跨来源统一）。</summary>
     public int HurtCooldown;
 
     /// <summary>
-    /// 受击免伤帧（tick，60 ≈ 1 秒）。**所有伤害来源共用**（接触 / 敌对弹幕 / 客户端上报的包 117）——
-    /// 原版 `Player.immune` 也是跨来源的统一窗口；不共用会让同一次接触被服务端与客户端各记一次（双倍伤害）。
+    /// **接触攻击**（NPC 撞击）的免伤帧：原版 <c>Player.GiveImmuneTimeForCollisionAttack(longInvince ? 60 : 30)</c>。
+    /// 我们未建模十字项链 → 取 30 tick（0.5 秒）。
     /// </summary>
-    public const int HurtImmunityTicks = 60;
+    public const int ContactImmunityTicks = 30;
+
+    /// <summary>
+    /// **通用受击**（客户端上报的包 117 / 下落伤害 / 敌对弹幕）的免伤帧。
+    /// 原版 <c>Player.Hurt</c>：<c>immuneTime = pvp ? 8 : (伤害 ≠ 1 ? (longInvince ? 80 : 40) : (longInvince ? 40 : 20))</c>。
+    /// 我们未建模十字项链、非 PvP → 伤害 &gt; 1 取 <see cref="HurtImmunityTicks"/>，伤害被防御压到 1 取 <see cref="WeakHurtImmunityTicks"/>。
+    /// </summary>
+    public const int HurtImmunityTicks = 40;
+
+    /// <summary>通用受击里「伤害 ≤ 1」时的较短窗口（原版 20 tick）。</summary>
+    public const int WeakHurtImmunityTicks = 20;
+
+    /// <summary>按原版规则取通用免伤帧长（无十字项链、非 PvP）。</summary>
+    public static int GeneralImmunityTicks(int damage) => damage > 1 ? HurtImmunityTicks : WeakHurtImmunityTicks;
 
     /// <summary>连续下落距离（像素），落地时用于结算下落伤害。</summary>
     public float FallDistance;

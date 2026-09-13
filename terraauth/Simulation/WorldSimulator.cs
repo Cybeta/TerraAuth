@@ -881,9 +881,6 @@ public partial class WorldSimulator : IWorldViewProvider
         return NpcTileSolid(leftCol, feetRow) || NpcTileSolid(rightCol, feetRow);
     }
 
-    /// <summary>玩家受击后的免伤帧（tick，60 ≈ 1 秒；与 <see cref="DamagePlayerCommand"/> 共用同一窗口）。</summary>
-    private const int HurtImmunityTicks = PlayerRuntime.HurtImmunityTicks;
-
     /// <summary>
     /// 阶段 4：战斗结算（服务端权威）。下落伤害 + 敌怪 / Boss 接触伤害。
     /// 接触伤害由服务端判定并结算（客户端上报的受击仅作参考），避免「漏报伤害避免死亡」。
@@ -903,7 +900,7 @@ public partial class WorldSimulator : IWorldViewProvider
                     int damage = (int)((player.FallDistance - FallDamageThreshold) / TileSize);
                     if (damage > 0)
                     {
-                        ApplyPlayerDamage(player, damage, "fall_damage");
+                        ApplyPlayerDamage(player, damage, "fall_damage", PlayerRuntime.GeneralImmunityTicks(damage));
                         LogPlayerDamage(player, damage, "fall_damage", $"下落距离={player.FallDistance:F0}");
                     }
                 }
@@ -923,7 +920,7 @@ public partial class WorldSimulator : IWorldViewProvider
             int contact = FindContactDamage(player, out var contactNpc);
             if (contact > 0)
             {
-                ApplyPlayerDamage(player, contact, "contact_damage");
+                ApplyPlayerDamage(player, contact, "contact_damage", PlayerRuntime.ContactImmunityTicks);
                 LogPlayerDamage(player, contact, "contact_damage",
                     $"NPC {contactNpc!.Type}@{contactNpc.X:F0},{contactNpc.Y:F0} " +
                     $"玩家判定={player.AimPosition.X:F0},{player.AimPosition.Y:F0}（上报={player.Position.X:F0},{player.Position.Y:F0}）");
@@ -933,7 +930,7 @@ public partial class WorldSimulator : IWorldViewProvider
             // 4.3 敌对弹幕伤害（Boss 弹幕）：同样受免伤帧约束
             int projectile = FindHostileProjectileDamage(player);
             if (projectile > 0)
-                ApplyPlayerDamage(player, projectile, "projectile_damage");
+                ApplyPlayerDamage(player, projectile, "projectile_damage", PlayerRuntime.GeneralImmunityTicks(projectile));
         }
     }
 
@@ -1024,15 +1021,17 @@ public partial class WorldSimulator : IWorldViewProvider
     private int _contactNearMissLogCount;
 
     /// <summary>
-    /// 服务端结算玩家伤害：扣血 → 必要时置死亡态 → 登记受击通知（包 117 表现 + 包 16 权威血量）。
+    /// 服务端结算玩家伤害：扣血 → 置免伤帧 → 必要时置死亡态 → 登记受击通知（包 117 表现 + 包 16 权威血量）。
     /// 这是玩家生命的唯一权威入口（客户端上报的包 117 只做非负校验，不直接改血）。
+    /// <paramref name="immunityTicks"/> 按原版分来源取值：接触攻击 30（<c>GiveImmuneTimeForCollisionAttack</c>），
+    /// 通用受击 40 / 20（<c>Hurt</c> 的 <c>immuneTime</c>）。
     /// </summary>
-    private void ApplyPlayerDamage(PlayerRuntime player, int damage, string kind)
+    private void ApplyPlayerDamage(PlayerRuntime player, int damage, string kind, int immunityTicks)
     {
         if (damage <= 0 || player.Dead) return;
 
         player.Hp = Math.Max(0, player.Hp - damage);
-        player.HurtCooldown = HurtImmunityTicks;
+        player.HurtCooldown = immunityTicks;
         player.FallDistance = 0f;
 
         if (player.Hp == 0)
