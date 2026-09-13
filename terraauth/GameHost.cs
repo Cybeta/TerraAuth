@@ -320,7 +320,11 @@ public sealed class GameHost : IDisposable
             }
         }, ct);
 
-        // 3.5 NPC 同步（包 23）：循环按 60Hz 跑，但**逐 NPC 分档**下发（见 BroadcastNpcUpdatesAsync）：
+        // 3.5 NPC 同步（包 23）：**挂到仿真 tick** 上（轮询 State.Tick，每前进 1 tick 处理一次），
+        //     频率 = 仿真频率（GameLoop 高精度定时后 ≈60Hz），不再有独立 Task.Delay 循环的频率漂移
+        //     （此前用 Task.Delay(1000/60) 驱动，Windows 时钟粒度下两套循环互相漂移，
+        //      实测同一史莱姆两次包 23 间隔 4~6 tick，近身 60Hz 从未成立）。
+        //     逐 NPC 分档仍保留（见 BroadcastNpcUpdatesAsync）：
         //     Boss / 近身（3 格内）NPC 逐 tick 发，其余每 3 次调用（20Hz）发一次。
         //     客户端收到包 23 后会按原版自行推进 NPC，同步越稀疏、双方位置差越大；
         //     而**接触判定用的是服务端位置**，差值一大就会出现「看着离史莱姆很远却在掉血」，
@@ -329,12 +333,20 @@ public sealed class GameHost : IDisposable
         //     仍是「变化才发 + 心跳补发」，静止 NPC 不占额外带宽。
         var npcSyncTask = Task.Run(async () =>
         {
+            long lastTick = -1;
             while (!ct.IsCancellationRequested)
             {
+                var tick = Simulator.State.Tick;
+                if (tick == lastTick)
+                {
+                    await Task.Delay(1, ct).ConfigureAwait(false);   // 等下一 tick（timeBeginPeriod 后 1ms 精度）
+                    continue;
+                }
+
+                lastTick = tick;
                 // 逐 NPC 分档：非高优先级（远处）NPC 只在每 N 次调用下发一次
-                var fullRate = Simulator.State.Tick % NpcSyncRateDivisor == 0;
+                var fullRate = tick % NpcSyncRateDivisor == 0;
                 await BroadcastNpcUpdatesAsync(ct, fullRate).ConfigureAwait(false);
-                await Task.Delay(1000 / 60, ct);
             }
         }, ct);
 
