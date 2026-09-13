@@ -203,7 +203,7 @@ public sealed class GameHost : IDisposable
                 networkForNames is not null && networkForNames.TryGetPlayerName(id, out var n) ? n : null);
 
         // 5. 仿真层（Phase 3）
-        var simulator = new WorldSimulator(world, commands, recorder, snapshots);
+        var simulator = new WorldSimulator(world, commands, recorder, snapshots, config);
 
         // 6. 网络层（Phase 5）——先建，以便把 SnapshotSender 注入快照广播
         var protocol = new TerrariaProtocol();
@@ -310,6 +310,8 @@ public sealed class GameHost : IDisposable
                 await FlushChestUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端判定的玩家受击（接触 / 下落伤害）→ 包 117 + 包 16
                 await FlushPlayerHurtAsync(ct).ConfigureAwait(false);
+                // NPC 命中确认 → 包 162（客户端据此出队一条待确认伤害；漏发会导致幽灵碰撞）
+                await FlushNpcDamageAcksAsync(ct).ConfigureAwait(false);
                 // 服务端主动生成的掉落物（Boss 掉落等）→ 包 21
                 await FlushNewItemsAsync(ct).ConfigureAwait(false);
                 // 新增弹幕（客户端上报 / Boss AI 发射）→ 包 27
@@ -679,6 +681,27 @@ public sealed class GameHost : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// 下发 NPC 命中确认（包 162，无 payload）：服务端每收到一次 NPC 命中（包 28）都要回一个，
+    /// 客户端收到即 <c>NPC.AckDamage()</c> 把**最早入队**的待确认伤害出队。
+    /// <para>**必须 FIFO 且不可漏发**：客户端在收到包 23 时会以
+    /// <c>npc.life = 服务端血量 - 待确认伤害总和</c> 修正本地血量；漏发会让该总和持续累积，
+    /// 本地血量被算成负数 → 客户端抹掉贴图（本地判死）而服务端该怪仍存活并继续造成接触伤害，
+    /// 即「击杀后出现幽灵碰撞」。</para>
+    /// </summary>
+    public async Task FlushNpcDamageAcksAsync(CancellationToken ct = default)
+    {
+        var acks = Simulator.State.DrainNpcDamageAck(MaxNpcDamageAckPerFlush);
+        foreach (var playerId in acks)
+        {
+            await Network.SendToPlayerAsync(playerId, PacketId.NpcDamageAck,
+                new NpcDamageAckPacket(), ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>单轮下发的命中确认条数上限（FIFO，逐条对应客户端的一次入队）。</summary>
+    private const int MaxNpcDamageAckPerFlush = 128;
 
     /// <summary>
     /// 下发服务端主动生成的掉落物（如 Boss 掉落）：包 21（含服务端分配的槽位 / 位置 / 速度 / 堆叠），按视口裁剪。

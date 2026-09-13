@@ -581,7 +581,7 @@ return new(false, CommandFailures.NotApplied);
 
 /// <summary>NPC 受击命令：包 28 权威通过后生成，由仿真扣减 NPC 生命（生命归零即死亡）。</summary>
 public sealed record NpcStrikeCommand(
-    long Tick, int? PlayerId, int NpcIndex, int Damage, int Generation = 0)
+    long Tick, int? PlayerId, int NpcIndex, int Damage, int Generation = 0, bool Crit = false)
     : Command(Tick, PlayerId, "npc_strike")
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
@@ -591,6 +591,10 @@ public sealed record NpcStrikeCommand(
         if (!TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
 
+        // 原版服务端在收到包 28 时**无条件**回一个包 162（且在校验之前），客户端据此出队一条待确认伤害。
+        // 在此登记可保证后续因 generation / 存活校验而未生效的命中同样被确认，客户端的队列不会漏账。
+        world.MarkNpcDamageAck(playerId);
+
         lock (world.NpcsLock)
         {
             if (NpcIndex < 0 || NpcIndex >= world.Npcs.Count)
@@ -598,17 +602,33 @@ public sealed record NpcStrikeCommand(
 
             var npc = world.Npcs[NpcIndex];
             if (!npc.Active)
+            {
+                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 客户端gen={Generation} 服务端已死(type={npc.Type}) dmg={Damage}");
                 return new(false, CommandFailures.NotApplied);
+            }
             if ((byte)Generation != npc.Generation)
+            {
+                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 客户端gen={Generation} 服务端gen={npc.Generation} dmg={Damage}");
                 return new(false, CommandFailures.NotApplied);
+            }
 
-            npc.Life -= Damage;
+            // 原版 StrikeNPC_Inner 在服务端同样应用暴击倍率：
+            //   Main.CalculateDamageNPCsTake(Damage, defense) * (crit ? 2 : 1)
+            // 漏掉 ×2 会造成「客户端按暴击打死、服务端还差一半血」——客户端贴图消失，服务端该怪仍存活
+            // 并继续造成接触伤害（幽灵碰撞）。NPC 防御减伤尚未建模（史莱姆防御为 0，不影响当前用例）。
+            int applied = Damage * (Crit ? 2 : 1);
+            npc.Life -= applied;
             if (npc.Life <= 0)
             {
                 npc.Life = 0;
                 npc.Active = false; // 由世界同步下发 life=0，客户端据此移除
                 npc.DeadTick = Tick;
+                Console.WriteLine($"[Kill] slot={NpcIndex} gen={npc.Generation} type={npc.Type} dmg={Damage}×{(Crit ? 2 : 1)} @{npc.X:F0},{npc.Y:F0}");
                 world.NotifyNpcKilled(npc.Type, npc.X, npc.Y); // Boss 击杀 → 世界进度与掉落 // Boss 击杀 → 世界进度 + 掉落
+            }
+            else
+            {
+                Console.WriteLine($"[Strike] slot={NpcIndex} gen={npc.Generation} dmg={Damage}×{(Crit ? 2 : 1)}={applied} → life={npc.Life}");
             }
         }
 

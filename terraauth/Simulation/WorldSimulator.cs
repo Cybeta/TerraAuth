@@ -3,6 +3,7 @@
 
 using System.Collections.Generic;
 using TerraAuth.Concurrency; // DoubleBufferedWorldState（无依赖的通用原语，同 Authority 层用法）
+using TerraAuth.Config;      // IConfigurationService：运行期可调的刷怪上限等
 using TerraAuth.Protocol;
 
 namespace TerraAuth.Simulation;
@@ -14,6 +15,9 @@ public partial class WorldSimulator : IWorldViewProvider
     private readonly EventRecorder _recorder;
     private readonly SnapshotStore _snapshots;
     private readonly IRng _rng = new XoshiroRng(0x12345);
+
+    /// <summary>配置服务（可选）：读取 server.json 的运行期可调项（如同屏敌怪上限）；测试路径可为 null。</summary>
+    private readonly IConfigurationService? _config;
 
     /// <summary>双缓冲发布：仿真线程写 / 快照线程读，读取端无需加锁。</summary>
     private readonly DoubleBufferedWorldState<WorldEntityView> _entityViews = new();
@@ -91,24 +95,28 @@ public partial class WorldSimulator : IWorldViewProvider
             var slot = _world.Npcs[i];
             if (!slot.IsTownNpc && !slot.Active && _world.Tick - slot.DeadTick > EnemyRemovalDelayTicks)
             {
+                Console.WriteLine($"[Slot] 复用 {i}：旧 gen={slot.Generation} type={slot.Type} → 新 gen={npc.Generation} type={npc.Type}");
                 _world.Npcs[i] = npc;
                 return;
             }
         }
 
         _world.Npcs.Add(npc);
+        Console.WriteLine($"[Slot] 追加 {_world.Npcs.Count - 1}：gen={npc.Generation} type={npc.Type}");
     }
 
     public WorldSimulator(
         WorldState world,
         CommandQueue commands,
         EventRecorder recorder,
-        SnapshotStore snapshots)
+        SnapshotStore snapshots,
+        IConfigurationService? config = null)
     {
         _world = world;
         _commands = commands;
         _recorder = recorder;
         _snapshots = snapshots;
+        _config = config;
     }
 
     /// <summary>推进一个固定 timestep（架构 §4.3）。</summary>
@@ -258,8 +266,8 @@ public partial class WorldSimulator : IWorldViewProvider
     /// <summary>一个夜晚的时间单位数。</summary>
     private const double NightLength = 32400.0;
 
-    /// <summary>同屏敌怪上限（达到后不再刷怪）。</summary>
-    private const int MaxEnemies = 8;
+    /// <summary>同屏敌怪上限的兜底值（未注入配置时使用）；生产路径取 server.json 的 <c>MaxEnemies</c>。</summary>
+    private const int DefaultMaxEnemies = 8;
     /// <summary>刷怪 / 死亡清理间隔（tick）。</summary>
     private const int SpawnIntervalTicks = 60;
     /// <summary>敌怪清理延迟（tick）：确保 life=0 已通过世界同步下发后再从列表移除。</summary>
@@ -342,25 +350,12 @@ public partial class WorldSimulator : IWorldViewProvider
                     continue;
                 }
 
-                // 命中判定（服务端权威）：仅**玩家弹幕**结算敌怪伤害；敌对弹幕（Owner = -1）
-                // 打玩家，见 SimulateCombat。
-                var hit = p.Owner >= 0 ? FindHitEnemy(p) : null;
-                if (hit is not null)
-                {
-                    int damage = Math.Max(1, p.Damage);
-                    hit.Life -= damage;
-                    if (hit.Life <= 0)
-                    {
-                        hit.Life = 0;
-                        hit.Active = false;
-                        hit.DeadTick = _world.Tick;
-                        _world.NotifyNpcKilled(hit.Type, hit.X, hit.Y); // Boss 击杀 → 世界进度 + 掉落
-                    }
-                    p.Active = false;
-                    p.DeadTick = _world.Tick;
-                    _recorder.Record(new GameEvent(_world.Tick, p.Owner, GameEventKinds.ProjectileHit, damage));
-                    continue;
-                }
+                // 玩家弹幕（Owner >= 0）**不在此结算敌怪伤害**。原版只允许弹幕归属者自己结算
+                // （Projectile.Damage 内有断言 `netMode == 0 || owner == Main.myPlayer`），
+                // 服务端 myPlayer == 255 永不满足，故玩家弹幕命中一律由客户端 StrikeNPC 发包 28 上报。
+                // 此前服务端又用近似命中盒自行结算一次，导致**双重结算、且可能命中不同的 NPC**：
+                // 客户端把 A 打死后本地移除，服务端却把伤害记到 B 上、A 仍存活并继续造成接触伤害
+                // —— 表现为"身边没有怪物却一直在掉血"的幽灵碰撞。弹幕销毁由客户端发包 29 驱动。
 
                 if (--p.TimeLeft <= 0)
                 {
@@ -564,27 +559,7 @@ public partial class WorldSimulator : IWorldViewProvider
     private static bool IsLiquidBlocking(in Tile tile)
         => tile.Active && TileIdSets.IsTileSolid(tile.Type) && !tile.InActive;
 
-    /// <summary>
-    /// 查找被弹幕命中的存活敌怪（不含城镇 NPC）：弹幕碰撞盒与 NPC 碰撞盒（原版逐类型尺寸）求交。
-    /// </summary>
-    private WorldNpc? FindHitEnemy(ProjectileEntity p)
-    {
-        lock (_world.NpcsLock)
-        {
-            foreach (var npc in _world.Npcs)
-            {
-                if (!npc.Active || npc.IsTownNpc) continue;
-
-                var (width, height) = NpcSizes.Of(npc.Type);
-                if (BoxesOverlap(p.Position.X, p.Position.Y, ProjectileHitBoxSize, ProjectileHitBoxSize,
-                                 npc.X, npc.Y, width, height))
-                    return npc;
-            }
-        }
-        return null;
-    }
-
-    /// <summary>弹幕命中判定用的碰撞盒边长（像素）：原版弹幕宽度多为 6~16，统一取 16 作为宽容近似。</summary>
+    /// <summary>敌对弹幕命中玩家判定用的碰撞盒边长（像素）：原版弹幕宽度多为 6~16，统一取 16 作为宽容近似。</summary>
     private const int ProjectileHitBoxSize = 16;
 
     /// <summary>AI 执行期间产生的刷怪请求（遍历结束后统一入队，避免遍历中修改集合）。</summary>
@@ -702,7 +677,7 @@ public partial class WorldSimulator : IWorldViewProvider
         int enemies = 0;
         foreach (var n in _world.Npcs)
             if (n.Active && !n.IsTownNpc) enemies++;
-        if (enemies >= MaxEnemies) return;
+        if (enemies >= (_config?.Current.MaxEnemies ?? DefaultMaxEnemies)) return;
 
         var target = PickPlayer();
         if (target is null) return;
@@ -937,13 +912,15 @@ public partial class WorldSimulator : IWorldViewProvider
                 continue;
             }
 
-            int contact = FindContactDamage(player, out var contactNpc);
+            int contact = FindContactDamage(player, out var contactNpc, out var contactSlot);
             if (contact > 0)
             {
                 ApplyPlayerDamage(player, contact, "contact_damage", PlayerRuntime.GeneralImmunityTicks(contact));
                 LogPlayerDamage(player, contact, "contact_damage",
-                    $"NPC {contactNpc!.Type}@{contactNpc.X:F0},{contactNpc.Y:F0} " +
+                    $"NPC {contactNpc!.Type} slot={contactSlot} gen={contactNpc.Generation} " +
+                    $"@{contactNpc.X:F0},{contactNpc.Y:F0} " +
                     $"玩家判定={player.AimPosition.X:F0},{player.AimPosition.Y:F0}（上报={player.Position.X:F0},{player.Position.Y:F0}）");
+                DumpNearbyNpcs(player, contactNpc);
                 continue;
             }
 
@@ -963,6 +940,36 @@ public partial class WorldSimulator : IWorldViewProvider
 
     private int _damageLogCount;
 
+    /// <summary>
+    /// 诊断输出：玩家 300px 内的全部 NPC（槽位 / 代数 / 存活 / 血量 / 坐标），用于对照
+    /// 「服务端认为这里有怪」与「客户端画面里到底有没有」——幽灵碰撞排查用。
+    /// </summary>
+    private void DumpNearbyNpcs(PlayerRuntime player, WorldNpc contactNpc)
+    {
+        if (Interlocked.Increment(ref _dumpLogCount) > 200) return;
+
+        var sb = new System.Text.StringBuilder();
+        lock (_world.NpcsLock)
+        {
+            for (var i = 0; i < _world.Npcs.Count; i++)
+            {
+                var n = _world.Npcs[i];
+                if (n.IsTownNpc) continue;
+
+                var dx = n.X - player.AimPosition.X;
+                var dy = n.Y - player.AimPosition.Y;
+                if (dx * dx + dy * dy > 300f * 300f) continue;
+
+                sb.Append($" [slot={i} gen={n.Generation} act={(n.Active ? 1 : 0)} life={n.Life} type={n.Type}"
+                          + $" @{n.X:F0},{n.Y:F0}{(ReferenceEquals(n, contactNpc) ? "←接触" : "")}]");
+            }
+        }
+
+        Console.WriteLine($"[Near] 玩家 #{player.Id} 300px 内 NPC：{sb}");
+    }
+
+    private int _dumpLogCount;
+
     /// <summary>敌怪 / Boss 接触伤害表（简化：按类型固定值，未收录按普通敌怪计）。</summary>
     private static int ContactDamageOf(int npcType) => npcType switch
     {
@@ -979,16 +986,18 @@ public partial class WorldSimulator : IWorldViewProvider
     /// **不设最小重叠**（两轴各 1px 即命中），且用逐类型尺寸而非「点 + 半径」。
     /// <paramref name="contactNpc"/> 回传实际接触的 NPC（诊断输出用）。
     /// </summary>
-    private int FindContactDamage(PlayerRuntime player, out WorldNpc? contactNpc)
+    private int FindContactDamage(PlayerRuntime player, out WorldNpc? contactNpc, out int contactIndex)
     {
         float px = player.AimPosition.X, py = player.AimPosition.Y;
         int best = 0;
         contactNpc = null;
+        contactIndex = -1;
 
         lock (_world.NpcsLock)
         {
-            foreach (var npc in _world.Npcs)
+            for (var i = 0; i < _world.Npcs.Count; i++)
             {
+                var npc = _world.Npcs[i];
                 if (!npc.Active || npc.IsTownNpc) continue;
 
                 var (width, height) = NpcSizes.Of(npc.Type);
@@ -1000,6 +1009,7 @@ public partial class WorldSimulator : IWorldViewProvider
                 {
                     best = damage;
                     contactNpc = npc;
+                    contactIndex = i;
                 }
             }
         }

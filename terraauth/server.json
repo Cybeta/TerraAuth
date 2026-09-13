@@ -5,6 +5,7 @@
   "ViewportRadius": 2000,
   "WorldPath": "",
   "WorldSize": "Small",
+  "MaxEnemies": 2,
   "WorldExportPath": "",
   "WorldExportIntervalSeconds": 600,
   "SessionResumeGraceSeconds": 60,

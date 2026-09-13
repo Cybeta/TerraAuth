@@ -1365,8 +1365,15 @@ public class VanillaFeatureTests
             "远程拾取未被拒绝");
     }
 
+    /// <summary>
+    /// 玩家弹幕（包 27）**不在服务端结算敌怪伤害**。原版只允许弹幕归属者自己结算命中
+    /// （<c>Projectile.Damage</c> 内有断言 <c>netMode == 0 || owner == Main.myPlayer</c>），
+    /// 服务端 <c>myPlayer == 255</c> 永不满足，故命中一律由客户端 <c>StrikeNPC</c> 发包 28 上报。
+    /// 此前服务端又用自己的近似命中盒结算一次，造成**双重结算、且可能命中不同的 NPC**：
+    /// 客户端已打死的怪在服务端仍存活并继续造成接触伤害（表现为"身边没怪却一直在掉血"）。
+    /// </summary>
     [Fact]
-    public async Task Vanilla_Projectile_Hit_Damages_Enemy()
+    public async Task Vanilla_PlayerProjectile_Does_Not_Damage_Enemy_ServerSide()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
@@ -1378,15 +1385,30 @@ public class VanillaFeatureTests
             TimeSpan.FromSeconds(20)), "未刷出敌怪");
 
         WorldNpc enemy;
-        lock (world.NpcsLock) enemy = world.Npcs.First(n => !n.IsTownNpc);
+        int index;
+        lock (world.NpcsLock)
+        {
+            enemy = world.Npcs.First(n => !n.IsTownNpc);
+            index = world.Npcs.IndexOf(enemy);
+        }
         int before = enemy.Life;
 
-        // 弹幕直接生成在敌怪位置（速度 0）→ 服务端命中判定应扣血
+        // 弹幕直接生成在敌怪位置（速度 0）：服务端只推进生命周期，绝不结算敌怪伤害
         await s.SendAsync(PacketId.ProjectileNew,
             new ProjectileNewPacket(77, new Vector2(enemy.X, enemy.Y), new Vector2(0f, 0f), 1) { Damage = 10 });
 
-        Assert.True(await TickUntilAsync(server, () => enemy.Life < before || !enemy.Active,
-            TimeSpan.FromSeconds(5)), "弹幕命中未在服务端结算伤害");
+        for (int i = 0; i < 30; i++)
+            server.Host.Simulator.Tick();
+
+        Assert.Equal(before, enemy.Life);
+        Assert.True(enemy.Active, "服务端不应因玩家弹幕而销毁敌怪");
+
+        // 伤害来源唯一：客户端命中上报（包 28）→ 服务端结算
+        await s.SendAsync(PacketId.NpcStrike,
+            new NpcStrikePacket(index, 10) { Generation = enemy.Generation });
+
+        Assert.True(await TickUntilAsync(server, () => enemy.Life < before, TimeSpan.FromSeconds(5)),
+            "包 28 上报的命中未在服务端结算");
     }
 
     // ========================================================================

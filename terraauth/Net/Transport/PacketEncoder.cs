@@ -123,6 +123,7 @@ public sealed class PacketEncoder : IPacketEncoder
 
                 case InitialSpawnPacket:
                 case FinishedConnectingPacket:
+                case NpcDamageAckPacket:
                     // 无 payload
                     break;
 

@@ -36,6 +36,12 @@ public record ServerConfig
     public int WorldExportIntervalSeconds { get; init; } = 600;
 
     /// <summary>
+    /// 同屏敌怪上限（达到后停止刷新）；只统计存活且**非城镇**的 NPC，普通情况即史莱姆。
+    /// 调小便于单人测试（例如 2）。默认 8。
+    /// </summary>
+    public int MaxEnemies { get; init; } = 8;
+
+    /// <summary>
     /// 会话恢复宽限期（秒）：玩家断线后在此时长内以**同一玩家名**重连，服务端把原运行时（位置 / 血量 / 增益）
     /// 交还给他，而不是当作新玩家从头进服。0 = 关闭（断线即回收）。
     /// 注意：原版客户端断线只会退回主菜单、手动重进，故这是「手动重进的会话接管」，非自动重连。

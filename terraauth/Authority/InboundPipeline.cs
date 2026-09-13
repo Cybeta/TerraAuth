@@ -214,7 +214,7 @@ public sealed class TerminalStage : IPipelineStage
         TilePlacePacket place => new TilePlaceCommand(context.Tick, context.PlayerId, place.X, place.Y, place.TileType, place.Style),
         // 包 28 DamageNPC → NPC 受击指令（服务端扣血，生命归零即死亡）
         NpcStrikePacket strike => new NpcStrikeCommand(
-            context.Tick, context.PlayerId, strike.NpcId, strike.Damage, strike.Generation),
+            context.Tick, context.PlayerId, strike.NpcId, strike.Damage, strike.Generation, strike.Crit),
         // 包 21 SyncItem → 掉落物生成（服务端分配槽位）
         ItemDropPacket drop => new SpawnItemCommand(context.Tick, context.PlayerId,
             drop.ItemId, drop.Stack, drop.Position, drop.Velocity, drop.Prefix),

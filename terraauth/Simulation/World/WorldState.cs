@@ -704,6 +704,44 @@ public sealed class WorldState
         }
     }
 
+    // ---- NPC 命中确认（包 162 下发）----
+
+    /// <summary>待下发命中确认的跨线程保护：仿真线程入队，网络线程消费。</summary>
+    public object NpcDamageAckLock { get; } = new();
+
+    private readonly List<int> _pendingNpcDamageAck = new();
+
+    /// <summary>待下发命中确认上限（防止极端情况下无界增长）。</summary>
+    private const int MaxPendingNpcDamageAck = 512;
+
+    /// <summary>
+    /// 登记一次待下发的 NPC 命中确认（包 162）。服务端每收到一次包 28 都应登记一条：
+    /// 客户端按 FIFO 出队（<c>NPC.AckDamage()</c>），漏发会让其待确认伤害无限累积，
+    /// 最终把本地 NPC 血量算成负数（贴图消失）而服务端该怪仍存活 —— 幽灵碰撞。
+    /// </summary>
+    public void MarkNpcDamageAck(int playerId)
+    {
+        lock (NpcDamageAckLock)
+        {
+            if (_pendingNpcDamageAck.Count < MaxPendingNpcDamageAck)
+                _pendingNpcDamageAck.Add(playerId);
+        }
+    }
+
+    /// <summary>取出至多 <paramref name="max"/> 条待下发命中确认；**必须保持 FIFO**（与客户端入队顺序一致）。</summary>
+    public List<int> DrainNpcDamageAck(int max)
+    {
+        lock (NpcDamageAckLock)
+        {
+            if (_pendingNpcDamageAck.Count == 0) return new List<int>();
+
+            int take = Math.Min(max, _pendingNpcDamageAck.Count);
+            var result = _pendingNpcDamageAck.GetRange(0, take);
+            _pendingNpcDamageAck.RemoveRange(0, take);
+            return result;
+        }
+    }
+
     // ---- 掉落物 / 弹幕（服务端权威实体）----
 
     /// <summary>世界掉落物（原版 <c>Main.item[]</c>）。</summary>
