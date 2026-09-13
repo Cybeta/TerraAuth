@@ -1962,7 +1962,8 @@ public class VanillaFeatureTests
     }
 
     /// <summary>
-    /// 接触伤害的**免伤帧**（原版接触攻击 30 tick）。用「每 tick 把敌怪钉在玩家碰撞盒中心」排除 AI 位移干扰
+    /// 接触伤害的**免伤帧**（原版走通用 <c>Hurt</c>：非 PvP、无十字项链、伤害 ≠ 1 → 40 tick）。
+    /// 用「每 tick 把敌怪钉在玩家碰撞盒中心」排除 AI 位移干扰
     /// —— 敌怪现在是跳跃式移动（会起跳离开 32px 接触圈），本用例只验证免伤窗口本身。
     /// </summary>
     [Fact]
@@ -1979,25 +1980,25 @@ public class VanillaFeatureTests
         Assert.True(await TickUntilAsync(server, () => player.Hp == 93, TimeSpan.FromSeconds(5)),
             "首次接触伤害未结算");
 
-        // 接触攻击免伤帧：原版 GiveImmuneTimeForCollisionAttack(30) → 30 tick 内不应再受伤
-        for (int i = 0; i < 20; i++)
+        // 接触免伤帧取自通用 Hurt 的 immuneTime = 40 → 40 tick 内不应再受伤
+        for (int i = 0; i < 30; i++)
         {
             PinSlimeToPlayer(world, slime, player);
             server.Host.Simulator.Tick();
         }
         Assert.Equal(93, player.Hp);
 
-        // 免伤帧到期后应恰好再结算一次（原版 30 tick 一档；60 是旧的错误值）
-        // 计数含上面已走的 20 tick，因此这里的门槛按「距首次受伤的总 tick 数」判定。
-        int ticksToSecondHit = 20;
-        while (player.Hp == 93 && ticksToSecondHit < 80)
+        // 免伤帧到期后应恰好再结算一次（原版 40 tick 一档；30 是盾牌弹反分支的误取、60 是更早的错误值）
+        // 计数含上面已走的 30 tick，因此这里的门槛按「距首次受伤的总 tick 数」判定。
+        int ticksToSecondHit = 30;
+        while (player.Hp == 93 && ticksToSecondHit < 100)
         {
             PinSlimeToPlayer(world, slime, player);
             server.Host.Simulator.Tick();
             ticksToSecondHit++;
         }
         Assert.Equal(86, player.Hp);
-        Assert.InRange(ticksToSecondHit, 26, 36);   // ≈30 tick（含结算顺序 / 轮询检测的 ±几 tick）
+        Assert.InRange(ticksToSecondHit, 36, 46);   // ≈40 tick（含结算顺序 / 轮询检测的 ±几 tick）
     }
 
     // ========================================================================

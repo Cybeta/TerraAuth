@@ -207,7 +207,7 @@ TerraAuth                     ← 组合根（Program / GameHost）
 | `Authority/` | 已实现 | 六子系统 + `InboundPipeline` 阶段链 |
 | `Simulation/`（核心） | 已实现 | `GameLoop` / `CommandQueue` / `SnapshotStore` / `EventRecorder` / 确定性 RNG |
 | `Simulation/World/` | 部分 | `Tile`/`TileMap`、`TileIdSets`（含 `tileFrameImportant`）、`WorldState`、`WorldGenerator`、`.wld` **解析 + 写出**（写出带写后读回校验 / 原子替换 / `.bak`）、包 10 `TileSection` 与**包 20 `TileSquare`** 编码均已实现；世界可在 `ServerConfig.WorldPath` 指定为基准世界；**程序化生成支持三档尺寸**（小 / 中 / 大，`ServerConfig.WorldSize`）并生成**分层地形**（噪声地表 / 洞穴 / 深度分带矿脉 / 海滩与海水 / 地狱层 / 2×2 宝箱+战利品） |
-| `Simulation/WorldSimulator` | 已实现 | 六阶段 tick + 扩展阶段：AI（城镇 NPC / 敌怪 / 入侵怪 / Boss 追击）/ 物理（重力 + 图格碰撞 + 边界钳制）/ 战斗（下落伤害 + 敌怪·Boss 接触伤害（含 60tick 免伤帧）+ 弹幕命中 + Boss 击杀记进度 + 玩家死亡态 + 受击通知入队）/ 世界（昼夜 + 月相 + 简化事件：血月 · 日食）/ 实体（掉落物、弹幕）/ 液体（逐格简化流动，下发按视口裁剪）/ 电路（受限 BFS 翻转执行器 + 图格变更推送）；为简化模型，非原版全量物理 |
+| `Simulation/WorldSimulator` | 已实现 | 六阶段 tick + 扩展阶段：AI（城镇 NPC / 敌怪 / 入侵怪 / Boss 追击）/ 物理（重力 + 图格碰撞 + 边界钳制）/ 战斗（下落伤害 + 敌怪·Boss 接触伤害（原版整型 AABB、无最小重叠；免伤帧 40/20）+ 弹幕命中 + Boss 击杀记进度 + 玩家死亡态 + 受击通知入队）/ 世界（昼夜 + 月相 + 简化事件：血月 · 日食）/ 实体（掉落物、弹幕）/ 液体（逐格简化流动，下发按视口裁剪）/ 电路（受限 BFS 翻转执行器 + 图格变更推送）；为简化模型，非原版全量物理 |
 | `Net/Phase4` | 部分 | 快照广播框架 + `BuildDelta`（实体提取 / 增量 / `Removed` / xxHash32 校验和）+ `SubmitInputs` Command 生成 + `ShadowPredictor` 影子预测（输入重放/速度钳制/偏差阈值）+ 每玩家分桶（`BuildFrameFor`）+ 视野裁剪（`ViewportRadius`）已实现 |
 | `Net/Phase5`（协议） | 部分 | `Framing` / `Connection` / 握手链已实现 |
 | `Net/Phase5` `PacketEncoder` | 部分 | 已实现 **37 类出站包**（握手链 2/3/4/7/8/9/10/12/49/129 + 权威与状态 5/13/14/16/17/18/20/21/22/23/27/28/29/31/32/34/35/36/42/50/65/73/79/117/118 + 包 82 的 NetText / NetLiquid 模块 + 包 15 `Snapshot`）；包 10 `TileSection`、**包 20 `TileSquare`（未压缩小矩形）**、包 13 可选尾随段（挂载 / 回城 / 相机）已实现 |

@@ -920,7 +920,7 @@ public partial class WorldSimulator : IWorldViewProvider
             int contact = FindContactDamage(player, out var contactNpc);
             if (contact > 0)
             {
-                ApplyPlayerDamage(player, contact, "contact_damage", PlayerRuntime.ContactImmunityTicks);
+                ApplyPlayerDamage(player, contact, "contact_damage", PlayerRuntime.GeneralImmunityTicks(contact));
                 LogPlayerDamage(player, contact, "contact_damage",
                     $"NPC {contactNpc!.Type}@{contactNpc.X:F0},{contactNpc.Y:F0} " +
                     $"玩家判定={player.AimPosition.X:F0},{player.AimPosition.Y:F0}（上报={player.Position.X:F0},{player.Position.Y:F0}）");
@@ -955,8 +955,8 @@ public partial class WorldSimulator : IWorldViewProvider
 
     /// <summary>
     /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。
-    /// 原版用 AABB 求交（<c>Collision.CheckAABBvAABBCollision</c>），此处按原版尺寸做同一判定，
-    /// 避免「点 + 半径」在矮身 / 大体积 NPC 上误判（玩家莫名受伤或漏判）。
+    /// 判定口径与原版 <c>Player.Update_NPCCollision</c> 一致：玩家 / NPC 盒各自取整后做 AABB 求交，
+    /// **不设最小重叠**（两轴各 1px 即命中），且用逐类型尺寸而非「点 + 半径」。
     /// <paramref name="contactNpc"/> 回传实际接触的 NPC（诊断输出用）。
     /// </summary>
     private int FindContactDamage(PlayerRuntime player, out WorldNpc? contactNpc)
@@ -972,16 +972,8 @@ public partial class WorldSimulator : IWorldViewProvider
                 if (!npc.Active || npc.IsTownNpc) continue;
 
                 var (width, height) = NpcSizes.Of(npc.Type);
-                if (!BoxesOverlap(px, py, NpcSizes.PlayerWidth, NpcSizes.PlayerHeight,
-                                  npc.X, npc.Y, width, height, ContactMinOverlap))
-                {
-                    // 诊断：有重叠但不足阈值（「擦着走」）—— 限频打印，用于确认阈值收得是否合适
-                    if (BoxesOverlap(px, py, NpcSizes.PlayerWidth, NpcSizes.PlayerHeight, npc.X, npc.Y, width, height)
-                        && Interlocked.Increment(ref _contactNearMissLogCount) <= 30)
-                        Console.WriteLine($"[Contact] 擦边未计入 NPC {npc.Type}@{npc.X:F1},{npc.Y:F1} " +
-                                          $"玩家={px:F1},{py:F1}（需两轴重叠 ≥{ContactMinOverlap:F0}px）");
+                if (!PlayerTouchesNpc(px, py, npc.X, npc.Y, width, height))
                     continue;
-                }
 
                 int damage = ContactDamageOf(npc.Type);
                 if (damage > best)
@@ -996,35 +988,30 @@ public partial class WorldSimulator : IWorldViewProvider
     }
 
     /// <summary>
-    /// 两个轴对齐碰撞盒是否重叠（像素坐标，X/Y 为左上角）。
-    /// <paramref name="minOverlap"/> 要求两轴上的重叠都达到该像素数 —— 用于吸收服务端 NPC 位置
-    /// 与客户端画面之间几像素的偏差：只擦到 1~2px 的「掠过」不应判定成接触
-    /// （真机症状：史莱姆从头顶擦过、看着没碰到却在扣血）。
+    /// 玩家盒（<see cref="NpcSizes.PlayerWidth"/> × <see cref="NpcSizes.PlayerHeight"/>）与 NPC 盒是否相交。
+    /// 原版 <c>Player.Update_NPCCollision</c> 的做法是 <c>new Rectangle((int)position.X, (int)position.Y, width, height)</c>
+    /// 对 NPC 同法取整后 <c>Rectangle.Intersects</c> —— **取整后再比、无最小重叠**。
+    /// 两端同口径取整，位置一致时判定必然一致；位置不一致要靠对齐位置解决，而不是放大阈值。
     /// </summary>
+    private static bool PlayerTouchesNpc(float px, float py, float nx, float ny, int nw, int nh)
+    {
+        int px0 = (int)px, py0 = (int)py;
+        int nx0 = (int)nx, ny0 = (int)ny;
+        return px0 < nx0 + nw && nx0 < px0 + NpcSizes.PlayerWidth
+            && py0 < ny0 + nh && ny0 < py0 + NpcSizes.PlayerHeight;
+    }
+
+    /// <summary>两个轴对齐碰撞盒是否重叠（像素坐标，X/Y 为左上角；浮点精度，无最小重叠）。</summary>
     private static bool BoxesOverlap(
         float ax, float ay, int aw, int ah,
-        float bx, float by, int bw, int bh,
-        float minOverlap = 0f)
-        => ax < bx + bw - minOverlap && bx < ax + aw - minOverlap
-        && ay < by + bh - minOverlap && by < ay + ah - minOverlap;
-
-    /// <summary>
-    /// 接触伤害要求的最小重叠（像素）。用途：吸收服务端 NPC 位置与客户端画面之间的几像素偏差，
-    /// 并排除「擦着走」——真机日志实测：史莱姆贴着你走过时**水平只重叠 3~4px**，
-    /// 玩家看到的是"没碰到"却在掉血；而真正走进你身上的接触，重叠是十几到二十像素
-    /// （史莱姆盒 24 宽 / 玩家盒 20 宽，走穿时重叠可达 20px）。
-    /// 取 8（半格）即「只有明显压到才算接触」，宁可少判一点也不误伤。
-    /// </summary>
-    private const float ContactMinOverlap = 8f;
-
-    /// <summary>「擦边未计入」诊断输出的计数上限（限频，避免刷屏）。</summary>
-    private int _contactNearMissLogCount;
+        float bx, float by, int bw, int bh)
+        => ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
 
     /// <summary>
     /// 服务端结算玩家伤害：扣血 → 置免伤帧 → 必要时置死亡态 → 登记受击通知（包 117 表现 + 包 16 权威血量）。
     /// 这是玩家生命的唯一权威入口（客户端上报的包 117 只做非负校验，不直接改血）。
-    /// <paramref name="immunityTicks"/> 按原版分来源取值：接触攻击 30（<c>GiveImmuneTimeForCollisionAttack</c>），
-    /// 通用受击 40 / 20（<c>Hurt</c> 的 <c>immuneTime</c>）。
+    /// <paramref name="immunityTicks"/> 按原版 <c>Player.Hurt</c> 的 <c>immuneTime</c> 取值
+    /// （接触 / 包 117 / 下落 / 弹幕共用 <see cref="PlayerRuntime.GeneralImmunityTicks"/>：40 / 20）。
     /// </summary>
     private void ApplyPlayerDamage(PlayerRuntime player, int damage, string kind, int immunityTicks)
     {

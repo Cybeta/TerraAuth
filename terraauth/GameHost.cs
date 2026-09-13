@@ -318,16 +318,20 @@ public sealed class GameHost : IDisposable
             }
         }, ct);
 
-        // 3.5 NPC 同步（包 23）单独跑在 **tick 频率（60Hz）**：
+        // 3.5 NPC 同步（包 23）：循环按 60Hz 跑，但**逐 NPC 分档**下发（见 BroadcastNpcUpdatesAsync）：
+        //     Boss / 近身（3 格内）NPC 逐 tick 发，其余每 3 次调用（20Hz）发一次。
         //     客户端收到包 23 后会按原版自行推进 NPC，同步越稀疏、双方位置差越大；
-        //     而**接触判定用的是服务端位置**，差值一大就会出现「看着离史莱姆很远却在掉血」
-        //     （原版服务端在 netUpdate 时几乎每 tick 都发，这里对齐该节奏；NPC 数量少，带宽可接受）。
+        //     而**接触判定用的是服务端位置**，差值一大就会出现「看着离史莱姆很远却在掉血」，
+        //     故接触相关的 NPC 必须保持高频对齐，远处的按 20Hz 即可。
+        //     原版用令牌桶把普通 NPC 压到 ≈2 包/秒（Boss ≈12Hz），这里取 20Hz 折中：约省 3 倍带宽。
         //     仍是「变化才发 + 心跳补发」，静止 NPC 不占额外带宽。
         var npcSyncTask = Task.Run(async () =>
         {
             while (!ct.IsCancellationRequested)
             {
-                await BroadcastNpcUpdatesAsync(ct).ConfigureAwait(false);
+                // 逐 NPC 分档：非高优先级（远处）NPC 只在每 N 次调用下发一次
+                var fullRate = Simulator.State.Tick % NpcSyncRateDivisor == 0;
+                await BroadcastNpcUpdatesAsync(ct, fullRate).ConfigureAwait(false);
                 await Task.Delay(1000 / 60, ct);
             }
         }, ct);
@@ -964,19 +968,29 @@ public sealed class GameHost : IDisposable
     }
 
     /// <summary>
-    /// NPC 状态同步（包 23）：位置 / 速度 / 生命。由快照循环按 20Hz 调用。
-    /// 原版客户端不做服务端专属 AI 的完整模拟，位置以服务端下发为准 —— 早期实现只在 1Hz 的世界同步里
-    /// 下发，客户端表现为「每秒被拽一次」的卡顿；现改为快照频率。
+    /// NPC 状态同步（包 23）：位置 / 速度 / 生命。
+    /// 由 60Hz 循环调用，但**逐 NPC 分档**：Boss 与「近身」NPC 每次都发，其余仅当
+    /// <paramref name="fullRate"/> 为真时才发（调用方按 <see cref="NpcSyncRateDivisor"/> 分频 → 20Hz）。
+    /// 原版用令牌桶把普通 NPC 压到 ≈2 包/秒（Boss ≈12Hz），这里取 20Hz 折中：约省 3 倍带宽，
+    /// 同时让接触判定相关的 NPC 保持逐 tick 对齐（接触判定用服务端位置，同步越稀疏、位置差越大）。
     /// 带宽控制：**状态变化才发**（X/Y/速度/生命/存活），未变化时按 <see cref="NpcSyncHeartbeatTicks"/>
     /// 补发一次心跳，保证中途入服的玩家也能看到静止 NPC。
     /// </summary>
-    public async Task BroadcastNpcUpdatesAsync(CancellationToken ct = default)
+    public async Task BroadcastNpcUpdatesAsync(CancellationToken ct = default, bool fullRate = true)
     {
         var world = Simulator.State;
 
         // 视口裁剪：只发给视野半径内的玩家，避免把全世界 NPC 推给所有人
         var radius = Math.Max(1, Config.Current.ViewportRadius);
         var radiusSq = (float)radius * radius;
+
+        // 近身判定用的玩家快照：仅在降频轮需要，锁内取一次（避免在 NPC 循环里反复加锁）
+        PlayerRuntime[] players = Array.Empty<PlayerRuntime>();
+        if (!fullRate)
+        {
+            lock (world.PlayersLock)
+                players = world.Players.Values.Where(p => p.Active && !p.Dead).ToArray();
+        }
 
         // 先在锁内取一致快照（仿真线程会增删 NPC），再在锁外逐个下发（不在持锁期间做 I/O）
         // 索引上限 199（原版 Main.npc[200]）；下标即客户端认的 npcIndex
@@ -1000,6 +1014,9 @@ public sealed class GameHost : IDisposable
                           || !npc.Ai.AsSpan().SequenceEqual(npc.SyncedAi);
             var heartbeat = world.Tick - npc.SyncedTick >= NpcSyncHeartbeatTicks;
             if (!changed && !heartbeat) continue;
+
+            // 降频档：本轮不下发，且**不更新 Synced\***（下一轮仍算「有变化」），等下一个 20Hz 窗口
+            if (!fullRate && !IsNpcHighPriority(npc, players)) continue;
 
             npc.SyncedX = npc.X;
             npc.SyncedY = npc.Y;
@@ -1030,6 +1047,26 @@ public sealed class GameHost : IDisposable
             await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet,
                 playerId => IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq), ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>非高优先级 NPC 的降频倍数：60Hz / 3 = 20Hz。</summary>
+    private const int NpcSyncRateDivisor = 3;
+
+    /// <summary>「近身」判定半径的平方（3 格 = 48px）：该范围内 NPC 可能与玩家接触，需逐 tick 对齐。</summary>
+    private const float NpcSyncNearRangeSq = 48f * 48f;
+
+    /// <summary>是否需要逐 tick 下发：Boss，或与任一存活玩家近身（可能发生接触伤害）。</summary>
+    private static bool IsNpcHighPriority(WorldNpc npc, PlayerRuntime[] players)
+    {
+        if (npc.IsBoss) return true;
+
+        foreach (var p in players)
+        {
+            var dx = p.Position.X - npc.X;
+            var dy = p.Position.Y - npc.Y;
+            if (dx * dx + dy * dy <= NpcSyncNearRangeSq) return true;
+        }
+        return false;
     }
 
     /// <summary>NPC 同步心跳（tick）：状态未变化也按该周期补发一次（≈1s @ 60Hz）。</summary>

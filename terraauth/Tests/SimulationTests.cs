@@ -738,12 +738,13 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 接触伤害要求明显重叠（≥8px，见 <c>WorldSimulator.ContactMinOverlap</c>）：
-    /// 史莱姆**擦着走**（水平只重叠 2~4px）不得判定为接触 —— 真机日志实测的「没碰到却在扣血」；
-    /// 而真正走进玩家身上（重叠十几像素）必须结算。
+    /// 接触判定对齐原版 <c>Player.Update_NPCCollision</c>：取整后 AABB 求交、**不设最小重叠** ——
+    /// 两轴各重叠 1px 即命中，边缘相切（重叠 0px）不命中。
+    /// 早期版本用 8px 最小重叠去「吸收位置偏差」，结果服务端判定比原版严格、与客户端不一致
+    /// （客户端按原版 0px 判定并发包 117，服务端却漏判自己那一次）；位置偏差要靠对齐位置解决，而不是放大阈值。
     /// </summary>
     [Fact]
-    public void ContactDamage_Requires_MinOverlap()
+    public void ContactDamage_Aligns_With_Vanilla_Intersect()
     {
         var world = WorldGenerator.GenerateSmall();
         var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
@@ -762,52 +763,55 @@ public class WorldGeneratorTests
         };
         lock (world.PlayersLock) world.Players[1] = player;
 
-        WorldNpc slime;
+        WorldNpc npc;
         lock (world.NpcsLock)
         {
-            slime = new WorldNpc
+            npc = new WorldNpc
             {
-                Type = 1,
-                NetId = 1,
-                AiStyle = 1,
+                // 用「城镇 NPC 的 aiStyle 7 + IsTownNpc=false」构造一个**水平完全静止**的敌人：
+                // aiStyle 7 在未落地时直接返回、不产生水平速度，避免 AI 位移干扰边界判定。
+                Type = 22,
+                NetId = 22,
+                AiStyle = 7,
+                IsTownNpc = false,
                 Active = true,
                 Life = 25,
                 LifeMax = 25,
-                X = px + 16f,          // 水平重叠 = 玩家宽 20 − 16 = 4px（真机日志里的「擦着走」）
-                Y = py + 10f,          // 垂直完全落在玩家盒内（重叠 18px）
+                X = px + NpcSizes.PlayerWidth,   // 玩家右边缘 == NPC 左边缘（重叠 0px）
+                Y = py,                          // 悬空（脚底未落地）→ aiStyle 7 不做水平移动
             };
-            world.Npcs.Add(slime);
+            world.Npcs.Add(npc);
         }
 
-        // 钉住「擦着走」的位置与速度：4px 重叠不应扣血
+        // 边缘相切（水平重叠 0px）→ 不结算
         for (int i = 0; i < 5; i++)
         {
             lock (world.NpcsLock)
             {
-                slime.X = px + 16f;
-                slime.Y = py + 10f;
-                slime.VelocityX = 0f;
-                slime.VelocityY = 0f;
+                npc.X = px + NpcSizes.PlayerWidth;
+                npc.Y = py;
+                npc.VelocityX = 0f;
+                npc.VelocityY = 0f;
             }
             sim.Tick();
         }
         Assert.Equal(100, player.Hp);
 
-        // 压深到 16px 水平重叠（= 真正走进玩家身上）→ 必须结算
+        // 压进 1px（原版判定即为接触）→ 必须结算
         bool damaged = false;
         for (int i = 0; i < 10 && !damaged; i++)
         {
             lock (world.NpcsLock)
             {
-                slime.X = px + 4f;
-                slime.Y = py + 10f;
-                slime.VelocityX = 0f;
-                slime.VelocityY = 0f;
+                npc.X = px + NpcSizes.PlayerWidth - 1f;
+                npc.Y = py;
+                npc.VelocityX = 0f;
+                npc.VelocityY = 0f;
             }
             sim.Tick();
             damaged = player.Hp < 100;
         }
-        Assert.True(damaged, "16px 重叠（走进玩家身上）未被结算");
+        Assert.True(damaged, "1px 重叠（原版判定为接触）未被结算");
     }
 
     /// <summary>

@@ -933,22 +933,18 @@ public sealed class PlayerRuntime
     public int HurtCooldown;
 
     /// <summary>
-    /// **接触攻击**（NPC 撞击）的免伤帧：原版 <c>Player.GiveImmuneTimeForCollisionAttack(longInvince ? 60 : 30)</c>。
-    /// 我们未建模十字项链 → 取 30 tick（0.5 秒）。
-    /// </summary>
-    public const int ContactImmunityTicks = 30;
-
-    /// <summary>
-    /// **通用受击**（客户端上报的包 117 / 下落伤害 / 敌对弹幕）的免伤帧。
-    /// 原版 <c>Player.Hurt</c>：<c>immuneTime = pvp ? 8 : (伤害 ≠ 1 ? (longInvince ? 80 : 40) : (longInvince ? 40 : 20))</c>。
+    /// **受击免伤帧**（接触攻击 / 客户端上报的包 117 / 下落伤害 / 敌对弹幕共用一个窗口）。
+    /// 原版 <c>Player.Hurt</c>：<c>immuneTime = pvp ? 8 : (伤害 ≠ 1 ? (longInvince ? 80 : 40) : (longInvince ? 40 : 20))</c>，
+    /// 且 NPC 接触走的也是 <c>Hurt</c>（<c>cooldownCounter == ImmunityCooldownID.General</c>）。
+    /// 注意原版 <c>GiveImmuneTimeForCollisionAttack(60 / 30)</c> 只用于**盾牌弹反**分支，不是普通接触。
     /// 我们未建模十字项链、非 PvP → 伤害 &gt; 1 取 <see cref="HurtImmunityTicks"/>，伤害被防御压到 1 取 <see cref="WeakHurtImmunityTicks"/>。
     /// </summary>
     public const int HurtImmunityTicks = 40;
 
-    /// <summary>通用受击里「伤害 ≤ 1」时的较短窗口（原版 20 tick）。</summary>
+    /// <summary>受击里「伤害 ≤ 1」时的较短窗口（原版 20 tick）。</summary>
     public const int WeakHurtImmunityTicks = 20;
 
-    /// <summary>按原版规则取通用免伤帧长（无十字项链、非 PvP）。</summary>
+    /// <summary>按原版 <c>Hurt</c> 规则取免伤帧长（无十字项链、非 PvP）；接触 / 弹幕 / 下落 / 包 117 共用。</summary>
     public static int GeneralImmunityTicks(int damage) => damage > 1 ? HurtImmunityTicks : WeakHurtImmunityTicks;
 
     /// <summary>连续下落距离（像素），落地时用于结算下落伤害。</summary>

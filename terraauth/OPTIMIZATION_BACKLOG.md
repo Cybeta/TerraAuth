@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第三十四轮：免伤帧按原版分来源 —— 接触 30 / 通用 40 / 弱伤害 20）
+> 最后更新：2026-09-12（第三十五轮：接触判定回归原版整型 AABB + 接触免伤帧修正为 40 + NPC 同步分档）
 
 ---
 
@@ -24,7 +24,8 @@
 | 11 | 史莱姆一直朝一个方向走 | NPC 物理**没有水平碰撞** → 服务端 NPC 穿墙直线前进，与客户端发散 | 加 `NpcBlockedHorizontally` 水平阻挡 | 32 |
 | 12 | 擦着走仍扣血 | 3~4px 贴边算接触 | 接触阈值收到 **8px**（半格） | 32 |
 
-> 未解决/待观察（见文末「剩余清单」）：擦边阈值是否收得过紧；接触判定与免伤帧的原版对齐（第三十三轮已把玩家移动换成控制位模拟）。
+> 后续修正：第 12 条的 8px 阈值、第 9 条的免伤帧都已在 **第三十五轮**回归原版 —— 8px 移除（改整型 AABB、无最小重叠）；
+> 接触免伤帧由 30 改为 40（30 是盾牌弹反分支的误取）；NPC 同步由 60Hz 改为分档（普通 20Hz / Boss 与近身 60Hz）。
 
 ---
 
@@ -110,13 +111,66 @@
 
 ## 附：本轮回溯
 
+### 第三十五轮（2026-09-12）：接触判定回归原版 + 免伤帧取错分支的修正 + NPC 同步分档
+
+**一、上一轮（第三十四轮）取错了分支 —— 接触免伤帧不是 30，而是 40**
+
+`GiveImmuneTimeForCollisionAttack(longInvince ? 60 : 30)` 位于 `Player.Update_NPCCollision` 的 **`if (num)`** 分支，
+而 `num = CanParryAgainst(...)` —— **那是盾牌弹反的免伤帧**。普通 NPC 接触的免伤帧来自 `Hurt()`：
+
+```csharp
+int num10 = pvp ? 8 : ((num2 != 1.0) ? (longInvince ? 80 : 40) : (longInvince ? 40 : 20));
+if (cooldownCounter == ImmunityCooldownID.General) { immune = true; immuneTime = num10; }
+```
+
+接触的 `cooldownCounter` 默认即 `ImmunityCooldownID.General` → **40**（被防御压到 1 → 20）。
+影响：30 tick 就能再次受伤 → 比原版多挨约 1/3 伤害；而且同类事件走两条路径时不一致（包 117 用 40/20、服务端接触用 30）。
+
+**改动**：删除 `PlayerRuntime.ContactImmunityTicks`；接触改用 `GeneralImmunityTicks(damage)`（与包 117 / 下落 / 弹幕同档）。
+
+**二、接触判定去掉 8px 最小重叠，回归原版整型 AABB**
+
+原版 `Player.Update_NPCCollision`：玩家盒 `new Rectangle((int)position.X, (int)position.Y, width, height)`，
+NPC 盒同法取整后 `Rectangle.Intersects` —— **取整后再比、无最小重叠**（两轴各 1px 即命中）。
+
+8px 阈值（第三十二轮加的）实际治不了「擦着走过却掉血」：客户端按原版 0px 判定，会把 1~8px 的擦边
+用包 117 报上来（`DamagePlayerCommand` 只查免伤帧、不查几何）→ 照样扣血；8px 只是让**服务端自己的判定**
+比原版严 8 倍，与客户端不一致。位置偏差要靠对齐位置解决（逐类型尺寸 / 控制位物理 / 高频同步都已就位），
+而不是放大阈值。
+
+**改动**：新增 `WorldSimulator.PlayerTouchesNpc`（两端同口径取整 + 无最小重叠）替代接触判定里的 8px 调用；
+`BoxesOverlap` 去掉 `minOverlap` 参数；删除 `ContactMinOverlap` 与「擦边未计入」诊断（阈值归零后该诊断不再有意义）。
+
+**三、NPC 同步（包 23）分档：普通 20Hz / Boss 与近身 60Hz**
+
+原版 `NPC.UpdateNetworkCode` 用令牌桶：`num = boss ? 5 : 30`，`netSpam` 每 tick 减 1，
+状态变化时要求 `netSpam <= 3 * num` 才发包并 `netSpam += num`
+→ 持续 **普通 ≈2 包/秒、Boss ≈12 包/秒**（另有 `StreamUpdatesToNearbyPlayers` 给近距玩家补充包）。
+
+**改动**：60Hz 循环保留，`BroadcastNpcUpdatesAsync(ct, fullRate)` 增加分档 ——
+`IsNpcHighPriority`（Boss，或与任一存活玩家中心距 ≤ 3 格）逐 tick 发，其余每 3 次调用（20Hz）发一次；
+降频轮**不更新** `Synced*`，故下一个 20Hz 窗口必然补发。仍保持「变化才发 + 1s 心跳 + 视口裁剪」，静止 NPC 不占带宽。
+
+**测试**：**306 / 306 通过**（无新增用例）。`ContactDamage_Requires_MinOverlap` 重写为
+`ContactDamage_Aligns_With_Vanilla_Intersect`（边缘相切 0px 不结算 / 压进 1px 必结算）；
+`Vanilla_ContactDamage_Has_ImmunityWindow` 期望从 ≈30 改为 ≈40。
+
+**遗留（下一轮候选）**：
+
+1. **玩家物理的其余分支**：可变跳跃高度、冲刺 / 坐骑 / 翅膀 / 水中 / 蜂蜜 / 斜坡与台阶自动上抬、抓钩与传送。
+2. **NPC 同步进一步对齐原版**：令牌桶（普通 2Hz / Boss 12Hz）+ 近距流送 —— 前提是客户端 aiStyle 移植足够忠实，
+   否则「看着很远却掉血」会回归；当前 20Hz / 60Hz 分档是折中。
+3. **框架**：buff 表（施加 debuff 通道 + 剩余时间 / 到期移除）、粉尘 / 音效、外观包 40 建模、弹幕逐类型碰撞盒。
+
 ### 第三十四轮（2026-09-12）：免伤帧按原版**分来源**取值
+
+> ⚠️ 本轮的「接触 = 30」取错分支（那是盾牌弹反的免伤帧），已在**第三十五轮**修正为 40。
 
 **原版依据**（此前统一 60 tick，偏长）：
 
 | 来源 | 原版 | 我们 |
 |---|---|---|
-| **接触攻击**（NPC 撞击） | `Player.GiveImmuneTimeForCollisionAttack(longInvince ? 60 : 30)` → **30 tick**（0.5s） | `PlayerRuntime.ContactImmunityTicks = 30` |
+| **接触攻击**（NPC 撞击） | `GiveImmuneTimeForCollisionAttack(longInvince ? 60 : 30)` → ❌ 见第三十五轮：那是盾牌弹反分支，实际走 `Hurt` → **40** | ❌ 第三十五轮已改为 `GeneralImmunityTicks` = 40 |
 | **通用受击**（包 117 / 下落 / 敌对弹幕） | `Player.Hurt`：`immuneTime = pvp ? 8 : (伤害 ≠ 1 ? (longInvince ? 80 : 40) : (longInvince ? 40 : 20))` | 伤害 > 1 → **40**；伤害被压到 1 → **20**（`GeneralImmunityTicks(damage)`） |
 | PvP | 8 | 未建模 PvP，暂不需 |
 
@@ -132,8 +186,9 @@
 **遗留（下一轮候选）**：
 
 1. **玩家物理的其余分支**：可变跳跃高度、冲刺 / 坐骑 / 翅膀 / 水中 / 蜂蜜 / 斜坡与台阶自动上抬、抓钩与传送。
-2. **NPC 同步节奏**：可考虑从 60Hz 回落到原版令牌桶（普通 ≈3 包/1.5s、Boss ≈12Hz，`netSpamPacketLimit = 3`）。
-3. **接触判定**：原版用 `npc.position + netOffset`（渲染位置）做 AABB 相交且无最小重叠；我们取 8px 半格阈值。
+2. ~~**NPC 同步节奏**~~ —— ✅ **已在第三十五轮部分完成**：改为分档（普通 20Hz / Boss 与近身 60Hz）；
+   若要完全对齐原版令牌桶（2Hz / 12Hz）+ 近距流送，需等客户端 aiStyle 移植足够忠实。
+3. ~~**接触判定**（8px 半格阈值）~~ —— ✅ **已在第三十五轮完成**：改为原版整型 AABB、无最小重叠（`PlayerTouchesNpc`）。
 4. **框架**：buff 表（施加 debuff 通道 + 剩余时间 / 到期移除）、粉尘 / 音效、外观包 40 建模、弹幕逐类型碰撞盒。
 
 ### 第三十三轮（2026-09-12）：玩家移动改为「服务端按控制位模拟」（对齐原版做法）
@@ -177,11 +232,11 @@ if (controlJump && releaseJump && 贴地 && !controlDown) velocity.Y = -jumpSpee
 
 **遗留（下一轮候选）**：
 
-1. ~~**免伤帧对齐原版**~~ —— ✅ **已在第三十四轮完成**：接触 30 / 通用 40 / 弱伤害 20。
+1. ~~**免伤帧对齐原版**~~ —— ✅ **已在第三十四轮完成**（接触档位在**第三十五轮**修正为 40）：接触 / 通用 / 弱伤害。
 2. **玩家物理的其余分支**：可变跳跃高度（按住跳更高）、冲刺 / 坐骑 / 翅膀 / 水中 / 蜂蜜 / 斜坡与台阶自动上抬、
    抓钩与传送 —— 当前只实现了平地行走 / 跳跃 / 落地 / 水平阻挡。
-3. **NPC 同步节奏**：可考虑从 60Hz 回落到原版令牌桶（普通 ≈3 包/1.5s、Boss ≈12Hz，`netSpamPacketLimit = 3`）。
-4. **接触判定**：原版用 `npc.position + netOffset`（渲染位置）做 AABB 相交且无最小重叠；我们取 8px 半格阈值。
+3. ~~**NPC 同步节奏**~~ —— ✅ **已在第三十五轮部分完成**：改为分档（普通 20Hz / Boss 与近身 60Hz）。
+4. ~~**接触判定**（8px 半格阈值）~~ —— ✅ **已在第三十五轮完成**：改为原版整型 AABB、无最小重叠。
 5. **框架**：buff 表（施加 debuff 通道）、粉尘 / 音效、外观包 40 建模、弹幕逐类型碰撞盒。
 
 ### 第三十二轮（2026-09-12）：接触阈值收到 8px + NPC 水平阻挡（不再穿墙）
