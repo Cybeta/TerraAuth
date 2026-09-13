@@ -73,9 +73,30 @@ public partial class WorldSimulator : IWorldViewProvider
             Generation = (byte)(_rng.NextUInt32() & 0xFF),
         };
 
-        lock (_world.NpcsLock) _world.Npcs.Add(boss);
+        lock (_world.NpcsLock) AddNpc(boss);
         _world.ProgressDirty = true;
         return boss;
+    }
+
+    /// <summary>
+    /// 分配稳定的 NPC 槽位并写入世界列表（对应原版 <c>Main.npc[200]</c> 的固定槽位 + whoAmI 语义）。
+    /// 死亡槽位**原位保留、不再整表前移**；新刷怪优先复用已过死亡宽限期的空槽，
+    /// 从而保证包 28 的 npcIndex 在 NPC 存活期间不因移除而错位。
+    /// 调用方须持有 <see cref="WorldState.NpcsLock"/>。
+    /// </summary>
+    private void AddNpc(WorldNpc npc)
+    {
+        for (int i = 0; i < _world.Npcs.Count; i++)
+        {
+            var slot = _world.Npcs[i];
+            if (!slot.IsTownNpc && !slot.Active && _world.Tick - slot.DeadTick > EnemyRemovalDelayTicks)
+            {
+                _world.Npcs[i] = npc;
+                return;
+            }
+        }
+
+        _world.Npcs.Add(npc);
     }
 
     public WorldSimulator(
@@ -580,9 +601,7 @@ public partial class WorldSimulator : IWorldViewProvider
             if (_world.Tick % SpawnIntervalTicks == 0)
             {
                 TrySpawnEnemy();
-                // 死亡清理：已下发 life=0 之后再移除，避免客户端留下幽灵 NPC
-                _world.Npcs.RemoveAll(n =>
-                    !n.IsTownNpc && !n.Active && _world.Tick - n.DeadTick > EnemyRemovalDelayTicks);
+                // 死亡 NPC 不再整表移除（会前移下标导致包 28 错位）；槽位原位保留，由 AddNpc 复用。
             }
 
             _pendingNpcSpawns.Clear();
@@ -600,7 +619,8 @@ public partial class WorldSimulator : IWorldViewProvider
             // AI 期间产生的刷怪 / 弹幕请求在遍历结束后入队，避免遍历中修改集合
             if (_pendingNpcSpawns.Count > 0)
             {
-                _world.Npcs.AddRange(_pendingNpcSpawns);
+                foreach (var npc in _pendingNpcSpawns)
+                    AddNpc(npc);
                 _pendingNpcSpawns.Clear();
             }
 
@@ -697,7 +717,7 @@ public partial class WorldSimulator : IWorldViewProvider
             if (!tile.Active || !TileIdSets.IsTileSolid(tile.Type)) continue;
 
             var (slimeW, slimeH) = NpcSizes.Of(BlueSlimeType);
-            _world.Npcs.Add(new WorldNpc
+            AddNpc(new WorldNpc
             {
                 Type = BlueSlimeType,
                 NetId = BlueSlimeType,
@@ -729,7 +749,7 @@ public partial class WorldSimulator : IWorldViewProvider
             if (!tile.Active || !TileIdSets.IsTileSolid(tile.Type)) continue;
 
             var (goblinW, goblinH) = NpcSizes.Of(GoblinPeonType);
-            _world.Npcs.Add(new WorldNpc
+            AddNpc(new WorldNpc
             {
                 Type = GoblinPeonType,
                 NetId = GoblinPeonType,

@@ -50,6 +50,7 @@ public sealed record WorldEntityView(
         for (int i = 0; i < world.Npcs.Count; i++)
         {
             var npc = world.Npcs[i];
+            if (!npc.Active) continue;   // 死亡槽位原位保留（whoAmI 稳定），但不进入实体视图
             entities.Add(new EntityState(
                 SnapshotFrame.NpcEntityId(i), new Vector2(npc.X, npc.Y), new Vector2(0, 0),
                 EntityStateType.Active));

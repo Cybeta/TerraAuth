@@ -886,6 +886,54 @@ public class VanillaFeatureTests
     }
 
     /// <summary>
+    /// 回归：杀死一只敌怪后，其余敌怪的 npcIndex（包 23 下发 / 包 28 攻击所用的下标）必须保持稳定。
+    /// 旧实现用 list + RemoveAll 原地压缩，死亡清理会前移后续下标，导致客户端按旧 npcIndex
+    /// 发起包 28 时命中错误槽位（Generation 不符被静默拒绝），表现为「杀完了还持续掉血」。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_NpcIndex_Stable_After_Killing_Another()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+
+        // 手动放两只可区分的敌怪（向导占槽 0，A/B 依次占后续槽位）
+        var slimeA = PlaceSlimeOn(server, sx * 16f + 120f, sy * 16f - 8f);
+        var slimeB = PlaceSlimeOn(server, sx * 16f + 180f, sy * 16f - 8f);
+        slimeA.Generation = 3;
+        slimeB.Generation = 9;
+
+        int indexA, indexB;
+        lock (world.NpcsLock)
+        {
+            indexA = world.Npcs.IndexOf(slimeA);
+            indexB = world.Npcs.IndexOf(slimeB);
+        }
+        Assert.NotEqual(indexA, indexB);
+
+        // 先杀 A
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(indexA, 25) { Generation = slimeA.Generation });
+        Assert.True(await TickUntilAsync(server, () => !slimeA.Active, TimeSpan.FromSeconds(5)), "A 未被击杀");
+
+        // 越过死亡清理窗口（60 tick 钩子 + 120 tick 宽限）；旧实现会在此 RemoveAll 前移下标
+        for (int i = 0; i < 240; i++)
+            server.Host.Simulator.Tick();
+
+        // B 的下标必须原封不动
+        int indexBAgain;
+        lock (world.NpcsLock) indexBAgain = world.Npcs.IndexOf(slimeB);
+        Assert.Equal(indexB, indexBAgain);
+
+        // 用稳定下标再杀 B；修复前会因错位 + Generation 不符被拒绝
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(indexB, 25) { Generation = slimeB.Generation });
+        Assert.True(await TickUntilAsync(server, () => !slimeB.Active, TimeSpan.FromSeconds(5)),
+            "B 未被击杀：下标可能在前一只死亡后发生错位");
+        Assert.Equal(0, slimeB.Life);
+    }
+
+    /// <summary>
     /// NPC 同步（包 23）：**状态变化才发**，未变化且心跳未到时不再重复下发（省带宽），
     /// 位置变化后立刻下发。生产路径由快照循环按 20Hz 调用，保证客户端看到的移动是连续的。
     /// </summary>

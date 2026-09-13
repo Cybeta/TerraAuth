@@ -548,7 +548,10 @@ public static class WorldFileWriter
         var town = new List<WorldNpc>();
         var others = new List<WorldNpc>();
         foreach (var npc in state.Npcs)
+        {
+            if (!npc.Active) continue;   // 死亡槽位不落盘（whoAmI 原位保留，仅存活 NPC 导出）
             (npc.IsTownNpc ? town : others).Add(npc);
+        }
 
         w.Write(0);     // 微光 NPC 列表（v >= 268）
 
