@@ -87,6 +87,9 @@ public sealed class NetworkHost : IAsyncDisposable
 
     public ISnapshotSender SnapshotSender { get; }
 
+    /// <summary>服务端命令子系统（游戏内 / 前缀命令分发）；null = 关闭。</summary>
+    private readonly Authority.CommandService? _commandService;
+
     /// <summary>实际监听端口（endpoint 端口传 0 时由 OS 分配）；<see cref="Start"/> 之后有效。</summary>
     public int BoundPort => ((IPEndPoint)_listener.LocalEndpoint).Port;
 
@@ -120,7 +123,8 @@ public sealed class NetworkHost : IAsyncDisposable
         IReadOnlyCollection<string>? playerWhitelist = null,
         IHookRegistry? hooks = null,
         ViolationKickLimits? violationKick = null,
-        int sessionResumeGraceSeconds = 0)
+        int sessionResumeGraceSeconds = 0,
+        Authority.CommandService? commandService = null)
     {
         _sessionResumeGraceTicks = Math.Max(0, sessionResumeGraceSeconds) * TicksPerSecond;
         _listener = new TcpListener(endpoint);
@@ -135,6 +139,7 @@ public sealed class NetworkHost : IAsyncDisposable
         _playerWhitelist = playerWhitelist;
         _hooks = hooks;
         _violationKick = violationKick ?? ViolationKickLimits.Default;
+        _commandService = commandService;
 
         SnapshotSender = new ConnectionSnapshotSender(connections, encoder);
     }
@@ -311,8 +316,18 @@ public sealed class NetworkHost : IAsyncDisposable
                 if (packet is NetTextPacket { IsClientMessage: true } chat)
                 {
                     // 客户端聊天（命令名 + 文本）→ 转服务端下行形态广播给**所有人**（含发送者，与原版一致）
-                    await BroadcastChatAsync(PlayerChatLine(connection.PlayerId, chat.Text), ct: ct)
-                        .ConfigureAwait(false);
+                    if (_commandService is not null && chat.Text.StartsWith("/", StringComparison.Ordinal))
+                    {
+                        // 游戏内命令：/give /who 等 → CommandService 分发，结果仅回发给发起者
+                        var cmdResult = _commandService.Execute(connection.PlayerId, chat.Text[1..]);
+                        await SendChatAsync(connection.PlayerId, cmdResult.Output, cmdResult.Success ? "Yellow" : "Red", ct)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await BroadcastChatAsync(PlayerChatLine(connection.PlayerId, chat.Text), ct: ct)
+                            .ConfigureAwait(false);
+                    }
                 }
                 else if (packet is ChestPacket chestOpen)
                 {
@@ -822,6 +837,26 @@ public sealed class NetworkHost : IAsyncDisposable
             $"[Net] 玩家 #{connection.PlayerId} 进入世界（出生点 {_world.SpawnTileX},{_world.SpawnTileY}）");
 
         TriggerPlayerJoined(connection);
+
+        // SSC 全量背包同步：仅 SSC 模式下服务端持有背包唯一真相（WorldInfo SSC 标志已下发），
+        // 进世界即把 59 个槽位逐一用包 5 下发，客户端据此初始化背包显示
+        // （原版 SyncOnePlayer 在 State==10 时同样下发全部背包槽；否则 SSC 下客户端背包保持未初始化）。
+        // 关闭 SSC 时跳过：客户端以本地档案背包为准（原版非 SSC 流程）。
+        if (_world.SscEnabled && _world.Players.TryGetValue(connection.PlayerId, out var runtime))
+        {
+            for (int i = 0; i < PlayerRuntime.InventorySlotCount; i++)
+            {
+                var itemId = runtime.Items[i];
+                await connection.SendEncodedAsync(PacketId.InventorySlot,
+                    new InventorySlotPacket(i, itemId, itemId == 0 ? 0 : 1)
+                    {
+                        PlayerId = connection.PlayerId,
+                        Prefix = runtime.ItemPrefixes[i],
+                    }, ct).ConfigureAwait(false);
+            }
+            Console.WriteLine(
+                $"[Give] 进世界全量下发 #{connection.PlayerId} 背包 {PlayerRuntime.InventorySlotCount} 槽");
+        }
 
         await connection.SendEncodedAsync(
             PacketId.FinishedConnecting,

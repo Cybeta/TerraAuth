@@ -39,6 +39,13 @@ public sealed class WorldState
     /// </summary>
     public bool StrikeWeaponCheck { get; set; } = true;
 
+    /// <summary>
+    /// 全局 SSC（Server Side Characters）开关，对应 <c>ServerConfig.SscEnabled</c>（组合根注入）。
+    /// 开启：WorldInfo 置 SSC 位、进世界全量下发背包、服务端背包权威（/give 等）生效；
+    /// 关闭：走原版非 SSC 流程，客户端本地背包为准，服务端不参与背包权威。
+    /// </summary>
+    public bool SscEnabled { get; set; } = true;
+
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
 
@@ -828,6 +835,10 @@ public sealed class WorldState
         if (p.DownedBoss3) b4 |= 1 << 3;
         if (p.HardMode) b4 |= 1 << 4;
         if (p.DownedClown) b4 |= 1 << 5;
+        // 原版 bitsByte7[6] = ServerSideCharacter：开启 SSC 时服务端持有背包唯一真相，
+        // 客户端据此才会接受服务端下发的背包槽（包 5）；否则客户端忽略对自身的包 5（give 无效）。
+        // 由全局配置 <see cref="SscEnabled"/> 控制：关闭时走原版非 SSC 流程（客户端本地背包为准）。
+        if (SscEnabled) b4 |= 1 << 6;
         if (p.DownedPlantBoss) b4 |= 1 << 7;
         flags[0] = b4;
 
@@ -1091,6 +1102,13 @@ public sealed class PlayerRuntime
 
     /// <summary>按原版 <c>Hurt</c> 规则取免伤帧长（无十字项链、非 PvP）；接触 / 弹幕 / 下落 / 包 117 共用。</summary>
     public static int GeneralImmunityTicks(int damage) => damage > 1 ? HurtImmunityTicks : WeakHurtImmunityTicks;
+
+    /// <summary>
+    /// **重生无敌帧**：原版 <c>Player.Spawn</c> 的 <c>ReviveFromDeath</c> 分支 <c>immuneTime = 180</c>（3 秒），
+    /// PvP 死亡复活为 300（5 秒）。服务端在复活时同样置免伤帧，接触兜底 / 包 117 在此期间跳过，与客户端重生闪烁对齐。
+    /// 进世界（SpawningIntoWorld）的 60 由进服流程自然覆盖（出生点通常无怪）。
+    /// </summary>
+    public const int RespawnImmunityTicks = 180;
 
     /// <summary>连续下落距离（像素），落地时用于结算下落伤害。</summary>
     public float FallDistance;

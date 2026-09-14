@@ -221,6 +221,8 @@ public sealed class TerminalStage : IPipelineStage
             drop.ItemId, drop.Stack, drop.Position, drop.Velocity, drop.Prefix),
         // 包 22 SyncItemOwner → 物品拾取（服务端移除世界实体并入库）
         ItemPickupPacket pickup => new PickupItemCommand(context.Tick, context.PlayerId, pickup.ItemSlotIndex),
+        // 包 151 ItemDestroy → 物品拾取（原版 1.4.5 客户端拾取物品后的真实通知路径）
+        ItemDestroyPacket destroy => new PickupItemCommand(context.Tick, context.PlayerId, destroy.ItemSlotIndex),
         // 包 5 InventorySlot → 物品栏槽位写入（SSC 服务端唯一真相；装备区防御由此回填 Defense，前缀用于近战武器校验）
         InventorySlotPacket slot => new SetInventorySlotCommand(context.Tick, context.PlayerId,
             slot.Slot, slot.ItemId, slot.Stack, slot.Prefix),

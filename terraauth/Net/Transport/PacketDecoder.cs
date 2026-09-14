@@ -82,6 +82,7 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.TilePlace         => DecodeTilePlace(reader),
             PacketId.ItemDrop          => DecodeSyncItem(reader),
             PacketId.ItemPickup        => DecodeItemPickup(reader),
+            PacketId.ItemDestroy       => DecodeItemDestroy(reader),
             PacketId.SyncChestItem     => DecodeSyncChestItem(reader),
             PacketId.SyncPlayerChestIndex => DecodePlayerChestIndex(reader),
             PacketId.PlayerHeal        => DecodePlayerHeal(reader),
@@ -548,6 +549,13 @@ public sealed class PacketDecoder : IPacketDecoder
         var itemSlot = r.ReadInt16();
         var playerId = r.ReadByte();
         return new ItemPickupPacket(itemSlot) { PlayerId = playerId };
+    }
+
+    private INetworkPacket DecodeItemDestroy(BinaryReader r)
+    {
+        // ItemDestroy（包 151）：Int16 世界物品槽位（客户端拾取通知）
+        var itemSlot = r.ReadInt16();
+        return new ItemDestroyPacket(itemSlot);
     }
 
     private INetworkPacket DecodeSyncChestItem(BinaryReader r)

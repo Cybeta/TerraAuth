@@ -62,6 +62,7 @@ public sealed class GameHost : IDisposable
     private readonly ConcurrentDictionary<int, ConcurrentDictionary<(int Index, byte Generation), byte>> _npcBaselines = new();
     private readonly MetricsHttpServer? _metricsServer;
     private readonly IAsyncDisposable? _pipelineDisposable;
+    private readonly WorldState _world; // 供热重载同步全局开关（SSC 等）
 
     /// <summary>权威子系统聚合：配置热重载时用于推送新阈值。</summary>
     private readonly AuthorityEnforcers _enforcers;
@@ -112,6 +113,7 @@ public sealed class GameHost : IDisposable
         Parallel = parallel;
         Workers = workers;
         _enforcers = enforcers;
+        _world = simulator.State; // 供热重载同步全局开关（SSC 等）
         _pipelineDisposable = pipelineDisposable;
 
         // 配置热更新 → 动态调整阈值（如 MaxWalkSpeed / MaxSingleDamage）
@@ -145,6 +147,7 @@ public sealed class GameHost : IDisposable
         // 世界数据：优先加载配置指定的 .wld；未配置则按 WorldSize 程序化生成（见 WorldGenerator 注释）
         var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize);
         world.GameMode = (int)config.Current.GameMode; // 阶段 D：玩家受击公式按难度取分支（经典/专家/大师），117 上界与接触兜底共用
+        world.SscEnabled = config.Current.SscEnabled;   // 全局 SSC 开关：开=服务器背包权威，关=原版客户端本地背包
 
         // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
         // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
@@ -211,6 +214,7 @@ public sealed class GameHost : IDisposable
         var connections = new ConnectionManager(config.Current.MaxConnections);
         var decoder = new PacketDecoder();
         var encoder = new PacketEncoder(protocol.Version);
+        var commandService = new CommandService();
         var network = new NetworkHost(
             new IPEndPoint(IPAddress.Any, port),
             decoder, encoder, protocol, connections, hookedPipeline, commands, workers, world,
@@ -218,7 +222,8 @@ public sealed class GameHost : IDisposable
             new ViolationKickLimits(
                 config.Current.MaxViolationsBeforeBan,
                 config.Current.ViolationWindowMinutes * 60),
-            sessionResumeGraceSeconds: config.Current.SessionResumeGraceSeconds);
+            sessionResumeGraceSeconds: config.Current.SessionResumeGraceSeconds,
+            commandService: commandService);
         networkForNames = network; // HookedPipeline 的玩家名解析延迟绑定到此
 
         // 6.5 保留未来兼容层对象，但不进入当前 Vanilla-only 生产能力。
@@ -229,10 +234,9 @@ public sealed class GameHost : IDisposable
 
         // 7. 插件上下文 + 加载器
         // 必须在网络层之后：ServerApi 需要连接管理（踢出/在线查询）与封禁管理器才能真实生效
-        // 命令子系统：内置 say / who / kick / help；插件可经 IServerApi.ExecuteCommand 调用
-        var commandService = new CommandService();
+        // 命令子系统：内置 say / who / kick / help / give；插件可经 IServerApi.ExecuteCommand 调用
         var serverApi = new ServerApi(auditLogger, metrics, network, connections, bans, world, commandService);
-        RegisterBuiltinCommands(commandService, serverApi);
+        RegisterBuiltinCommands(commandService, serverApi, world, network);
 
         var pluginContext = new PluginContext(
             hooks: hooks,
@@ -680,6 +684,7 @@ public sealed class GameHost : IDisposable
 
             if (player is not null)
             {
+                Console.WriteLine($"[HP] 玩家 #{playerId} 下发包16 hp={player.Hp}/{player.HpMax}");
                 await Network.SendToPlayerAsync(playerId, PacketId.PlayerHealth,
                     new PlayerHealthPacket(playerId, player.Hp, player.HpMax), ct).ConfigureAwait(false);
             }
@@ -739,6 +744,21 @@ public sealed class GameHost : IDisposable
                     },
                     playerId => IsPlayerWithin(world, playerId, item.Position.X, item.Position.Y, radiusSq),
                     ct).ConfigureAwait(false);
+
+                // 专属掉落物（OwnedBy ≥ 0，如 /give SSC 关闭时的 GiveItemByDrop 方案）：
+                // 包 21 本身不含归属字段，客户端收到后本地归属为 255（无主）→ 拾取条件（归属==自己）不满足。
+                // 原版机制由 FindOwner/ReserveFor 广播包 22（SyncItemOwner）同步归属；这里对齐：
+                // 向全体广播完整包 22，客户端据此把本地归属更新为目标玩家，从而可拾取。
+                if (item.OwnedBy >= 0)
+                {
+                    await Network.BroadcastAsync(PacketId.ItemPickup,
+                        new ItemOwnerPacket(item.OwnedBy, item.Position)
+                        {
+                            ItemSlotIndex = item.Slot,
+                            TimeToKeepReservation = 15,
+                        },
+                        ct).ConfigureAwait(false);
+                }
 
                 item.NewNotified = true;   // 只有真正发出才记「已通知」，否则下次循环重试
             }
@@ -1194,6 +1214,7 @@ public sealed class GameHost : IDisposable
         // 把全部新阈值推送给已构造的权威子系统：子系统以引用整体替换阈值，无需重启即生效
         var t = AuthorityThresholds.From(cfg);
         _enforcers.UpdateThresholds(t.Rate, t.Player, t.Movement, t.Combat, t.Inventory, t.World);
+        _world.SscEnabled = cfg.SscEnabled; // 全局 SSC 开关热重载（新连接 / 下次 WorldInfo 生效）
 
         Console.WriteLine(
             $"[Config] 热重载已生效：MaxSingleDamage={cfg.MaxSingleDamage}, " +
@@ -1224,8 +1245,9 @@ public sealed class GameHost : IDisposable
         return path;
     }
 
-    /// <summary>注册内置命令（say / who / kick / help）；插件可另注册自己的命令。</summary>
-    private static void RegisterBuiltinCommands(CommandService commands, ServerApi server)
+    /// <summary>注册内置命令（say / who / kick / help / give）；插件可另注册自己的命令。</summary>
+    private static void RegisterBuiltinCommands(CommandService commands, ServerApi server,
+        WorldState world, NetworkHost network)
     {
         commands.Register("say", "广播一条消息：say <text>", (_, args) =>
         {
@@ -1254,6 +1276,64 @@ public sealed class GameHost : IDisposable
 
         commands.Register("help", "列出全部命令", (_, _) =>
             CommandResult.Ok(string.Join("\n", commands.Commands.Select(c => $"{c.Name} - {c.Help}"))));
+
+        commands.Register("give", "给在线玩家物品并同步背包：give <playerId> <itemId> [slot]", (_, args) =>
+        {
+            if (args.Length < 2 || !int.TryParse(args[0], out var pid) || !int.TryParse(args[1], out var itemId))
+                return CommandResult.Fail("用法：give <playerId> <itemId> [slot]");
+
+            int slot;
+            lock (world.PlayersLock)
+            {
+                if (!world.Players.TryGetValue(pid, out var p))
+                    return CommandResult.Fail($"玩家 #{pid} 不在线");
+
+                // 全局 SSC 开关：关闭时走 TShock「GiveItemByDrop」方案 —— 在玩家脚下生成**专属掉落物**
+                // （包 21 由快照循环 FlushNewItemsAsync 下发），玩家拾取（包 22 → PickupItemCommand）入背包。
+                // 拾取是客户端驱动的正常流程（客户端把物品加入本地背包并显示），不依赖 SSC 背包权威。
+                if (!world.SscEnabled)
+                {
+                    int itemSlot;
+                    lock (world.ItemsLock)
+                    {
+                        itemSlot = 0;
+                        while (world.Items.Any(i => i.Slot == itemSlot)) itemSlot++;
+                        world.Items.Add(new WorldItemEntity
+                        {
+                            Slot = itemSlot,
+                            ItemId = itemId,
+                            Stack = 1,
+                            Position = p.Position,
+                            Velocity = new Vector2(0, -2f),   // 轻微上抛，便于玩家看见
+                            Prefix = 0,
+                            OwnedBy = pid,                    // 专属：只准目标玩家拾取
+                            NewNotified = false,              // 服务端主动生成 → 快照循环补发包 21
+                        });
+                    }
+                    Console.WriteLine($"[Give] 玩家 #{pid} 脚下生成掉落物 槽 {itemSlot} 物品 {itemId}（SSC 关闭：拾取入包）");
+                    return CommandResult.Ok($"已在 #{pid} 脚下生成物品 {itemId}（SSC 关闭，请拾取）");
+                }
+
+                // SSC 开启：服务端背包唯一真相 → 直接写背包 + 包 5 下发
+                slot = args.Length > 2 && int.TryParse(args[2], out var s) ? s : -1;
+                if (slot < 0)
+                {
+                    slot = -1;
+                    for (int i = 0; i < p.Items.Length; i++)
+                        if (p.Items[i] == 0) { slot = i; break; }
+                    if (slot < 0) return CommandResult.Fail("背包已满");
+                }
+                else if (slot >= p.Items.Length)
+                    return CommandResult.Fail("槽位越界");
+                p.Items[slot] = itemId;
+                p.ItemPrefixes[slot] = 0;
+                Console.WriteLine($"[Give] 玩家 #{pid} 槽 {slot} 物品 {itemId}（背包 Items[{slot}]={p.Items[slot]}）");
+            }
+            network.SendToPlayerAsync(pid, PacketId.InventorySlot,
+                new InventorySlotPacket(Slot: (short)slot, ItemId: itemId, Stack: 1) { PlayerId = pid });
+            Console.WriteLine($"[Give] 已向 #{pid} 下发包5 slot={slot} type={itemId}");
+            return CommandResult.Ok($"已给 #{pid} 槽 {slot} 放置物品 {itemId}");
+        });
     }
 
     /// <summary>

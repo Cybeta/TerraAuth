@@ -829,7 +829,8 @@ internal sealed class WorldAuthority : IWorldAuthority
     {
         TileBreakPacket brk => ValidateBreak(brk, playerId),
         TilePlacePacket place => ValidatePlace(place, playerId),
-        ItemPickupPacket pickup => ValidatePickup(pickup, playerId),
+        ItemPickupPacket pickup => ValidatePickup(pickup.ItemSlotIndex, playerId),
+        ItemDestroyPacket destroy => ValidatePickup(destroy.ItemSlotIndex, playerId),
         ChestPacket chest => ValidateChestOpen(chest, playerId, sessionId),
         SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId, sessionId),
         LiquidModulePacket liquid => ValidateLiquid(liquid, playerId),
@@ -954,10 +955,10 @@ internal sealed class WorldAuthority : IWorldAuthority
     private const int PickupReachPx = 64;
 
     /// <summary>
-    /// 掉落物拾取（包 22）：槽位必须对应真实存活的世界掉落物、玩家在线且在拾取半径内，
+    /// 掉落物拾取（包 22 / 包 151）：槽位必须对应真实存活的世界掉落物、玩家在线且在拾取半径内，
     /// 入库成功后才允许移除世界实体（背包已满则拒绝，世界实体保留）。
     /// </summary>
-    private AuthorityResult ValidatePickup(ItemPickupPacket pickup, int playerId)
+    private AuthorityResult ValidatePickup(int itemSlotIndex, int playerId)
     {
         PlayerRuntime? player;
         lock (_world.PlayersLock)
@@ -967,18 +968,22 @@ internal sealed class WorldAuthority : IWorldAuthority
 
         WorldItemEntity? item;
         lock (_world.ItemsLock)
-            item = _world.Items.FirstOrDefault(i => i.Slot == pickup.ItemSlotIndex && i.Active);
+            item = _world.Items.FirstOrDefault(i => i.Slot == itemSlotIndex && i.Active);
         if (item is null)
-            return Deny(playerId, "pickup_rejected", "item_not_found", new { pickup.ItemSlotIndex });
+            return Deny(playerId, "pickup_rejected", "item_not_found", new { itemSlotIndex });
 
         // 拾取半径：CE 远程拾取 → 拒绝
         var dx = player.Position.X - item.Position.X;
         var dy = player.Position.Y - item.Position.Y;
         if (dx * dx + dy * dy > (float)PickupReachPx * PickupReachPx)
-            return Deny(playerId, "pickup_rejected", "out_of_reach", new { pickup.ItemSlotIndex });
+            return Deny(playerId, "pickup_rejected", "out_of_reach", new { itemSlotIndex });
+
+        // 专属掉落物（OwnedBy ≥ 0，如 /give SSC 关闭时的 GiveItemByDrop 方案）：只准归属玩家拾取
+        if (item.OwnedBy >= 0 && item.OwnedBy != playerId)
+            return Deny(playerId, "pickup_rejected", "owned_by_other", new { itemSlotIndex });
 
         // 这里只做只读校验；库存入库与实体移除必须在仿真提交阶段原子完成。
-        return AuthorityResult.Accept(pickup);
+        return AuthorityResult.Accept(new ItemPickupPacket(itemSlotIndex) { PlayerId = playerId });
     }
 
     private AuthorityResult ValidateBreak(TileBreakPacket brk, int playerId)

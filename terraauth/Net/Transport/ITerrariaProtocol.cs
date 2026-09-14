@@ -87,6 +87,7 @@ public sealed class TerrariaProtocol : ITerrariaProtocol
     {
         PacketId.PlayerPosition or PacketId.NpcStrike or PacketId.ProjectileNew
             or PacketId.TileBreak or PacketId.TilePlace or PacketId.ItemDrop
+            or PacketId.ItemPickup or PacketId.ItemDestroy
             or PacketId.Chest or PacketId.InventorySlot
             or PacketId.TeleportEntity or PacketId.RequestTeleportationByServer
             or PacketId.PlayerHeal or PacketId.PlayerMana or PacketId.PlayerBuffs => true,

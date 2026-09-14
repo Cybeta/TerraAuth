@@ -340,6 +340,7 @@ public class EndToEndTests
     {
         // Arrange：管线对任意包都返回"纠正"，纠正包为背包槽同步（包 5，非健康包 16）
         var world = new WorldState();
+        world.SscEnabled = false; // 本用例只验证纠正包类型，关闭 SSC 避免进世界全量下发 59 个包 5 干扰首个包 5 断言
         var commands = new CommandQueue();
         var decoder = new PacketDecoder();
         var encoder = new PacketEncoder(ProtocolVersion.Current);

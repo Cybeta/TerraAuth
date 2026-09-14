@@ -5,11 +5,39 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-13 ｜ 当前测试：**306 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
+> 生成日期：2026-09-14 ｜ 当前测试：**329 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
 
 ---
 
-## 近期工作汇总（2026-09-13）
+## 近期工作汇总（2026-09-14）
+
+### 全局 SSC 开关（SscEnabled）
+
+- `ServerConfig.SscEnabled`（默认 `true`）全局控制服务器权威功能是否生效，经热重载同步到 `WorldState`：
+  - **开启（默认）**：WorldInfo 置 SSC 位 → 玩家进服由服务端全量下发 59 槽背包（包 5 初始化，SSC 背包唯一真相）；`/give` 直写背包并随槽位下发。
+  - **关闭**：不适用任何服务器权威 —— 客户端走本地背包、无槽位全量下发；`/give` 改为 TShock 风格的 `GiveItemByDrop` 方案（掉落物拾取），玩家在游戏中拾取后入包。
+
+### 非 SSC 模式 `/give`（GiveItemByDrop 方案）
+
+- 在目标玩家脚下生成**专属掉落物**（`WorldItemEntity.OwnedBy = 目标玩家`、轻微上抛便于发现），
+  快照循环补发包 21（SyncItem）后**追加广播包 22（SyncItemOwner）**同步归属；
+  只有归属玩家满足拾取条件（归属 == 自己），服务端 `PickupItemCommand` 亦校验 `OwnedBy`（越权拾取拒绝）。
+- 命令返回值提示玩家拾取；SSC 开启时仍走原有"直写背包 + 槽位下发"路径。
+
+### 拾取链路协议修正（关键修复：掉落物显示但无法拾取）
+
+- **包 22（SyncItemOwner）是下行归属同步**，完整字段为 槽位 / 归属玩家 / 保留时长 / 抓取延迟玩家 / 抓取延迟 / 位置；
+  客户端收到后把本地归属更新为目标玩家，拾取条件（归属 == 自己）才满足。此前把包 22 误当"客户端→服务端拾取请求"，方向相反。
+- **客户端拾取后的通知是包 151（ItemDestroy，Int16 槽位）**（全部拿走）或包 21（部分拾取），而非包 22；
+  服务端新增包 151 解码 → 权威校验（槽位对账 / 拾取半径 / `OwnedBy` 归属）→ `PickupItemCommand` 原子结算入库并移除世界实体。
+- 修复后：服务端生成的掉落物（含非 SSC `/give`）客户端可正常拾取，且仅归属玩家能拾取。
+
+### 验证结果
+
+- 自动化测试：**329/329 通过**，失败 0，跳过 0。
+- 真机验证：SSC 关闭下 `/give 1 3474` 掉落物显示在脚下并可拾取入包（非归属玩家拾取被服务端拒绝）。
+
+---
 
 ### 目录与版本适配整理
 
@@ -33,7 +61,7 @@
 
 ### 验证结果
 
-- 自动化测试：306/306 通过，失败 0，跳过 0。
+- 自动化测试：329/329 通过，失败 0，跳过 0。
 - Release 构建：成功，错误 0。
 - 本轮重点验证：NPC Generation、玩家级 NPC 同步基线、原版客户端连接兼容和项目目录整理。
 
@@ -62,8 +90,10 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
   拆分 `Dead`（死亡态）与 `Active`（在线），修掉「下落伤害致死把玩家置为离线态导致永久冻结」的缺陷。
 - **服务端伤害来源（接触）**：仿真新增敌怪 / Boss 接触伤害判定（32px + 60tick 免伤帧 + 简化伤害表），
   统一经同一入口结算；下发包 117（表现，广播）+ 包 16（单发权威血量）——此前下落伤害只改服务端血量、客户端毫不知情。
-- **掉落物拾取（包 22）**：服务端做槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC），
-  成功后移除世界实体并下发包 21（stack=0）；拒绝远程拾取 / 重复拾取。
+- **掉落物拾取（包 151 拾取通知 + 包 22 归属同步）**：服务端做槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC），
+  成功后移除世界实体并下发包 21（stack=0）；拒绝远程拾取 / 重复拾取 / 越权拾取。
+  拾取链路对齐原版：服务端下发包 22（SyncItemOwner，完整字段）同步物品归属 → 客户端归属==自己才发起拾取 →
+  拾取后发包 151（ItemDestroy）通知服务端结算；包 22 仅作归属同步（下行），不再是拾取请求。
 - **弹幕命中判定（包 27）**：仿真按弹幕 / 敌怪距离判定命中并扣血，不再采信客户端声明。
 - **法力（包 42）**：服务端跟踪法力 / 上限；非负校验，上限由服务端持有（超出即下发权威纠正包）；原版不向他人转发。
 - **治疗（包 35）**：非负校验 → 回血上限钳制到服务端 `HpMax`（客户端超额治疗不会让服务端生命越界）。
@@ -112,7 +142,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **306 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
+- 套件 **329 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -416,7 +446,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **306 / 306 通过** |
+| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **329 / 329 通过** |
 | Vanilla-only 网络与集成过滤 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore --filter "FullyQualifiedName~IntegrationTests|FullyQualifiedName~VanillaFeatureTests"` | **94 / 94 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。

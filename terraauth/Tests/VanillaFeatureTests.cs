@@ -1311,10 +1311,13 @@ public class VanillaFeatureTests
         var player = world.Players[1];
         Assert.True(MathF.Abs(player.Position.X - (world.SpawnTileX + 0.5f) * 16f) < 2f,
             $"复活点应为服务端出生点，实际 X={player.Position.X}");
+        // 重生无敌帧：原版 Player.Spawn（ReviveFromDeath）immuneTime = 180（3 秒），服务端对齐。
+        // 断言时仿真已推进若干 tick，免伤帧从 180 开始递减，允许少量递减
+        Assert.InRange(player.HurtCooldown, PlayerRuntime.RespawnImmunityTicks - 2, PlayerRuntime.RespawnImmunityTicks);
     }
 
     // ========================================================================
-    // 十三、掉落物拾取（包 22）/ 弹幕命中判定（服务端权威）
+    // 十三、掉落物拾取（包 151 拾取通知 + 包 22 归属同步）/ 弹幕命中判定（服务端权威）
     // ========================================================================
 
     [Fact]

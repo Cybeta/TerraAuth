@@ -136,6 +136,14 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
         if (player!.Dead)
             return new(false, CommandFailures.NotApplied);
 
+        // 前置：免伤帧内忽略（与服务端 contact_damage 共享统一免伤帧，避免同一次接触双扣——
+        // 客户端本地 Hurt 上报的包 117 与服务端接触兜底是「同一次伤害的两条表达」，只扣一次）
+        if (player.HurtCooldown > 0)
+        {
+            Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage}（包117）但免伤帧中，忽略");
+            return new(false, CommandFailures.NotApplied);
+        }
+
         // 前置：此刻必须确实接触着敌怪（防伪造远程受伤；判定口径与服务端接触兜底一致）
         if (!CombatResolver.IsPlayerInContact(world, player))
         {
@@ -234,6 +242,9 @@ public sealed record RespawnCommand(long Tick, int? PlayerId)
         player.Position = new Vector2((world.SpawnTileX + 0.5f) * 16f, world.SpawnTileY * 16f);
         player.AimPosition = player.Position;
         player.Velocity = new Vector2(0, 0);
+        // 重生无敌帧：原版 Player.Spawn（ReviveFromDeath）immuneTime = 180（3 秒），
+        // 服务端同样生效（接触兜底在免伤帧内跳过），与客户端重生闪烁对齐
+        player.HurtCooldown = PlayerRuntime.RespawnImmunityTicks;
         world.MarkPlayerChanged(id);
         player.DeathNotified = true;
         player.RespawnNotified = false; // 世界同步线程据此补发复活包 12 / 16
@@ -267,6 +278,11 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
                 foreach (var item in world.Items)
                 {
                     if (item.Slot != ItemSlotIndex || !item.Active) continue;
+
+                    // 专属掉落物（OwnedBy ≥ 0，如 /give SSC 关闭时的 GiveItemByDrop 方案）：
+                    // 只准归属玩家拾取，其余玩家的包 22 拾取请求直接拒绝（物品保持不动）。
+                    if (item.OwnedBy >= 0 && item.OwnedBy != playerId)
+                        return new(false, CommandFailures.OutOfReach);
 
                     var dx = player.Position.X - item.Position.X;
                     var dy = player.Position.Y - item.Position.Y;

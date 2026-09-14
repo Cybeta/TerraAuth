@@ -211,6 +211,22 @@ public sealed class PacketEncoder : IPacketEncoder
                     bw.Write((byte)pickup.PlayerId);
                     break;
 
+                case ItemOwnerPacket owner:
+                    // SyncItemOwner（包 22，下行完整形态）：Int16 槽位 + Byte 归属玩家
+                    // + 7Bit 保留时长 + Byte 抓取延迟玩家 + 7Bit 抓取延迟 + Vector2 位置
+                    bw.Write((short)owner.ItemSlotIndex);
+                    bw.Write((byte)owner.OwnerPlayerId);
+                    bw.Write7BitEncodedInt(owner.TimeToKeepReservation);
+                    bw.Write(owner.GrabDelayPlayer);
+                    bw.Write7BitEncodedInt(owner.GrabDelayTime);
+                    WriteVector2(bw, owner.Position);
+                    break;
+
+                case ItemDestroyPacket destroy:
+                    // ItemDestroy（包 151）：Int16 世界物品槽位（客户端拾取通知）
+                    bw.Write((short)destroy.ItemSlotIndex);
+                    break;
+
                 case SyncChestItemPacket chestItem:
                     // SyncChestItem（包 32）：Int16 ChestIndex + Byte Slot + Int16 Stack + Byte Prefix + Int16 Type
                     bw.Write((short)chestItem.ChestIndex);

@@ -973,16 +973,23 @@ public class WorldGeneratorTests
         };
         lock (world.NpcsLock) world.Npcs.Add(slime);
 
-        // 3) 区间内（上报 7）→ 按上报值扣血 + 置免伤帧
-        Assert.True(new DamagePlayerCommand(2, 1, 7).Apply(world, rng).Applied);
+        // 3) 超上界（上报 10 > 上界 ceil(7×1.15)=9）→ 拒绝，生命不变
+        var above = new DamagePlayerCommand(2, 1, 10).Apply(world, rng);
+        Assert.False(above.Applied);
+        Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
+        Assert.Equal(100, player.Hp);
+
+        // 4) 区间内（上报 7）→ 按上报值扣血 + 置免伤帧
+        Assert.True(new DamagePlayerCommand(3, 1, 7).Apply(world, rng).Applied);
         Assert.Equal(93, player.Hp);
         Assert.Equal(PlayerRuntime.GeneralImmunityTicks(7), player.HurtCooldown);
         Assert.False(player.Dead);
 
-        // 4) 超上界（上报 10 > 9）→ 拒绝，生命 / 免伤帧不变
-        var above = new DamagePlayerCommand(3, 1, 10).Apply(world, rng);
-        Assert.False(above.Applied);
-        Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
+        // 5) 免伤帧内再次上报（区间内 7）→ 忽略（包 117 与服务端接触兜底共享统一免伤帧，
+        //    同一次接触只扣一次，杜绝客户端本地 Hurt + 服务端兜底双扣导致血条掉速翻倍）
+        var inImmune = new DamagePlayerCommand(4, 1, 7).Apply(world, rng);
+        Assert.False(inImmune.Applied);
+        Assert.Equal(CommandFailures.NotApplied, inImmune.Reason);
         Assert.Equal(93, player.Hp);
         Assert.Equal(PlayerRuntime.GeneralImmunityTicks(7), player.HurtCooldown);
     }
@@ -1038,14 +1045,14 @@ public class WorldGeneratorTests
         };
         lock (world.NpcsLock) world.Npcs.Add(slime);
 
-        // 区间内（专家上界 18）→ 接受并按上报值扣血：100 − 18 = 82
-        Assert.True(new DamagePlayerCommand(2, 1, 18).Apply(world, rng).Applied);
-        Assert.Equal(82, player.Hp);
-
         // 超上界（19 > 18）→ 拒绝（hurt_damage_above_limit），生命不变
-        var above = new DamagePlayerCommand(3, 1, 19).Apply(world, rng);
+        var above = new DamagePlayerCommand(2, 1, 19).Apply(world, rng);
         Assert.False(above.Applied);
         Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
+        Assert.Equal(100, player.Hp);
+
+        // 区间内（专家上界 18）→ 接受并按上报值扣血：100 − 18 = 82
+        Assert.True(new DamagePlayerCommand(3, 1, 18).Apply(world, rng).Applied);
         Assert.Equal(82, player.Hp);
     }
 
@@ -1094,14 +1101,14 @@ public class WorldGeneratorTests
         };
         lock (world.NpcsLock) world.Npcs.Add(slime);
 
-        // 区间内（上报 6 = 上界）→ 接受并按上报值扣血：100 − 6 = 94
-        Assert.True(new DamagePlayerCommand(4, 1, 6).Apply(world, rng).Applied);
-        Assert.Equal(94, player.Hp);
-
         // 超上界（7 > 6，裸装上界为 9）→ 拒绝（防伪造伤害），生命不变
-        var above = new DamagePlayerCommand(5, 1, 7).Apply(world, rng);
+        var above = new DamagePlayerCommand(4, 1, 7).Apply(world, rng);
         Assert.False(above.Applied);
         Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
+        Assert.Equal(100, player.Hp);
+
+        // 区间内（上报 6 = 上界）→ 接受并按上报值扣血：100 − 6 = 94
+        Assert.True(new DamagePlayerCommand(5, 1, 6).Apply(world, rng).Applied);
         Assert.Equal(94, player.Hp);
 
         // 脱头盔（空槽清空语义）→ 防御降为 3（80 的 2 + 76 的 1，铜套三件不齐套装 +2 失效）
@@ -1702,6 +1709,7 @@ public class WorldGeneratorTests
         Assert.Equal(8, player.Defense);
         Assert.False(new DamagePlayerCommand(3, 1, 6).Apply(world, rng).Applied);
         Assert.Equal(91, player.Hp);
+        player.HurtCooldown = 0; // 免伤帧到期（40 tick 免疫已过），允许下一次受击上报
         Assert.True(new DamagePlayerCommand(4, 1, 5).Apply(world, rng).Applied);
         Assert.Equal(86, player.Hp);
     }

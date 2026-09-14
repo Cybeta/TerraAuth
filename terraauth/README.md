@@ -6,7 +6,7 @@
 > **当前状态**：Phase 1-7 骨架 + Phase 6 完整实装 + 插件系统与多线程优化；当前生产版本仅支持原版 Terraria 客户端（协议 326）。MOD / TModLoader / 自定义包暂不支持，未来单独立项。
 > + **Tile（挖 / 放方块）服务端权威全链路**（解码 → 权威校验 → Command → 仿真 → 增量广播 → SSC 背包扣减）
 > + **战斗 / 生存权威**（受伤→死亡→复活的 `DamagePlayerCommand` / `KillPlayerCommand` / `RespawnCommand`、
->   弹幕命中判定、掉落物拾取（包 22）+ SSC 入库、复活点由服务端划定；
+>   弹幕命中判定、掉落物拾取（包 151 拾取通知 + 包 22 归属同步）+ SSC 入库、复活点由服务端划定；
 >   法力（包 42）服务端跟踪 + 纠正、治疗（包 35）上限钳制、增益（包 50）服务端持有、弹幕生成（包 27）类型 / 伤害校验）
 > + **世界内容权威**（箱子内容服务端持有（包 31/32/34）、液体 NetLiquid 编辑与逐格流动 + 混合反应、电路线网 / 执行器编辑
 >   + 受限 BFS 信号传播、简化 Boss / 事件状态机（血月 · 日食 · 入侵 · Boss 击杀进度 + 掉落 → 包 7 广播 / 包 21 掉落））
@@ -93,7 +93,7 @@ TerraAuth.ExamplePlugins ──▶ TerraAuth.csproj（编译期引用 Private=fa
 | `Plugins/` | 已实现 | `HookRegistry` / `PluginLoader` / `HookedPipeline` 全链路（Hook 参数已填充包数据，插件可按 Damage / 方块坐标等真实值决策）；注册表采用**写时复制快照**，触发路径**零锁零分配**（无订阅者时不构造 `HookArgs`）；`IServerApi` 已实装踢出 / 封禁 / 在线玩家查询 / 服务器信息 / `ExecuteCommand`（经 `Authority/CommandService.cs` 分发，内置 say / who / kick / help；`Broadcast` / `SendMessage` 经包 82（NetTextModule）真实下发）；`EventStore.QueryAsync` 已接持久化审计查询 |
 | `ModCompat/` | 暂停 | 未来兼容层代码保留但默认禁用；当前生产不注册 250-255、不接受 TModLoader 握手、不透传自定义或未知包，MOD 后续单独立项 |
 | `Concurrency/` | 部分 | `WorkerPool` / `ShardedAuthorityProcessor` / `ParallelSnapshotBroadcaster` 已接入管线与快照广播；`DoubleBufferedWorldState` 已接入仿真→快照（发布不可变 `WorldEntityView`）；`SectionLocks` 区块分区锁已接入图格读写；并行区块仿真待 P4（前提见模块 README） |
-| `Tests/` | 部分 | 9 组验收测试（306 用例通过）；其中 `VanillaFeatureTests` 用**真实权威管线 + 真实 TCP** 逐项验证原版功能（登录链 / 外观广播 / 移动 / 挖放砖 / 背包 / 战斗（含服务端接触伤害与免伤帧）/ 传送（65·73）/ 血量纠正 / 法力跟踪与纠正 / 治疗上限钳制 / 增益服务端持有 / 弹幕生成校验 / 受伤→死亡→复活 / 掉落物拾取（含背包满保留 · 并发只成功一次）/ 弹幕命中 / 箱子内容（含持久化重启存活 · 会话代数隔离 · 关箱与离开距离关闭会话） / 液体（含视口裁剪与混合反应）/ 电路（含图格推送）/ Boss·事件（含掉落与已核对 ID 映射）/ 高熵区块拆分 / **Phase 7 对抗自动化** / 断线广播 / **断线会话保留（宽限期内同身份重连续回位置 / 血量，且换发新会话标识）** / **区块流送（离开出生点后地形）** / **未建模包拒绝** / 他人可见性中继 / 时间与 NPC 同步 / 聊天），覆盖矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)；`WorldFileTests` 覆盖 `.wld` 解析（最小合法世界 + 版本 / 魔数 / footer 拒绝路径）；另有真实 TCP 往返集成测试（含**旧连接实例踢出 / 移除不得影响复用槽位的新连接**）、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、命令子系统、指标导出、插件事件查询、实体视图发布、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、持久化往返（玩家 / 审计 / 封禁重启读回）、包 10 / 包 15 / 新增包编解码回归、`WorldGenerator` 确定性测试 |
+| `Tests/` | 部分 | 9 组验收测试（329 用例通过）；其中 `VanillaFeatureTests` 用**真实权威管线 + 真实 TCP** 逐项验证原版功能（登录链 / 外观广播 / 移动 / 挖放砖 / 背包 / 战斗（含服务端接触伤害与免伤帧）/ 传送（65·73）/ 血量纠正 / 法力跟踪与纠正 / 治疗上限钳制 / 增益服务端持有 / 弹幕生成校验 / 受伤→死亡→复活 / 掉落物拾取（含背包满保留 · 并发只成功一次）/ 弹幕命中 / 箱子内容（含持久化重启存活 · 会话代数隔离 · 关箱与离开距离关闭会话） / 液体（含视口裁剪与混合反应）/ 电路（含图格推送）/ Boss·事件（含掉落与已核对 ID 映射）/ 高熵区块拆分 / **Phase 7 对抗自动化** / 断线广播 / **断线会话保留（宽限期内同身份重连续回位置 / 血量，且换发新会话标识）** / **区块流送（离开出生点后地形）** / **未建模包拒绝** / 他人可见性中继 / 时间与 NPC 同步 / 聊天），覆盖矩阵见 [`VANILLA_COVERAGE.md`](VANILLA_COVERAGE.md)；`WorldFileTests` 覆盖 `.wld` 解析（最小合法世界 + 版本 / 魔数 / footer 拒绝路径）；另有真实 TCP 往返集成测试（含**旧连接实例踢出 / 移除不得影响复用槽位的新连接**）、配置阈值启动映射与热重载（含 `ModPolicy` 字符串枚举与 Int16 量纲校验）、命令子系统、指标导出、插件事件查询、实体视图发布、区块分区锁与包 10 编码并发安全、Hook 参数填充包数据、持久化往返（玩家 / 审计 / 封禁重启读回）、包 10 / 包 15 / 新增包编解码回归、`WorldGenerator` 确定性测试 |
 | `Phase6-Infrastructure/` | 文档 | 仅设计说明，实现见 `Config/Persistence/Monitoring/Security` |
 | `Phase7-RedTeam/` | 部分 | 对抗测试手册（M/P/R 清单）+ 服务端可自动化部分已落为测试（见其 README §零） |
 

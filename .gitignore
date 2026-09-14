@@ -2,8 +2,9 @@
 # 管理 terraauth 源码 + .vscode 配置
 # 独立的 terraauth/.gitignore 保留，本文件做根目录补充
 
-# ---- Terraria 二进制目录（只读，数百 .xnb/.dll/.exe，不可提交） ----
-Terraria/
+# ---- Terraria 二进制目录（只读，数百 .xnb/.dll/.exe，不可提交）----
+# 锚定仓库根，避免误伤 terraauth/Protocol/Terraria/（协议源码，需入库）
+/Terraria/
 
 # ---- .NET 构建产物 ----
 terraauth/bin/
