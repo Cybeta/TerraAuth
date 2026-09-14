@@ -76,7 +76,7 @@ public static class CombatResolver
 
     /// <summary>
     /// 阶段 E：玩家**手持武器**的权威伤害（原版 <c>Player.GetWeaponDamage</c> 口径）：
-    /// <c>base × (1 + 职业伤害%) × (1 + 全伤害%)</c>（buff / 药水实时生效，套装/饰品加成待数据覆盖）。
+    /// <c>base × (1 + 职业伤害%) × (1 + 全伤害%)</c>（Buff/药水实时生效，装备区穿齐套装另加职业加成）。
     /// 未收录武器（<paramref name="itemId"/> 不在 <see cref="ItemDamageTable.Of"/>）返回 0（调用方失败放行）。
     /// </summary>
     public static int GetWeaponDamage(PlayerRuntime player, int itemId)
@@ -87,6 +87,19 @@ public static class CombatResolver
         double damage = stats.Damage;
         damage *= 1.0 + BuffTable.ClassDamagePercent(player.Buffs, stats.Class) / 100.0;
         damage *= 1.0 + BuffTable.AllDamagePercent(player.Buffs) / 100.0;
+
+        // 套装职业加成（阶段 E-2）：穿齐熔岩套等 → 对应职业伤害 +%（ArmorSetBonuses 权威）。
+        if (ArmorSetBonusTable.BonusForEquipment(player.Items) is { } set)
+        {
+            int setPct = stats.Class switch
+            {
+                WeaponClass.Melee => set.MeleePct,
+                WeaponClass.Ranged => set.RangedPct,
+                WeaponClass.Magic => set.MagicPct,
+                _ => 0,
+            };
+            damage *= 1.0 + setPct / 100.0;
+        }
         return Math.Max(1, (int)damage);
     }
 

@@ -1002,14 +1002,14 @@ public class WorldGeneratorTests
 
         var rng = new XoshiroRng(1);
 
-        // 穿铜套：头盔 79(1) + 链甲 80(3) + 护腿 81(2) → 防御 6
-        Assert.True(new SetInventorySlotCommand(1, 1, 0, 79, 1).Apply(world, rng).Applied);
+        // 穿铜套：头盔 89(1) + 链甲 80(2) + 护腿 76(1) = 4，穿齐铜套套装加成 +2 → 防御 6
+        Assert.True(new SetInventorySlotCommand(1, 1, 0, 89, 1).Apply(world, rng).Applied);
         Assert.True(new SetInventorySlotCommand(2, 1, 1, 80, 1).Apply(world, rng).Applied);
-        Assert.True(new SetInventorySlotCommand(3, 1, 2, 81, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(3, 1, 2, 76, 1).Apply(world, rng).Applied);
         Assert.Equal(6, player.Defense);
-        Assert.Equal(79, player.Items[0]);
+        Assert.Equal(89, player.Items[0]);
         Assert.Equal(80, player.Items[1]);
-        Assert.Equal(81, player.Items[2]);
+        Assert.Equal(76, player.Items[2]);
 
         // 放置一只史莱姆钉在玩家碰撞盒中心（接触伤害 7）
         var slime = new WorldNpc
@@ -1034,9 +1034,9 @@ public class WorldGeneratorTests
         Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
         Assert.Equal(94, player.Hp);
 
-        // 脱头盔（空槽清空语义）→ 防御降为 5（3+2）
+        // 脱头盔（空槽清空语义）→ 防御降为 3（80 的 2 + 76 的 1，铜套三件不齐套装 +2 失效）
         Assert.True(new SetInventorySlotCommand(6, 1, 0, 0, 0).Apply(world, rng).Applied);
-        Assert.Equal(5, player.Defense);
+        Assert.Equal(3, player.Defense);
         Assert.Equal(0, player.Items[0]);
     }
 
@@ -1108,9 +1108,10 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 阶段 E：包 28 近战武器校验上界随 **Buff / 手持武器** 实时变化。
-    /// 木弓（26，9 伤）：无 buff 上界 ceil(9×1.15)=11；箭术（73，远程+20%）→ GetWeaponDamage
-    /// = 9×1.2=10.8 → 10，上界 ceil(10×1.15)=12；换木剑（25，7 伤）→ 上界 ceil(7×1.15)=9。
+    /// 阶段 E：包 28 近战武器校验上界随 **Buff / 手持武器 / 套装** 实时变化（1.4.5.8 权威 ID）。
+    /// 金弓（3516，11 伤）：无 buff 上界 ceil(11×1.15)=13；箭术（73，远程+20%）→ GetWeaponDamage
+    /// = 11×1.2=13.2 → 13，上界 ceil(13×1.15)=15；换金阔剑（3520，15 伤）→ 上界 18；
+    /// 穿熔岩套（231/232/233，近战+10%）→ GetWeaponDamage = 15×1.1=16.5 → 16，上界 19。
     /// </summary>
     [Fact]
     public void StrikeBound_Follows_Buffs_And_Held_Weapon_RealTime()
@@ -1132,8 +1133,8 @@ public class WorldGeneratorTests
 
         var rng = new XoshiroRng(1);
 
-        // 手持木弓（槽 3）：先经 MoveCommand 权威写入 SelectedSlot，验证包 13 → SelectedItem 落库
-        Assert.True(new SetInventorySlotCommand(1, 1, 3, 26, 1).Apply(world, rng).Applied);
+        // 手持金弓（槽 3）：先经 MoveCommand 权威写入 SelectedSlot，验证包 13 → SelectedItem 落库
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 3516, 1).Apply(world, rng).Applied);
         Assert.True(new MoveCommand(2, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
         Assert.Equal(3, player.SelectedSlot);
 
@@ -1151,24 +1152,34 @@ public class WorldGeneratorTests
         lock (world.NpcsLock) world.Npcs.Add(slime);
         int index = world.Npcs.IndexOf(slime);
 
-        // 无 buff：上界 11，报 12 拒、报 11 收
-        Assert.Equal(11, CombatResolver.WeaponDamageBound(player, 26, false));
-        Assert.False(new NpcStrikeCommand(3, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
+        // 无 buff：上界 13，报 14 拒、报 13 收 → 87
+        Assert.Equal(13, CombatResolver.WeaponDamageBound(player, 3516, false));
+        Assert.False(new NpcStrikeCommand(3, 1, index, 14, Generation: 3).Apply(world, rng).Applied);
         Assert.Equal(100, slime.Life);
-        Assert.True(new NpcStrikeCommand(4, 1, index, 11, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(89, slime.Life);
+        Assert.True(new NpcStrikeCommand(4, 1, index, 13, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(87, slime.Life);
 
-        // 箭术 Buff（包 50 权威）→ 上界实时升到 12，报 12 收
+        // 箭术 Buff（包 50 权威）→ 上界实时升到 15，报 14 收 → 73
         Assert.True(new SetBuffsCommand(5, 1, new[] { 73 }).Apply(world, rng).Applied);
-        Assert.Equal(12, CombatResolver.WeaponDamageBound(player, 26, false));
-        Assert.True(new NpcStrikeCommand(6, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(77, slime.Life);
+        Assert.Equal(15, CombatResolver.WeaponDamageBound(player, 3516, false));
+        Assert.True(new NpcStrikeCommand(6, 1, index, 14, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(73, slime.Life);
 
-        // 换持木剑（7 伤）→ 上界降回 9，报 10 拒
-        Assert.True(new SetInventorySlotCommand(7, 1, 3, 25, 1).Apply(world, rng).Applied);
-        Assert.Equal(9, CombatResolver.WeaponDamageBound(player, 25, false));
-        Assert.False(new NpcStrikeCommand(8, 1, index, 10, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(77, slime.Life);
+        // 换持金阔剑（15 伤）→ 上界 18，报 17 收 → 56
+        Assert.True(new SetInventorySlotCommand(7, 1, 3, 3520, 1).Apply(world, rng).Applied);
+        Assert.Equal(18, CombatResolver.WeaponDamageBound(player, 3520, false));
+        Assert.True(new NpcStrikeCommand(8, 1, index, 17, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(56, slime.Life);
+
+        // 穿熔岩套（近战 +10%）→ 上界实时升到 19，报 19 收 → 37，报 20 拒
+        Assert.True(new SetInventorySlotCommand(9, 1, 0, 231, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(10, 1, 1, 232, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(11, 1, 2, 233, 1).Apply(world, rng).Applied);
+        Assert.Equal(19, CombatResolver.WeaponDamageBound(player, 3520, false));
+        Assert.True(new NpcStrikeCommand(12, 1, index, 19, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(37, slime.Life);
+        Assert.False(new NpcStrikeCommand(13, 1, index, 20, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(37, slime.Life);
     }
 
     /// <summary>

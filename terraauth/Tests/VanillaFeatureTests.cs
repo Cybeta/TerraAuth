@@ -2140,20 +2140,20 @@ public class VanillaFeatureTests
         var player = world.Players[1];
         Assert.Equal(0, player.Defense); // 裸装
 
-        // 穿铜套：头盔 79(1) + 链甲 80(3) + 护腿 81(2) → 防御 6
-        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 79, 1));
+        // 穿铜套：头盔 89(1) + 链甲 80(2) + 护腿 76(1) = 4，穿齐铜套套装加成 +2 → 防御 6
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 89, 1));
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(1, 80, 1));
-        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(2, 81, 1));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(2, 76, 1));
 
         Assert.True(await TickUntilAsync(server, () => player.Defense == 6, TimeSpan.FromSeconds(5)),
             $"装备防御未经包 5 管线回填，实际 Defense={player.Defense}");
-        Assert.Equal(79, player.Items[0]);
+        Assert.Equal(89, player.Items[0]);
         Assert.Equal(80, player.Items[1]);
-        Assert.Equal(81, player.Items[2]);
+        Assert.Equal(76, player.Items[2]);
 
-        // 脱头盔（空槽清空语义）→ 防御降为 5
+        // 脱头盔（空槽清空语义）→ 防御降为 3（80 的 2 + 76 的 1，铜套三件不齐套装 +2 失效）
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 0, 0));
-        Assert.True(await TickUntilAsync(server, () => player.Defense == 5, TimeSpan.FromSeconds(5)),
+        Assert.True(await TickUntilAsync(server, () => player.Defense == 3, TimeSpan.FromSeconds(5)),
             $"空槽清空未降防，实际 Defense={player.Defense}");
         Assert.Equal(0, player.Items[0]);
     }

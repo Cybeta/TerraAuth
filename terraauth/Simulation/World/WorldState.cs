@@ -1041,7 +1041,7 @@ public sealed class PlayerRuntime
     public const int EquipmentSlotEnd = 8;
 
     /// <summary>
-    /// 重算防御：装备区物品防御 + Buff 防御（原版 <c>Player.statDefense</c> = 装备 + 增益）。
+    /// 重算防御：装备区物品防御 + Buff 防御 + 套装防御加成（原版 <c>Player.statDefense</c> = 装备 + 增益 + 套装）。
     /// 物品栏变更（包 5）与 Buff 变更（包 50）后调用；117 区间上界 / 接触兜底据此实时减防。
     /// 未知物品 / 空槽经 <see cref="ItemDefenseTable.DefenseOf"/> 记为 0。
     /// </summary>
@@ -1051,6 +1051,7 @@ public sealed class PlayerRuntime
         for (int i = EquipmentSlotStart; i <= EquipmentSlotEnd && i < InventorySlotCount; i++)
             sum += ItemDefenseTable.DefenseOf(Items[i]);
         sum += BuffTable.DefenseOf(Buffs);
+        sum += ArmorSetBonusTable.BonusForEquipment(Items)?.DefenseBonus ?? 0;
         Defense = sum;
     }
 
