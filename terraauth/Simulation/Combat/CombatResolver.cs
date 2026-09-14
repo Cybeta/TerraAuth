@@ -166,6 +166,62 @@ public static class CombatResolver
     }
 
     /// <summary>
+    /// 阶段 G：召唤 / 哨兵命中的**上报值上界**——玩家拥有的存活召唤弹幕**最高**伤害。
+    /// 原版召唤物仆从伤害 ≠ 手持武器（召唤后切换武器仍沿用创建时伤害），故按手持武器校验
+    /// 会误拒合法命中；改为取该玩家所有存活召唤弹幕（<see cref="SummonProjectileTable"/>）的
+    /// 最高 Damage 作基准（客户端打中的任意一枚召唤物伤害 ≤ 最高者，永不误拒）。
+    /// 弹幕伤害由客户端包 27 创建时上报（已含 minionDamage 修饰，攻击时经 DamageVar ±15% × 暴击），
+    /// 上界 = <c>ceil(最高弹幕伤害 × 1.15) × (crit ? 2 : 1)</c>。
+    /// 返回 null（无存活召唤弹幕）→ 调用方失败放行，绝不误拒。
+    /// </summary>
+    public static int? SummonDamageBound(WorldState world, int playerId, bool crit)
+    {
+        int best = 0;
+        lock (world.ProjectilesLock)
+        {
+            foreach (var p in world.Projectiles)
+            {
+                if (!p.Active || p.Owner != playerId || p.Damage <= 0) continue;
+                if (!SummonProjectileTable.Of.Contains(p.Type)) continue;
+                if (p.Damage > best) best = p.Damage;
+            }
+        }
+
+        if (best <= 0) return null;
+        return (int)Math.Ceiling(best * 1.15f) * (crit ? 2 : 1);
+    }
+
+    /// <summary>
+    /// 阶段 G：召唤 / 哨兵命中的**背包兜底上界**——玩家物品栏中最高基础伤害的召唤武器权威伤害
+    /// （<c>GetWeaponDamage</c>，含前缀 / Buff / 饰品 / 套装修饰）。
+    /// 服务端未跟踪到召唤弹幕时（弹幕类型未收录 / 包 27 丢失 / 掉线重连）用作兜底基准，防作弊不失效。
+    /// <para>
+    /// 注意不能**单独**作为召唤上界：原版仆从伤害 = **召唤时**的武器伤害，召唤后把武器移出背包
+    /// 会导致背包上界低于仆从实际伤害 → 误拒合法命中；故与 <see cref="SummonDamageBound"/>（弹幕）
+    /// 由调用方取最大合并——弹幕在时不受背包变动影响，弹幕丢失时由背包兜底。
+    /// </para>
+    /// 返回 null（背包无召唤武器）→ 调用方失败放行。
+    /// </summary>
+    public static int? SummonBackpackBound(PlayerRuntime player, bool crit)
+    {
+        int best = 0;
+        for (int i = 0; i < player.Items.Length; i++)
+        {
+            int item = player.Items[i];
+            if (item <= 0) continue;
+            if (ItemDamageTable.Of.TryGetValue(item, out var stats) && stats.Class == WeaponClass.Summon)
+            {
+                byte prefix = i < player.ItemPrefixes.Length ? player.ItemPrefixes[i] : (byte)0;
+                int wd = GetWeaponDamage(player, item, prefix);
+                if (wd > best) best = wd;
+            }
+        }
+
+        if (best <= 0) return null;
+        return (int)Math.Ceiling(best * 1.15f) * (crit ? 2 : 1);
+    }
+
+    /// <summary>
     /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。
     /// 判定口径与原版 <c>Player.Update_NPCCollision</c> 一致：玩家 / NPC 盒各自取整后做 AABB 求交，
     /// **不设最小重叠**（两轴各 1px 即命中），且用逐类型尺寸而非「点 + 半径」。

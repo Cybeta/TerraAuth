@@ -1189,6 +1189,199 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 阶段 G：召唤 / 哨兵命中按**玩家存活召唤弹幕最高伤害**上界校验，且不因手持弱武器误拒。
+    /// 星尘细胞法杖召唤 191 号弹幕（<see cref="SummonProjectileTable"/>），客户端包 27 上报 Damage=60
+    /// （已含 minionDamage 修饰）→ 上界 = ceil(60×1.15)=69，暴击 138。
+    /// 手持木剑（24，7 伤）武器上界仅 ceil(7×1.15)=9：召唤物命中 46 不得被武器通道误拒；
+    /// 报 999（超两通道上界）必须拒绝；召唤后切空手仍被通道 2 约束（999 拒 / 46 收）；
+    /// 移除弹幕 + 空手（两通道皆无上界）→ 失败放行；无弹幕时武器通道独立生效。
+    /// </summary>
+    [Fact]
+    public void StrikeBound_Summon_Uses_Minion_Projectile_Damage()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.StrikeWeaponCheck = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 手持木剑（槽 3，7 伤近战）：武器通道上界仅 9。
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 24, 1).Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(2, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+        Assert.Equal(9, CombatResolver.WeaponDamageBound(player, 24, false));
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 500,
+            LifeMax = 500,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        // 玩家拥有存活召唤弹幕：type 191（星尘细胞），Damage 60。
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 7,
+                Owner = 1,
+                Type = 191,
+                Position = new Vector2(320f, 380f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 60,
+                Active = true,
+            });
+
+        Assert.Equal(69, CombatResolver.SummonDamageBound(world, 1, false));
+        Assert.Equal(138, CombatResolver.SummonDamageBound(world, 1, true));
+
+        // 召唤物合法命中 46（60 经 DamageVar ±15% 内）→ 虽超武器通道 9，但召唤通道 69 放行。
+        Assert.True(new NpcStrikeCommand(3, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
+        // 暴击上界内 138 → 接受。
+        Assert.True(new NpcStrikeCommand(4, 1, index, 138, Generation: 3, Crit: true).Apply(world, rng).Applied);
+        // 超暴击上界 139 → 拒绝。
+        Assert.False(new NpcStrikeCommand(5, 1, index, 139, Generation: 3, Crit: true).Apply(world, rng).Applied);
+        // 999 远超两通道上界 → 拒绝。
+        Assert.False(new NpcStrikeCommand(6, 1, index, 999, Generation: 3).Apply(world, rng).Applied);
+
+        // 召唤后切换空手：召唤弹幕仍在 → 通道 2 不依赖手持武器，999 拒绝、合法 46 接受。
+        player.Items[3] = 0;
+        player.ItemPrefixes[3] = 0;
+        Assert.False(new NpcStrikeCommand(7, 1, index, 999, Generation: 3).Apply(world, rng).Applied);
+        Assert.True(new NpcStrikeCommand(8, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
+
+        // 移除召唤弹幕 + 空手 → 两通道皆无上界 → 失败放行，绝不误拒。
+        // 注：报 1 而非 999——「放行」后服务端仍按上报值结算伤害，报 999 会秒杀 NPC 使后续命令失效。
+        lock (world.ProjectilesLock)
+            world.Projectiles[0].Active = false;
+        Assert.Null(CombatResolver.SummonDamageBound(world, 1, false));
+        Assert.True(new NpcStrikeCommand(9, 1, index, 1, Generation: 3).Apply(world, rng).Applied);
+
+        // 无弹幕时武器通道独立生效：重新持木剑 → 999 超上界 9 → 拒绝。
+        Assert.True(new SetInventorySlotCommand(10, 1, 3, 24, 1).Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(11, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+        Assert.False(new NpcStrikeCommand(12, 1, index, 999, Generation: 3).Apply(world, rng).Applied);
+
+        // 无弹幕 + 空手 + 背包含召唤武器（星尘细胞法杖 3474，60 伤，槽 4）→ 背包兜底上界 69：
+        // 999 拒绝、合法 46 接受（弹幕丢失时防作弊不失效）。
+        player.Items[3] = 0;
+        player.ItemPrefixes[3] = 0;
+        Assert.True(new SetInventorySlotCommand(13, 1, 4, 3474, 1).Apply(world, rng).Applied);
+        Assert.Equal(69, CombatResolver.SummonBackpackBound(player, false));
+        Assert.False(new NpcStrikeCommand(14, 1, index, 999, Generation: 3).Apply(world, rng).Applied);
+        Assert.True(new NpcStrikeCommand(15, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
+    }
+
+    /// <summary>
+    /// 阶段 G：召唤弹幕**不因背包武器移除而销毁**（原版仆从不随武器移动消失）——
+    /// 武器移出背包后弹幕基准仍生效：999 拒绝、合法 46 接受。
+    /// 若此处销毁弹幕，「召唤 → 移除武器 → 报 999」即无任何上界而被放行。
+    /// </summary>
+    [Fact]
+    public void Summon_Bound_Survives_Weapon_Removed_From_Backpack()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.StrikeWeaponCheck = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 500,
+            LifeMax = 500,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 7,
+                Owner = 1,
+                Type = 191,
+                Position = new Vector2(320f, 380f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 60,
+                Active = true,
+            });
+
+        // 背包槽 4 先放星尘细胞法杖（3474，60 伤）再移出背包 → 背包兜底消失、弹幕基准仍在。
+        Assert.True(new SetInventorySlotCommand(1, 1, 4, 3474, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(2, 1, 4, 0, 0).Apply(world, rng).Applied);
+        Assert.Null(CombatResolver.SummonBackpackBound(player, false));
+        Assert.Equal(69, CombatResolver.SummonDamageBound(world, 1, false));
+
+        // 空手（两通道：背包 null + 弹幕 69）→ 999 拒绝、46 接受。
+        Assert.False(new NpcStrikeCommand(3, 1, index, 999, Generation: 3).Apply(world, rng).Applied);
+        Assert.True(new NpcStrikeCommand(4, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
+    }
+
+    /// <summary>
+    /// 阶段 G：召唤弹幕不随默认 300 tick 超时销毁（否则合法召唤物命中会失去伤害基准），
+    /// 位置由客户端包 27 权威更新而非服务端直线积分。
+    /// </summary>
+    [Fact]
+    public void Summon_Projectiles_Skip_Timeout_And_Integration()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 9,
+                Owner = 1,
+                Type = 191,
+                Position = new Vector2(200f, 200f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 60,
+                TimeLeft = 1, // 即使只剩 1 tick，召唤弹幕也不因超时失效
+                Active = true,
+            });
+
+        sim.Tick();
+        lock (world.ProjectilesLock)
+        {
+            var p = Assert.Single(world.Projectiles);
+            Assert.True(p.Active, "召唤弹幕不应因默认超时被销毁");
+            Assert.Equal(200f, p.Position.X); // 未被直线积分推进
+        }
+    }
+
+    /// <summary>
     /// 阶段 E-4：武器前缀伤害倍率参与近战武器校验。
     /// 木剑（24，7 伤）无前缀上界 = ceil(7×1.15)=9；前缀 57（凶残 +18%）→ base = ceil(7×1.18)=9，
     /// 上界 = ceil(9×1.15)=11 —— 不带前缀倍率会把合法命中 11 误拒。前缀数据经 SetInventorySlotCommand 落库。

@@ -690,16 +690,20 @@ public sealed record NpcStrikeCommand(
                 }
             }
 
-            // 阶段 E「近战武器伤害校验」/ 阶段 F「远程武器校验」：无弹幕的命中按**手持武器权威伤害**区间校验。
-            // 上界 = ceil(权威伤害 × 1.15) × (crit ? 2 : 1)，权威伤害随 Buff/药水/套装/饰品实时变化
-            // （base × 前缀倍率 × 修饰%，原版 Player.GetWeaponDamage 口径；阶段 E-4 起前缀参与基础伤害修正）。
-            // 近战 / 魔法：武器伤害即弹幕伤害，直接按武器上界校验；
-            // 远程：弹幕伤害 = 武器 + 弹药（原版 PickAmmo 合并，弹药乘修饰倍率），
-            //       未收录弹药类型 / 无弹药合并武器（投掷、鱼叉、gunProj 四件）按武器伤害校验；
-            // 召唤：仆从伤害 ≠ 手持武器，按武器上界校验会误拒合法命中，失败放行。
-            // 未收录武器 / 空手 → 失败放行（退回既有校验），绝不误拒未知物品。
+            // 阶段 E「近战武器伤害校验」/ 阶段 F「远程武器校验」/ 阶段 G「召唤弹幕校验」：
+            // 无弹幕匹配的命中按**多通道取最大上界**校验——任一合法来源（手持武器或召唤物）
+            // 的权威伤害都构成合法上界，上报值超过**所有**通道的上界才拒绝。
+            //   · 近战 / 魔法：武器伤害即弹幕伤害（无弹药合并），直接按武器上界校验；
+            //   · 远程：弹幕伤害 = 武器 + 弹药（原版 PickAmmo 合并，弹药乘修饰倍率），
+            //     未收录弹药类型 / 无弹药合并武器（投掷、鱼叉、gunProj 四件）按武器伤害校验；
+            //   · 召唤：仆从伤害 ≠ 手持武器（召唤后切换武器仍沿用创建时伤害），不进手持通道，
+            //     改按玩家拥有的存活召唤弹幕最高伤害上界校验（SummonProjectileTable）。
+            // 未收录武器 / 空手 / 无召唤弹幕 → 无通道上界，失败放行，绝不误拒未知物品。
             if (!projectileMatched && world.StrikeWeaponCheck)
             {
+                int? upperBound = null;
+
+                // 通道 1：手持武器权威伤害上界（近战 / 魔法 / 远程）。
                 if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
                 {
                     int heldItem = player.Items[player.SelectedSlot];
@@ -710,30 +714,30 @@ public sealed record NpcStrikeCommand(
                         if (heldStats.Class is WeaponClass.Melee or WeaponClass.Magic)
                         {
                             int bound = CombatResolver.WeaponDamageBound(player, heldItem, Crit, heldPrefix);
-                            if (Damage > bound)
-                            {
-                                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 手持武器 {heldItem} 上报 {Damage} 超武器上界 {bound}（buff={string.Join(',', player.Buffs)} crit={Crit}）");
-                                return new(false, CommandFailures.StrikeDamageMismatch);
-                            }
+                            upperBound = Math.Max(upperBound ?? 0, bound);
                         }
                         else if (heldStats.Class == WeaponClass.Ranged)
                         {
-                            int? bound = CombatResolver.RangedDamageBound(player, heldItem, Crit, heldPrefix);
-                            if (bound is int rb && Damage > rb)
-                            {
-                                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 手持远程武器 {heldItem} 上报 {Damage} 超上界 {rb}（含弹药合并 buff={string.Join(',', player.Buffs)} crit={Crit}）");
-                                return new(false, CommandFailures.StrikeDamageMismatch);
-                            }
+                            if (CombatResolver.RangedDamageBound(player, heldItem, Crit, heldPrefix) is int rb)
+                                upperBound = Math.Max(upperBound ?? 0, rb);
                         }
-                        else
-                        {
-                            Console.WriteLine($"[Strike] slot={NpcIndex} 手持召唤武器 {heldItem}，仆从伤害≠手持武器，失败放行 dmg={Damage}");
-                        }
+                        // 召唤武器：武器伤害 ≠ 仆从伤害，不进通道 1（由通道 2 覆盖）。
                     }
-                    else
-                    {
-                        Console.WriteLine($"[Strike] slot={NpcIndex} 手持物品 {heldItem} 未收录（或空手），失败放行 dmg={Damage}");
-                    }
+                }
+
+                // 通道 2：召唤 / 哨兵上界（阶段 G）。无论手持武器，只要该玩家拥有存活召唤弹幕，
+                // 其最高伤害即构成合法上界——召唤物命中不会因「手持弱武器」被误拒。
+                // 弹幕基准 + 背包兜底取最大：弹幕未被跟踪时（类型未收录 / 包 27 丢失 / 掉线重连）
+                // 由背包最高召唤武器伤害兜底，防作弊不失效；弹幕在时不受「召唤后武器移出背包」影响。
+                if (CombatResolver.SummonDamageBound(world, playerId, Crit) is int sb)
+                    upperBound = Math.Max(upperBound ?? 0, sb);
+                if (CombatResolver.SummonBackpackBound(player, Crit) is int pb)
+                    upperBound = Math.Max(upperBound ?? 0, pb);
+
+                if (upperBound is int ub && Damage > ub)
+                {
+                    Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 上报 {Damage} 超上界 {ub}（crit={Crit}）");
+                    return new(false, CommandFailures.StrikeDamageMismatch);
                 }
             }
 

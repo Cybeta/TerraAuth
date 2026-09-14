@@ -333,6 +333,13 @@ public partial class WorldSimulator : IWorldViewProvider
             {
                 if (!p.Active) continue;
 
+                // 召唤 / 哨兵弹幕（阶段 G）：由召唤 AI 驱动（跟随 / 驻守），位置 / 朝向
+                // 完全由客户端包 27 权威上报，服务端直线积分反而会漂移；且默认 300 tick
+                // 超时会在合法召唤物命中前销毁弹幕、丢失伤害基准。故**不积分、不超时**，
+                // 生命周期由客户端包 29（销毁）驱动，掉线兜底见下方统一回收。
+                if (SummonProjectileTable.Of.Contains(p.Type))
+                    continue;
+
                 // 原版字段驱动的行为（图格碰撞 / 重力 / extraUpdates / 生存期钳制）：
                 // 仅登记过的类型（服务端发射的 Boss 弹幕）生效，其余保持简化直线积分。
                 var behavior = ProjectileBehaviorOf(p.Type);
