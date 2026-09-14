@@ -690,31 +690,49 @@ public sealed record NpcStrikeCommand(
                 }
             }
 
-            // 阶段 E「近战武器伤害校验」：无弹幕的命中按**手持武器权威伤害**区间校验。
-            // 上界 = ceil(GetWeaponDamage × 1.15) × (crit ? 2 : 1)，GetWeaponDamage 随 Buff/药水/套装/饰品实时变化
+            // 阶段 E「近战武器伤害校验」/ 阶段 F「远程武器校验」：无弹幕的命中按**手持武器权威伤害**区间校验。
+            // 上界 = ceil(权威伤害 × 1.15) × (crit ? 2 : 1)，权威伤害随 Buff/药水/套装/饰品实时变化
             // （base × 前缀倍率 × 修饰%，原版 Player.GetWeaponDamage 口径；阶段 E-4 起前缀参与基础伤害修正）。
-            // 阶段 E-5：仅**近战 / 魔法**职业参与校验——远程（弓/枪）弹幕伤害 = 武器 + 弹药（原版 PickAmmo
-            // 合并），召唤仆从伤害 ≠ 手持武器，按武器上界校验会误拒合法命中，故这两类失败放行。
+            // 近战 / 魔法：武器伤害即弹幕伤害，直接按武器上界校验；
+            // 远程：弹幕伤害 = 武器 + 弹药（原版 PickAmmo 合并，弹药乘修饰倍率），
+            //       未收录弹药类型 / 无弹药合并武器（投掷、鱼叉、gunProj 四件）按武器伤害校验；
+            // 召唤：仆从伤害 ≠ 手持武器，按武器上界校验会误拒合法命中，失败放行。
             // 未收录武器 / 空手 → 失败放行（退回既有校验），绝不误拒未知物品。
             if (!projectileMatched && world.StrikeWeaponCheck)
             {
                 if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
                 {
                     int heldItem = player.Items[player.SelectedSlot];
+                    byte heldPrefix = player.ItemPrefixes[player.SelectedSlot];
                     if (heldItem > 0
-                        && ItemDamageTable.Of.TryGetValue(heldItem, out var heldStats)
-                        && heldStats.Class is WeaponClass.Melee or WeaponClass.Magic)
+                        && ItemDamageTable.Of.TryGetValue(heldItem, out var heldStats))
                     {
-                        int bound = CombatResolver.WeaponDamageBound(player, heldItem, Crit, player.ItemPrefixes[player.SelectedSlot]);
-                        if (Damage > bound)
+                        if (heldStats.Class is WeaponClass.Melee or WeaponClass.Magic)
                         {
-                            Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 手持武器 {heldItem} 上报 {Damage} 超武器上界 {bound}（buff={string.Join(',', player.Buffs)} crit={Crit}）");
-                            return new(false, CommandFailures.StrikeDamageMismatch);
+                            int bound = CombatResolver.WeaponDamageBound(player, heldItem, Crit, heldPrefix);
+                            if (Damage > bound)
+                            {
+                                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 手持武器 {heldItem} 上报 {Damage} 超武器上界 {bound}（buff={string.Join(',', player.Buffs)} crit={Crit}）");
+                                return new(false, CommandFailures.StrikeDamageMismatch);
+                            }
+                        }
+                        else if (heldStats.Class == WeaponClass.Ranged)
+                        {
+                            int? bound = CombatResolver.RangedDamageBound(player, heldItem, Crit, heldPrefix);
+                            if (bound is int rb && Damage > rb)
+                            {
+                                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 手持远程武器 {heldItem} 上报 {Damage} 超上界 {rb}（含弹药合并 buff={string.Join(',', player.Buffs)} crit={Crit}）");
+                                return new(false, CommandFailures.StrikeDamageMismatch);
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[Strike] slot={NpcIndex} 手持召唤武器 {heldItem}，仆从伤害≠手持武器，失败放行 dmg={Damage}");
                         }
                     }
                     else
                     {
-                        Console.WriteLine($"[Strike] slot={NpcIndex} 手持物品 {heldItem} 非近战/魔法（或未收录），失败放行 dmg={Damage}");
+                        Console.WriteLine($"[Strike] slot={NpcIndex} 手持物品 {heldItem} 未收录（或空手），失败放行 dmg={Damage}");
                     }
                 }
             }

@@ -1241,6 +1241,91 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 阶段 F：远程武器上界校验（含弹药合并，原版 ItemCheck_Shoot 口径）。
+    /// 木弓（39，4 伤，箭 40）：无弹药上界 ceil(4×1.15)=5；放木箭（40，5 伤）→ 合 9 → 上界 11；
+    /// 换烈焰箭（41，7 伤）→ 合 11 → 上界 13；暴击 ×2 → 26。
+    /// 火枪（95，13 伤，子弹 97）+ 陨星弹（234，8 伤）→ 合 21 → 上界 25；
+    /// 吹管（281，9 伤，镖 283）+ 毒镖（1310，10 伤）→ 合 19 → 上界 22。
+    /// 酒醉（25，远程+10%）同时放大武器与弹药：木弓+木箭 → 武器 (int)(4×1.1)=4、弹药 ceil(5×1.1)=6 → 合 10 → 上界 12。
+    /// 非远程 / 未收录武器（木剑 24、99999）→ null（失败放行）。
+    /// 端到端：手持木弓 + 木箭，上报 12（>11）被拒、11 被收 → 服务端按防御减伤结算 89。
+    /// </summary>
+    [Fact]
+    public void RangedDamageBound_Merges_Ammo_And_Modifiers()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 无弹药：上界 = 武器伤害 ×1.15（弹药合并为 0）
+        Assert.Equal(5, CombatResolver.RangedDamageBound(player, 39, false));   // 木弓 4 伤
+        Assert.Equal(15, CombatResolver.RangedDamageBound(player, 95, false));  // 火枪 13 伤
+
+        // 木弓 + 木箭（40，5 伤）→ 4+5=9 → 上界 ceil(9×1.15)=11
+        Assert.True(new SetInventorySlotCommand(1, 1, 50, 40, 1).Apply(world, rng).Applied);
+        Assert.Equal(11, CombatResolver.RangedDamageBound(player, 39, false));
+
+        // 烈焰箭（41，7 伤）→ 4+7=11 → 上界 13；暴击 ×2 → 26
+        Assert.True(new SetInventorySlotCommand(2, 1, 50, 41, 1).Apply(world, rng).Applied);
+        Assert.Equal(13, CombatResolver.RangedDamageBound(player, 39, false));
+        Assert.Equal(26, CombatResolver.RangedDamageBound(player, 39, true));
+
+        // 火枪（95）+ 陨星弹（234，8 伤）→ 13+8=21 → 上界 25
+        Assert.True(new SetInventorySlotCommand(3, 1, 50, 234, 1).Apply(world, rng).Applied);
+        Assert.Equal(25, CombatResolver.RangedDamageBound(player, 95, false));
+
+        // 吹管（281）+ 毒镖（1310，10 伤）→ 9+10=19 → 上界 22
+        Assert.True(new SetInventorySlotCommand(4, 1, 50, 1310, 1).Apply(world, rng).Applied);
+        Assert.Equal(22, CombatResolver.RangedDamageBound(player, 281, false));
+
+        // 酒醉（25，远程+10%）：木弓 4 伤 → 武器 (int)(4×1.1)=4、弹药 ceil(5×1.1)=6 → 合 10 → 上界 12
+        Assert.True(new SetInventorySlotCommand(5, 1, 50, 40, 1).Apply(world, rng).Applied);
+        Assert.True(new SetBuffsCommand(6, 1, new[] { 25 }).Apply(world, rng).Applied);
+        Assert.Equal(12, CombatResolver.RangedDamageBound(player, 39, false));
+        Assert.True(new SetBuffsCommand(7, 1, Array.Empty<int>()).Apply(world, rng).Applied);
+
+        // 非远程 / 未收录 → null（失败放行）
+        Assert.Null(CombatResolver.RangedDamageBound(player, 24, false));    // 木剑（近战）
+        Assert.Null(CombatResolver.RangedDamageBound(player, 99999, false)); // 未收录
+
+        // 端到端：手持木弓（槽 3）+ 木箭（槽 50），上报 12 超界被拒、11 被收 → 89
+        Assert.True(new SetInventorySlotCommand(8, 1, 3, 39, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(9, 1, 50, 40, 1).Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(10, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+        Assert.Equal(3, player.SelectedSlot);
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        Assert.False(new NpcStrikeCommand(11, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(100, slime.Life);
+        Assert.True(new NpcStrikeCommand(12, 1, index, 11, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(89, slime.Life);
+    }
+
+    /// <summary>
     /// 阶段 E-4：空槽清空时前缀同步清零（避免残留前缀误放大后续武器上界）。
     /// </summary>
     [Fact]

@@ -1,8 +1,9 @@
 // TerraAuth — 服务端权威伤害结算：武器基础伤害表（阶段 E 全量补齐）
 // 阶段 E：近战 / 魔法（无弹药合并）命中按**手持武器权威伤害**校验包 28 上报值。
-// 阶段 E-5：武器上界校验仅对**近战 / 魔法**职业生效——远程（弓/枪）弹幕伤害 = 武器 + 弹药
-//          （原版 PickAmmo 合并），召唤仆从伤害 ≠ 手持武器，按武器上界校验会**误拒**，均失败放行。
-//          本表仍收录远程 / 召唤武器作为权威数据（供后续弹幕匹配阶段使用），但不参与武器上界校验。
+// 阶段 F：远程命中按**武器 + 弹药**权威伤害校验（弹幕伤害 = 武器 + 弹药，原版 PickAmmo 合并，
+//         弹药乘修饰倍率，见 WeaponAmmoTypeOf / AmmoTypeOf / CombatResolver.RangedDamageBound）；
+//         无弹药合并的远程（投掷 / 鱼叉 / gunProj 四件）按武器伤害校验。召唤仆从伤害 ≠ 手持武器，失败放行。
+//          本表仍收录召唤武器作为权威数据，但不参与武器上界校验。
 // 数据源：Terraria 1.4.5.8 原版 Item.SetDefaults1-5 的 damage 字段（取 **case 内基础赋值**，
 //          排除 StrongerVariant 等变体 if 块内的覆盖；ID 以 ItemID.cs 为准）。
 // 未收录的物品（含空手 / 未知武器 / 弹药 / 工具）→ 失败放行（退回既有上限校验），绝不误拒。
@@ -473,5 +474,25 @@ public static class ItemDamageTable
         [6152] = new(8,  WeaponClass.Magic),   // 太阳花法杖 Daybloom Staff
         [6153] = new(11, WeaponClass.Magic),   // 冰川之牙 Glacier Fang
         [6154] = new(20, WeaponClass.Magic),   // 花瓣风暴 Petalstorm
+        // ---- 阶段 F：投掷武器（消耗型，原版 1.4 起并入远程类；弹幕伤害 = 武器伤害，无弹药合并，可安全校验）----
+        [42]  = new(10, WeaponClass.Ranged),   // 手里剑 Shuriken
+        [154] = new(20, WeaponClass.Ranged),   // 骨头 Bone
+        [161] = new(16, WeaponClass.Ranged),   // 尖刺球 Spiky Ball
+        [168] = new(60, WeaponClass.Ranged),   // 手榴弹 Grenade
+        [287] = new(14, WeaponClass.Ranged),   // 毒刀 Poisoned Knife
+        [422] = new(20, WeaponClass.Ranged),   // 圣水 Holy Water
+        [423] = new(20, WeaponClass.Ranged),   // 邪水 Unholy Water
+        [1130] = new(12, WeaponClass.Ranged),  // 蜜蜂手榴弹 Beenade
+        [1809] = new(13, WeaponClass.Ranged),  // 臭鸡蛋 Rotten Egg
+        [1913] = new(14, WeaponClass.Ranged),  // 八角星 Star Anise
+        [3094] = new(17, WeaponClass.Ranged),  // 标枪 Javelin
+        [3116] = new(65, WeaponClass.Ranged),  // 弹力手榴弹 Bouncy Grenade
+        [3197] = new(17, WeaponClass.Ranged),  // 霜冻匕首鱼 Frost Daggerfish
+        [3378] = new(20, WeaponClass.Ranged),  // 骨标枪 Bone Javelin
+        [3379] = new(14, WeaponClass.Ranged),  // 骨刀 Bone Dagger
+        [3477] = new(20, WeaponClass.Ranged),  // 血水 Blood Water
+        [3548] = new(30, WeaponClass.Ranged),  // 派对女孩手榴弹 Party Girl Grenade
+        [5572] = new(8,  WeaponClass.Ranged),  // 泥球 Mud Ball
+        [5577] = new(13, WeaponClass.Ranged),  // 漂亮镜子 Pretty Mirror
     };
 }

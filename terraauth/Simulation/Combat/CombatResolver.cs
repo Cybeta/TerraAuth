@@ -75,6 +75,36 @@ public static class CombatResolver
         => Math.Max(1, damage - (int)Math.Round(defense * 0.5f));
 
     /// <summary>
+    /// 某职业的伤害修饰百分比合计（%）：Buff 职业% + Buff 全% + 饰品职业% + 饰品全% + 护甲单件职业%
+    /// + 套装职业%（加算，原版口径）。供 <see cref="GetWeaponDamage"/> 与 <see cref="RangedDamageBound"/>
+    /// （弹药部分按原版 <c>GetWeaponDamageMultiplier</c> 用同一修饰倍率）共用。
+    /// </summary>
+    private static double GetClassModifierPercent(PlayerRuntime player, WeaponClass cls)
+    {
+        double totalPct =
+            BuffTable.ClassDamagePercent(player.Buffs, cls)
+            + BuffTable.AllDamagePercent(player.Buffs)
+            + AccessoryTable.ClassDamagePercent(player.Items, cls)
+            + AccessoryTable.AllDamagePercent(player.Items)
+            + ArmorPieceBonusTable.ClassDamagePercent(player.Items, cls); // 阶段 E-5：护甲单件（头/胸/腿）职业加成，与套装加成加算
+
+        // 套装职业加成（阶段 E-2）：穿齐熔岩套等 → 对应职业伤害 +%（ArmorSetBonuses 权威）；
+        // 全伤害类套装（南瓜/水晶刺客）经 AllDamage 计入所有职业。
+        if (ArmorSetBonusTable.BonusForEquipment(player.Items) is { } set)
+        {
+            totalPct += set.AllDamage + (cls switch
+            {
+                WeaponClass.Melee => set.MeleePct,
+                WeaponClass.Ranged => set.RangedPct,
+                WeaponClass.Magic => set.MagicPct,
+                _ => 0,
+            });
+        }
+
+        return totalPct;
+    }
+
+    /// <summary>
     /// 阶段 E：玩家**手持武器**的权威伤害（原版 <c>Player.GetWeaponDamage</c> 口径）：
     /// <c>base × (1 + 总修饰%)</c>。各类修饰**加算**累进职业伤害字段（原版无独立 allDamage 字段，
     /// 「全伤害」如 Wrath/复仇者徽章是对四职业字段 += 同一值）：Buff 职业% + Buff 全% + 套装职业% + 饰品职业% + 饰品全%。
@@ -88,27 +118,7 @@ public static class CombatResolver
             return 0;
 
         double baseDmg = Math.Ceiling(stats.Damage * PrefixDamageTable.DamageMultiplier(prefix));
-        double totalPct =
-            BuffTable.ClassDamagePercent(player.Buffs, stats.Class)
-            + BuffTable.AllDamagePercent(player.Buffs)
-            + AccessoryTable.ClassDamagePercent(player.Items, stats.Class)
-            + AccessoryTable.AllDamagePercent(player.Items)
-            + ArmorPieceBonusTable.ClassDamagePercent(player.Items, stats.Class); // 阶段 E-5：护甲单件（头/胸/腿）职业加成，与套装加成加算
-
-        // 套装职业加成（阶段 E-2）：穿齐熔岩套等 → 对应职业伤害 +%（ArmorSetBonuses 权威）；
-        // 全伤害类套装（南瓜/水晶刺客）经 AllDamage 计入所有职业。
-        if (ArmorSetBonusTable.BonusForEquipment(player.Items) is { } set)
-        {
-            totalPct += set.AllDamage + (stats.Class switch
-            {
-                WeaponClass.Melee => set.MeleePct,
-                WeaponClass.Ranged => set.RangedPct,
-                WeaponClass.Magic => set.MagicPct,
-                _ => 0,
-            });
-        }
-
-        return Math.Max(1, (int)(baseDmg * (1.0 + totalPct / 100.0)));
+        return Math.Max(1, (int)(baseDmg * (1.0 + GetClassModifierPercent(player, stats.Class) / 100.0)));
     }
 
     /// <summary>
@@ -118,6 +128,42 @@ public static class CombatResolver
     /// </summary>
     public static int WeaponDamageBound(PlayerRuntime player, int itemId, bool crit, byte prefix = 0)
         => (int)Math.Ceiling(GetWeaponDamage(player, itemId, prefix) * 1.15f) * (crit ? 2 : 1);
+
+    /// <summary>
+    /// 阶段 F：远程命中的**上报值上界**（含弹药合并，原版 <c>Player.ItemCheck_Shoot</c> 口径）：
+    /// <c>Damage = GetWeaponDamage(武器，含前缀+修饰) + ammo.damage × GetWeaponDamageMultiplier(弹药)</c>
+    /// （弹药乘本类修饰倍率；枪械 gunProj 四件与原版一致**不合并**弹药，未收录弹药类型同理）。
+    /// 上界 = <c>ceil(权威总伤害 × 1.15) × (crit ? 2 : 1)</c>。
+    /// 弹药部分取玩家物品栏中与武器同类型弹药的**最高**基础伤害（原版 PickAmmo 扫栏取值 × 修饰；
+    /// 未收录于 <see cref="AmmoDamageTable"/> 的同类弹药原版基础伤害为 0，按 0 计，绝不误拒）。
+    /// 返回 null（非远程 / 未收录武器）→ 调用方失败放行。
+    /// </summary>
+    public static int? RangedDamageBound(PlayerRuntime player, int itemId, bool crit, byte prefix = 0)
+    {
+        if (!ItemDamageTable.Of.TryGetValue(itemId, out var stats) || stats.Class != WeaponClass.Ranged)
+            return null;
+
+        int weaponDmg = GetWeaponDamage(player, itemId, prefix);
+        int ammoType = WeaponAmmoTypeOf.Of.TryGetValue(itemId, out var at) ? at : 0;
+
+        // 无弹药合并（投掷 / 鱼叉 / gunProj 等）→ 弹幕伤害 = 武器伤害，与近战同口径校验。
+        if (ammoType == 0)
+            return (int)Math.Ceiling(weaponDmg * 1.15f) * (crit ? 2 : 1);
+
+        int bestAmmo = 0;
+        foreach (int slot in player.Items)
+        {
+            if (slot <= 0 || !AmmoTypeOf.Of.TryGetValue(slot, out int a) || a != ammoType)
+                continue;
+            if (AmmoDamageTable.Of.TryGetValue(slot, out int ammoDmg) && ammoDmg > bestAmmo)
+                bestAmmo = ammoDmg;
+        }
+
+        double ammoContribution = bestAmmo > 0
+            ? Math.Ceiling(bestAmmo * (1.0 + GetClassModifierPercent(player, WeaponClass.Ranged) / 100.0))
+            : 0;
+        return (int)Math.Ceiling((weaponDmg + ammoContribution) * 1.15f) * (crit ? 2 : 1);
+    }
 
     /// <summary>
     /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。
