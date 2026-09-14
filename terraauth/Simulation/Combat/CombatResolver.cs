@@ -92,18 +92,20 @@ public static class CombatResolver
             BuffTable.ClassDamagePercent(player.Buffs, stats.Class)
             + BuffTable.AllDamagePercent(player.Buffs)
             + AccessoryTable.ClassDamagePercent(player.Items, stats.Class)
-            + AccessoryTable.AllDamagePercent(player.Items);
+            + AccessoryTable.AllDamagePercent(player.Items)
+            + ArmorPieceBonusTable.ClassDamagePercent(player.Items, stats.Class); // 阶段 E-5：护甲单件（头/胸/腿）职业加成，与套装加成加算
 
-        // 套装职业加成（阶段 E-2）：穿齐熔岩套等 → 对应职业伤害 +%（ArmorSetBonuses 权威）。
+        // 套装职业加成（阶段 E-2）：穿齐熔岩套等 → 对应职业伤害 +%（ArmorSetBonuses 权威）；
+        // 全伤害类套装（南瓜/水晶刺客）经 AllDamage 计入所有职业。
         if (ArmorSetBonusTable.BonusForEquipment(player.Items) is { } set)
         {
-            totalPct += stats.Class switch
+            totalPct += set.AllDamage + (stats.Class switch
             {
                 WeaponClass.Melee => set.MeleePct,
                 WeaponClass.Ranged => set.RangedPct,
                 WeaponClass.Magic => set.MagicPct,
                 _ => 0,
-            };
+            });
         }
 
         return Math.Max(1, (int)(baseDmg * (1.0 + totalPct / 100.0)));

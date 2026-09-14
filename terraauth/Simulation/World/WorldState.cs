@@ -1043,6 +1043,9 @@ public sealed class PlayerRuntime
     public const int EquipmentSlotStart = 0;
     public const int EquipmentSlotEnd = 8;
 
+    /// <summary>护甲槽闭区间 [0, 2]：头盔/胸甲/护腿（供护甲单件职业伤害修饰扫描）。</summary>
+    public const int ArmorSlotEnd = 2;
+
     /// <summary>饰品槽起点（原版 3-8：3-7 饰品 + 8 盾牌/坐骑专属），供饰品伤害/防御修饰扫描。</summary>
     public const int AccessorySlotStart = 3;
 

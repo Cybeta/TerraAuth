@@ -693,13 +693,17 @@ public sealed record NpcStrikeCommand(
             // 阶段 E「近战武器伤害校验」：无弹幕的命中按**手持武器权威伤害**区间校验。
             // 上界 = ceil(GetWeaponDamage × 1.15) × (crit ? 2 : 1)，GetWeaponDamage 随 Buff/药水/套装/饰品实时变化
             // （base × 前缀倍率 × 修饰%，原版 Player.GetWeaponDamage 口径；阶段 E-4 起前缀参与基础伤害修正）。
+            // 阶段 E-5：仅**近战 / 魔法**职业参与校验——远程（弓/枪）弹幕伤害 = 武器 + 弹药（原版 PickAmmo
+            // 合并），召唤仆从伤害 ≠ 手持武器，按武器上界校验会误拒合法命中，故这两类失败放行。
             // 未收录武器 / 空手 → 失败放行（退回既有校验），绝不误拒未知物品。
             if (!projectileMatched && world.StrikeWeaponCheck)
             {
                 if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
                 {
                     int heldItem = player.Items[player.SelectedSlot];
-                    if (heldItem > 0 && ItemDamageTable.Of.ContainsKey(heldItem))
+                    if (heldItem > 0
+                        && ItemDamageTable.Of.TryGetValue(heldItem, out var heldStats)
+                        && heldStats.Class is WeaponClass.Melee or WeaponClass.Magic)
                     {
                         int bound = CombatResolver.WeaponDamageBound(player, heldItem, Crit, player.ItemPrefixes[player.SelectedSlot]);
                         if (Damage > bound)
@@ -710,7 +714,7 @@ public sealed record NpcStrikeCommand(
                     }
                     else
                     {
-                        Console.WriteLine($"[Strike] slot={NpcIndex} 手持物品 {heldItem} 未收录伤害表（空手/未知武器），失败放行 dmg={Damage}");
+                        Console.WriteLine($"[Strike] slot={NpcIndex} 手持物品 {heldItem} 非近战/魔法（或未收录），失败放行 dmg={Damage}");
                     }
                 }
             }

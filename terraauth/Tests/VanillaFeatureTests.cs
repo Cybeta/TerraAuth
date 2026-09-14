@@ -2862,7 +2862,7 @@ public class VanillaFeatureTests
         int qbIndex;
         lock (world.NpcsLock) qbIndex = world.Npcs.IndexOf(queenBee);
         await s.SendAsync(PacketId.NpcStrike,
-            new NpcStrikePacket(qbIndex, 1000) { Generation = queenBee.Generation });
+            new NpcStrikePacket(qbIndex, 4000) { Generation = queenBee.Generation }); // 3400 血 + 防御 8 → 3996 击杀
 
         Assert.True(await TickUntilAsync(server, () => !queenBee.Active, TimeSpan.FromSeconds(5)),
             "Queen Bee 未被击杀");
@@ -2874,7 +2874,7 @@ public class VanillaFeatureTests
         int twinsIndex;
         lock (world.NpcsLock) twinsIndex = world.Npcs.IndexOf(twins);
         await s.SendAsync(PacketId.NpcStrike,
-            new NpcStrikePacket(twinsIndex, 1000) { Generation = twins.Generation });
+            new NpcStrikePacket(twinsIndex, 25000) { Generation = twins.Generation }); // 23000 血 + 防御 10 → 24995 击杀
 
         Assert.True(await TickUntilAsync(server, () => !twins.Active, TimeSpan.FromSeconds(5)),
             "The Twins 未被击杀");

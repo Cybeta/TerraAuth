@@ -1108,11 +1108,11 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 阶段 E：包 28 近战武器校验上界随 **Buff / 手持武器 / 套装 / 饰品** 实时变化（1.4.5.8 权威 ID）。
-    /// 金弓（3516，11 伤）：无 buff 上界 ceil(11×1.15)=13；箭术（73，远程+20%）→ GetWeaponDamage
-    /// = 11×1.2=13.2 → 13，上界 ceil(13×1.15)=15；换金阔剑（3520，15 伤）→ 上界 18；
-    /// 穿熔岩套（231/232/233，近战+10%）→ GetWeaponDamage = 15×1.1=16.5 → 16，上界 19；
-    /// 戴战士徽章（490，近战+15%）→ 总修饰 10+15=25% → GetWeaponDamage = 15×1.25=18.75 → 18，上界 21。
+    /// 阶段 E / E-5：包 28 近战武器校验上界随 **Buff / 手持武器 / 套装 / 饰品** 实时变化（1.4.5.8 权威 ID）。
+    /// 金阔剑（3520，15 伤）：无 buff 上界 ceil(15×1.15)=18；酒醉（25，近战+10%）→ 16.5→16，上界 19；
+    /// 穿熔岩套（231/232/233，近战+10%）→ 总修饰 20% → 18，上界 21；
+    /// 戴战士徽章（490，近战+15%）→ 总修饰 35% → 20.25→20，上界 23。
+    /// E-5 起远程（弓/枪弹幕伤害含弹药）与召唤（仆从伤害≠手持武器）不再参与武器上界校验（失败放行）。
     /// </summary>
     [Fact]
     public void StrikeBound_Follows_Buffs_And_Held_Weapon_RealTime()
@@ -1134,8 +1134,8 @@ public class WorldGeneratorTests
 
         var rng = new XoshiroRng(1);
 
-        // 手持金弓（槽 3）：先经 MoveCommand 权威写入 SelectedSlot，验证包 13 → SelectedItem 落库
-        Assert.True(new SetInventorySlotCommand(1, 1, 3, 3516, 1).Apply(world, rng).Applied);
+        // 手持金阔剑（槽 3）：先经 MoveCommand 权威写入 SelectedSlot，验证包 13 → SelectedItem 落库
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 3520, 1).Apply(world, rng).Applied);
         Assert.True(new MoveCommand(2, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
         Assert.Equal(3, player.SelectedSlot);
 
@@ -1153,43 +1153,39 @@ public class WorldGeneratorTests
         lock (world.NpcsLock) world.Npcs.Add(slime);
         int index = world.Npcs.IndexOf(slime);
 
-        // 无 buff：上界 13，报 14 拒、报 13 收 → 87
-        Assert.Equal(13, CombatResolver.WeaponDamageBound(player, 3516, false));
-        Assert.False(new NpcStrikeCommand(3, 1, index, 14, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(100, slime.Life);
-        Assert.True(new NpcStrikeCommand(4, 1, index, 13, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(87, slime.Life);
-
-        // 箭术 Buff（包 50 权威）→ 上界实时升到 15，报 14 收 → 73
-        Assert.True(new SetBuffsCommand(5, 1, new[] { 73 }).Apply(world, rng).Applied);
-        Assert.Equal(15, CombatResolver.WeaponDamageBound(player, 3516, false));
-        Assert.True(new NpcStrikeCommand(6, 1, index, 14, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(73, slime.Life);
-
-        // 换持金阔剑（15 伤）→ 上界 18，报 17 收 → 56
-        Assert.True(new SetInventorySlotCommand(7, 1, 3, 3520, 1).Apply(world, rng).Applied);
+        // 无 buff：上界 18，报 19 拒、报 18 收 → 82
         Assert.Equal(18, CombatResolver.WeaponDamageBound(player, 3520, false));
-        Assert.True(new NpcStrikeCommand(8, 1, index, 17, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(56, slime.Life);
+        Assert.False(new NpcStrikeCommand(3, 1, index, 19, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(100, slime.Life);
+        Assert.True(new NpcStrikeCommand(4, 1, index, 18, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(82, slime.Life);
 
-        // 穿熔岩套（近战 +10%）→ 上界实时升到 19，报 19 收 → 37，报 20 拒
-        Assert.True(new SetInventorySlotCommand(9, 1, 0, 231, 1).Apply(world, rng).Applied);
-        Assert.True(new SetInventorySlotCommand(10, 1, 1, 232, 1).Apply(world, rng).Applied);
-        Assert.True(new SetInventorySlotCommand(11, 1, 2, 233, 1).Apply(world, rng).Applied);
+        // 酒醉 Buff（包 50 权威，近战 +10%）→ 上界实时升到 19，报 19 收 → 63，报 20 拒
+        Assert.True(new SetBuffsCommand(5, 1, new[] { 25 }).Apply(world, rng).Applied);
         Assert.Equal(19, CombatResolver.WeaponDamageBound(player, 3520, false));
-        Assert.True(new NpcStrikeCommand(12, 1, index, 19, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(37, slime.Life);
-        Assert.False(new NpcStrikeCommand(13, 1, index, 20, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(37, slime.Life);
+        Assert.True(new NpcStrikeCommand(6, 1, index, 19, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(63, slime.Life);
+        Assert.False(new NpcStrikeCommand(7, 1, index, 20, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(63, slime.Life);
 
-        // 戴战士徽章（490，近战 +15%，槽 4 饰品）→ 总修饰 = 10（熔岩套）+ 15（徽章）= 25% →
-        // 权威伤害 15×1.25=18.75 → 18，上界 ceil(18×1.15)=21，报 21 收 → 16，报 22 拒
-        Assert.True(new SetInventorySlotCommand(14, 1, 4, 490, 1).Apply(world, rng).Applied);
-        Assert.Equal(21, CombatResolver.WeaponDamageBound(player, 3520, false));
-        Assert.True(new NpcStrikeCommand(15, 1, index, 21, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(16, slime.Life);
-        Assert.False(new NpcStrikeCommand(16, 1, index, 22, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(16, slime.Life);
+        // 穿熔岩套（近战 +10%）+ 熔岩胸甲单件（近战 +7%）→ 总修饰 27%，上界实时升到 22，报 21 收 → 42，报 23 拒
+        Assert.True(new SetInventorySlotCommand(8, 1, 0, 231, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(9, 1, 1, 232, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(10, 1, 2, 233, 1).Apply(world, rng).Applied);
+        Assert.Equal(22, CombatResolver.WeaponDamageBound(player, 3520, false));
+        Assert.True(new NpcStrikeCommand(11, 1, index, 21, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(42, slime.Life);
+        Assert.False(new NpcStrikeCommand(12, 1, index, 23, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(42, slime.Life);
+
+        // 戴战士徽章（490，近战 +15%，槽 4 饰品）→ 总修饰 = 10（酒醉）+ 10（熔岩套）+ 7（熔岩胸甲）+ 15（徽章）= 42% →
+        // 权威伤害 15×1.42=21.3 → 21，上界 ceil(21×1.15)=25，报 23 收 → 19，报 26 拒
+        Assert.True(new SetInventorySlotCommand(13, 1, 4, 490, 1).Apply(world, rng).Applied);
+        Assert.Equal(25, CombatResolver.WeaponDamageBound(player, 3520, false));
+        Assert.True(new NpcStrikeCommand(14, 1, index, 23, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(19, slime.Life);
+        Assert.False(new NpcStrikeCommand(15, 1, index, 26, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(19, slime.Life);
     }
 
     /// <summary>
@@ -1312,7 +1308,7 @@ public class WorldGeneratorTests
 
     /// <summary>
     /// 阶段 E：包 117 上界随 **Buff 防御**（铁皮）实时降低：
-    /// 接触史莱姆 7 伤，0 防御上界 = ceil(7×1.15)−0 = 9；铁皮（14，+8 防）→ 上界 = 9−round(8×0.5)=5。
+    /// 接触史莱姆 7 伤，0 防御上界 = ceil(7×1.15)−0 = 9；铁皮（5，+8 防）→ 上界 = 9−round(8×0.5)=5。
     /// </summary>
     [Fact]
     public void HurtBound_Follows_BuffDefense_RealTime()
@@ -1353,8 +1349,8 @@ public class WorldGeneratorTests
         Assert.True(new DamagePlayerCommand(1, 1, 9).Apply(world, rng).Applied);
         Assert.Equal(91, player.Hp);
 
-        // 铁皮（14）→ 防御 8，上界降为 5：报 6 拒、报 5 收 → 86
-        Assert.True(new SetBuffsCommand(2, 1, new[] { 14 }).Apply(world, rng).Applied);
+        // 铁皮（5）→ 防御 8，上界降为 5：报 6 拒、报 5 收 → 86
+        Assert.True(new SetBuffsCommand(2, 1, new[] { 5 }).Apply(world, rng).Applied);
         Assert.Equal(8, player.Defense);
         Assert.False(new DamagePlayerCommand(3, 1, 6).Apply(world, rng).Applied);
         Assert.Equal(91, player.Hp);

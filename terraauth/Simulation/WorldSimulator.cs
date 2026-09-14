@@ -55,10 +55,10 @@ public partial class WorldSimulator : IWorldViewProvider
         _world.ProgressDirty = true;
     }
 
-    /// <summary>在指定位置生成一只 Boss（生命上限取自简化表）并返回该 NPC。</summary>
+    /// <summary>在指定位置生成一只 Boss（生命上限取自 <see cref="NpcStatsTable"/>，未收录按 1000 兜底）并返回该 NPC。</summary>
     public WorldNpc SpawnBoss(int npcType, float x, float y)
     {
-        int life = BossLife.TryGetValue(npcType, out var hp) ? hp : 1000;
+        int life = NpcStatsTable.Of.TryGetValue(npcType, out var stats) ? stats.LifeMax : 1000;
 
         // 调用方给的是「希望 Boss 出现的位置」→ 换算成原版口径的碰撞盒左上角（X/Y = 左上角，脚底 = Y + height）
         var (width, height) = NpcSizes.Of(npcType);
@@ -293,18 +293,7 @@ public partial class WorldSimulator : IWorldViewProvider
     /// <summary>Boss 飞行速度（像素 / tick）。</summary>
     private const float BossSpeed = 2f;
 
-    /// <summary>Boss 类型 → 生命上限（简化表；未收录类型按 1000 处理）。</summary>
-    private static readonly Dictionary<int, int> BossLife = new()
-    {
-        [4] = 2800,   // Eye of Cthulhu
-        [35] = 4400,  // Skeletron
-        [50] = 2000,  // King Slime
-    };
-
-    /// <summary>
-    /// 阶段 5.5：世界实体（服务端权威）。
-    /// 掉落物：重力 + 图格落地；弹幕：直线积分 + 生存期耗尽即失效。
-    /// </summary>
+    /// <summary>世界实体 / 掉落物相关。</summary>
     private void SimulateEntities()
     {
         lock (_world.ItemsLock)
