@@ -148,6 +148,8 @@ public sealed class GameHost : IDisposable
         var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize);
         world.GameMode = (int)config.Current.GameMode; // 阶段 D：玩家受击公式按难度取分支（经典/专家/大师），117 上界与接触兜底共用
         world.SscEnabled = config.Current.SscEnabled;   // 全局 SSC 开关：开=服务器背包权威，关=原版客户端本地背包
+        world.DestroySummonsOnWeaponRemoval =
+            config.Current.DestroySummonsOnWeaponRemoval; // 移除召唤武器即销毁对应召唤弹幕（可热重载）
 
         // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
         // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
@@ -311,6 +313,8 @@ public sealed class GameHost : IDisposable
                 await FlushTileUpdatesAsync(ct).ConfigureAwait(false);
                 // 客户端状态变更仅在仿真 Apply 成功后，按服务端最终状态生成包 13
                 await FlushPlayerUpdatesAsync(ct).ConfigureAwait(false);
+                // 服务端权威修改的增益列表（如移除召唤 Buff）→ 包 50 回写本人
+                await FlushPlayerBuffsAsync(ct).ConfigureAwait(false);
                 // 箱子改动只在仿真提交后同步给当前打开该箱子的玩家
                 await FlushChestUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端判定的玩家受击（接触 / 下落伤害）→ 包 117 + 包 16
@@ -319,6 +323,8 @@ public sealed class GameHost : IDisposable
                 await FlushNpcDamageAcksAsync(ct).ConfigureAwait(false);
                 // 服务端主动生成的掉落物（Boss 掉落等）→ 包 21
                 await FlushNewItemsAsync(ct).ConfigureAwait(false);
+                // 周期刷新掉落物归属（原版 FindOwner 循环）→ 包 22（归属变更才发）
+                await FlushItemOwnersAsync(ct).ConfigureAwait(false);
                 // 新增弹幕（客户端上报 / Boss AI 发射）→ 包 27
                 await FlushNewProjectilesAsync(ct).ConfigureAwait(false);
                 // 按玩家位置流送其周边图格区块（仅跨区块时补发，跳过已发过的区块）
@@ -651,9 +657,45 @@ public sealed class GameHost : IDisposable
                 world.Players.TryGetValue(playerId, out player);
             if (player is null || !player.Active) continue;
 
-            await Network.BroadcastAsync(PacketId.PlayerPosition,
-                new PlayerControlsPacket((byte)playerId, player.Position, player.Velocity), ct)
-                .ConfigureAwait(false);
+            // 位置广播只发给**其他**玩家（原版 SendData(PlayerControls) 用 ignoreClient=whoAmI 排除本人）：
+            // 客户端本地物理是权威的，把服务端持有的位置回显给本人会覆盖其本地物理状态
+            // （起跳被拉回地面、移动被旧位置覆盖 → 卡顿 + 跳跃几乎不可用）。
+            await Network.BroadcastWhereAsync(PacketId.PlayerPosition,
+                new PlayerControlsPacket((byte)playerId, player.Position, player.Velocity),
+                pid => pid != playerId, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>单批增益变更通知上限。</summary>
+    private const int MaxPlayerBuffsPerFlush = 64;
+
+    /// <summary>
+    /// 下发服务端权威修改后的增益列表（包 50）：如「移除召唤武器即销毁」时移除召唤 Buff。
+    /// 原版仆从由召唤 Buff 驱动存活，仅销毁服务端弹幕（包 29）不够——客户端 Buff 未移除时
+    /// 仆从不消失、仍持续发射弹幕造成伤害（用户实测：必须手动点掉 Buff 提示召唤物才消失）。
+    /// 回写包 50 后客户端 Buff 消失 → 仆从自毁，与用户手动点掉 Buff 的效果一致。
+    /// 只发给本人（包 50 玩家增益为本人私有的权威状态，原版不对他人转发）。
+    /// </summary>
+    public async Task FlushPlayerBuffsAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var playerIds = world.DrainPlayerBuffsChanged(MaxPlayerBuffsPerFlush);
+        foreach (var playerId in playerIds)
+        {
+            PlayerRuntime? player;
+            lock (world.PlayersLock)
+                world.Players.TryGetValue(playerId, out player);
+            if (player is null || !player.Active) continue;
+
+            try
+            {
+                await Network.SendToPlayerAsync(playerId, PacketId.PlayerBuffs,
+                    new PlayerBuffsPacket(playerId, new List<int>(player.Buffs)), ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                // 发送失败（连接已断开等）：该玩家已不在线，直接丢弃；重连后按全量状态重新下发。
+            }
         }
     }
 
@@ -742,23 +784,17 @@ public sealed class GameHost : IDisposable
                         Velocity = item.Velocity,
                         Prefix = item.Prefix,
                     },
+                    // 丢弃的掉落物广播给所有玩家（含丢弃者本人）：客户端丢弃发包 21 时 index=400
+                    // （NEW_ITEM_INDEX）即本地未持有，由服务器分配槽位并统一下发。
                     playerId => IsPlayerWithin(world, playerId, item.Position.X, item.Position.Y, radiusSq),
                     ct).ConfigureAwait(false);
 
-                // 专属掉落物（OwnedBy ≥ 0，如 /give SSC 关闭时的 GiveItemByDrop 方案）：
-                // 包 21 本身不含归属字段，客户端收到后本地归属为 255（无主）→ 拾取条件（归属==自己）不满足。
-                // 原版机制由 FindOwner/ReserveFor 广播包 22（SyncItemOwner）同步归属；这里对齐：
-                // 向全体广播完整包 22，客户端据此把本地归属更新为目标玩家，从而可拾取。
-                if (item.OwnedBy >= 0)
-                {
-                    await Network.BroadcastAsync(PacketId.ItemPickup,
-                        new ItemOwnerPacket(item.OwnedBy, item.Position)
-                        {
-                            ItemSlotIndex = item.Slot,
-                            TimeToKeepReservation = 15,
-                        },
-                        ct).ConfigureAwait(false);
-                }
+                // 归属同步（包 22）：**所有**掉落物都需要，不只专属掉落物——
+                // 原版 1.4.5.8 客户端 Player.GrabItems 只拾取 playerIndexTheItemIsReservedFor == 自己 的物品，
+                // 无主（255）物品反而不可拾取。包 21 不含归属字段，客户端收到后本地归属为 255，
+                // 因此丢弃物 / 专属物都必须广播包 22（原版 ApplySpawnOwnership → FindOwner → ReserveFor 流程）。
+                // 专属物（OwnedBy ≥ 0）固定归属目标玩家；丢弃物按 FindOwner 就近分配（最近在线玩家）。
+                await ReserveItemForAsync(world, item, ct).ConfigureAwait(false);
 
                 item.NewNotified = true;   // 只有真正发出才记「已通知」，否则下次循环重试
             }
@@ -768,6 +804,118 @@ public sealed class GameHost : IDisposable
                     GameEventKinds.BroadcastFailed, "item_drop", GameEventCategory.Broadcast));
             }
         }
+    }
+
+    /// <summary>无主掉落物归属搜索间隔（tick）：原版 Main.UpdateServer 对无主物品每 5 tick 重跑 FindOwner。</summary>
+    private const int ItemOwnerUnreservedRefreshTicks = 5;
+
+    /// <summary>已归属掉落物归属搜索间隔（tick）：原版对已归属物品每 300 tick（5 秒）重跑 FindOwner。</summary>
+    private const int ItemOwnerReservedRefreshTicks = 300;
+
+    /// <summary>
+    /// 归属搜索半径（像素，平方比较）：与 <see cref="PickupItemCommand"/> 的拾取接受半径（160px）一致，
+    /// 保证「服务端会接受拾取」时客户端必然已收到归属（≤5 tick 内），从而能发起拾取。
+    /// </summary>
+    private const float ItemOwnerSearchRangeSq = 160f * 160f;
+
+    /// <summary>
+    /// 服务端 FindOwner：为掉落物选定归属玩家并广播包 22。
+    /// 专属物（OwnedBy ≥ 0）固定归属目标玩家；无主物就近分配（范围内最近在线玩家，无则 255）。
+    /// 首次搜索（ReservedFor = -1）**必须**广播——即便目标为 255 也要把拾取延迟字段
+    /// （grabDelayPlayer / grabDelayTime）带给客户端，否则丢弃后无延迟 → 原地立即重新拾取（与原版不符）。
+    /// </summary>
+    private async Task ReserveItemForAsync(WorldState world, WorldItemEntity item, CancellationToken ct)
+    {
+        int target = item.OwnedBy >= 0
+            ? item.OwnedBy
+            : FindOwnerTarget(world, item);
+
+        // 首次搜索也必须广播（携带 grabDelay 字段）；其后仅在归属变更时广播。
+        if (item.ReservedFor != -1 && target == item.ReservedFor)
+            return;
+
+        item.ReservedFor = target;
+        item.OwnerSearchAge = 0;
+
+        // 原版丢弃：grabDelayPlayer=丢弃者、grabDelayTime=100（DefaultGrabDelay），由包 22 带给客户端强制执行。
+        // 延迟过期后 grabDelay 字段归零（255 / 0），否则新归属玩家也会被错误地套上延迟。
+        var remainingDelay = item.RemainingGrabDelayTicks(world.Tick);
+        var grabDelayPlayer = remainingDelay > 0 && item.DroppedBy >= 0 ? item.DroppedBy : 255;
+
+        await Network.BroadcastAsync(PacketId.ItemPickup,
+            new ItemOwnerPacket(target, item.Position)
+            {
+                ItemSlotIndex = item.Slot,
+                TimeToKeepReservation = 15,
+                GrabDelayPlayer = (byte)grabDelayPlayer,
+                GrabDelayTime = remainingDelay,
+            }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 周期刷新掉落物归属（原版 Main.UpdateServer 的 FindOwner 循环）：
+    /// 无主物每 5 tick、已归属物每 300 tick 重跑就近分配，并把变更广播包 22。
+    /// 覆盖「归属玩家离开 / 下线后物品永久不可拾取」与「更近玩家靠近后转移归属」两种场景。
+    /// </summary>
+    public async Task FlushItemOwnersAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+
+        WorldItemEntity[] items;
+        lock (world.ItemsLock)
+            items = world.Items.Where(i => i.Active).ToArray();
+        if (items.Length == 0) return;
+
+        foreach (var item in items)
+        {
+            // 专属物（OwnedBy ≥ 0）不参与动态就近分配：归属由服务器权威固定。
+            if (item.OwnedBy >= 0) continue;
+
+            var interval = item.ReservedFor == 255
+                ? ItemOwnerUnreservedRefreshTicks
+                : ItemOwnerReservedRefreshTicks;
+            if (++item.OwnerSearchAge < interval) continue;
+
+            try
+            {
+                await ReserveItemForAsync(world, item, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                // 广播失败：ReservedFor 保持旧值，下次按间隔重试。
+            }
+        }
+    }
+
+    /// <summary>
+    /// 就地选择最近在线（非死亡）玩家；超出拾取半径返回 255（无主）。
+    /// 原版 FindOwner 在拾取延迟（grabDelayTime &gt; 0）期间**跳过丢弃者**（grabDelayPlayer），
+    /// 使丢弃后延迟期内归属先让给其他玩家 / 保持无主，杜绝「丢→立刻捡回」。
+    /// </summary>
+    private static int FindOwnerTarget(WorldState world, WorldItemEntity item)
+    {
+        int best = 255;
+        float bestDistSq = ItemOwnerSearchRangeSq;
+        var skipDropper = item.RemainingGrabDelayTicks(world.Tick) > 0;
+        lock (world.PlayersLock)
+        {
+            foreach (var kv in world.Players)
+            {
+                var p = kv.Value;
+                if (!p.Active || p.Dead) continue;
+                if (skipDropper && kv.Key == item.DroppedBy) continue;
+
+                var dx = p.Position.X - item.Position.X;
+                var dy = p.Position.Y - item.Position.Y;
+                var distSq = dx * dx + dy * dy;
+                if (distSq < bestDistSq)
+                {
+                    bestDistSq = distSq;
+                    best = kv.Key;
+                }
+            }
+        }
+        return best;
     }
 
     /// <summary>
@@ -936,6 +1084,8 @@ public sealed class GameHost : IDisposable
         {
             try
             {
+                if (p.Destroyed)
+                    Console.WriteLine($"[DIAG] Pkt29 destroy key={p.Key} (spawner={p.Key & 0xFF}, idx={(p.Key >> 8) & 0x3FF}, gen={(p.Key >> 18) & 0x3FFF})");
                 await Network.BroadcastAsync(PacketId.ProjectileDestroy,
                     new ProjectileDestroyPacket(p.Key, p.Position), ct).ConfigureAwait(false);
 
@@ -1215,6 +1365,7 @@ public sealed class GameHost : IDisposable
         var t = AuthorityThresholds.From(cfg);
         _enforcers.UpdateThresholds(t.Rate, t.Player, t.Movement, t.Combat, t.Inventory, t.World);
         _world.SscEnabled = cfg.SscEnabled; // 全局 SSC 开关热重载（新连接 / 下次 WorldInfo 生效）
+        _world.DestroySummonsOnWeaponRemoval = cfg.DestroySummonsOnWeaponRemoval; // 移除召唤武器即销毁（即时生效）
 
         Console.WriteLine(
             $"[Config] 热重载已生效：MaxSingleDamage={cfg.MaxSingleDamage}, " +

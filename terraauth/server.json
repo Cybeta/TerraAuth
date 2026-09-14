@@ -28,6 +28,7 @@
   "MaxChatPerMinute": 30,
   "SscEnabled": true,
   "MaxStackSize": 999,
+  "DestroySummonsOnWeaponRemoval": true,
   "MaxViolationsBeforeBan": 10,
   "ViolationWindowMinutes": 60,
   "PlayerWhitelist": [],

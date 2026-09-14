@@ -48,4 +48,29 @@ public static class SummonProjectileTable
         1112, 1113,          // 1.4.5 新增召唤弹幕
         1118, 1119,          // 1.4.5 新增召唤弹幕
     };
+
+    /// <summary>
+    /// 召唤武器（物品 ID）→ 其召唤 Buff（原版 <c>Item.SetDefaults</c> 的 <c>buffType</c> 字段）。
+    /// 用于「移除召唤武器即销毁」（<see cref="WorldState.DestroySummonsOnWeaponRemoval"/>）时
+    /// 同步移除客户端对应召唤 Buff：原版仆从由该 Buff 驱动存活，**只销毁服务端弹幕（包 29）不够**——
+    /// 客户端 Buff 未移除时仆从不消失，仍持续发射弹幕并造成伤害（用户实测：必须手动点掉 Buff 提示）。
+    /// 哨兵法杖（1572 FrostHydra / 3569 LunarPortal / 3571 RainbowCrystal）无玩家 Buff，不在此列。
+    /// </summary>
+    public static readonly IReadOnlyDictionary<int, int> SummonWeaponBuff = new Dictionary<int, int>
+    {
+        [1157] = 49,   // PygmyStaff → Pygmy
+        [1309] = 64,   // SlimeStaff → BabySlime
+        [1802] = 83,   // RavenStaff → Raven
+        [3249] = 161,  // DeadlySphereStaff → DeadlySphere
+        [3474] = 182,  // StardustCellStaff → StardustMinion
+        [3531] = 188,  // StardustDragonStaff → StardustDragon
+    };
+
+    /// <summary>判断 Buff 是否为召唤 Buff（供 <see cref="WorldState.KillSummonedProjectiles"/> 移除）。</summary>
+    public static bool IsSummonBuff(int buffId)
+    {
+        foreach (var buff in SummonWeaponBuff.Values)
+            if (buff == buffId) return true;
+        return false;
+    }
 }

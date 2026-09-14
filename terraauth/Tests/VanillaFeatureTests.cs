@@ -624,21 +624,145 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task Vanilla_ItemDrop_Is_Committed_By_Server()
+    public async Task Vanilla_ItemDrop_Is_Committed_And_Relayed_To_AllPlayers()
     {
         using var server = VanillaServer.Start();
         await using var a = await server.ConnectAsync("Alice");
         await using var b = await server.ConnectAsync("Bee");
+        var world = server.Host.Simulator.State;
 
-        await a.SendAsync(PacketId.ItemDrop, new ItemDropPacket(1, 5));
+        // 丢弃位置设在出生点附近（默认 (0,0) 会超出其他玩家的视口裁剪半径，导致收不到）
+        await a.SendAsync(PacketId.ItemDrop,
+            new ItemDropPacket(1, 5)
+            {
+                Position = new Vector2(world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f),
+            });
         var applied = await TickUntilAsync(server,
-            () => server.Host.Simulator.State.Items.Any(i => i.ItemId == 1 && i.Stack == 5 && i.Active),
+            () => world.Items.Any(i => i.ItemId == 1 && i.Stack == 5 && i.Active),
             TimeSpan.FromSeconds(5));
         Assert.True(applied, "掉落物生成命令未在仿真 Tick 中提交");
 
         await server.Host.FlushNewItemsAsync();
-        var got = await b.ReadUntilAsync(p => p is ItemDropPacket, TimeSpan.FromMilliseconds(500));
-        Assert.DoesNotContain(got, p => p is ItemDropPacket { ItemId: 1, Stack: 5 });
+
+        // 服务器广播丢弃掉落物给所有玩家（含丢弃者本人）：客户端丢弃发包 21 时 index=400
+        // （NEW_ITEM_INDEX）即本地未持有，槽位由服务器分配并统一下发。
+        var gotB = await b.ReadUntilAsync(p => p is ItemDropPacket, TimeSpan.FromMilliseconds(500));
+        Assert.Contains(gotB, p => p is ItemDropPacket { ItemId: 1, Stack: 5 });
+        var gotA = await a.ReadUntilAsync(p => p is ItemDropPacket { ItemId: 1 }, TimeSpan.FromMilliseconds(500));
+        Assert.Contains(gotA, p => p is ItemDropPacket { ItemId: 1, Stack: 5 });
+    }
+
+    /// <summary>
+    /// 掉落物下发时必须同步归属（包 22）：原版 1.4.5.8 客户端 <c>Player.GrabItems</c> 只拾取
+    /// <c>playerIndexTheItemIsReservedFor == 自己</c> 的物品，无主（255）物品反而**不可拾取**。
+    /// 因此丢弃物也必须走 FindOwner 就近分配并广播包 22（只广播专属物是「地图上出现却拾不起来」的根因）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_ItemDrop_Is_Reserved_To_Nearest_Player_After_Flush()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+        var world = server.Host.Simulator.State;
+
+        await a.SendAsync(PacketId.ItemDrop,
+            new ItemDropPacket(1, 5)
+            {
+                Position = new Vector2(world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f),
+            });
+        var applied = await TickUntilAsync(server,
+            () => world.Items.Any(i => i.ItemId == 1 && i.Stack == 5 && i.Active),
+            TimeSpan.FromSeconds(5));
+        Assert.True(applied, "掉落物生成命令未在仿真 Tick 中提交");
+
+        await server.Host.FlushNewItemsAsync();
+
+        // 物品落在出生点附近 → 就近玩家被广播归属（包 22）；槽位须与包 21 一致
+        // （测试会话解码器把下行包 22 还原为 ItemPickupPacket{ ItemSlotIndex, PlayerId }）
+        var got = await a.ReadUntilAsync(p => p is ItemPickupPacket, TimeSpan.FromMilliseconds(500));
+        var owner = Assert.Single(got.OfType<ItemPickupPacket>());
+        Assert.InRange(owner.PlayerId, 0, 254);
+        var item = Assert.Single(world.Items.Where(i => i.ItemId == 1 && i.Active));
+        Assert.Equal(item.Slot, owner.ItemSlotIndex);
+    }
+
+    /// <summary>
+    /// 原版丢弃后 ~100 tick（<c>WorldItem.DefaultGrabDelay</c> ≈ 1.67s）的拾取延迟：
+    /// 包 22 携带 grabDelayPlayer=丢弃者 / grabDelayTime=100，FindOwner 在延迟期间**跳过丢弃者**
+    /// （归属不回到本人，保持无主/让给其他玩家）——否则丢弃的物品会原地被玩家立即重新拾取（与原版不符）。
+    /// 延迟过期后归属回归丢弃者、延迟清零，方可拾取。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_Dropped_Item_Carries_GrabDelay_And_Owner_Defers()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        await a.SendAsync(PacketId.ItemDrop,
+            new ItemDropPacket(1, 5)
+            {
+                Position = new Vector2(world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f),
+            });
+        var applied = await TickUntilAsync(server,
+            () => world.Items.Any(i => i.ItemId == 1 && i.Active),
+            TimeSpan.FromSeconds(5));
+        Assert.True(applied, "掉落物生成命令未在仿真 Tick 中提交");
+
+        await server.Host.FlushNewItemsAsync();
+
+        // 服务端状态：丢弃者已登记 + 拾取延迟生效（原版 DefaultGrabDelay = 100 tick）
+        var item = Assert.Single(world.Items.Where(i => i.ItemId == 1 && i.Active));
+        Assert.Equal(1, item.DroppedBy);
+        Assert.InRange(item.RemainingGrabDelayTicks(world.Tick), 1, 100);
+
+        // 首次包 22：延迟期间 FindOwner 跳过丢弃者 → 只有 Alice 在线 → 归属 255（无主）
+        // （延迟字段 grabDelayPlayer/grabDelayTime 由编码器写入包体，客户端 case 22 依序读取）
+        var got = await a.ReadUntilAsync(p => p is ItemPickupPacket, TimeSpan.FromMilliseconds(500));
+        var owner = Assert.Single(got.OfType<ItemPickupPacket>());
+        Assert.Equal(255, owner.PlayerId);
+
+        // 延迟过期（100 tick）后：归属回归丢弃者 → 可拾取
+        var expired = await TickUntilAsync(server,
+            () =>
+            {
+                var it = world.Items.FirstOrDefault(i => i.ItemId == 1 && i.Active);
+                return it != null && it.RemainingGrabDelayTicks(world.Tick) == 0;
+            },
+            TimeSpan.FromSeconds(10));
+        Assert.True(expired, "拾取延迟未在 100 tick 后过期");
+
+        ItemPickupPacket? owner2 = null;
+        for (int i = 0; i < 10 && owner2 is null; i++)
+        {
+            await server.Host.FlushItemOwnersAsync();
+            var got2 = await a.ReadUntilAsync(p => p is ItemPickupPacket, TimeSpan.FromMilliseconds(300));
+            owner2 = got2.OfType<ItemPickupPacket>().LastOrDefault();
+        }
+        Assert.NotNull(owner2);
+        Assert.Equal(1, owner2.PlayerId);
+    }
+
+    /// <summary>
+    /// 服务端权威移除召唤 Buff 后，经 <see cref="GameHost.FlushPlayerBuffsAsync"/> 下发包 50 回写本人：
+    /// 原版仆从由召唤 Buff 驱动存活，客户端 Buff 未移除则仆从不消失（用户实测：手动点掉 Buff 才消失）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_Removed_Summon_Buff_Is_Synced_Back_With_PlayerBuffs()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        world.DestroySummonsOnWeaponRemoval = true;
+
+        var player = world.Players[1];
+        player.Buffs.Add(182); // StardustMinion（星尘细胞法杖 3474）
+
+        world.KillSummonedProjectiles(1);
+
+        await server.Host.FlushPlayerBuffsAsync();
+        var got = await a.ReadUntilAsync(p => p is PlayerBuffsPacket, TimeSpan.FromMilliseconds(500));
+        Assert.Contains(got, p => p is PlayerBuffsPacket buffs && !buffs.BuffTypes.Contains(182));
     }
 
     [Fact]

@@ -86,6 +86,13 @@ public record ServerConfig
     public bool SscEnabled { get; init; } = true;          // Server Side Characters
     public int MaxStackSize { get; init; } = 999;          // 单格最大堆叠
 
+    /// <summary>
+    /// 玩家从背包移除（清空 / 换出）召唤武器后，是否立即销毁该玩家已召唤的弹幕。
+    /// false（默认）= 原版行为：召唤物不随武器移除而消失，继续攻击至自然消失 / 替换 / 掉线；
+    /// true = 武器移除即销毁对应召唤弹幕（服务端置 Active=false，由世界同步补发包 29 广播销毁）。
+    /// </summary>
+    public bool DestroySummonsOnWeaponRemoval { get; init; } = false;
+
     // ---- 封禁 / 违规处置 (Phase 6 IBanManager + Phase 5 连接处置) ----
     public int MaxViolationsBeforeBan { get; init; } = 10; // 窗口内累计违规达此值 → 封禁记录 + 踢出连接
     public int ViolationWindowMinutes { get; init; } = 60; // 违规时间窗口（滑动，分钟）

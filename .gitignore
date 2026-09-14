@@ -16,6 +16,7 @@ terraauth/obj/
 # ---- 运行时数据 ----
 terraauth/*.db
 terraauth/*.log
+*.log
 
 # ---- 编辑器/系统 ----
 .DS_Store

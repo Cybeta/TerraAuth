@@ -46,6 +46,12 @@ public sealed class WorldState
     /// </summary>
     public bool SscEnabled { get; set; } = true;
 
+    /// <summary>
+    /// 移除背包召唤武器即销毁对应召唤弹幕，对应 <c>ServerConfig.DestroySummonsOnWeaponRemoval</c>（组合根注入）。
+    /// false（默认）= 原版行为：召唤物不随武器移除而消失；true = 武器移除即置召唤弹幕 Active=false。
+    /// </summary>
+    public bool DestroySummonsOnWeaponRemoval { get; set; } = false;
+
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
 
@@ -62,6 +68,57 @@ public sealed class WorldState
     private readonly Dictionary<string, OfflineSession> _offlineSessions = new(StringComparer.Ordinal);
 
     private sealed record OfflineSession(PlayerRuntime Runtime, long DeadlineTick);
+
+    /// <summary>
+    /// 销毁指定玩家的全部存活召唤 / 哨兵弹幕（置 <c>Active=false</c>）。
+    /// <c>RemovalNotified</c> 保持 false，由世界同步循环补发包 29（ProjectileDestroy）广播销毁；
+    /// 用于断线清场（对齐原版——玩家掉线其召唤物立即消失）与可配置的「移除召唤武器即销毁」。
+    /// 同时移除该玩家的召唤 Buff（原版仆从由召唤 Buff 驱动存活，仅销毁弹幕不够：
+    /// 客户端 Buff 未移除时仆从不消失、仍发射弹幕造成伤害），并标记下发包 50。
+    /// </summary>
+    public void KillSummonedProjectiles(int playerId)
+    {
+        lock (ProjectilesLock)
+        {
+            int destroyed = 0;
+            for (int i = 0; i < Projectiles.Count; i++)
+            {
+                var p = Projectiles[i];
+                if (p.Active && p.Owner == playerId && SummonProjectileTable.Of.Contains(p.Type))
+                {
+                    p.Active = false;
+                    p.Destroyed = true;   // 永久销毁：拒绝被后续包 27 更新复活
+                    destroyed++;
+                }
+            }
+            Console.WriteLine($"[DIAG] KillSummonedProjectiles pid={playerId} destroyed={destroyed}");
+        }
+
+        // 召唤 Buff 移除：原版仆从由 Buff 驱动（客户端仆从 AI 每帧检查、Buff 消失则仆从自杀），
+        // 只有服务端销毁弹幕 + 包 29 时客户端仆从仍存活并继续攻击（命中校验双通道上界均 null → 放行）。
+        // 与用户实测「手动点掉 Buff 提示召唤物才消失」一致：此处服务端主动移除并回写客户端。
+        lock (PlayersLock)
+        {
+            if (!Players.TryGetValue(playerId, out var player) || player is null) return;
+
+            int removed = 0;
+            for (int i = player.Buffs.Count - 1; i >= 0; i--)
+            {
+                if (SummonProjectileTable.IsSummonBuff(player.Buffs[i]))
+                {
+                    player.Buffs.RemoveAt(i);
+                    removed++;
+                }
+            }
+
+            if (removed > 0)
+            {
+                player.RecalculateDefense();   // 防御型 Buff 移除后即时并入 statDefense
+                MarkPlayerBuffsChanged(playerId);
+                Console.WriteLine($"[DIAG] KillSummonedProjectiles pid={playerId} removed_buffs={removed}");
+            }
+        }
+    }
 
     /// <summary>
     /// 玩家断线：把运行时移出在线集合（**这同时修掉「断线运行时永不释放」的泄漏**）。
@@ -87,15 +144,7 @@ public sealed class WorldState
         // 阶段 H：断线清空该玩家的召唤弹幕（对齐原版——玩家掉线其召唤物立即消失）。
         // 置 Active=false（RemovalNotified 保持 false）交由世界同步循环补发包 29 广播销毁；
         // 此后槽位复用 / 会话接管时，旧召唤物不会残留为幽灵上界基准。
-        lock (ProjectilesLock)
-        {
-            for (int i = 0; i < Projectiles.Count; i++)
-            {
-                var p = Projectiles[i];
-                if (p.Active && p.Owner == playerId && SummonProjectileTable.Of.Contains(p.Type))
-                    p.Active = false;
-            }
-        }
+        KillSummonedProjectiles(playerId);
 
         if (graceTicks <= 0 || string.IsNullOrEmpty(resumeKey)) return;
 
@@ -543,6 +592,38 @@ public sealed class WorldState
                 if (result.Count >= max) break;
             }
             foreach (var playerId in result) _pendingPlayerUpdates.Remove(playerId);
+            return result;
+        }
+    }
+
+    // ---- 增益列表变更推送（仿真移除增益后生成原版包 50）----
+
+    public object PlayerBuffsLock { get; } = new();
+    private readonly HashSet<int> _pendingPlayerBuffs = new();
+
+    /// <summary>
+    /// 标记玩家增益列表已由服务端权威修改（如「移除召唤武器即销毁」时移除召唤 Buff），
+    /// 世界同步线程据此向该玩家下发包 50（PlayerBuffs）回写更新后的列表。
+    /// </summary>
+    public void MarkPlayerBuffsChanged(int playerId)
+    {
+        lock (PlayerBuffsLock) _pendingPlayerBuffs.Add(playerId);
+    }
+
+    public List<int> DrainPlayerBuffsChanged(int max)
+    {
+        if (max <= 0)
+            return new List<int>();
+
+        lock (PlayerBuffsLock)
+        {
+            var result = new List<int>(Math.Min(max, _pendingPlayerBuffs.Count));
+            foreach (var playerId in _pendingPlayerBuffs)
+            {
+                result.Add(playerId);
+                if (result.Count >= max) break;
+            }
+            foreach (var playerId in result) _pendingPlayerBuffs.Remove(playerId);
             return result;
         }
     }

@@ -5,6 +5,13 @@ using TerraAuth.Protocol;
 
 namespace TerraAuth.Simulation;
 
+/// <summary>召唤武器判定 helper（ItemDamageTable 权威职业 = Summon）。</summary>
+internal static class SummonWeaponLookup
+{
+    public static bool IsSummonWeapon(int itemId)
+        => ItemDamageTable.Of.TryGetValue(itemId, out var stats) && stats.Class == WeaponClass.Summon;
+}
+
 public readonly record struct CommandApplyResult(bool Applied, string? Reason = null);
 
 /// <summary>命令基类。客户端意图 → Authority 接受 → Command → 仿真。</summary>
@@ -186,8 +193,18 @@ public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot,
         if (Slot < 0 || Slot >= PlayerRuntime.InventorySlotCount)
             return new(false, CommandFailures.NotApplied);
 
+        // 可配置「移除召唤武器即销毁」：该槽位从召唤武器变为非召唤武器（清空 / 换出）时，
+        // 销毁该玩家全部存活召唤弹幕（默认 false 保持原版行为——召唤物不随武器移除而消失）。
+        var removedId = player!.Items[Slot];
+        if (world.DestroySummonsOnWeaponRemoval && removedId != 0 &&
+            removedId != (Stack > 0 ? ItemId : 0) &&
+            SummonWeaponLookup.IsSummonWeapon(removedId))
+        {
+            world.KillSummonedProjectiles(id);
+        }
+
         // 空槽（Stack == 0）允许任意 ItemId（清空语义），统一记为 0；前缀同步清零
-        player!.Items[Slot] = Stack > 0 ? ItemId : 0;
+        player.Items[Slot] = Stack > 0 ? ItemId : 0;
         player.ItemPrefixes[Slot] = Stack > 0 ? Prefix : (byte)0;
         player.RecalculateDefense();
         return new(true);
@@ -825,6 +842,11 @@ public sealed record SpawnItemCommand(
         if (PlayerId is int playerId && !TryGetPlayer(world, playerId, out _, out var failure))
             return failure;
 
+        // 可配置「移除召唤武器即销毁」：玩家丢弃（包 21 上行）召唤武器时立即销毁其召唤弹幕。
+        // 客户端丢弃物品只发包 21 创建掉落物、不必然发包 5 清槽，故在此路径补充销毁检测。
+        if (world.DestroySummonsOnWeaponRemoval && PlayerId is int pid && SummonWeaponLookup.IsSummonWeapon(ItemId))
+            world.KillSummonedProjectiles(pid);
+
         lock (world.ItemsLock)
         {
             if (world.Items.Count >= MaxSlots)
@@ -841,7 +863,12 @@ public sealed record SpawnItemCommand(
                 Position = Position,
                 Velocity = Velocity,
                 Prefix = Prefix,
-                OwnedBy = PlayerId ?? -1,
+                OwnedBy = -1,              // 丢弃物品无归属（原版语义：谁都能拾取）
+                DroppedBy = PlayerId ?? -1,  // 丢弃者：FindOwner 延迟期间跳过 + 包 22 下发拾取延迟
+                GrabDelayExpireTick = PlayerId >= 0
+                    ? world.Tick + WorldItemEntity.DefaultGrabDelay  // 原版 100 tick ≈ 1.67s
+                    : 0,
+                NewNotified = false,       // 由服务器统一广播（客户端丢弃 index=400，本地未持有，须服务端下发）
             });
         }
 
@@ -867,6 +894,10 @@ public sealed record SpawnProjectileCommand(
             var existing = world.Projectiles.FirstOrDefault(p => p.Key == Key);
             if (existing is not null)
             {
+                // 服务端已永久销毁（如「移除召唤武器即销毁」）：忽略后续更新，拒绝复活。
+                if (existing.Destroyed)
+                    return new(true);
+
                 existing.Position = Position;
                 existing.Velocity = Velocity;
                 existing.Active = true;

@@ -297,6 +297,26 @@ public sealed class NetworkHost : IAsyncDisposable
         if (!await HandleConnectionStateAsync(packet, connection, ct).ConfigureAwait(false))
             return;
 
+        // [DIAG] 入站关键包诊断（真机排障用）：确认客户端丢弃 / 拾取实际发的包与内容
+        switch (packet)
+        {
+            case ItemDropPacket drop:
+                Console.WriteLine($"[DIAG] 21 ItemDrop pid={connection.PlayerId} slot={drop.ItemSlotIndex} id={drop.ItemId} stack={drop.Stack} pos=({drop.Position.X:0},{drop.Position.Y:0}) vel=({drop.Velocity.X:0},{drop.Velocity.Y:0})");
+                break;
+            case ItemDestroyPacket des:
+                Console.WriteLine($"[DIAG] 151 ItemDestroy pid={connection.PlayerId} slot={des.ItemSlotIndex}");
+                break;
+            case ItemPickupPacket pick:
+                Console.WriteLine($"[DIAG] 22 ItemPickup pid={connection.PlayerId} slot={pick.ItemSlotIndex} owner={pick.PlayerId}");
+                break;
+            case InventorySlotPacket slot:
+                Console.WriteLine($"[DIAG] 5 InventorySlot pid={connection.PlayerId} slot={slot.Slot} id={slot.ItemId} stack={slot.Stack}");
+                break;
+            case UnknownPacket unk:
+                Console.WriteLine($"[DIAG] UNKNOWN pid={connection.PlayerId} type={unk.Type}");
+                break;
+        }
+
         // 走 Phase 2 权威管线
         var result = await _pipeline.ProcessAsync(
             packet,

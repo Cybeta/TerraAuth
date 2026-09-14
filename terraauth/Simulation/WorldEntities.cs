@@ -20,8 +20,36 @@ public sealed class WorldItemEntity
 
     public bool Active = true;
 
-    /// <summary>拾取归属玩家（-1 = 无归属）。</summary>
+    /// <summary>拾取归属玩家（-1 = 无归属，谁都能拾取；/give 专属掉落物 = 目标玩家）。</summary>
     public int OwnedBy = -1;
+
+    /// <summary>原版 <c>WorldItem.DefaultGrabDelay</c>：丢弃后拾取延迟 100 tick ≈ 1.67s。</summary>
+    public const int DefaultGrabDelay = 100;
+
+    /// <summary>
+    /// 当前动态归属（原版 <c>FindOwner</c> 结果，包 22 同步给客户端）：
+    /// 原版 1.4.5.8 客户端 <c>Player.GrabItems</c> 只拾取 <c>playerIndexTheItemIsReservedFor == 自己</c> 的物品，
+    /// 无主（255）物品反而**不可拾取**。255 = 无主，-1 = 尚未搜索（首次立即搜索并广播）。
+    /// </summary>
+    public int ReservedFor = -1;
+
+    /// <summary>距上次 FindOwner 归属搜索的 tick 数（-1 = 尚未搜索）。</summary>
+    public long OwnerSearchAge = -1;
+
+    /// <summary>丢弃者玩家 ID（-1 = 非玩家丢弃，如 Boss 掉落 / 服务端生成）。</summary>
+    public int DroppedBy = -1;
+
+    /// <summary>
+    /// 拾取延迟到期 tick（原版 <c>DefaultGrabDelay = 100</c> tick ≈ 1.67s，仅玩家丢弃设置）：
+    /// 丢弃后延迟期间，丢弃者不能立即重新拾取（原版 ApplySpawnOwnership 设
+    /// <c>grabDelayTime=100</c> / <c>grabDelayPlayer=丢弃者</c>，FindOwner 同时跳过丢弃者）。
+    /// 0 = 无延迟。延迟通过包 22 的 grabDelayPlayer / grabDelayTime 字段带给客户端强制执行。
+    /// </summary>
+    public long GrabDelayExpireTick;
+
+    /// <summary>剩余拾取延迟（tick）：延迟未激活时返回 0。</summary>
+    public int RemainingGrabDelayTicks(long nowTick) =>
+        (int)Math.Max(0, GrabDelayExpireTick - nowTick);
 
     /// <summary>失效是否已下发给客户端（由世界同步线程置位，避免重复发包）。</summary>
     public bool RemovalNotified;
@@ -54,6 +82,12 @@ public sealed class ProjectileEntity
     public int TimeLeft = 300;
 
     public bool Active = true;
+
+    /// <summary>
+    /// 服务端永久销毁标记（如「移除召唤武器即销毁」/ 断线清场）。
+    /// 置位后该弹幕不可被客户端包 27 更新复活，由世界同步广播包 29 后清理。
+    /// </summary>
+    public bool Destroyed;
 
     /// <summary>失效发生的 tick（用于延后清理）。</summary>
     public long DeadTick;

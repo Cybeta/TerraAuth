@@ -1427,6 +1427,250 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 可配置「移除召唤武器即销毁」（<see cref="WorldState.DestroySummonsOnWeaponRemoval"/>）：
+    /// 开启时，召唤武器移出背包（清空 / 换出）立即销毁该玩家全部存活召唤弹幕；
+    /// 空槽放入 / 换成非召唤武器不触发；默认关闭保持原版行为（见上一个用例）。
+    /// </summary>
+    [Fact]
+    public void Summon_Projectiles_Destroyed_On_Weapon_Removal_When_Configured()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.DestroySummonsOnWeaponRemoval = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        void AddSummonProjectile(int key)
+        {
+            lock (world.ProjectilesLock)
+            {
+                world.Projectiles.Add(new ProjectileEntity
+                {
+                    Key = key,
+                    Owner = 1,
+                    Type = 191,
+                    Position = new Vector2(320f, 380f),
+                    Velocity = new Vector2(0f, 0f),
+                    Damage = 60,
+                    Active = true,
+                });
+            }
+        }
+
+        // 槽 4 放入星尘细胞法杖（3474）→ 弹幕存活；清空该槽 → 弹幕立即销毁（Active=false）。
+        AddSummonProjectile(7);
+        Assert.True(new SetInventorySlotCommand(1, 1, 4, 3474, 1).Apply(world, rng).Applied);
+        Assert.True(world.Projectiles[0].Active);
+        Assert.True(new SetInventorySlotCommand(2, 1, 4, 0, 0).Apply(world, rng).Applied);
+        Assert.False(world.Projectiles[0].Active, "配置开启时移除召唤武器应立即销毁召唤弹幕");
+
+        // 换成非召唤武器同样销毁；空槽放入召唤武器 / 换成其它非召唤武器不触发。
+        AddSummonProjectile(8);
+        Assert.True(new SetInventorySlotCommand(3, 1, 4, 757, 1).Apply(world, rng).Applied); // TerraBlade 放入
+        Assert.True(world.Projectiles[1].Active, "非召唤武器放入空槽不销毁");
+        Assert.True(new SetInventorySlotCommand(4, 1, 4, 757, 1).Apply(world, rng).Applied); // 同物品重写
+        Assert.True(world.Projectiles[1].Active);
+        Assert.True(new SetInventorySlotCommand(5, 1, 4, 3484, 1).Apply(world, rng).Applied); // 换出为另一非召唤武器
+        Assert.True(world.Projectiles[1].Active);
+
+        AddSummonProjectile(9);
+        Assert.True(new SetInventorySlotCommand(6, 1, 5, 3474, 1).Apply(world, rng).Applied); // 召唤武器放入空槽 5
+        Assert.True(world.Projectiles[2].Active, "放入召唤武器（空槽→有物）不销毁");
+        Assert.True(new SetInventorySlotCommand(7, 1, 5, 0, 0).Apply(world, rng).Applied);    // 召唤武器清空
+        Assert.False(world.Projectiles[2].Active, "召唤武器清空立即销毁");
+    }
+
+    /// <summary>
+    /// 销毁的召唤弹幕不可被后续包 27 更新「复活」：客户端在召唤物存活期间持续上报弹幕状态，
+    /// 若更新路径把 Active 置回 true，销毁即失效且包 29 永不广播。
+    /// </summary>
+    [Fact]
+    public void Destroyed_Summon_Projectile_Is_Not_Revived_By_Update()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.DestroySummonsOnWeaponRemoval = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        ProjectileEntity AddSummonProjectile(int key)
+        {
+            var p = new ProjectileEntity
+            {
+                Key = key,
+                Owner = 1,
+                Type = 191,
+                Position = new Vector2(320f, 380f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 60,
+                Active = true,
+            };
+            lock (world.ProjectilesLock) world.Projectiles.Add(p);
+            return p;
+        }
+
+        // 服务端销毁 → Destroyed 标记置位。
+        var p1 = AddSummonProjectile(5);
+        world.KillSummonedProjectiles(1);
+        Assert.False(p1.Active);
+        Assert.True(p1.Destroyed);
+
+        // 客户端继续上报包 27（同 Key 更新）→ 忽略，不复活。
+        var update = new SpawnProjectileCommand(6, 1, 5, 191,
+            new Vector2(320f, 300f), new Vector2(0f, 0f), 60);
+        Assert.True(update.Apply(world, rng).Applied);
+        Assert.False(p1.Active, "已销毁弹幕不可被包 27 更新复活");
+
+        // 未销毁弹幕正常更新。
+        var p2 = AddSummonProjectile(6);
+        var update2 = new SpawnProjectileCommand(7, 1, 6, 191,
+            new Vector2(320f, 300f), new Vector2(0f, 0f), 60);
+        Assert.True(update2.Apply(world, rng).Applied);
+        Assert.True(p2.Active, "未销毁弹幕正常更新");
+    }
+
+    /// <summary>
+    /// 销毁召唤弹幕的同时，服务端必须移除玩家增益列表中的召唤 Buff 并标记包 50 下发：
+    /// 原版仆从由召唤 Buff 驱动存活（客户端 AI 每帧检查、Buff 消失则仆从自杀），
+    /// 只销毁服务端弹幕不够——客户端 Buff 未移除时仆从不消失、仍发射弹幕造成伤害。
+    /// </summary>
+    [Fact]
+    public void KillSummonedProjectiles_Removes_Summon_Buff_And_Marks_Buffs_Changed()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        player.Buffs.Add(182); // StardustMinion（星尘细胞法杖 3474）
+        player.Buffs.Add(9);   // 铁皮（非召唤 Buff，应保留）
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 5,
+                Owner = 1,
+                Type = 191,
+                Position = new Vector2(320f, 380f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 60,
+                Active = true,
+            });
+
+        world.KillSummonedProjectiles(1);
+
+        // 召唤 Buff 移除、非召唤 Buff 保留
+        Assert.DoesNotContain(182, player.Buffs);
+        Assert.Contains(9, player.Buffs);
+        // 已标记待下发包 50（世界同步线程据此回写客户端）
+        Assert.Contains(1, world.DrainPlayerBuffsChanged(16));
+    }
+
+    /// <summary>
+    /// 客户端丢弃物品只发包 21（SyncItem）不必然发包 5 清槽，故丢弃召唤武器（包 21 路径）
+    /// 在 <see cref="SpawnItemCommand"/> 中同样触发「移除召唤武器即销毁」。
+    /// </summary>
+    [Fact]
+    public void Summon_Projectiles_Destroyed_On_Weapon_Drop_When_Configured()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.DestroySummonsOnWeaponRemoval = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        void AddSummonProjectile(int key)
+        {
+            lock (world.ProjectilesLock)
+            {
+                world.Projectiles.Add(new ProjectileEntity
+                {
+                    Key = key,
+                    Owner = 1,
+                    Type = 191,
+                    Position = new Vector2(320f, 380f),
+                    Velocity = new Vector2(0f, 0f),
+                    Damage = 60,
+                    Active = true,
+                });
+            }
+        }
+
+        // 丢弃召唤武器（3474）→ 弹幕立即销毁。
+        AddSummonProjectile(7);
+        var drop = new SpawnItemCommand(1, 1, 3474, 1,
+            new Vector2(320f, 460f), new Vector2(0f, -2f), 0);
+        Assert.True(drop.Apply(world, rng).Applied);
+        Assert.False(world.Projectiles[0].Active, "配置开启时丢弃召唤武器应立即销毁召唤弹幕");
+
+        // 丢弃非召唤武器（757 TerraBlade）→ 弹幕存活。
+        AddSummonProjectile(8);
+        var dropMelee = new SpawnItemCommand(2, 1, 757, 1,
+            new Vector2(320f, 460f), new Vector2(0f, -2f), 0);
+        Assert.True(dropMelee.Apply(world, rng).Applied);
+        Assert.True(world.Projectiles[1].Active, "丢弃非召唤武器不销毁");
+
+        // 默认配置（false）= 原版行为：丢弃召唤武器不销毁。
+        var worldDefault = WorldGenerator.GenerateSmall();
+        worldDefault.DestroySummonsOnWeaponRemoval = false;
+        lock (worldDefault.PlayersLock) worldDefault.Players[1] = player;
+        lock (worldDefault.ProjectilesLock)
+        {
+            worldDefault.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 9,
+                Owner = 1,
+                Type = 191,
+                Position = new Vector2(320f, 380f),
+                Velocity = new Vector2(0f, 0f),
+                Damage = 60,
+                Active = true,
+            });
+        }
+        var dropDefault = new SpawnItemCommand(3, 1, 3474, 1,
+            new Vector2(320f, 460f), new Vector2(0f, -2f), 0);
+        Assert.True(dropDefault.Apply(worldDefault, rng).Applied);
+        Assert.True(worldDefault.Projectiles[0].Active, "默认配置保持原版行为：丢弃召唤武器不销毁");
+    }
+
+    /// <summary>
     /// 阶段 G：召唤弹幕不随默认 300 tick 超时销毁（否则合法召唤物命中会失去伤害基准），
     /// 位置由客户端包 27 权威更新而非服务端直线积分。
     /// </summary>
