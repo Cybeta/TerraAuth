@@ -656,8 +656,10 @@ public sealed class GameHost : IDisposable
     private const int MaxHurtNotifiesPerFlush = 64;
 
     /// <summary>
-    /// 下发服务端判定的玩家受击：包 117（受击表现，广播给所有玩家）+
-    /// 包 16（权威生命，单发给受击者，客户端据此更新血条）。由快照循环按快照频率调用。
+    /// 下发服务端判定的玩家受击：包 117（受击表现，**转发给其他玩家**）+ 包 16（权威生命，单发给受击者）。
+    /// 原版 <c>NetMessage.SendPlayerHurt</c> 用 <c>ignoreClient = whoAmI</c> 排除本人：原版客户端
+    /// <c>Player.Hurt</c> 的 <c>quiet</c> 只挡发包、不挡扣血与伤害数字显示，把 117 回给本人会造成二次扣血显示（双结算）。
+    /// 本人只收包 16 权威血量，血条以服务端为准。由快照循环按快照频率调用。
     /// </summary>
     public async Task FlushPlayerHurtAsync(CancellationToken ct = default)
     {
@@ -667,8 +669,9 @@ public sealed class GameHost : IDisposable
 
         foreach (var (playerId, damage) in hurts)
         {
-            await Network.BroadcastAsync(PacketId.PlayerHurtV2,
-                new PlayerHurtV2Packet(playerId, damage), ct).ConfigureAwait(false);
+            await Network.BroadcastWhereAsync(PacketId.PlayerHurtV2,
+                new PlayerHurtV2Packet(playerId, damage),
+                pid => pid != playerId, ct).ConfigureAwait(false);
 
             PlayerRuntime? player;
             lock (world.PlayersLock)

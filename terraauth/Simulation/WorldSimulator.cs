@@ -90,6 +90,13 @@ public partial class WorldSimulator : IWorldViewProvider
     /// </summary>
     private void AddNpc(WorldNpc npc)
     {
+        // 回填权威战斗属性（伤害 / 防御）：服务端战斗结算不再依赖简化常量表
+        if (NpcStatsTable.Of.TryGetValue(npc.Type, out var stats))
+        {
+            npc.Damage = stats.Damage;
+            npc.Defense = stats.Defense;
+        }
+
         for (int i = 0; i < _world.Npcs.Count; i++)
         {
             var slot = _world.Npcs[i];
@@ -915,8 +922,10 @@ public partial class WorldSimulator : IWorldViewProvider
             int contact = FindContactDamage(player, out var contactNpc, out var contactSlot);
             if (contact > 0)
             {
-                ApplyPlayerDamage(player, contact, "contact_damage", PlayerRuntime.GeneralImmunityTicks(contact));
-                LogPlayerDamage(player, contact, "contact_damage",
+                // 兜底结算同样走原版 CalculateDamagePlayersTake（减玩家防御），与包 117 主路径扣血口径一致
+                int damage = CombatResolver.CalculateDamagePlayersTake(contact, player.Defense);
+                ApplyPlayerDamage(player, damage, "contact_damage", PlayerRuntime.GeneralImmunityTicks(damage));
+                LogPlayerDamage(player, damage, "contact_damage",
                     $"NPC {contactNpc!.Type} slot={contactSlot} gen={contactNpc.Generation} " +
                     $"@{contactNpc.X:F0},{contactNpc.Y:F0} " +
                     $"玩家判定={player.AimPosition.X:F0},{player.AimPosition.Y:F0}（上报={player.Position.X:F0},{player.Position.Y:F0}）");
@@ -970,66 +979,12 @@ public partial class WorldSimulator : IWorldViewProvider
 
     private int _dumpLogCount;
 
-    /// <summary>敌怪 / Boss 接触伤害表（简化：按类型固定值，未收录按普通敌怪计）。</summary>
-    private static int ContactDamageOf(int npcType) => npcType switch
-    {
-        26 => 12,   // Goblin Peon
-        4 => 20,    // Eye of Cthulhu
-        35 => 30,   // Skeletron
-        50 => 20,   // King Slime
-        _ => 7,     // 史莱姆等普通敌怪
-    };
-
     /// <summary>
     /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。
-    /// 判定口径与原版 <c>Player.Update_NPCCollision</c> 一致：玩家 / NPC 盒各自取整后做 AABB 求交，
-    /// **不设最小重叠**（两轴各 1px 即命中），且用逐类型尺寸而非「点 + 半径」。
-    /// <paramref name="contactNpc"/> 回传实际接触的 NPC（诊断输出用）。
+    /// 判定逻辑在 <see cref="CombatResolver"/>（与包 117 区间校验共用同口径，见 <see cref="CombatResolver.FindContactDamage"/>）。
     /// </summary>
     private int FindContactDamage(PlayerRuntime player, out WorldNpc? contactNpc, out int contactIndex)
-    {
-        float px = player.AimPosition.X, py = player.AimPosition.Y;
-        int best = 0;
-        contactNpc = null;
-        contactIndex = -1;
-
-        lock (_world.NpcsLock)
-        {
-            for (var i = 0; i < _world.Npcs.Count; i++)
-            {
-                var npc = _world.Npcs[i];
-                if (!npc.Active || npc.IsTownNpc) continue;
-
-                var (width, height) = NpcSizes.Of(npc.Type);
-                if (!PlayerTouchesNpc(px, py, npc.X, npc.Y, width, height))
-                    continue;
-
-                int damage = ContactDamageOf(npc.Type);
-                if (damage > best)
-                {
-                    best = damage;
-                    contactNpc = npc;
-                    contactIndex = i;
-                }
-            }
-        }
-
-        return best;
-    }
-
-    /// <summary>
-    /// 玩家盒（<see cref="NpcSizes.PlayerWidth"/> × <see cref="NpcSizes.PlayerHeight"/>）与 NPC 盒是否相交。
-    /// 原版 <c>Player.Update_NPCCollision</c> 的做法是 <c>new Rectangle((int)position.X, (int)position.Y, width, height)</c>
-    /// 对 NPC 同法取整后 <c>Rectangle.Intersects</c> —— **取整后再比、无最小重叠**。
-    /// 两端同口径取整，位置一致时判定必然一致；位置不一致要靠对齐位置解决，而不是放大阈值。
-    /// </summary>
-    private static bool PlayerTouchesNpc(float px, float py, float nx, float ny, int nw, int nh)
-    {
-        int px0 = (int)px, py0 = (int)py;
-        int nx0 = (int)nx, ny0 = (int)ny;
-        return px0 < nx0 + nw && nx0 < px0 + NpcSizes.PlayerWidth
-            && py0 < ny0 + nh && ny0 < py0 + NpcSizes.PlayerHeight;
-    }
+        => CombatResolver.FindContactDamage(_world, player, out contactNpc, out contactIndex);
 
     /// <summary>两个轴对齐碰撞盒是否重叠（像素坐标，X/Y 为左上角；浮点精度，无最小重叠）。</summary>
     private static bool BoxesOverlap(
@@ -1038,28 +993,14 @@ public partial class WorldSimulator : IWorldViewProvider
         => ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
 
     /// <summary>
-    /// 服务端结算玩家伤害：扣血 → 置免伤帧 → 必要时置死亡态 → 登记受击通知（包 117 表现 + 包 16 权威血量）。
-    /// 这是玩家生命的唯一权威入口（客户端上报的包 117 只做非负校验，不直接改血）。
+    /// 服务端结算玩家伤害：状态变更委托 <see cref="WorldState.ApplyDamageToPlayer"/>（唯一权威入口），
+    /// 本方法仅补记事件日志。接触兜底（此处）与包 117 区间校验（<see cref="DamagePlayerCommand"/>）共用该入口。
     /// <paramref name="immunityTicks"/> 按原版 <c>Player.Hurt</c> 的 <c>immuneTime</c> 取值
     /// （接触 / 包 117 / 下落 / 弹幕共用 <see cref="PlayerRuntime.GeneralImmunityTicks"/>：40 / 20）。
     /// </summary>
     private void ApplyPlayerDamage(PlayerRuntime player, int damage, string kind, int immunityTicks)
     {
-        if (damage <= 0 || player.Dead) return;
-
-        player.Hp = Math.Max(0, player.Hp - damage);
-        player.HurtCooldown = immunityTicks;
-        player.FallDistance = 0f;
-
-        if (player.Hp == 0)
-        {
-            // 死亡：置死亡态而非离线态（Active 表示在线），等待复活命令复位
-            player.Dead = true;
-            player.DeathNotified = false;
-            player.Velocity = new Vector2(0, 0);
-        }
-
-        _world.MarkPlayerHurt(player.Id, damage);
+        _world.ApplyDamageToPlayer(player, damage, immunityTicks);
         _recorder.Record(new GameEvent(_world.Tick, player.Id, kind, damage));
     }
 

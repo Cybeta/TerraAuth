@@ -112,7 +112,12 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     }
 }
 
-/// <summary>玩家受伤命令：包 117 权威通过后生成，仅记录客户端伤害报告，不由仿真扣减服务端生命。</summary>
+/// <summary>
+/// 玩家受伤命令：包 117（原版 PlayerHurtV2）权威通过后生成。
+/// 服务端权威结算：前置「此刻确实接触敌怪」（防伪造远程受伤）→ 伤害上界
+/// （接触者基础伤害 × ±15% 浮动上界 → 减玩家防御，原版 <c>CalculateDamagePlayersTake</c>）→
+/// 区间内按客户端上报值扣血（客户端显示 = 服务端扣血，完全一致）。
+/// </summary>
 public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
     : Command(Tick, PlayerId, "damage_player")
 {
@@ -126,9 +131,26 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
         if (player!.Dead)
             return new(false, CommandFailures.NotApplied);
 
-        // 包 117 是客户端伤害报告，仅用于诊断；服务端不据此扣血，也不设置免伤帧或其他状态。
-        Console.WriteLine($"[Damage] 玩家 #{id} 上报伤害 {Damage}（包117，仅上报/未扣血）HP={player.Hp} " +
-                          $"位置={player.Position.X:F0},{player.Position.Y:F0}");
+        // 前置：此刻必须确实接触着敌怪（防伪造远程受伤；判定口径与服务端接触兜底一致）
+        if (!CombatResolver.IsPlayerInContact(world, player))
+        {
+            Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage}（包117）但未接触敌怪，忽略");
+            return new(false, CommandFailures.NotApplied);
+        }
+
+        // 伤害上界：接触者最大基础伤害 × ±15% 浮动上界 → 减玩家防御（原版 CalculateDamagePlayersTake）
+        int contact = CombatResolver.FindContactDamage(world, player, out _, out _);
+        int upper = CombatResolver.CalculateDamagePlayersTake(
+            (int)Math.Ceiling(contact * 1.15f), player.Defense);
+
+        if (Damage > upper)
+        {
+            Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage} 超上界 {upper}（接触={contact} def={player.Defense}），拒绝");
+            return new(false, CommandFailures.HurtDamageAboveLimit);
+        }
+
+        // 区间内：按客户端上报值（含 ±15% 浮动）扣血 → 客户端显示 = 服务端扣血，完全一致
+        world.ApplyDamageToPlayer(player, Damage, PlayerRuntime.GeneralImmunityTicks(Damage));
         return new(true);
     }
 }

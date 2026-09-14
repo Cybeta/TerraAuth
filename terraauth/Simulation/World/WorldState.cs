@@ -690,6 +690,31 @@ public sealed class WorldState
         }
     }
 
+    /// <summary>
+    /// **玩家生命的唯一权威写入路径**（原 <c>WorldSimulator.ApplyPlayerDamage</c> 的核心抽入）：
+    /// 扣血 → 置免伤帧 → 必要时置死亡态 → 登记受击通知（包 117 表现 + 包 16 权威血量）。
+    /// 接触兜底（SimulateCombat）与包 117 区间校验（DamagePlayerCommand）共用，
+    /// 从而保证「服务端扣的血」在两条路径下都以同一入口生效。
+    /// </summary>
+    public void ApplyDamageToPlayer(PlayerRuntime player, int damage, int immunityTicks)
+    {
+        if (damage <= 0 || player.Dead) return;
+
+        player.Hp = Math.Max(0, player.Hp - damage);
+        player.HurtCooldown = immunityTicks;
+        player.FallDistance = 0f;
+
+        if (player.Hp == 0)
+        {
+            // 死亡：置死亡态而非离线态（Active 表示在线），等待复活命令复位
+            player.Dead = true;
+            player.DeathNotified = false;
+            player.Velocity = new Vector2(0, 0);
+        }
+
+        MarkPlayerHurt(player.Id, damage);
+    }
+
     /// <summary>取出至多 <paramref name="max"/> 条待下发受击通知。</summary>
     public List<(int PlayerId, int Damage)> DrainPlayerHurt(int max)
     {
@@ -972,6 +997,13 @@ public sealed class PlayerRuntime
     public int HurtCooldown;
 
     /// <summary>
+    /// 玩家防御值（原版 <c>Player.statDefense</c>，装备 / buff 合计）。
+    /// 阶段 D 前恒为 0（裸装）；随包 5 物品栏接入后由装备防御表回填。
+    /// 用于 117 区间校验的减防上界与扣血计算。
+    /// </summary>
+    public int Defense;
+
+    /// <summary>
     /// **受击免伤帧**（接触攻击 / 客户端上报的包 117 / 下落伤害 / 敌对弹幕共用一个窗口）。
     /// 原版 <c>Player.Hurt</c>：<c>immuneTime = pvp ? 8 : (伤害 ≠ 1 ? (longInvince ? 80 : 40) : (longInvince ? 40 : 20))</c>，
     /// 且 NPC 接触走的也是 <c>Hurt</c>（<c>cooldownCounter == ImmunityCooldownID.General</c>）。
@@ -1237,6 +1269,12 @@ public sealed class WorldNpc
 
     public int Life = 100;
     public int LifeMax = 100;
+
+    /// <summary>基础伤害（原版 <c>NPC.SetDefaults.damage</c>，经典难度基准；生成时由 <see cref="NpcStatsTable"/> 回填）。</summary>
+    public int Damage;
+
+    /// <summary>基础防御（原版 <c>NPC.SetDefaults.defense</c>）。</summary>
+    public int Defense;
 
     public float VelocityX;
     public float VelocityY;

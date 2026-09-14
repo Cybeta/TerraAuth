@@ -2013,30 +2013,42 @@ public class VanillaFeatureTests
     public async Task Vanilla_EnemyContact_Damages_Player_And_Notifies()
     {
         using var server = VanillaServer.Start();
-        await using var s = await server.ConnectAsync("Alice");
+        await using var a = await server.ConnectAsync("Alice");   // 受击者
+        await using var b = await server.ConnectAsync("Bee");     // 旁观者（验证 117 广播「排除本人」）
         var world = server.Host.Simulator.State;
         var spawnX = world.SpawnTileX * 16f + 8f;
         var spawnY = world.SpawnTileY * 16f - 8f;
-        await StandAtAsync(server, s, spawnX, spawnY);
+        await StandAtAsync(server, a, spawnX, spawnY);
+
+        // 旁观者 Bee 远离战场：117 只广播给其他玩家，若 Bee 也站原地会被同一只史莱姆误伤，
+        // 产生第二条受击通知，破坏「本人收不到自己的 117」断言。
+        lock (world.PlayersLock)
+        {
+            var bee = world.Players[2];
+            bee.Position = new Vector2(spawnX + 800f, spawnY);
+            bee.AimPosition = bee.Position;
+        }
 
         var player = world.Players[1];
         PlaceSlimeOn(server, player.Position.X, player.Position.Y + 21f); // 玩家碰撞盒中心
 
-        // 接触伤害 7（史莱姆）→ 100 - 7 = 93
+        // 接触伤害 7（史莱姆，防御 0）→ 100 - 7 = 93
         Assert.True(await TickUntilAsync(server, () => player.Hp == 93, TimeSpan.FromSeconds(5)),
             $"接触伤害未在服务端结算，实际 HP={player.Hp}");
 
         await server.Host.FlushPlayerHurtAsync();
 
-        // 服务端先广播包 117（受击表现），随后向受击者单发包 16（权威血量）
-        var got = await s.ReadUntilAsync(p => p is PlayerHealthPacket, TimeSpan.FromSeconds(5));
+        // 受击者本人：只收包 16 权威血量，**不收**自己的包 117（双结算修复：117 不回本人）
+        var selfGot = await a.ReadUntilAsync(
+            p => p is PlayerHealthPacket { PlayerId: 1, Hp: 93 }, TimeSpan.FromSeconds(5));
+        Assert.Contains(selfGot, p => p is PlayerHealthPacket { PlayerId: 1, Hp: 93 });
+        Assert.DoesNotContain(selfGot, p => p is PlayerHurtV2Packet { PlayerId: 1 });
 
-        var hurt = Assert.Single(got.OfType<PlayerHurtV2Packet>());
+        // 其他玩家：收到包 117 受击表现（伤害 7 / 玩家 1）
+        var obsGot = await b.ReadUntilAsync(p => p is PlayerHurtV2Packet, TimeSpan.FromSeconds(5));
+        var hurt = Assert.Single(obsGot.OfType<PlayerHurtV2Packet>());
         Assert.Equal(7, hurt.Damage);
         Assert.Equal(1, hurt.PlayerId);
-
-        // 权威血量同步给受击者（客户端血条据此更新）
-        Assert.Contains(got, p => p is PlayerHealthPacket { Hp: 93 });
     }
 
     /// <summary>

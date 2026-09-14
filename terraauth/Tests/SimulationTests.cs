@@ -862,11 +862,12 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 客户端上报的包 117 仅作为伤害报告接受并记录诊断，不由服务端据此扣血或设置免伤帧；
-    /// 连续报告也必须保持玩家生命与受击状态不变。
+    /// 客户端上报的包 117 走**区间校验 + 权威扣血**闭环（服务端权威结算玩家受击）：
+    /// 未接触敌怪 → 拒绝（防伪造远程受伤）；接触但上报值超上界 → 拒绝；
+    /// 区间内 → 按上报值扣血并置免伤帧（客户端显示 = 服务端扣血，完全一致）。
     /// </summary>
     [Fact]
-    public void ClientReportedDamage_IsAccepted_WithoutServerDamage()
+    public void ClientReportedDamage_Is_Validated_And_Applied_Authoritatively()
     {
         var world = WorldGenerator.GenerateSmall();
         var player = new PlayerRuntime
@@ -875,31 +876,45 @@ public class WorldGeneratorTests
             Active = true,
             Hp = 100,
             HpMax = 100,
-            HurtCooldown = 7,
-            FallDistance = 12.5f,
-            Velocity = new Vector2(3f, 4f),
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
             DeathNotified = true,
         };
         lock (world.PlayersLock) world.Players[1] = player;
 
         var rng = new XoshiroRng(1);
 
-        Assert.True(new DamagePlayerCommand(1, 1, 10).Apply(world, rng).Applied);
+        // 1) 未接触敌怪 → 拒绝（防伪造远程受伤），生命 / 受击状态不变
+        var noContact = new DamagePlayerCommand(1, 1, 10).Apply(world, rng);
+        Assert.False(noContact.Applied);
+        Assert.Equal(CommandFailures.NotApplied, noContact.Reason);
         Assert.Equal(100, player.Hp);
-        Assert.Equal(7, player.HurtCooldown);
-        Assert.False(player.Dead);
-        Assert.Equal(12.5f, player.FallDistance);
-        Assert.Equal(new Vector2(3f, 4f), player.Velocity);
-        Assert.True(player.DeathNotified);
 
-        // 连续客户端报告仍接受，但不改变生命、免伤帧或其他受击状态。
-        Assert.True(new DamagePlayerCommand(2, 1, 10).Apply(world, rng).Applied);
-        Assert.Equal(100, player.Hp);
-        Assert.Equal(7, player.HurtCooldown);
+        // 2) 放置一只史莱姆钉在玩家碰撞盒中心（接触伤害 7，防御 0 → 上界 ceil(7×1.15) = 9）
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 25,
+            LifeMax = 25,
+            X = player.Position.X,
+            Y = player.Position.Y + 21f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+
+        // 3) 区间内（上报 7）→ 按上报值扣血 + 置免伤帧
+        Assert.True(new DamagePlayerCommand(2, 1, 7).Apply(world, rng).Applied);
+        Assert.Equal(93, player.Hp);
+        Assert.Equal(PlayerRuntime.GeneralImmunityTicks(7), player.HurtCooldown);
         Assert.False(player.Dead);
-        Assert.Equal(12.5f, player.FallDistance);
-        Assert.Equal(new Vector2(3f, 4f), player.Velocity);
-        Assert.True(player.DeathNotified);
+
+        // 4) 超上界（上报 10 > 9）→ 拒绝，生命 / 免伤帧不变
+        var above = new DamagePlayerCommand(3, 1, 10).Apply(world, rng);
+        Assert.False(above.Applied);
+        Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
+        Assert.Equal(93, player.Hp);
+        Assert.Equal(PlayerRuntime.GeneralImmunityTicks(7), player.HurtCooldown);
     }
 
     /// <summary>
