@@ -31,6 +31,14 @@ public sealed class WorldState
     /// </summary>
     public bool StrikeProjectileMatch { get; set; }
 
+    /// <summary>
+    /// 阶段 E「近战武器伤害校验」开关：开启后无弹幕的包 28（近战挥砍）按**手持武器权威伤害**区间校验
+    /// （<see cref="CombatResolver.WeaponDamageBound"/>：base × 修饰（Buff/药水实时）±15% 浮动上界 × 暴击）。
+    /// 默认关：未收录武器 / 空手失败放行，且套装/饰品伤害加成未全覆盖时强行开启可能误拒，随数据覆盖成熟后默认开。
+    /// 与 <see cref="StrikeProjectileMatch"/> 同属实例级开关（避免并行测试互相污染）。
+    /// </summary>
+    public bool StrikeWeaponCheck { get; set; }
+
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
 
@@ -1022,12 +1030,19 @@ public sealed class PlayerRuntime
     /// <summary>物品栏（槽位 → 物品 ID；0 = 空）。由包 5 InventorySlot 权威写入（服务端 SSC 唯一真相）。</summary>
     public readonly int[] Items = new int[InventorySlotCount];
 
+    /// <summary>
+    /// 手持热键槽（原版 <c>Player.selectedItem</c>，包 13 权威更新）：手持武器 = <see cref="Items"/>[SelectedSlot]。
+    /// 阶段 E 近战武器校验据此定位玩家当前武器。
+    /// </summary>
+    public int SelectedSlot;
+
     /// <summary>装备区槽位闭区间 [0, 8]：0-2 头盔/胸甲/护腿、3-7 饰品、8 盾牌（原版给防御的装备区）。</summary>
     public const int EquipmentSlotStart = 0;
     public const int EquipmentSlotEnd = 8;
 
     /// <summary>
-    /// 重算防御：装备区物品防御求和（原版 <c>Player.statDefense</c>）。物品栏变更后调用。
+    /// 重算防御：装备区物品防御 + Buff 防御（原版 <c>Player.statDefense</c> = 装备 + 增益）。
+    /// 物品栏变更（包 5）与 Buff 变更（包 50）后调用；117 区间上界 / 接触兜底据此实时减防。
     /// 未知物品 / 空槽经 <see cref="ItemDefenseTable.DefenseOf"/> 记为 0。
     /// </summary>
     public void RecalculateDefense()
@@ -1035,6 +1050,7 @@ public sealed class PlayerRuntime
         int sum = 0;
         for (int i = EquipmentSlotStart; i <= EquipmentSlotEnd && i < InventorySlotCount; i++)
             sum += ItemDefenseTable.DefenseOf(Items[i]);
+        sum += BuffTable.DefenseOf(Buffs);
         Defense = sum;
     }
 

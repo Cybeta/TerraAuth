@@ -66,6 +66,9 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
     /// <summary>包 13 若携带速度（StateBits bit2）则一并采纳，使服务端状态与客户端对齐。</summary>
     public Vector2? ReportedVelocity { get; init; }
 
+    /// <summary>包 13 携带的当前手持热键槽（原版 <c>Player.selectedItem</c>），阶段 E 近战武器校验据此定位手持武器。</summary>
+    public byte SelectedItem { get; init; }
+
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int id)
@@ -106,6 +109,8 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
         if (ReportedVelocity is { } reported)
             player.Velocity = reported;
         player.ControlBits = ControlBits;
+        if (SelectedItem < PlayerRuntime.InventorySlotCount)
+            player.SelectedSlot = SelectedItem;
         player.Active = true;
         world.MarkPlayerChanged(id);
         return new(true);
@@ -635,7 +640,7 @@ public sealed record NpcStrikeCommand(
     {
         if (PlayerId is not int playerId)
             return new(false, CommandFailures.MissingPlayer);
-        if (!TryGetPlayer(world, playerId, out _, out var failure))
+        if (!TryGetPlayer(world, playerId, out var player, out var failure))
             return failure;
 
         // 原版服务端在收到包 28 时**无条件**回一个包 162（且在校验之前），客户端据此出队一条待确认伤害。
@@ -663,13 +668,14 @@ public sealed record NpcStrikeCommand(
             // 原版客户端 Projectile.Damage()：Damage × DamageVar(±15%) × (crit ? 2 : 1)（均发生在防御减伤**之前**，
             // 包 28 上报的是减防御前数值；NPC 防御减伤在服务端结算时应用，见下方 applied）。
             // 上界 = ceil(p.Damage × 1.15) × (crit ? 2 : 1)。
-            // 近战挥砍无弹幕（找不到匹配）→ 退回既有校验并告警，避免误杀近战攻击。
+            // 近战挥砍无弹幕（找不到匹配）→ 交棒阶段 E 武器校验。
+            bool projectileMatched = false;
             if (world.StrikeProjectileMatch)
             {
                 var proj = FindPlayerProjectileNearNpc(world, playerId, npc);
                 if (proj is null)
                 {
-                    Console.WriteLine($"[Strike] slot={NpcIndex} 未找到归属玩家 #{playerId} 的存活弹幕（近战挥砍？），退回既有校验 dmg={Damage}");
+                    Console.WriteLine($"[Strike] slot={NpcIndex} 未找到归属玩家 #{playerId} 的存活弹幕（近战挥砍？），交棒武器校验 dmg={Damage}");
                 }
                 else
                 {
@@ -678,6 +684,32 @@ public sealed record NpcStrikeCommand(
                     {
                         Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 上报伤害 {Damage} 超弹幕上界 {bound}（弹幕key={proj.Key} dmg={proj.Damage} crit={Crit}）");
                         return new(false, CommandFailures.StrikeDamageMismatch);
+                    }
+                    projectileMatched = true;
+                }
+            }
+
+            // 阶段 E「近战武器伤害校验」：无弹幕的命中按**手持武器权威伤害**区间校验。
+            // 上界 = ceil(GetWeaponDamage × 1.15) × (crit ? 2 : 1)，GetWeaponDamage 随 Buff/药水实时变化
+            // （base × 职业伤害% × 全伤害%，原版 Player.GetWeaponDamage 口径）。
+            // 未收录武器 / 空手 → 失败放行（退回既有校验），绝不误拒未知物品。
+            if (!projectileMatched && world.StrikeWeaponCheck)
+            {
+                if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
+                {
+                    int heldItem = player.Items[player.SelectedSlot];
+                    if (heldItem > 0 && ItemDamageTable.Of.ContainsKey(heldItem))
+                    {
+                        int bound = CombatResolver.WeaponDamageBound(player, heldItem, Crit);
+                        if (Damage > bound)
+                        {
+                            Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 手持武器 {heldItem} 上报 {Damage} 超武器上界 {bound}（buff={string.Join(',', player.Buffs)} crit={Crit}）");
+                            return new(false, CommandFailures.StrikeDamageMismatch);
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[Strike] slot={NpcIndex} 手持物品 {heldItem} 未收录伤害表（空手/未知武器），失败放行 dmg={Damage}");
                     }
                 }
             }
@@ -896,6 +928,7 @@ public sealed record SetBuffsCommand(long Tick, int? PlayerId, IReadOnlyList<int
 
         player!.Buffs.Clear();
         player.Buffs.AddRange(Buffs);
+        player.RecalculateDefense(); // Buff 防御（铁皮/吃饱…）实时并入 statDefense，驱动 117 上界
         world.MarkPlayerChanged(id);
         return new(true);
     }

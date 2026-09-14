@@ -69,10 +69,33 @@ public static class CombatResolver
 
     /// <summary>
     /// 原版 <c>Main.CalculateDamageNPCsTake</c>（Main.cs L89180）：<c>dmg - def×0.5</c>，最低 1。
-    /// 供阶段 C（玩家攻击 NPC 弹幕匹配）与后续近战校验使用。
+    /// 供阶段 C（玩家攻击 NPC 弹幕匹配）与阶段 E（近战武器校验）使用。
     /// </summary>
     public static int CalculateDamageNPCsTake(int damage, int defense)
         => Math.Max(1, damage - (int)Math.Round(defense * 0.5f));
+
+    /// <summary>
+    /// 阶段 E：玩家**手持武器**的权威伤害（原版 <c>Player.GetWeaponDamage</c> 口径）：
+    /// <c>base × (1 + 职业伤害%) × (1 + 全伤害%)</c>（buff / 药水实时生效，套装/饰品加成待数据覆盖）。
+    /// 未收录武器（<paramref name="itemId"/> 不在 <see cref="ItemDamageTable.Of"/>）返回 0（调用方失败放行）。
+    /// </summary>
+    public static int GetWeaponDamage(PlayerRuntime player, int itemId)
+    {
+        if (!ItemDamageTable.Of.TryGetValue(itemId, out var stats))
+            return 0;
+
+        double damage = stats.Damage;
+        damage *= 1.0 + BuffTable.ClassDamagePercent(player.Buffs, stats.Class) / 100.0;
+        damage *= 1.0 + BuffTable.AllDamagePercent(player.Buffs) / 100.0;
+        return Math.Max(1, (int)damage);
+    }
+
+    /// <summary>
+    /// 阶段 E：近战命中的**上报值上界** = <c>ceil(权威伤害 × 1.15) × (crit ? 2 : 1)</c>
+    /// （与阶段 C 弹幕匹配同口径：±15% 浮动上界 → 暴击倍率；防御减伤在服务端结算时另行应用）。
+    /// </summary>
+    public static int WeaponDamageBound(PlayerRuntime player, int itemId, bool crit)
+        => (int)Math.Ceiling(GetWeaponDamage(player, itemId) * 1.15f) * (crit ? 2 : 1);
 
     /// <summary>
     /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。

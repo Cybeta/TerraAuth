@@ -197,6 +197,7 @@ public sealed class TerminalStage : IPipelineStage
             ReportedVelocity = (controls.StateBits & PlayerControlsPacket.StateBitHasVelocity) != 0
                 ? controls.Velocity
                 : null,
+            SelectedItem = controls.SelectedItem, // 手持热键槽（阶段 E 近战武器校验据此定位手持武器）
         },
         // 包 65 TeleportEntity：本玩家带落点的传送 → 移动指令（bit2 无位置时由服务端自持位置，不生成）
         TeleportEntityPacket teleport when !teleport.NoPosition

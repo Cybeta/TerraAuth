@@ -1108,6 +1108,122 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 阶段 E：包 28 近战武器校验上界随 **Buff / 手持武器** 实时变化。
+    /// 木弓（26，9 伤）：无 buff 上界 ceil(9×1.15)=11；箭术（73，远程+20%）→ GetWeaponDamage
+    /// = 9×1.2=10.8 → 10，上界 ceil(10×1.15)=12；换木剑（25，7 伤）→ 上界 ceil(7×1.15)=9。
+    /// </summary>
+    [Fact]
+    public void StrikeBound_Follows_Buffs_And_Held_Weapon_RealTime()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.StrikeWeaponCheck = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 手持木弓（槽 3）：先经 MoveCommand 权威写入 SelectedSlot，验证包 13 → SelectedItem 落库
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 26, 1).Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(2, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+        Assert.Equal(3, player.SelectedSlot);
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        // 无 buff：上界 11，报 12 拒、报 11 收
+        Assert.Equal(11, CombatResolver.WeaponDamageBound(player, 26, false));
+        Assert.False(new NpcStrikeCommand(3, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(100, slime.Life);
+        Assert.True(new NpcStrikeCommand(4, 1, index, 11, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(89, slime.Life);
+
+        // 箭术 Buff（包 50 权威）→ 上界实时升到 12，报 12 收
+        Assert.True(new SetBuffsCommand(5, 1, new[] { 73 }).Apply(world, rng).Applied);
+        Assert.Equal(12, CombatResolver.WeaponDamageBound(player, 26, false));
+        Assert.True(new NpcStrikeCommand(6, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(77, slime.Life);
+
+        // 换持木剑（7 伤）→ 上界降回 9，报 10 拒
+        Assert.True(new SetInventorySlotCommand(7, 1, 3, 25, 1).Apply(world, rng).Applied);
+        Assert.Equal(9, CombatResolver.WeaponDamageBound(player, 25, false));
+        Assert.False(new NpcStrikeCommand(8, 1, index, 10, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(77, slime.Life);
+    }
+
+    /// <summary>
+    /// 阶段 E：包 117 上界随 **Buff 防御**（铁皮）实时降低：
+    /// 接触史莱姆 7 伤，0 防御上界 = ceil(7×1.15)−0 = 9；铁皮（14，+8 防）→ 上界 = 9−round(8×0.5)=5。
+    /// </summary>
+    [Fact]
+    public void HurtBound_Follows_BuffDefense_RealTime()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 放置一只史莱姆钉在玩家碰撞盒中心（接触伤害 7）
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            Defense = 0,
+            Generation = 3,
+            X = player.Position.X,
+            Y = player.Position.Y + 21f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+
+        // 无 buff：上界 9，报 9 收 → 91
+        Assert.Equal(9, CombatResolver.CalculateDamagePlayersTake(
+            (int)Math.Ceiling(7 * 1.15f), player.Defense, GameMode.Classic));
+        Assert.True(new DamagePlayerCommand(1, 1, 9).Apply(world, rng).Applied);
+        Assert.Equal(91, player.Hp);
+
+        // 铁皮（14）→ 防御 8，上界降为 5：报 6 拒、报 5 收 → 86
+        Assert.True(new SetBuffsCommand(2, 1, new[] { 14 }).Apply(world, rng).Applied);
+        Assert.Equal(8, player.Defense);
+        Assert.False(new DamagePlayerCommand(3, 1, 6).Apply(world, rng).Applied);
+        Assert.Equal(91, player.Hp);
+        Assert.True(new DamagePlayerCommand(4, 1, 5).Apply(world, rng).Applied);
+        Assert.Equal(86, player.Hp);
+    }
+
+    /// <summary>
     /// 清一条水平走廊（上方留空、地面铺平），让玩家物理的断言不受地形影响。
     /// </summary>
     private static void ClearCorridor(WorldState world, int centerTileX, int span)
