@@ -6,6 +6,23 @@ using TerraAuth.Simulation;
 
 namespace TerraAuth.Simulation;
 
+/// <summary>
+/// 游戏难度（对应原版 <c>Main.GameMode</c>）：决定玩家受击伤害公式
+/// （<see cref="CombatResolver.CalculateDamagePlayersTake"/>）与 NPC 对玩家的伤害倍率。
+/// server.json 用字符串枚举读写（"Classic" / "Expert" / "Master"）。
+/// </summary>
+public enum GameMode
+{
+    /// <summary>经典：<c>dmg − def×0.5</c>（最低 1）。</summary>
+    Classic = 0,
+
+    /// <summary>专家：<c>dmg×2 − def×0.75</c>（最低 1）。</summary>
+    Expert = 1,
+
+    /// <summary>大师：<c>dmg×3 − def</c>（最低 1）。</summary>
+    Master = 2,
+}
+
 /// <summary>服务端权威战斗判定与伤害公式（无状态，公式照抄原版）。</summary>
 public static class CombatResolver
 {
@@ -20,11 +37,35 @@ public static class CombatResolver
     }
 
     /// <summary>
-    /// 原版 <c>Main.CalculateDamagePlayersTake</c>（Main.cs L89200）：经典难度 <c>dmg - def×0.5</c>，最低 1。
-    /// 大师模式分支（<c>dmg - def</c>）随阶段 D 的难度配置补入。
+    /// 原版 <c>Main.CalculateDamagePlayersTake</c>（Main.cs L89200），按难度取分支，最低 1：
+    /// <list type="bullet">
+    /// <item>经典：<c>dmg − def×0.5</c></item>
+    /// <item>专家：<c>dmg×2 − def×0.75</c></item>
+    /// <item>大师：<c>dmg×3 − def</c></item>
+    /// </list>
+    /// <paramref name="damage"/> 为 NPC 基础伤害（<see cref="NpcStatsTable"/>，原版正常模式数值）——
+    /// 难度倍率内置于本公式（原版 1.4 起不再单独放大 <c>npc.damage</c>），
+    /// 服务端上界与客户端 <c>Player.Hurt</c> 显示口径完全一致。
     /// </summary>
-    public static int CalculateDamagePlayersTake(int damage, int defense)
-        => Math.Max(1, damage - (int)Math.Round(defense * 0.5f));
+    public static int CalculateDamagePlayersTake(int damage, int defense, GameMode mode = GameMode.Classic)
+        => mode switch
+        {
+            GameMode.Expert => Math.Max(1, damage * 2 - (int)Math.Round(defense * 0.75f)),
+            GameMode.Master => Math.Max(1, damage * 3 - defense),
+            _ => Math.Max(1, damage - (int)Math.Round(defense * 0.5f)),
+        };
+
+    /// <summary>
+    /// 世界难度 int（<c>WorldState.GameMode</c>：0=普通、1=专家、2=大师、3=旅途）→ 战斗难度枚举。
+    /// 3（旅途）未建模难度滑杆 → 按经典战斗公式兜底。
+    /// </summary>
+    public static GameMode FromWorldDifficulty(int difficulty)
+        => difficulty switch
+        {
+            1 => GameMode.Expert,
+            2 => GameMode.Master,
+            _ => GameMode.Classic,
+        };
 
     /// <summary>
     /// 原版 <c>Main.CalculateDamageNPCsTake</c>（Main.cs L89180）：<c>dmg - def×0.5</c>，最低 1。

@@ -138,10 +138,10 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
             return new(false, CommandFailures.NotApplied);
         }
 
-        // 伤害上界：接触者最大基础伤害 × ±15% 浮动上界 → 减玩家防御（原版 CalculateDamagePlayersTake）
+        // 伤害上界：接触者最大基础伤害 × ±15% 浮动上界 → 减玩家防御（原版 CalculateDamagePlayersTake，按难度取分支）
         int contact = CombatResolver.FindContactDamage(world, player, out _, out _);
         int upper = CombatResolver.CalculateDamagePlayersTake(
-            (int)Math.Ceiling(contact * 1.15f), player.Defense);
+            (int)Math.Ceiling(contact * 1.15f), player.Defense, CombatResolver.FromWorldDifficulty(world.GameMode));
 
         if (Damage > upper)
         {

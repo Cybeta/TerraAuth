@@ -164,7 +164,11 @@ public sealed class WorldState
     public ulong WorldGeneratorVersion { get; set; }
     public string Seed { get; set; } = "";
 
-    /// <summary>0=普通、1=专家、2=大师、3=旅途。</summary>
+    /// <summary>
+    /// 世界难度（0=普通、1=专家、2=大师、3=旅途；启动时由 <c>ServerConfig.GameMode</c> 写入，见 <c>GameHost</c>）。
+    /// 玩家受击区间校验（<see cref="DamagePlayerCommand"/>）与接触兜底（<c>WorldSimulator.SimulateCombat</c>）
+    /// 经 <see cref="CombatResolver.FromWorldDifficulty"/> 取原版 <c>Main.CalculateDamagePlayersTake</c> 对应分支。
+    /// </summary>
     public int GameMode { get; set; }
 
     // ---- 时间 / 天气 ----

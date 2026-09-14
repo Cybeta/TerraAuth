@@ -922,8 +922,8 @@ public partial class WorldSimulator : IWorldViewProvider
             int contact = FindContactDamage(player, out var contactNpc, out var contactSlot);
             if (contact > 0)
             {
-                // 兜底结算同样走原版 CalculateDamagePlayersTake（减玩家防御），与包 117 主路径扣血口径一致
-                int damage = CombatResolver.CalculateDamagePlayersTake(contact, player.Defense);
+                // 兜底结算同样走原版 CalculateDamagePlayersTake（减玩家防御，按难度取分支），与包 117 主路径扣血口径一致
+                int damage = CombatResolver.CalculateDamagePlayersTake(contact, player.Defense, CombatResolver.FromWorldDifficulty(_world.GameMode));
                 ApplyPlayerDamage(player, damage, "contact_damage", PlayerRuntime.GeneralImmunityTicks(damage));
                 LogPlayerDamage(player, damage, "contact_damage",
                     $"NPC {contactNpc!.Type} slot={contactSlot} gen={contactNpc.Generation} " +

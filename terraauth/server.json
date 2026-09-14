@@ -6,6 +6,7 @@
   "WorldPath": "",
   "WorldSize": "Small",
   "MaxEnemies": 2,
+  "GameMode": "Classic",
   "WorldExportPath": "",
   "WorldExportIntervalSeconds": 600,
   "SessionResumeGraceSeconds": 60,

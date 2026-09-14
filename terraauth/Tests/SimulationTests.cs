@@ -918,6 +918,68 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 原版 <c>Main.CalculateDamagePlayersTake</c> 按难度取分支（阶段 D）：
+    /// 经典 <c>dmg − def×0.5</c>、专家 <c>dmg×2 − def×0.75</c>、大师 <c>dmg×3 − def</c>，最低 1。
+    /// </summary>
+    [Theory]
+    [InlineData(GameMode.Classic, 7, 2, 6)]     // 7 − round(2×0.5)=1 → 6
+    [InlineData(GameMode.Expert, 7, 2, 12)]     // 14 − round(2×0.75)=2 → 12
+    [InlineData(GameMode.Master, 7, 2, 19)]     // 21 − 2 → 19
+    [InlineData(GameMode.Classic, 1, 10, 1)]    // 下限 1
+    [InlineData(GameMode.Expert, 1, 10, 1)]     // 2 − round(7.5)=8 → 下限 1
+    [InlineData(GameMode.Master, 0, 0, 1)]      // 0 → 下限 1
+    public void CalculateDamagePlayersTake_Applies_Mode_Formula(GameMode mode, int damage, int defense, int expected)
+        => Assert.Equal(expected, CombatResolver.CalculateDamagePlayersTake(damage, defense, mode));
+
+    /// <summary>
+    /// 阶段 D：专家模式下包 117 区间上界按难度放大（原版 1.4 起难度倍率内置于
+    /// <c>CalculateDamagePlayersTake</c>，不再单独放大 <c>npc.damage</c>）。
+    /// 史莱姆接触 7、玩家防御 0 → 专家上界 = ceil(7×1.15)=9 × 2 − 0 = 18（经典为 9）。
+    /// </summary>
+    [Fact]
+    public void ExpertMode_Contact_UpperBound_Scales_With_Difficulty()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.GameMode = (int)GameMode.Expert;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 25,
+            LifeMax = 25,
+            X = player.Position.X,
+            Y = player.Position.Y + 21f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+
+        // 区间内（专家上界 18）→ 接受并按上报值扣血：100 − 18 = 82
+        Assert.True(new DamagePlayerCommand(2, 1, 18).Apply(world, rng).Applied);
+        Assert.Equal(82, player.Hp);
+
+        // 超上界（19 > 18）→ 拒绝（hurt_damage_above_limit），生命不变
+        var above = new DamagePlayerCommand(3, 1, 19).Apply(world, rng);
+        Assert.False(above.Applied);
+        Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
+        Assert.Equal(82, player.Hp);
+    }
+
+    /// <summary>
     /// 清一条水平走廊（上方留空、地面铺平），让玩家物理的断言不受地形影响。
     /// </summary>
     private static void ClearCorridor(WorldState world, int centerTileX, int span)

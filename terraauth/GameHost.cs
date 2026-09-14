@@ -144,6 +144,7 @@ public sealed class GameHost : IDisposable
         // 5. 权威层（Phase 2）+ 审计桥接
         // 世界数据：优先加载配置指定的 .wld；未配置则按 WorldSize 程序化生成（见 WorldGenerator 注释）
         var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize);
+        world.GameMode = (int)config.Current.GameMode; // 阶段 D：玩家受击公式按难度取分支（经典/专家/大师），117 上界与接触兜底共用
 
         // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
         // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
