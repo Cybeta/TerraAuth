@@ -38,6 +38,7 @@ public static class AccessoryTable
         [2220] = new(0, 0, 0, 15),    // 天界徽章 Celestial Emblem：魔法 +15%
         [3015] = new(5, 0, 0, 0),     // 恶臭香气 Putrid Scent：全伤害 +5%
         [3110] = new(10, 0, 0, 0),    // 天界壳 Celestial Shell：全伤害 +10%（skyStoneEffects）
+        [4005] = new(0, 0, 10, 0),    // 侦察镜 Recon Scope：远程 +10%（L15408）
     };
 
     /// <summary>饰品槽合计「全伤害」加成（百分比）。</summary>

@@ -37,8 +37,8 @@ public static class ArmorSetBonusTable
         (new[] { 91, 82, 78 },    new ArmorSetBonus(DefenseBonus: 3)),   // 银套（MetalTier2）
         (new[] { 92, 83, 79 },    new ArmorSetBonus(DefenseBonus: 3)),   // 金套（MetalTier2）
         (new[] { 955, 83, 79 },   new ArmorSetBonus(DefenseBonus: 3)),   // 金套远古头盔变体（MetalTier2）
-        (new[] { 690, 691, 692 }, new ArmorSetBonus(DefenseBonus: 3)),   // 钨套（MetalTier2）
-        (new[] { 693, 694, 695 }, new ArmorSetBonus(DefenseBonus: 3)),   // 铂金套变体（MetalTier2）
+        (new[] { 690, 691, 692 }, new ArmorSetBonus(DefenseBonus: 3)),   // 铅套 Lead（MetalTier2）
+        (new[] { 693, 694, 695 }, new ArmorSetBonus(DefenseBonus: 3)),   // 钨套 Tungsten（MetalTier2）
         (new[] { 696, 697, 698 }, new ArmorSetBonus(DefenseBonus: 4)),   // 铂金套 Platinum
         (new[] { 231, 232, 233 }, new ArmorSetBonus(MeleePct: 10)),       // 熔岩套 Molten：近战 +10%
         (new[] { 684, 685, 686 }, new ArmorSetBonus(MeleePct: 10, RangedPct: 10)), // 霜冻套 Frost
