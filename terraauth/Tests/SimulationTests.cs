@@ -1108,10 +1108,11 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 阶段 E：包 28 近战武器校验上界随 **Buff / 手持武器 / 套装** 实时变化（1.4.5.8 权威 ID）。
+    /// 阶段 E：包 28 近战武器校验上界随 **Buff / 手持武器 / 套装 / 饰品** 实时变化（1.4.5.8 权威 ID）。
     /// 金弓（3516，11 伤）：无 buff 上界 ceil(11×1.15)=13；箭术（73，远程+20%）→ GetWeaponDamage
     /// = 11×1.2=13.2 → 13，上界 ceil(13×1.15)=15；换金阔剑（3520，15 伤）→ 上界 18；
-    /// 穿熔岩套（231/232/233，近战+10%）→ GetWeaponDamage = 15×1.1=16.5 → 16，上界 19。
+    /// 穿熔岩套（231/232/233，近战+10%）→ GetWeaponDamage = 15×1.1=16.5 → 16，上界 19；
+    /// 戴战士徽章（490，近战+15%）→ 总修饰 10+15=25% → GetWeaponDamage = 15×1.25=18.75 → 18，上界 21。
     /// </summary>
     [Fact]
     public void StrikeBound_Follows_Buffs_And_Held_Weapon_RealTime()
@@ -1180,6 +1181,15 @@ public class WorldGeneratorTests
         Assert.Equal(37, slime.Life);
         Assert.False(new NpcStrikeCommand(13, 1, index, 20, Generation: 3).Apply(world, rng).Applied);
         Assert.Equal(37, slime.Life);
+
+        // 戴战士徽章（490，近战 +15%，槽 4 饰品）→ 总修饰 = 10（熔岩套）+ 15（徽章）= 25% →
+        // 权威伤害 15×1.25=18.75 → 18，上界 ceil(18×1.15)=21，报 21 收 → 16，报 22 拒
+        Assert.True(new SetInventorySlotCommand(14, 1, 4, 490, 1).Apply(world, rng).Applied);
+        Assert.Equal(21, CombatResolver.WeaponDamageBound(player, 3520, false));
+        Assert.True(new NpcStrikeCommand(15, 1, index, 21, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(16, slime.Life);
+        Assert.False(new NpcStrikeCommand(16, 1, index, 22, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(16, slime.Life);
     }
 
     /// <summary>

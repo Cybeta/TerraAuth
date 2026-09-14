@@ -1040,6 +1040,9 @@ public sealed class PlayerRuntime
     public const int EquipmentSlotStart = 0;
     public const int EquipmentSlotEnd = 8;
 
+    /// <summary>饰品槽起点（原版 3-8：3-7 饰品 + 8 盾牌/坐骑专属），供饰品伤害/防御修饰扫描。</summary>
+    public const int AccessorySlotStart = 3;
+
     /// <summary>
     /// 重算防御：装备区物品防御 + Buff 防御 + 套装防御加成（原版 <c>Player.statDefense</c> = 装备 + 增益 + 套装）。
     /// 物品栏变更（包 5）与 Buff 变更（包 50）后调用；117 区间上界 / 接触兜底据此实时减防。

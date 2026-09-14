@@ -76,7 +76,8 @@ public static class CombatResolver
 
     /// <summary>
     /// 阶段 E：玩家**手持武器**的权威伤害（原版 <c>Player.GetWeaponDamage</c> 口径）：
-    /// <c>base × (1 + 职业伤害%) × (1 + 全伤害%)</c>（Buff/药水实时生效，装备区穿齐套装另加职业加成）。
+    /// <c>base × (1 + 总修饰%)</c>。各类修饰**加算**累进职业伤害字段（原版无独立 allDamage 字段，
+    /// 「全伤害」如 Wrath/复仇者徽章是对四职业字段 += 同一值）：Buff 职业% + Buff 全% + 套装职业% + 饰品职业% + 饰品全%。
     /// 未收录武器（<paramref name="itemId"/> 不在 <see cref="ItemDamageTable.Of"/>）返回 0（调用方失败放行）。
     /// </summary>
     public static int GetWeaponDamage(PlayerRuntime player, int itemId)
@@ -84,23 +85,25 @@ public static class CombatResolver
         if (!ItemDamageTable.Of.TryGetValue(itemId, out var stats))
             return 0;
 
-        double damage = stats.Damage;
-        damage *= 1.0 + BuffTable.ClassDamagePercent(player.Buffs, stats.Class) / 100.0;
-        damage *= 1.0 + BuffTable.AllDamagePercent(player.Buffs) / 100.0;
+        double totalPct =
+            BuffTable.ClassDamagePercent(player.Buffs, stats.Class)
+            + BuffTable.AllDamagePercent(player.Buffs)
+            + AccessoryTable.ClassDamagePercent(player.Items, stats.Class)
+            + AccessoryTable.AllDamagePercent(player.Items);
 
         // 套装职业加成（阶段 E-2）：穿齐熔岩套等 → 对应职业伤害 +%（ArmorSetBonuses 权威）。
         if (ArmorSetBonusTable.BonusForEquipment(player.Items) is { } set)
         {
-            int setPct = stats.Class switch
+            totalPct += stats.Class switch
             {
                 WeaponClass.Melee => set.MeleePct,
                 WeaponClass.Ranged => set.RangedPct,
                 WeaponClass.Magic => set.MagicPct,
                 _ => 0,
             };
-            damage *= 1.0 + setPct / 100.0;
         }
-        return Math.Max(1, (int)damage);
+
+        return Math.Max(1, (int)(stats.Damage * (1.0 + totalPct / 100.0)));
     }
 
     /// <summary>
