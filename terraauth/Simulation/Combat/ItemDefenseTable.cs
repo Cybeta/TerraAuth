@@ -16,7 +16,6 @@ public static class ItemDefenseTable
         // ---- 木质基础套 ----
         [727] = 1,    // Wood Helmet
         [728] = 1,    // Wood Breastplate
-        [729] = 0,    // Wood Greaves
         // ---- 矿石套（铜 / 锡 / 铁 / 铅 / 银 / 钨 / 金 / 铂金）----
         [89] = 1,     // Copper Helmet
         [80] = 2,     // Copper Chainmail

@@ -29,6 +29,27 @@ public static class ItemDamageTable
         [10]  = new(5,  WeaponClass.Melee),   // IronAxe
         [7]   = new(7,  WeaponClass.Melee),   // IronHammer
         [196] = new(2,  WeaponClass.Melee),   // WoodenHammer
+        // ---- 前困难模式金属武器（1.4.5.8 的 3480-3499 段，3500+ 变体 switch 的前身）----
+        [3480] = new(13, WeaponClass.Ranged),  // 铂金弓 Platinum Bow
+        [3481] = new(10, WeaponClass.Melee),   // 铂金锤 Platinum Hammer
+        [3482] = new(8,  WeaponClass.Melee),   // 铂金斧 Platinum Axe
+        [3483] = new(13, WeaponClass.Melee),   // 铂金短剑 Platinum Shortsword
+        [3484] = new(16, WeaponClass.Melee),   // 铂金阔剑 Platinum Broadsword
+        [3485] = new(7,  WeaponClass.Melee),   // 铂金镐 Platinum Pickaxe
+        [3486] = new(10, WeaponClass.Ranged),  // 钨弓 Tungsten Bow
+        [3487] = new(9,  WeaponClass.Melee),   // 钨锤 Tungsten Hammer
+        [3488] = new(7,  WeaponClass.Melee),   // 钨斧 Tungsten Axe
+        [3489] = new(10, WeaponClass.Melee),   // 钨短剑 Tungsten Shortsword
+        [3490] = new(14, WeaponClass.Melee),   // 钨阔剑 Tungsten Broadsword
+        [3491] = new(6,  WeaponClass.Melee),   // 钨镐 Tungsten Pickaxe
+        [3492] = new(9,  WeaponClass.Ranged),  // 铅弓 Lead Bow
+        [3493] = new(8,  WeaponClass.Melee),   // 铅锤 Lead Hammer
+        [3494] = new(6,  WeaponClass.Melee),   // 铅斧 Lead Axe
+        [3495] = new(9,  WeaponClass.Melee),   // 铅短剑 Lead Shortsword
+        [3496] = new(13, WeaponClass.Melee),   // 铅阔剑 Lead Broadsword
+        [3497] = new(6,  WeaponClass.Melee),   // 铅镐 Lead Pickaxe
+        [3498] = new(7,  WeaponClass.Ranged),  // 锡弓 Tin Bow
+        [3499] = new(6,  WeaponClass.Melee),   // 锡锤 Tin Hammer
         [3500] = new(4,  WeaponClass.Melee),  // 锡斧 Tin Axe
         [3503] = new(5,  WeaponClass.Melee),  // 锡镐 Tin Pickaxe
         [3505] = new(4,  WeaponClass.Melee),  // 铜锤 Copper Hammer
@@ -439,5 +460,18 @@ public static class ItemDamageTable
         [6149] = new(40, WeaponClass.Summon),  // PalworldMinionTrustyFoxsparks
         [6161] = new(5,  WeaponClass.Summon),  // ClayPotMinion
         [6164] = new(40, WeaponClass.Summon),  // ForbiddenMinion
+        // ---- 阶段 E-5 补漏：缺失武器（NPC 掉落 / 1.4.5+ 新武器 / 信号枪等）----
+        [930]  = new(2,  WeaponClass.Ranged),  // 信号枪 Flare Gun
+        [3349] = new(20, WeaponClass.Melee),   // 染料商弯刀 Dye Trader's Scimitar
+        [3351] = new(40, WeaponClass.Melee),   // 税收官末日棍 Tax Collector's Stick of Doom
+        [3352] = new(14, WeaponClass.Melee),   // 发型师剪刀 Stylist's KilLaKill Scissors
+        [4347] = new(42, WeaponClass.Magic),   // 灰色冲击枪 Zapinator (Gray)
+        [4348] = new(100, WeaponClass.Magic),  // 橙色冲击枪 Zapinator (Orange)
+        [4703] = new(14, WeaponClass.Ranged),  // 四管霰弹枪 Quad-Barrel Shotgun
+        [5283] = new(9,  WeaponClass.Melee),   // 灰木锤 Ash Wood Hammer
+        [5629] = new(5,  WeaponClass.Ranged),  // 橡实弹弓 Acorn Slingshot
+        [6152] = new(8,  WeaponClass.Magic),   // 太阳花法杖 Daybloom Staff
+        [6153] = new(11, WeaponClass.Magic),   // 冰川之牙 Glacier Fang
+        [6154] = new(20, WeaponClass.Magic),   // 花瓣风暴 Petalstorm
     };
 }
