@@ -980,6 +980,134 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 阶段 D 第二部分：物品栏装备（包 5 → SetInventorySlotCommand）回填 <see cref="PlayerRuntime.Defense"/>，
+    /// 包 117 区间上界按真实装备减防（原版 CalculateDamagePlayersTake）。
+    /// 铜套（79/80/81 = 1/3/2）→ 防御 6；史莱姆接触 7 → 上界 = ceil(7×1.15)=9 − round(6×0.5)=3 → 6。
+    /// </summary>
+    [Fact]
+    public void EquippedArmor_Feeds_Defense_Into_117_UpperBound()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 穿铜套：头盔 79(1) + 链甲 80(3) + 护腿 81(2) → 防御 6
+        Assert.True(new SetInventorySlotCommand(1, 1, 0, 79, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(2, 1, 1, 80, 1).Apply(world, rng).Applied);
+        Assert.True(new SetInventorySlotCommand(3, 1, 2, 81, 1).Apply(world, rng).Applied);
+        Assert.Equal(6, player.Defense);
+        Assert.Equal(79, player.Items[0]);
+        Assert.Equal(80, player.Items[1]);
+        Assert.Equal(81, player.Items[2]);
+
+        // 放置一只史莱姆钉在玩家碰撞盒中心（接触伤害 7）
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 25,
+            LifeMax = 25,
+            X = player.Position.X,
+            Y = player.Position.Y + 21f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+
+        // 区间内（上报 6 = 上界）→ 接受并按上报值扣血：100 − 6 = 94
+        Assert.True(new DamagePlayerCommand(4, 1, 6).Apply(world, rng).Applied);
+        Assert.Equal(94, player.Hp);
+
+        // 超上界（7 > 6，裸装上界为 9）→ 拒绝（防伪造伤害），生命不变
+        var above = new DamagePlayerCommand(5, 1, 7).Apply(world, rng);
+        Assert.False(above.Applied);
+        Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
+        Assert.Equal(94, player.Hp);
+
+        // 脱头盔（空槽清空语义）→ 防御降为 5（3+2）
+        Assert.True(new SetInventorySlotCommand(6, 1, 0, 0, 0).Apply(world, rng).Applied);
+        Assert.Equal(5, player.Defense);
+        Assert.Equal(0, player.Items[0]);
+    }
+
+    /// <summary>
+    /// 阶段 D 第三部分：NPC 防御减伤在包 28 结算时应用（原版服务端收包后
+    /// <c>CalculateDamageNPCsTake(dmg, def) × (crit ? 2 : 1)</c>——先减伤、再暴击）。
+    /// 哥布林（type=26，防御 4）：上报 10 → 10 − round(4×0.5)=2 → 8；暴击 20 → 8×2=16。
+    /// 防御 0 的史莱姆按上报值原样扣减（既有行为不回归）。
+    /// </summary>
+    [Fact]
+    public void NpcStrike_Applies_Defense_Reduction()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 哥布林（type=26，防御 4，生命 60）——手动构造不走 AddNpc，需显式给防御
+        var goblin = new WorldNpc
+        {
+            Type = 26,
+            NetId = 26,
+            Active = true,
+            Life = 60,
+            LifeMax = 60,
+            Defense = 4,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(goblin);
+        int index = world.Npcs.IndexOf(goblin);
+
+        // 上报 10 → 减防御 2 → 8；60 − 8 = 52
+        Assert.True(new NpcStrikeCommand(1, 1, index, 10, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(52, goblin.Life);
+
+        // 暴击：上报 20 → 减防御 2 → 18 × 2 = 36；52 − 36 = 16
+        Assert.True(new NpcStrikeCommand(2, 1, index, 20, Generation: 3, Crit: true).Apply(world, rng).Applied);
+        Assert.Equal(16, goblin.Life);
+
+        // 防御为 0 的史莱姆：上报值原样扣减（不受减伤影响）
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 25,
+            LifeMax = 25,
+            Generation = 7,
+            X = 400f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int sIndex = world.Npcs.IndexOf(slime);
+
+        Assert.True(new NpcStrikeCommand(3, 1, sIndex, 10, Generation: 7).Apply(world, rng).Applied);
+        Assert.Equal(15, slime.Life);
+    }
+
+    /// <summary>
     /// 清一条水平走廊（上方留空、地面铺平），让玩家物理的断言不受地形影响。
     /// </summary>
     private static void ClearCorridor(WorldState world, int centerTileX, int span)

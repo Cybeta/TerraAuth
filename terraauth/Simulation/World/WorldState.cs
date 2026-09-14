@@ -1011,10 +1011,32 @@ public sealed class PlayerRuntime
 
     /// <summary>
     /// 玩家防御值（原版 <c>Player.statDefense</c>，装备 / buff 合计）。
-    /// 阶段 D 前恒为 0（裸装）；随包 5 物品栏接入后由装备防御表回填。
+    /// 由 <see cref="RecalculateDefense"/> 在物品栏变更（包 5）时重算；
     /// 用于 117 区间校验的减防上界与扣血计算。
     /// </summary>
     public int Defense;
+
+    /// <summary>物品栏槽位数量（原版 59：装备区 0-8 / 物品区 / 钱币 / 弹药 / 材料）。</summary>
+    public const int InventorySlotCount = 59;
+
+    /// <summary>物品栏（槽位 → 物品 ID；0 = 空）。由包 5 InventorySlot 权威写入（服务端 SSC 唯一真相）。</summary>
+    public readonly int[] Items = new int[InventorySlotCount];
+
+    /// <summary>装备区槽位闭区间 [0, 8]：0-2 头盔/胸甲/护腿、3-7 饰品、8 盾牌（原版给防御的装备区）。</summary>
+    public const int EquipmentSlotStart = 0;
+    public const int EquipmentSlotEnd = 8;
+
+    /// <summary>
+    /// 重算防御：装备区物品防御求和（原版 <c>Player.statDefense</c>）。物品栏变更后调用。
+    /// 未知物品 / 空槽经 <see cref="ItemDefenseTable.DefenseOf"/> 记为 0。
+    /// </summary>
+    public void RecalculateDefense()
+    {
+        int sum = 0;
+        for (int i = EquipmentSlotStart; i <= EquipmentSlotEnd && i < InventorySlotCount; i++)
+            sum += ItemDefenseTable.DefenseOf(Items[i]);
+        Defense = sum;
+    }
 
     /// <summary>
     /// **受击免伤帧**（接触攻击 / 客户端上报的包 117 / 下落伤害 / 敌对弹幕共用一个窗口）。

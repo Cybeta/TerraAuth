@@ -874,11 +874,11 @@ public class VanillaFeatureTests
         var got = await s.ReadUntilAsync(p => p is NpcUpdatePacket { NetId: 1 }, TimeSpan.FromSeconds(5));
         Assert.Contains(got, p => p is NpcUpdatePacket { NetId: 1 });
 
-        // 包 28 击杀（史莱姆 25 血）→ 服务端扣血并置为死亡
+        // 包 28 击杀（史莱姆 25 血，防御 2 → 26 − round(2×0.5)=1 → 25 恰好击杀）→ 服务端扣血并置为死亡
         int index;
         lock (world.NpcsLock) index = world.Npcs.IndexOf(slime);
         await s.SendAsync(PacketId.NpcStrike,
-            new NpcStrikePacket(index, 25) { Generation = slime.Generation });
+            new NpcStrikePacket(index, 26) { Generation = slime.Generation });
 
         Assert.True(await TickUntilAsync(server, () => !slime.Active, TimeSpan.FromSeconds(5)),
             "NPC 受击后未被击杀");
@@ -1938,11 +1938,11 @@ public class VanillaFeatureTests
         var seen = await s.ReadUntilAsync(p => p is NpcUpdatePacket { NetId: 4 }, TimeSpan.FromSeconds(5));
         Assert.Contains(seen, p => p is NpcUpdatePacket { NetId: 4 });
 
-        // 击杀 → 服务端记录世界进度
+        // 击杀 → 服务端记录世界进度（眼魔 2800 血，防御 12 → 3000 − round(12×0.5)=6 → 2994 ≥ 2800 击杀）
         int index;
         lock (world.NpcsLock) index = world.Npcs.IndexOf(boss);
         await s.SendAsync(PacketId.NpcStrike,
-            new NpcStrikePacket(index, 2800) { Generation = boss.Generation });
+            new NpcStrikePacket(index, 3000) { Generation = boss.Generation });
 
         Assert.True(await TickUntilAsync(server, () => !boss.Active, TimeSpan.FromSeconds(5)),
             "Boss 未被击杀");
@@ -2122,6 +2122,40 @@ public class VanillaFeatureTests
         var hurt = Assert.Single(obsGot.OfType<PlayerHurtV2Packet>());
         Assert.Equal(7, hurt.Damage);
         Assert.Equal(1, hurt.PlayerId);
+    }
+
+    /// <summary>
+    /// 阶段 D 第二部分：包 5（InventorySlot）经完整管线 → SetInventorySlotCommand →
+    /// <see cref="PlayerRuntime.RecalculateDefense"/> 回填装备防御（SSC 服务端唯一真相）。
+    /// 铜套（79/80/81 = 1/3/2）→ 防御 6；空槽清空 → 降防。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_EquippedArmor_Feeds_Defense_From_InventorySlot_Packets()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        var player = world.Players[1];
+        Assert.Equal(0, player.Defense); // 裸装
+
+        // 穿铜套：头盔 79(1) + 链甲 80(3) + 护腿 81(2) → 防御 6
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 79, 1));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(1, 80, 1));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(2, 81, 1));
+
+        Assert.True(await TickUntilAsync(server, () => player.Defense == 6, TimeSpan.FromSeconds(5)),
+            $"装备防御未经包 5 管线回填，实际 Defense={player.Defense}");
+        Assert.Equal(79, player.Items[0]);
+        Assert.Equal(80, player.Items[1]);
+        Assert.Equal(81, player.Items[2]);
+
+        // 脱头盔（空槽清空语义）→ 防御降为 5
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 0, 0));
+        Assert.True(await TickUntilAsync(server, () => player.Defense == 5, TimeSpan.FromSeconds(5)),
+            $"空槽清空未降防，实际 Defense={player.Defense}");
+        Assert.Equal(0, player.Items[0]);
     }
 
     /// <summary>
@@ -2793,7 +2827,7 @@ public class VanillaFeatureTests
         int index;
         lock (world.NpcsLock) index = world.Npcs.IndexOf(boss);
         await s.SendAsync(PacketId.NpcStrike,
-            new NpcStrikePacket(index, 2800) { Generation = boss.Generation });
+            new NpcStrikePacket(index, 3000) { Generation = boss.Generation }); // 2800 血 + 防御 12 → 2994 击杀
 
         Assert.True(await TickUntilAsync(server, () => !boss.Active, TimeSpan.FromSeconds(5)),
             "Boss 未被击杀");

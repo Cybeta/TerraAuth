@@ -155,6 +155,31 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
     }
 }
 
+/// <summary>
+/// 物品栏槽位写入命令：包 5（InventorySlot）权威通过后生成。
+/// 服务端持有物品栏唯一真相（SSC），装备区槽位的物品防御由此回填 <see cref="PlayerRuntime.Defense"/>，
+/// 供包 117 区间上界与接触兜底结算按真实装备减防（阶段 D 第二部分）。
+/// </summary>
+public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot, int ItemId, int Stack)
+    : Command(Tick, PlayerId, "inventory_slot")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int id)
+            return new(false, CommandFailures.MissingPlayer);
+
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
+        if (Slot < 0 || Slot >= PlayerRuntime.InventorySlotCount)
+            return new(false, CommandFailures.NotApplied);
+
+        // 空槽（Stack == 0）允许任意 ItemId（清空语义），统一记为 0
+        player!.Items[Slot] = Stack > 0 ? ItemId : 0;
+        player.RecalculateDefense();
+        return new(true);
+    }
+}
+
 /// <summary>玩家死亡命令：包 118（客户端声明死亡）权威通过后生成。</summary>
 public sealed record KillPlayerCommand(long Tick, int? PlayerId)
     : Command(Tick, PlayerId, "kill_player")
@@ -635,8 +660,9 @@ public sealed record NpcStrikeCommand(
             }
 
             // 阶段 C「弹幕伤害匹配」：玩家攻击 NPC 的数值必须落在其**最近存活弹幕**的权威伤害区间内。
-            // 原版客户端 Projectile.Damage()：Damage × DamageVar(±15%) × (crit ? 2 : 1) → 减 NPC 防御；
-            // 上界 = ceil(p.Damage × 1.15) × (crit ? 2 : 1)（NPC 防御减伤尚未建模，阶段 D 补）。
+            // 原版客户端 Projectile.Damage()：Damage × DamageVar(±15%) × (crit ? 2 : 1)（均发生在防御减伤**之前**，
+            // 包 28 上报的是减防御前数值；NPC 防御减伤在服务端结算时应用，见下方 applied）。
+            // 上界 = ceil(p.Damage × 1.15) × (crit ? 2 : 1)。
             // 近战挥砍无弹幕（找不到匹配）→ 退回既有校验并告警，避免误杀近战攻击。
             if (world.StrikeProjectileMatch)
             {
@@ -656,23 +682,24 @@ public sealed record NpcStrikeCommand(
                 }
             }
 
-            // 原版 StrikeNPC_Inner 在服务端同样应用暴击倍率：
-            //   Main.CalculateDamageNPCsTake(Damage, defense) * (crit ? 2 : 1)
+            // 原版服务端收包 28 后的结算（对齐客户端显示口径）：
+            //   applied = Main.CalculateDamageNPCsTake(Damage, npc.defense) × (crit ? 2 : 1)
+            // 即**先按 NPC 防御减伤**（dmg − def×0.5，最低 1），**再应用暴击倍率**。
             // 漏掉 ×2 会造成「客户端按暴击打死、服务端还差一半血」——客户端贴图消失，服务端该怪仍存活
-            // 并继续造成接触伤害（幽灵碰撞）。NPC 防御减伤尚未建模（史莱姆防御为 0，不影响当前用例）。
-            int applied = Damage * (Crit ? 2 : 1);
+            // 并继续造成接触伤害（幽灵碰撞）；漏掉防御减伤则服务端扣血多于客户端显示，血量口径不一致。
+            int applied = CombatResolver.CalculateDamageNPCsTake(Damage, npc.Defense) * (Crit ? 2 : 1);
             npc.Life -= applied;
             if (npc.Life <= 0)
             {
                 npc.Life = 0;
                 npc.Active = false; // 由世界同步下发 life=0，客户端据此移除
                 npc.DeadTick = Tick;
-                Console.WriteLine($"[Kill] slot={NpcIndex} gen={npc.Generation} type={npc.Type} dmg={Damage}×{(Crit ? 2 : 1)} @{npc.X:F0},{npc.Y:F0}");
+                Console.WriteLine($"[Kill] slot={NpcIndex} gen={npc.Generation} type={npc.Type} dmg={Damage} def={npc.Defense} applied={applied} @{npc.X:F0},{npc.Y:F0}");
                 world.NotifyNpcKilled(npc.Type, npc.X, npc.Y); // Boss 击杀 → 世界进度与掉落 // Boss 击杀 → 世界进度 + 掉落
             }
             else
             {
-                Console.WriteLine($"[Strike] slot={NpcIndex} gen={npc.Generation} dmg={Damage}×{(Crit ? 2 : 1)}={applied} → life={npc.Life}");
+                Console.WriteLine($"[Strike] slot={NpcIndex} gen={npc.Generation} dmg={Damage} def={npc.Defense} applied={applied} → life={npc.Life}");
             }
         }
 
