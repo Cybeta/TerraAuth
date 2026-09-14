@@ -1411,6 +1411,79 @@ public class VanillaFeatureTests
             "包 28 上报的命中未在服务端结算");
     }
 
+    /// <summary>
+    /// 阶段 C「弹幕伤害匹配」：开启 <see cref="WorldState.StrikeProjectileMatch"/> 后，
+    /// 包 28 上报的伤害必须落在归属玩家**最近存活弹幕**的权威区间内
+    /// （上界 = ceil(p.Damage × 1.15) × (crit ? 2 : 1)，对齐原版 Projectile.Damage 的 ±15% 浮动 × 暴击）。
+    /// 超界记 <c>strike_damage_mismatch</c> 拒绝；弹幕已销毁（无匹配弹幕，近战挥砍场景）退回既有校验。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_PlayerStrike_Damage_Must_Match_Owned_Projectile()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        world.StrikeProjectileMatch = true;   // 阶段 C 开关：测试开启（生产默认关，近战无弹幕会全拒）
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 手动放置一只高血量史莱姆（不依赖刷怪，位置固定便于连续受击断言）
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            Generation = 5,
+            X = 320f,
+            Y = 300f,
+        };
+        int index;
+        lock (world.NpcsLock)
+        {
+            world.Npcs.Add(slime);
+            index = world.Npcs.IndexOf(slime);
+        }
+
+        // 27 生成归属玩家 Alice 的弹幕（Damage=10）：上界 = ceil(10×1.15) = 12（非暴击）→ ×2 = 24（暴击）
+        await s.SendAsync(PacketId.ProjectileNew,
+            new ProjectileNewPacket(7, new Vector2(slime.X, slime.Y), new Vector2(0f, 0f), 1) { Damage = 10 });
+        Assert.True(await TickUntilAsync(server,
+            () => world.Projectiles.Any(p => p.Key == 7 && p.Active && p.Damage == 10),
+            TimeSpan.FromSeconds(5)), "弹幕未在服务端登记");
+
+        // 区间内（12 ≤ 12）→ 接受：100 - 12 = 88
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 12) { Generation = 5 });
+        Assert.True(await TickUntilAsync(server, () => slime.Life == 88, TimeSpan.FromSeconds(5)),
+            $"区间内上报未结算，实际 Life={slime.Life}");
+
+        // 超上界（13 > 12）→ 拒绝（strike_damage_mismatch），生命不变。
+        // 注意：命令级失败只进仿真事件（EventRecorder），不进 Prometheus 指标，
+        // 且 WaitForRejectAsync 不推进仿真 —— 必须手动 Tick 让命令被处理，再断言生命未被扣减。
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 13) { Generation = 5 });
+        await TickUntilAsync(server, () => slime.Life != 88, TimeSpan.FromMilliseconds(700));
+        Assert.Equal(88, slime.Life);
+
+        // 暴击区间内（24 ≤ ceil(10×1.15)×2 = 24）→ 接受：88 - 24×2 = 40
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 24) { Generation = 5, Crit = true });
+        Assert.True(await TickUntilAsync(server, () => slime.Life == 40, TimeSpan.FromSeconds(5)),
+            $"暴击区间内上报未结算，实际 Life={slime.Life}");
+
+        // 暴击超上界（25 > 24）→ 拒绝，生命不变
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 25) { Generation = 5, Crit = true });
+        await TickUntilAsync(server, () => slime.Life != 40, TimeSpan.FromMilliseconds(700));
+        Assert.Equal(40, slime.Life);
+
+        // 29 销毁弹幕 → 无匹配弹幕（近战挥砍场景）→ 退回既有校验：合法数值仍接受：40 - 12 = 28
+        await s.SendAsync(PacketId.ProjectileDestroy, new ProjectileDestroyPacket(7, new Vector2(slime.X, slime.Y)));
+        Assert.True(await TickUntilAsync(server,
+            () => !world.Projectiles.Any(p => p.Key == 7 && p.Active), TimeSpan.FromSeconds(5)),
+            "弹幕未被销毁");
+        await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 12) { Generation = 5 });
+        Assert.True(await TickUntilAsync(server, () => slime.Life == 28, TimeSpan.FromSeconds(5)),
+            $"弹幕销毁后合法数值未退回既有校验，实际 Life={slime.Life}");
+    }
+
     // ========================================================================
     // 十四、请求传送（包 73）
     // ========================================================================

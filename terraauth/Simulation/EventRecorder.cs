@@ -73,6 +73,8 @@ public static class CommandFailures
     public const string NotOwner = "not_owner";
     /// <summary>包 117 上报伤害超出服务端权威上界（接触者基础伤害 × 浮动 × 减防）。</summary>
     public const string HurtDamageAboveLimit = "hurt_damage_above_limit";
+    /// <summary>包 28 上报伤害超出归属弹幕的权威伤害区间（阶段 C 弹幕伤害匹配）。</summary>
+    public const string StrikeDamageMismatch = "strike_damage_mismatch";
 }
 
 /// <summary>游戏事件（状态变更的结果）。</summary>

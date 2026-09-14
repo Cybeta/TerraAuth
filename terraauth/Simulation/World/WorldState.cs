@@ -22,6 +22,15 @@ public sealed class WorldState
 {
     public IInventoryLedger? InventoryLedger { get; set; }
 
+    /// <summary>
+    /// 阶段 C「弹幕伤害匹配」开关：开启后包 28（NPC 受击）的伤害数值必须落在归属玩家的
+    /// **最近存活弹幕**的权威伤害区间内（<c>ceil(p.Damage × 1.15) × (crit ? 2 : 1)</c>），
+    /// 超界记 <see cref="CommandFailures.StrikeDamageMismatch"/> 拒绝。
+    /// 默认关：近战挥砍无弹幕，全量开启会把近战攻击全拒（武器数据阶段 D 建模后再默认开）。
+    /// 测试路径按用例开启，实例级开关（非静态）避免并行测试互相污染。
+    /// </summary>
+    public bool StrikeProjectileMatch { get; set; }
+
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
 

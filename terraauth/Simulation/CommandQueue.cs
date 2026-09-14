@@ -634,6 +634,28 @@ public sealed record NpcStrikeCommand(
                 return new(false, CommandFailures.NotApplied);
             }
 
+            // 阶段 C「弹幕伤害匹配」：玩家攻击 NPC 的数值必须落在其**最近存活弹幕**的权威伤害区间内。
+            // 原版客户端 Projectile.Damage()：Damage × DamageVar(±15%) × (crit ? 2 : 1) → 减 NPC 防御；
+            // 上界 = ceil(p.Damage × 1.15) × (crit ? 2 : 1)（NPC 防御减伤尚未建模，阶段 D 补）。
+            // 近战挥砍无弹幕（找不到匹配）→ 退回既有校验并告警，避免误杀近战攻击。
+            if (world.StrikeProjectileMatch)
+            {
+                var proj = FindPlayerProjectileNearNpc(world, playerId, npc);
+                if (proj is null)
+                {
+                    Console.WriteLine($"[Strike] slot={NpcIndex} 未找到归属玩家 #{playerId} 的存活弹幕（近战挥砍？），退回既有校验 dmg={Damage}");
+                }
+                else
+                {
+                    int bound = (int)Math.Ceiling(proj.Damage * 1.15f) * (Crit ? 2 : 1);
+                    if (Damage > bound)
+                    {
+                        Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 上报伤害 {Damage} 超弹幕上界 {bound}（弹幕key={proj.Key} dmg={proj.Damage} crit={Crit}）");
+                        return new(false, CommandFailures.StrikeDamageMismatch);
+                    }
+                }
+            }
+
             // 原版 StrikeNPC_Inner 在服务端同样应用暴击倍率：
             //   Main.CalculateDamageNPCsTake(Damage, defense) * (crit ? 2 : 1)
             // 漏掉 ×2 会造成「客户端按暴击打死、服务端还差一半血」——客户端贴图消失，服务端该怪仍存活
@@ -655,6 +677,36 @@ public sealed record NpcStrikeCommand(
         }
 
         return new(true);
+    }
+
+    /// <summary>
+    /// 查找归属该玩家、距离 NPC 最近的一枚存活弹幕（阶段 C 伤害匹配的数值来源）。
+    /// 原版客户端只结算「自己发射」的弹幕（<c>Projectile.Damage</c> 断言 owner == myPlayer），
+    /// 故匹配基准必须是 <c>Owner == playerId</c>；未找到（近战挥砍 / 弹幕已销毁）返回 null。
+    /// </summary>
+    private static ProjectileEntity? FindPlayerProjectileNearNpc(WorldState world, int playerId, WorldNpc npc)
+    {
+        ProjectileEntity? best = null;
+        float bestDistSq = float.MaxValue;
+
+        lock (world.ProjectilesLock)
+        {
+            foreach (var p in world.Projectiles)
+            {
+                if (!p.Active || p.Owner != playerId || p.Damage <= 0) continue;
+
+                float dx = p.Position.X - npc.X;
+                float dy = p.Position.Y - npc.Y;
+                float distSq = dx * dx + dy * dy;
+                if (distSq < bestDistSq)
+                {
+                    bestDistSq = distSq;
+                    best = p;
+                }
+            }
+        }
+
+        return best;
     }
 }
 
