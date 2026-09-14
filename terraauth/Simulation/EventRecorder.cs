@@ -75,6 +75,10 @@ public static class CommandFailures
     public const string HurtDamageAboveLimit = "hurt_damage_above_limit";
     /// <summary>包 28 上报伤害超出归属弹幕的权威伤害区间（阶段 C 弹幕伤害匹配）。</summary>
     public const string StrikeDamageMismatch = "strike_damage_mismatch";
+    /// <summary>阶段 H：召唤弹幕 spawn 上报伤害超出手持召唤武器的权威上界（武器伤害 × 1.15 容差）。</summary>
+    public const string ProjectileDamageAboveBound = "projectile_damage_above_bound";
+    /// <summary>阶段 H：空手 / 手持非召唤武器却 spawn 召唤弹幕（原版只有召唤武器能召唤）。</summary>
+    public const string SummonRequiresSummonWeapon = "summon_requires_summon_weapon";
 }
 
 /// <summary>游戏事件（状态变更的结果）。</summary>

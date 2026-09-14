@@ -842,7 +842,7 @@ public sealed record SpawnProjectileCommand(
     {
         if (PlayerId is not int playerId)
             return new(false, CommandFailures.MissingPlayer);
-        if (!TryGetPlayer(world, playerId, out _, out var failure))
+        if (!TryGetPlayer(world, playerId, out var player, out var failure))
             return failure;
 
         lock (world.ProjectilesLock)
@@ -856,6 +856,49 @@ public sealed record SpawnProjectileCommand(
                 existing.Active = true;
                 existing.RemovalNotified = false;
                 return new(true);
+            }
+
+            // 阶段 H：召唤 / 哨兵弹幕 spawn 伤害权威校验——堵住「虚报弹幕伤害 → 命中上界随之上抬」漏洞。
+            // 原版仆从伤害 = **召唤时**武器伤害（GetWeaponDamage 含前缀 / Buff / 饰品 / 套装），创建时一次确定，
+            // 之后不随背包 / 手持变化；阶段 G 依此用弹幕 Damage 计算命中上界（ceil(p.Damage × 1.15) × crit）。
+            // 规则：
+            //   · 手持已收录**召唤武器**：弹幕 Damage 必须 ≤ ceil(权威武器伤害 × 1.15)（容差对齐命中浮动），超限拒绝；
+            //   · 空手 / 手持明确非召唤武器（近战 / 远程 / 魔法）：拒绝（原版只有召唤武器能 spawn 召唤弹幕，
+            //     空手 spawn 只存在于客户端本地，登记会造成幽灵弹幕）；
+            //   · 手持未收录武器（mod 等）：放行（绝不误拒未知物品）。
+            if (SummonProjectileTable.Of.Contains(Type))
+            {
+                bool heldHasItem = false, heldIsKnown = false, heldIsSummon = false;
+                int weaponDamage = 0;
+                if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
+                {
+                    int heldItem = player.Items[player.SelectedSlot];
+                    if (heldItem > 0)
+                    {
+                        heldHasItem = true;
+                        if (ItemDamageTable.Of.TryGetValue(heldItem, out var heldStats))
+                        {
+                            heldIsKnown = true;
+                            if (heldStats.Class == WeaponClass.Summon)
+                            {
+                                heldIsSummon = true;
+                                weaponDamage = CombatResolver.GetWeaponDamage(player, heldItem,
+                                    player.ItemPrefixes[player.SelectedSlot]);
+                            }
+                        }
+                    }
+                }
+
+                if (heldIsSummon)
+                {
+                    if (Damage > (int)Math.Ceiling(weaponDamage * 1.15f))
+                        return new(false, CommandFailures.ProjectileDamageAboveBound);
+                }
+                else if (!heldHasItem || heldIsKnown)
+                {
+                    return new(false, CommandFailures.SummonRequiresSummonWeapon);
+                }
+                // 未收录武器（heldHasItem && !heldIsKnown）→ 放行。
             }
 
             world.Projectiles.Add(new ProjectileEntity

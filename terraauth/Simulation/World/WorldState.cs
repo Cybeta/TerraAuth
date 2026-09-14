@@ -77,6 +77,19 @@ public sealed class WorldState
         runtime.Velocity = new Vector2(0, 0);
         CloseChestSession(playerId, expectedSessionId);
 
+        // 阶段 H：断线清空该玩家的召唤弹幕（对齐原版——玩家掉线其召唤物立即消失）。
+        // 置 Active=false（RemovalNotified 保持 false）交由世界同步循环补发包 29 广播销毁；
+        // 此后槽位复用 / 会话接管时，旧召唤物不会残留为幽灵上界基准。
+        lock (ProjectilesLock)
+        {
+            for (int i = 0; i < Projectiles.Count; i++)
+            {
+                var p = Projectiles[i];
+                if (p.Active && p.Owner == playerId && SummonProjectileTable.Of.Contains(p.Type))
+                    p.Active = false;
+            }
+        }
+
         if (graceTicks <= 0 || string.IsNullOrEmpty(resumeKey)) return;
 
         runtime.ResumeKey = resumeKey;

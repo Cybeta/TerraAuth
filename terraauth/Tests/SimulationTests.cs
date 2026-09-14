@@ -137,6 +137,76 @@ public class SimulationTests
     }
 
     [Fact]
+    public void Disconnect_Clears_Owned_Summon_Projectiles()
+    {
+        // 阶段 H：玩家断线时其召唤弹幕立即失效（对齐原版——掉线召唤物消失）；
+        // 非召唤类型与他人弹幕不受影响；Active=false 后由世界同步循环补发包 29 广播销毁。
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 22, Active = true };
+        lock (world.ProjectilesLock)
+        {
+            world.Projectiles.Add(new ProjectileEntity { Key = 1, Owner = 1, Type = 191, Active = true });
+            world.Projectiles.Add(new ProjectileEntity { Key = 2, Owner = 1, Type = 1, Active = true });
+            world.Projectiles.Add(new ProjectileEntity { Key = 3, Owner = 2, Type = 191, Active = true });
+        }
+
+        world.MarkPlayerOffline(1, 22, "old", 0);
+
+        Assert.False(world.Projectiles[0].Active);  // 本玩家召唤弹幕 → 失效
+        Assert.True(world.Projectiles[1].Active);   // 非召唤类型不受影响
+        Assert.True(world.Projectiles[2].Active);   // 他人召唤弹幕不受影响
+    }
+
+    [Fact]
+    public void Summon_Projectile_Spawn_Validates_Weapon_And_Damage()
+    {
+        // 阶段 H：召唤弹幕 spawn 时校验权威伤害——手持已收录召唤武器则弹幕 Damage 须 ≤ 武器上界，
+        // 空手 / 非召唤武器拒绝，未收录武器（mod）放行，非召唤弹幕不受影响。
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
+        var player = world.Players[1];
+        var rng = new XoshiroRng(1);
+
+        // 1) 手持星尘细胞法杖（3474，60 伤 Summon）→ 弹幕伤害 60 ≤ ceil(60×1.15)=69 → 接受
+        player.Items[3] = 3474;
+        player.ItemPrefixes[3] = 0;
+        player.SelectedSlot = 3;
+        Assert.True(new SpawnProjectileCommand(1, 1, 7, 191, new Vector2(0, 0), new Vector2(0, 0), 60)
+            .Apply(world, rng).Applied);
+
+        // 2) 弹幕伤害 999 超权威上界 69 → 拒绝（堵住虚报弹幕伤害抬高命中上界）
+        Assert.Equal("projectile_damage_above_bound",
+            new SpawnProjectileCommand(2, 1, 8, 191, new Vector2(0, 0), new Vector2(0, 0), 999)
+                .Apply(world, rng).Reason);
+
+        // 3) 空手 spawn 召唤弹幕 → 拒绝（原版空手不能召唤）
+        player.Items[3] = 0;
+        player.ItemPrefixes[3] = 0;
+        Assert.Equal("summon_requires_summon_weapon",
+            new SpawnProjectileCommand(3, 1, 9, 191, new Vector2(0, 0), new Vector2(0, 0), 10)
+                .Apply(world, rng).Reason);
+
+        // 4) 手持近战武器（木剑 24）spawn 召唤弹幕 → 拒绝
+        player.Items[3] = 24;
+        player.ItemPrefixes[3] = 0;
+        Assert.Equal("summon_requires_summon_weapon",
+            new SpawnProjectileCommand(4, 1, 10, 191, new Vector2(0, 0), new Vector2(0, 0), 10)
+                .Apply(world, rng).Reason);
+
+        // 5) 非召唤弹幕类型（Type=1）不受校验 → 空手也能 spawn
+        player.Items[3] = 0;
+        Assert.True(new SpawnProjectileCommand(5, 1, 11, 1, new Vector2(0, 0), new Vector2(0, 0), 10)
+            .Apply(world, rng).Applied);
+
+        // 6) 未收录武器（99999 不在表，mod 场景）spawn 召唤弹幕 → 放行（绝不误拒）
+        player.Items[3] = 99999;
+        Assert.True(new SpawnProjectileCommand(6, 1, 12, 191, new Vector2(0, 0), new Vector2(0, 0), 999)
+            .Apply(world, rng).Applied);
+    }
+
+    [Fact]
     public void ChestSession_RejectsStaleConnectionAndPreservesReplacement()
     {
         var world = new WorldState();
