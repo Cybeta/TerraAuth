@@ -1,5 +1,5 @@
 // TerraAuth — 服务端权威伤害结算：NPC 基础属性表
-// 数据源：Terraria 1.4.5.8 原版 NPC.SetDefaults（经典难度基准值；专家/大师倍率见 CombatResolver）
+// 数据源：Terraria 1.4.5.8 原版 NPC.SetDefaults 数据（经典难度基准值；专家/大师倍率见 CombatResolver）
 
 namespace TerraAuth.Simulation;
 

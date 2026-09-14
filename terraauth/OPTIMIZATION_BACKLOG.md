@@ -570,7 +570,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 
 1. **服务端**：`SimulateEnemyStep` 每 tick `VelocityX = ±1` + 重力，**从不给 `VelocityY` 向上初速度**
    → 权威运动本身就是「贴地滑行」，没有滞空阶段。
-2. **客户端**：[MessageBuffer.cs](Terraria/MessageBuffer.cs) 处理包 23 时
+2. **客户端**：`MessageBuffer.cs`（包 23 解码）处理包 23 时
    `npc.position = ...; npc.velocity = velocity; for (i<NPC.maxAI) npc.ai[i] = array2[i];`
    —— **速度与 ai[] 都被覆盖**（未置位的 ai 位即 0）。所以 20Hz 的「地面速度 + ai 全零」
    会把客户端本地史莱姆的跳跃状态每 50ms 冲掉一次，即使客户端自己起跳也会被立刻抹平。

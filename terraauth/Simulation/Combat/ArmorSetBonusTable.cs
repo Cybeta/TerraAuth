@@ -1,5 +1,5 @@
 // TerraAuth — 服务端权威伤害结算：套装加成表（阶段 E-2）
-// 数据源：Terraria 1.4.5.8 原版 ArmorSetBonuses.cs（套装 ID 组合与 Benefits）：
+// 数据源：Terraria 1.4.5.8 原版 ArmorSetBonuses 数据（套装 ID 组合与 Benefits）：
 //   - Molten 熔岩套（231/232/233）：meleeDamage +10%
 //   - MetalTier1（铜 89/80/76、锡 687/688/689、铁 90/81/77）：statDefense +2
 //   - MetalTier2（银 91/82/78、金 92/83/79）：statDefense +3
