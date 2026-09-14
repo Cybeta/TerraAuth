@@ -78,13 +78,16 @@ public static class CombatResolver
     /// 阶段 E：玩家**手持武器**的权威伤害（原版 <c>Player.GetWeaponDamage</c> 口径）：
     /// <c>base × (1 + 总修饰%)</c>。各类修饰**加算**累进职业伤害字段（原版无独立 allDamage 字段，
     /// 「全伤害」如 Wrath/复仇者徽章是对四职业字段 += 同一值）：Buff 职业% + Buff 全% + 套装职业% + 饰品职业% + 饰品全%。
+    /// 带前缀武器（<paramref name="prefix"/>）先按 <see cref="PrefixDamageTable"/> 修正基础伤害
+    /// （向上取整，保证上界不低于客户端任何舍入口径；阶段 E-4 防「+伤害前缀」被误拒）。
     /// 未收录武器（<paramref name="itemId"/> 不在 <see cref="ItemDamageTable.Of"/>）返回 0（调用方失败放行）。
     /// </summary>
-    public static int GetWeaponDamage(PlayerRuntime player, int itemId)
+    public static int GetWeaponDamage(PlayerRuntime player, int itemId, byte prefix = 0)
     {
         if (!ItemDamageTable.Of.TryGetValue(itemId, out var stats))
             return 0;
 
+        double baseDmg = Math.Ceiling(stats.Damage * PrefixDamageTable.DamageMultiplier(prefix));
         double totalPct =
             BuffTable.ClassDamagePercent(player.Buffs, stats.Class)
             + BuffTable.AllDamagePercent(player.Buffs)
@@ -103,15 +106,16 @@ public static class CombatResolver
             };
         }
 
-        return Math.Max(1, (int)(stats.Damage * (1.0 + totalPct / 100.0)));
+        return Math.Max(1, (int)(baseDmg * (1.0 + totalPct / 100.0)));
     }
 
     /// <summary>
     /// 阶段 E：近战命中的**上报值上界** = <c>ceil(权威伤害 × 1.15) × (crit ? 2 : 1)</c>
     /// （与阶段 C 弹幕匹配同口径：±15% 浮动上界 → 暴击倍率；防御减伤在服务端结算时另行应用）。
+    /// <paramref name="prefix"/> 为手持武器前缀（透传 <see cref="GetWeaponDamage"/>）。
     /// </summary>
-    public static int WeaponDamageBound(PlayerRuntime player, int itemId, bool crit)
-        => (int)Math.Ceiling(GetWeaponDamage(player, itemId) * 1.15f) * (crit ? 2 : 1);
+    public static int WeaponDamageBound(PlayerRuntime player, int itemId, bool crit, byte prefix = 0)
+        => (int)Math.Ceiling(GetWeaponDamage(player, itemId, prefix) * 1.15f) * (crit ? 2 : 1);
 
     /// <summary>
     /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。

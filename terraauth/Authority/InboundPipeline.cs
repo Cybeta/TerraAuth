@@ -221,9 +221,9 @@ public sealed class TerminalStage : IPipelineStage
             drop.ItemId, drop.Stack, drop.Position, drop.Velocity, drop.Prefix),
         // 包 22 SyncItemOwner → 物品拾取（服务端移除世界实体并入库）
         ItemPickupPacket pickup => new PickupItemCommand(context.Tick, context.PlayerId, pickup.ItemSlotIndex),
-        // 包 5 InventorySlot → 物品栏槽位写入（SSC 服务端唯一真相；装备区防御由此回填 Defense）
+        // 包 5 InventorySlot → 物品栏槽位写入（SSC 服务端唯一真相；装备区防御由此回填 Defense，前缀用于近战武器校验）
         InventorySlotPacket slot => new SetInventorySlotCommand(context.Tick, context.PlayerId,
-            slot.Slot, slot.ItemId, slot.Stack),
+            slot.Slot, slot.ItemId, slot.Stack, slot.Prefix),
         // 包 31 Chest → 建立服务端箱子会话；坐标为负视为「关闭箱子」（原版客户端关闭时本地清 chest，
         // 不发包，故这里兼容部分客户端 / 工具发出的负坐标关闭请求）
         ChestPacket { X: < 0 } => new CloseChestCommand(context.Tick, context.PlayerId),

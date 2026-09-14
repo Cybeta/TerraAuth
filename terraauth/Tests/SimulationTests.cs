@@ -1193,6 +1193,124 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 阶段 E-4：武器前缀伤害倍率参与近战武器校验。
+    /// 木剑（24，7 伤）无前缀上界 = ceil(7×1.15)=9；前缀 57（凶残 +18%）→ base = ceil(7×1.18)=9，
+    /// 上界 = ceil(9×1.15)=11 —— 不带前缀倍率会把合法命中 11 误拒。前缀数据经 SetInventorySlotCommand 落库。
+    /// </summary>
+    [Fact]
+    public void StrikeBound_Includes_WeaponPrefix_Multiplier()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 24, 1, Prefix: 57).Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(2, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+        Assert.Equal(57, player.ItemPrefixes[3]);
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        // 无前缀上界 9（7×1.15 上取整）；前缀 57（+18%）→ base ceil(7×1.18)=9 → 上界 11
+        Assert.Equal(9, CombatResolver.WeaponDamageBound(player, 24, false));
+        Assert.Equal(9, CombatResolver.GetWeaponDamage(player, 24, 57));
+        Assert.Equal(11, CombatResolver.WeaponDamageBound(player, 24, false, 57));
+
+        // 带前缀的合法命中 11 必须被接受（StrikeWeaponCheck 默认开启），12 超界拒绝
+        Assert.True(new NpcStrikeCommand(3, 1, index, 11, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(89, slime.Life);
+        Assert.False(new NpcStrikeCommand(4, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(89, slime.Life);
+    }
+
+    /// <summary>
+    /// 阶段 E-4：空槽清空时前缀同步清零（避免残留前缀误放大后续武器上界）。
+    /// </summary>
+    [Fact]
+    public void SetInventorySlot_ClearsPrefix_WhenSlotEmptied()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime { Id = 1, Active = true, Hp = 100, HpMax = 100 };
+        lock (world.PlayersLock) world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 24, 1, Prefix: 57).Apply(world, rng).Applied);
+        Assert.Equal(24, player.Items[3]);
+        Assert.Equal(57, player.ItemPrefixes[3]);
+
+        Assert.True(new SetInventorySlotCommand(2, 1, 3, 0, 0, Prefix: 57).Apply(world, rng).Applied);
+        Assert.Equal(0, player.Items[3]);
+        Assert.Equal(0, player.ItemPrefixes[3]);
+    }
+
+    /// <summary>
+    /// 阶段 E-4：<see cref="WorldState.StrikeWeaponCheck"/> 默认开启——
+    /// 未显式配置的世界里，无弹幕近战命中超出武器上界即被拒绝（此前默认关）。
+    /// </summary>
+    [Fact]
+    public void StrikeWeaponCheck_Defaults_To_On()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 3520, 1).Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(2, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        // 金阔剑（15 伤）上界 18；未设置开关（默认 true）→ 报 19 拒、报 18 收
+        Assert.True(world.StrikeWeaponCheck);
+        Assert.False(new NpcStrikeCommand(3, 1, index, 19, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(100, slime.Life);
+        Assert.True(new NpcStrikeCommand(4, 1, index, 18, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(82, slime.Life);
+    }
+
+    /// <summary>
     /// 阶段 E：包 117 上界随 **Buff 防御**（铁皮）实时降低：
     /// 接触史莱姆 7 伤，0 防御上界 = ceil(7×1.15)−0 = 9；铁皮（14，+8 防）→ 上界 = 9−round(8×0.5)=5。
     /// </summary>

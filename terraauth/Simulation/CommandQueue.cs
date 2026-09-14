@@ -165,7 +165,7 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
 /// 服务端持有物品栏唯一真相（SSC），装备区槽位的物品防御由此回填 <see cref="PlayerRuntime.Defense"/>，
 /// 供包 117 区间上界与接触兜底结算按真实装备减防（阶段 D 第二部分）。
 /// </summary>
-public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot, int ItemId, int Stack)
+public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot, int ItemId, int Stack, byte Prefix = 0)
     : Command(Tick, PlayerId, "inventory_slot")
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
@@ -178,8 +178,9 @@ public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot,
         if (Slot < 0 || Slot >= PlayerRuntime.InventorySlotCount)
             return new(false, CommandFailures.NotApplied);
 
-        // 空槽（Stack == 0）允许任意 ItemId（清空语义），统一记为 0
+        // 空槽（Stack == 0）允许任意 ItemId（清空语义），统一记为 0；前缀同步清零
         player!.Items[Slot] = Stack > 0 ? ItemId : 0;
+        player.ItemPrefixes[Slot] = Stack > 0 ? Prefix : (byte)0;
         player.RecalculateDefense();
         return new(true);
     }
@@ -690,8 +691,8 @@ public sealed record NpcStrikeCommand(
             }
 
             // 阶段 E「近战武器伤害校验」：无弹幕的命中按**手持武器权威伤害**区间校验。
-            // 上界 = ceil(GetWeaponDamage × 1.15) × (crit ? 2 : 1)，GetWeaponDamage 随 Buff/药水实时变化
-            // （base × 职业伤害% × 全伤害%，原版 Player.GetWeaponDamage 口径）。
+            // 上界 = ceil(GetWeaponDamage × 1.15) × (crit ? 2 : 1)，GetWeaponDamage 随 Buff/药水/套装/饰品实时变化
+            // （base × 前缀倍率 × 修饰%，原版 Player.GetWeaponDamage 口径；阶段 E-4 起前缀参与基础伤害修正）。
             // 未收录武器 / 空手 → 失败放行（退回既有校验），绝不误拒未知物品。
             if (!projectileMatched && world.StrikeWeaponCheck)
             {
@@ -700,7 +701,7 @@ public sealed record NpcStrikeCommand(
                     int heldItem = player.Items[player.SelectedSlot];
                     if (heldItem > 0 && ItemDamageTable.Of.ContainsKey(heldItem))
                     {
-                        int bound = CombatResolver.WeaponDamageBound(player, heldItem, Crit);
+                        int bound = CombatResolver.WeaponDamageBound(player, heldItem, Crit, player.ItemPrefixes[player.SelectedSlot]);
                         if (Damage > bound)
                         {
                             Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 手持武器 {heldItem} 上报 {Damage} 超武器上界 {bound}（buff={string.Join(',', player.Buffs)} crit={Crit}）");

@@ -44,6 +44,10 @@ public static class ItemDefenseTable
         [231] = 8,   // Molten Helmet
         [232] = 9,   // Molten Breastplate
         [233] = 8,   // Molten Greaves
+        // 陨石套（123-125）：5 / 6 / 5，合计 16
+        [123] = 5,   // Meteor Helmet
+        [124] = 6,   // Meteor Suit
+        [125] = 5,   // Meteor Leggings
     };
 
     /// <summary>查询物品防御；未知物品 / 空槽返回 0。</summary>

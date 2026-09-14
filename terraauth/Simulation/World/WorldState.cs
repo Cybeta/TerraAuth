@@ -33,11 +33,11 @@ public sealed class WorldState
 
     /// <summary>
     /// 阶段 E「近战武器伤害校验」开关：开启后无弹幕的包 28（近战挥砍）按**手持武器权威伤害**区间校验
-    /// （<see cref="CombatResolver.WeaponDamageBound"/>：base × 修饰（Buff/药水实时）±15% 浮动上界 × 暴击）。
-    /// 默认关：未收录武器 / 空手失败放行，且套装/饰品伤害加成未全覆盖时强行开启可能误拒，随数据覆盖成熟后默认开。
-    /// 与 <see cref="StrikeProjectileMatch"/> 同属实例级开关（避免并行测试互相污染）。
+    /// （<see cref="CombatResolver.WeaponDamageBound"/>：base × 前缀 × 修饰（Buff/药水/套装/饰品实时）±15% 浮动上界 × 暴击）。
+    /// 阶段 E-4 起默认开启：前缀数据流（包 5 → ItemPrefixes）已补齐，带 +伤害前缀武器不会误拒；
+    /// 未收录武器 / 空手失败放行。测试可实例级覆盖（并行测试互不污染）。
     /// </summary>
-    public bool StrikeWeaponCheck { get; set; }
+    public bool StrikeWeaponCheck { get; set; } = true;
 
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
@@ -1029,6 +1029,9 @@ public sealed class PlayerRuntime
 
     /// <summary>物品栏（槽位 → 物品 ID；0 = 空）。由包 5 InventorySlot 权威写入（服务端 SSC 唯一真相）。</summary>
     public readonly int[] Items = new int[InventorySlotCount];
+
+    /// <summary>物品栏槽位 → 物品前缀（包 5 权威写入；近战武器校验按此前缀修正基础伤害）。</summary>
+    public readonly byte[] ItemPrefixes = new byte[InventorySlotCount];
 
     /// <summary>
     /// 手持热键槽（原版 <c>Player.selectedItem</c>，包 13 权威更新）：手持武器 = <see cref="Items"/>[SelectedSlot]。
