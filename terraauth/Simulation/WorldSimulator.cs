@@ -565,9 +565,6 @@ public partial class WorldSimulator : IWorldViewProvider
     private static bool IsLiquidBlocking(in Tile tile)
         => tile.Active && TileIdSets.IsTileSolid(tile.Type) && !tile.InActive;
 
-    /// <summary>敌对弹幕命中玩家判定用的碰撞盒边长（像素）：原版弹幕宽度多为 6~16，统一取 16 作为宽容近似。</summary>
-    private const int ProjectileHitBoxSize = 16;
-
     /// <summary>AI 执行期间产生的刷怪请求（遍历结束后统一入队，避免遍历中修改集合）。</summary>
     private readonly List<WorldNpc> _pendingNpcSpawns = new();
 
@@ -987,8 +984,8 @@ public partial class WorldSimulator : IWorldViewProvider
 
     /// <summary>两个轴对齐碰撞盒是否重叠（像素坐标，X/Y 为左上角；浮点精度，无最小重叠）。</summary>
     private static bool BoxesOverlap(
-        float ax, float ay, int aw, int ah,
-        float bx, float by, int bw, int bh)
+        float ax, float ay, float aw, float ah,
+        float bx, float by, float bw, float bh)
         => ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
 
     /// <summary>

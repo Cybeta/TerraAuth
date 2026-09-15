@@ -2488,4 +2488,34 @@ public class WorldGeneratorTests
             Assert.True(proj.BouncesLeft >= 0 && proj.BouncesLeft <= 20, $"反弹预算异常：{proj.BouncesLeft}");
         }
     }
+
+    /// <summary>
+    /// 弹幕碰撞盒按原版逐类型尺寸（ProjectileCapabilityTable.Sizes）：spawn 时从表取 width/height
+    /// （如 type 20 = 4×4、type 101 = 6×6），未登记类型沿用 16×16 近似。
+    /// </summary>
+    [Fact]
+    public void SpawnProjectile_Uses_PerType_HitBoxSize()
+    {
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new SpawnProjectileCommand(1, 1, 1, 20, new Vector2(0, 0), new Vector2(0, 0), 10)
+            .Apply(world, rng).Applied);
+        Assert.True(new SpawnProjectileCommand(2, 1, 2, 101, new Vector2(0, 0), new Vector2(0, 0), 10)
+            .Apply(world, rng).Applied);
+        Assert.True(new SpawnProjectileCommand(3, 1, 3, 3999, new Vector2(0, 0), new Vector2(0, 0), 10)
+            .Apply(world, rng).Applied);
+
+        lock (world.ProjectilesLock)
+        {
+            var p20 = world.Projectiles.First(p => p.Key == 1);
+            var p101 = world.Projectiles.First(p => p.Key == 2);
+            var pFallback = world.Projectiles.First(p => p.Key == 3);
+            Assert.Equal(4f, p20.Width);  Assert.Equal(4f, p20.Height);
+            Assert.Equal(6f, p101.Width); Assert.Equal(6f, p101.Height);
+            Assert.Equal(16f, pFallback.Width); Assert.Equal(16f, pFallback.Height);
+        }
+    }
 }

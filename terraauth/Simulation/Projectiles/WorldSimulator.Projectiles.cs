@@ -86,7 +86,7 @@ public partial class WorldSimulator
         if (!b.Homing || _homingTargets.Length == 0)
             return;
 
-        float half = ProjectileHitBoxSize / 2f;
+        float half = p.Width / 2f;
         float pcx = p.Position.X + half, pcy = p.Position.Y + half;
 
         float bestSq = b.HomingRange * b.HomingRange;
@@ -145,7 +145,7 @@ public partial class WorldSimulator
         if (behavior.Bounces > 0 && p.BouncesLeft < 0)
             p.BouncesLeft = behavior.Bounces;
 
-        float w = ProjectileHitBoxSize, h = ProjectileHitBoxSize;
+        float w = p.Width, h = p.Height;
 
         for (int i = 0; i < behavior.UpdatesPerTick; i++)
         {
@@ -200,7 +200,7 @@ public partial class WorldSimulator
             {
                 if (!p.Active || p.Owner >= 0 || p.Damage <= 0) continue;
 
-                if (!BoxesOverlap(p.Position.X, p.Position.Y, ProjectileHitBoxSize, ProjectileHitBoxSize,
+                if (!BoxesOverlap(p.Position.X, p.Position.Y, p.Width, p.Height,
                                   px, py, NpcSizes.PlayerWidth, NpcSizes.PlayerHeight))
                     continue;
 

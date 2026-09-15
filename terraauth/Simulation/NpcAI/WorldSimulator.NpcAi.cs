@@ -88,6 +88,22 @@ public partial class WorldSimulator
         npc.VelocityX = target is null ? 0f : npc.Direction;   // 1 px/tick
     }
 
+    /// <summary>
+    /// 逐类型重力覆盖（原版 <c>NPC.UpdateNPC_UpdateGravity</c>）：默认 gravity 0.3 / maxFall 10，
+    /// 少数类型按 <c>ai</c> 状态覆盖（258 重力 0.1 且下落限速 3；425/427（ai[2]==1）重力 0.1；
+    /// 426 重力 0.1 且限速 3；541 无重力；576/577（ai[0]&gt;0 且 ai[1]==2）重力 0.45 且限速 32）。
+    /// 液体 / 空间高度因子（乘 0.25~1）未建模，保持原版地面默认口径。
+    /// </summary>
+    private (float Gravity, float MaxFall) NpcGravityOf(WorldNpc npc) => npc.Type switch
+    {
+        258 => (0.1f, 3f),
+        425 or 427 => npc.Ai[2] == 1f ? (0.1f, 10f) : (NpcGravity, NpcMaxFallSpeed),
+        426 => (0.1f, 3f),
+        541 => (0f, 10f),
+        576 or 577 => npc.Ai[0] > 0f && npc.Ai[1] == 2f ? (0.45f, 32f) : (NpcGravity, NpcMaxFallSpeed),
+        _ => (NpcGravity, NpcMaxFallSpeed),
+    };
+
     /// <summary>重力 + 位移 + 图格落地（所有走通用物理的 NPC 共用）；飞行体（<see cref="WorldNpc.NoGravity"/>）只积分位移。</summary>
     private void StepNpcPhysics(WorldNpc npc)
     {
@@ -103,7 +119,9 @@ public partial class WorldSimulator
         // 原版约定：X/Y = 碰撞盒左上角，脚底 = Y + height（逐类型尺寸，见 NpcSizes）
         var (width, height) = NpcSizes.Of(npc.Type);
 
-        npc.VelocityY = Math.Min(npc.VelocityY + NpcGravity, NpcMaxFallSpeed);
+        // 逐类型重力覆盖（原版 NPC.UpdateNPC_UpdateGravity）：默认 0.3 / 10
+        var (gravity, maxFall) = NpcGravityOf(npc);
+        npc.VelocityY = Math.Min(npc.VelocityY + gravity, maxFall);
 
         var nextX = npc.X + npc.VelocityX;
         var nextY = npc.Y + npc.VelocityY;

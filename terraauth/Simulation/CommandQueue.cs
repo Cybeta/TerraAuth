@@ -948,6 +948,9 @@ public sealed record SpawnProjectileCommand(
                 // 未收录武器（heldHasItem && !heldIsKnown）→ 放行。
             }
 
+            // 碰撞盒按原版逐类型尺寸（Sizes），未登记类型沿用 16×16 近似。
+            var size = ProjectileCapabilityTable.Sizes.TryGetValue(Type, out var s)
+                ? s : (Width: 16f, Height: 16f);
             world.Projectiles.Add(new ProjectileEntity
             {
                 Key = Key,
@@ -956,6 +959,8 @@ public sealed record SpawnProjectileCommand(
                 Position = Position,
                 Velocity = Velocity,
                 Damage = Damage,
+                Width = size.Width,
+                Height = size.Height,
                 NewNotified = false,   // 由世界同步循环推送给其他玩家（包 27）
             });
         }

@@ -78,6 +78,10 @@ public sealed class ProjectileEntity
     public Vector2 Velocity;
     public int Damage;
 
+    /// <summary>碰撞盒尺寸（按原版 Projectile.SetDefaults 逐类型 width/height；未登记类型取 16 近似）。</summary>
+    public float Width = 16f;
+    public float Height = 16f;
+
     /// <summary>剩余生存 tick；归零即失效（默认 300 ≈ 5 秒 @60Hz）。</summary>
     public int TimeLeft = 300;
 
