@@ -62,6 +62,8 @@
   否则易出现「已归还缓冲仍被读」类缺陷。
 - **触发条件**：GC / 分配采样显示 `ArrayBufferWriter` 为热点。
 
+  **结论（2026-09，GC 采样基线已跑）**：非热点，**不实施**。以快照高频主路径建模（20Hz × 20 玩家 × 4 分包 = 1600 包/秒，见测试 `Snapshot_EncodePath_Allocation_Sample`）测分配 ≈ **1.45 MB/s**（每包 ~950 B 分配，包体仅 82 B）。相对现代 .NET gen0 GC 吞吐量级可忽略（<1%），且 ArrayPool 跨线程归还属中风险、收益极小。留测试作可复现基线；若未来快照包体显著增大 / 更高在线数再复核。
+
 ### B-3 SnapshotStore 环形缓冲（消除 O(n) 移除）
 
 - **位置**：`Simulation/SnapshotStore.cs`
@@ -103,7 +105,7 @@
 9. **WorkerPool 设计分裂**：两套 WorkerPool 的调度、生命周期与错误处理语义不一致，应收敛为单一模型 → **本会话收敛**：`WorkerPool` 统一为「节流 + Task.Run」单一执行契约——`EnqueueAsync` 返回的 Task 现在等待工作真正完成并传播异常（此前立即返回，仅靠测试里的 500ms 延时掩盖，属语义缺陷）；移除从未被进队的 `_queue`/从未使用的 `_workers` 死字段。快照广播 / 分片权威校验与 WorkerPool 沿用同一并发纪律。
 10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效 → **本会话已核实并修掉一处死配置**：逐字段对照生产消费者（`GameHost` 组合根 + `AuthorityThresholds.From`）。除 `MaxWalkSpeed` 外均被消费——其从未进入 `MovementLimits`（生产用 `MaxFlightSpeed` 单一覆盖步行/冲刺以降低误判，见 `AuthorityThresholds.From` 注释），属死配置字段，已从 `ServerConfig`/`Validate` 移除。另已接线 `MetricsEnabled/MetricsPort`（条件创建 `MetricsHttpServer`）与 `HandshakeTimeoutSeconds`（握手看门狗）。
 11. **快照缓冲与批量限制未落地**：`SnapshotConfig.MaxEntitiesPerPacket` 分包与 `SnapshotStore` 环形缓冲**均已落地**（见 §附「下一步建议」第 3 项）；本项已完成。
-12. **协议元数据与分层约束分散**：包元数据分散多处，单程序集结构无法有效约束分层依赖与包契约边界 → **本会话评估**：协议侧元数据已在 Protocol 程序集内收敛——`PacketId` 枚举为包号契约唯一来源、`Packets.cs` 集中定义包记录、`Types.cs` 共享结构体，编解码在 `PacketDecoder/Encoder`。残留风险是**单程序集结构**导致无法用程序集边界强制分层依赖（Net↔Simulation↔Authority 相互可见），属既定架构取舍；完整解需拆分多程序集切片，属专项架构迁移，风险高、无当前功能缺陷，暂不作为增量步骤实施。
+12. **协议元数据与分层约束分散**：包元数据分散多处，单程序集结构无法有效约束分层依赖与包契约边界 → **本会话评估后决定搁置**：协议侧元数据已在 Protocol 程序集内收敛（`PacketId` 唯一来源 / `Packets.cs` 集中 / `Types.cs` 共享）。当前 `Simulation↔Net↔Authority` 依赖有环、尚非干净单向分层，直接切程序集需先破环、破坏性大且无当前功能缺陷；单作者 + 命名空间分层已够表达意图。**暂不拆**；若日后依赖真正单向化，再按 v1.0 设计基线回退拆分。
 
 > 结论：第 1~5、7、11 项已落地；第 6、8~10 项经本会话核实/收敛/修活；第 12 项评估为专项架构迁移（仍保留）。综上当前已无未决的功能性配置/广播/并发缺陷，仅余 §12 单程序集分层强制这一架构取舍。
 

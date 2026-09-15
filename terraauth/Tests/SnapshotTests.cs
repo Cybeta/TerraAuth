@@ -1,15 +1,21 @@
 // TerraAuth — Phase 4 验收测试
 
+using System.Buffers;
 using TerraAuth.Net.Snapshots;
 using TerraAuth.Net.Transport;
 using TerraAuth.Protocol;
 using TerraAuth.Simulation;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace TerraAuth.Tests;
 
 public class SnapshotTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public SnapshotTests(ITestOutputHelper output) => _output = output;
+
     [Fact]
     public void SnapshotFrame_Tick_IsMonotonic()
     {
@@ -735,6 +741,57 @@ public class SnapshotTests
         var world = new WorldState { Tick = tick };
         world.Players[playerId] = new PlayerRuntime { Id = playerId, Position = new Vector2(x, y) };
         return world;
+    }
+
+    /// <summary>
+    /// ⑤ 的「GC 采样基线」：快照出站编码每包分配 <c>new ArrayBufferWriter</c> + <c>WrittenSpan.ToArray()</c>
+    /// （见 <c>SnapshotBroadcaster.Encode</c> / <c>Connection.SendEncodedAsync</c>）。无真实服务器无法做运行时采样，
+    /// 故以「每包一次编码」为粒度建模高频主路径（典型 ≈ 20Hz × 玩家数 × 分包数），统计每秒分配字节，
+    /// 作为「是否值得用 ArrayPool 复用缓冲」的量级依据（低优先项，先证热点再改，见 backlog B-2）。
+    /// </summary>
+    [Fact]
+    public void Snapshot_EncodePath_Allocation_Sample()
+    {
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var frame = SnapshotFrame.Create(1, new[]
+        {
+            new EntityState(7, new Vector2(1.5f, 2.5f), new Vector2(0.5f, -0.5f), EntityStateType.Active),
+            new EntityState(11, new Vector2(30f, 40f), new Vector2(0, 0), EntityStateType.Active),
+            new EntityState(22, new Vector2(100f, 200f), new Vector2(1f, -2f), EntityStateType.Active),
+        }, System.Array.Empty<RemovedEntity>());
+
+        const int packsPerSecond = 1600; // ≈ 20Hz × 20 玩家 × 4 分包（快照主路径典型负载）
+        const int seconds = 2;
+
+        // 预热，稳定代偿（JIT / ArrayBufferWriter 首尺寸增长）
+        for (int i = 0; i < 1000; i++)
+        {
+            var w = new ArrayBufferWriter<byte>();
+            encoder.EncodeSnapshot(w, frame);
+            w.WrittenSpan.ToArray();
+        }
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        long payloadBytes = 0;
+        for (int i = 0; i < packsPerSecond * seconds; i++)
+        {
+            var writer = new ArrayBufferWriter<byte>();
+            encoder.EncodeSnapshot(writer, frame);
+            writer.WrittenSpan.ToArray();
+            payloadBytes += writer.WrittenSpan.Length;
+        }
+        long after = GC.GetAllocatedBytesForCurrentThread();
+
+        long allocPerSec = (after - before) / seconds;
+        // 采样结果输出（作为基线记录）；不设硬性阈值断言，防止不同环境/框架误报。
+        System.Console.WriteLine(
+            $"[#5 baseline] snapshot encode alloc = {allocPerSec / 1024} KB/s, = {allocPerSec / packsPerSecond} B/包, 平均包体 {payloadBytes / (packsPerSecond * seconds)} B");
+        _output.WriteLine(
+            $"[#5 baseline] snapshot encode alloc = {allocPerSec / 1024} KB/s, = {allocPerSec / packsPerSecond} B/包, 平均包体 {payloadBytes / (packsPerSecond * seconds)} B");
+
+        Assert.True(allocPerSec > 0); // 证明每包确实发生分配（采样有效）
     }
 
     /// <summary>测试替身：手动控制"已发布实体视图"。</summary>
