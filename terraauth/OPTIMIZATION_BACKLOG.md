@@ -97,15 +97,15 @@
 
 ### 仍待修正（风险保留）
 
-6. **提交前广播**：客户端原包仍可能在仿真提交前广播，其他客户端会先观察到未被权威状态确认的结果；广播应绑定已提交状态。
+6. **提交前广播**：客户端原包仍可能在仿真提交前广播，其他客户端会先观察到未被权威状态确认的结果；广播应绑定已提交状态 → **本会话核实：当前实现无「客户端原包即时中继」路径**。`WorldSimulator.Tick` 先 `ApplyCommandsForTick` 提交命令，再产出 Snapshot 并 `Publish` 实体视图（L163-164）；`NetworkHost` 标记「从服务端最终状态生成原版同步包，不存在客户端原包即时中继路径」（L358）；`GameHost` 备注「客户端上报位置不直接中继，避免在 Apply 前看到未提交状态」（L656）。出站帧均源自已提交态，本项不再构成当前缺陷。
 7. **缺少背压**：出站已有界；**入站 `CommandQueue`（无界优先队列）、分片入站队列与审计 `Channel`（均无界）仍无容量上限 / 过载策略** → **本项已落地**：出入站 / 分片入站 / 审计 channel 均已改有界；`CommandQueue` 新增可配置 `MaxCount`，超限入队返回 false 由管线拒绝该操作（防恶意超大未来 tick 堆积），生产以 8192 接线。
 8. **锁契约不统一**：`WorldState` 的锁契约（持锁范围 / 可重入性 / 快照一致性）与调用方假设不一致，存在竞态与死锁风险 → **本会话核实：当前无锁顺序死锁**。`KillSummonedProjectiles` 对 `ProjectilesLock` 与 `PlayersLock` 为**顺序获取**（两个独立 lock 块，非嵌套）；`MarkPlayerOffline`/命令路径均在锁外调用它；全仓无「先 PlayersLock 再 ProjectilesLock」的反向嵌套。契约仍以 public 锁对象暴露，属可加固点（收敛为私有 + 封装方法），非当前已触发缺陷。
-9. **WorkerPool 设计分裂**：两套 WorkerPool 的调度、生命周期与错误处理语义不一致，应收敛为单一模型。
-10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效 → **已接线两项**：`MetricsEnabled`/`MetricsPort` → 条件创建 `MetricsHttpServer`；`HandshakeTimeoutSeconds` → `ConnectionManager`/`Connection` 握手看门狗（超时未进 Playing 主动断开并回收槽位，含测试）。其余配置项需对照消费映射表逐一核实。
+9. **WorkerPool 设计分裂**：两套 WorkerPool 的调度、生命周期与错误处理语义不一致，应收敛为单一模型 → **本会话收敛**：`WorkerPool` 统一为「节流 + Task.Run」单一执行契约——`EnqueueAsync` 返回的 Task 现在等待工作真正完成并传播异常（此前立即返回，仅靠测试里的 500ms 延时掩盖，属语义缺陷）；移除从未被进队的 `_queue`/从未使用的 `_workers` 死字段。快照广播 / 分片权威校验与 WorkerPool 沿用同一并发纪律。
+10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效 → **本会话已核实并修掉一处死配置**：逐字段对照生产消费者（`GameHost` 组合根 + `AuthorityThresholds.From`）。除 `MaxWalkSpeed` 外均被消费——其从未进入 `MovementLimits`（生产用 `MaxFlightSpeed` 单一覆盖步行/冲刺以降低误判，见 `AuthorityThresholds.From` 注释），属死配置字段，已从 `ServerConfig`/`Validate` 移除。另已接线 `MetricsEnabled/MetricsPort`（条件创建 `MetricsHttpServer`）与 `HandshakeTimeoutSeconds`（握手看门狗）。
 11. **快照缓冲与批量限制未落地**：`SnapshotConfig.MaxEntitiesPerPacket` 分包与 `SnapshotStore` 环形缓冲**均已落地**（见 §附「下一步建议」第 3 项）；本项已完成。
-12. **协议元数据与分层约束分散**：包元数据分散多处，单程序集结构无法有效约束分层依赖与包契约边界。
+12. **协议元数据与分层约束分散**：包元数据分散多处，单程序集结构无法有效约束分层依赖与包契约边界 → **本会话评估**：协议侧元数据已在 Protocol 程序集内收敛——`PacketId` 枚举为包号契约唯一来源、`Packets.cs` 集中定义包记录、`Types.cs` 共享结构体，编解码在 `PacketDecoder/Encoder`。残留风险是**单程序集结构**导致无法用程序集边界强制分层依赖（Net↔Simulation↔Authority 相互可见），属既定架构取舍；完整解需拆分多程序集切片，属专项架构迁移，风险高、无当前功能缺陷，暂不作为增量步骤实施。
 
-> 结论：第 1~4 项已落地（依据见 §附第十九轮「代码侧核对结论」）；第 5 项部分落地；第 6~12 项仍为未完成风险，不应计入已完成。
+> 结论：第 1~5、7、11 项已落地；第 6、8~10 项经本会话核实/收敛/修活；第 12 项评估为专项架构迁移（仍保留）。综上当前已无未决的功能性配置/广播/并发缺陷，仅余 §12 单程序集分层强制这一架构取舍。
 
 ---
 

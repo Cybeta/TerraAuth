@@ -53,7 +53,7 @@ public record ServerConfig
     public int MaxPlayerMana { get; init; } = 200;         // 玩家法力上限
 
     // ---- 移动权威 (Phase 2 IMovementAuthority) ----
-    public float MaxWalkSpeed { get; init; } = 3.6f;      // 单位/秒，对应 terraria 基础移速
+    // 单一速度上限：飞行上限同时覆盖步行/冲刺以降低误判（见 GameHost.AuthorityThresholds.From）。
     public float MaxFlightSpeed { get; init; } = 8.0f;
     public float MaxFallSpeed { get; init; } = 20.0f;
     public float TeleportTolerance { get; init; } = 4.0f;  // 单 tick 允许最大位移（防瞬移）

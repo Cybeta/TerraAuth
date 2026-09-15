@@ -66,7 +66,6 @@ public sealed class ConfigurationService : IConfigurationService
     private static void Validate(ServerConfig c)
     {
         if (c.MaxConnections <= 0) throw new InvalidDataException("MaxConnections 必须 > 0");
-        if (c.MaxWalkSpeed <= 0) throw new InvalidDataException("MaxWalkSpeed 必须 > 0");
         if (c.MaxSingleDamage < 0) throw new InvalidDataException("MaxSingleDamage 不能为负");
         // 包 28 的伤害线格式为 Int16（±32767）：上限超过该范围将永不触发（量纲陷阱）
         if (c.MaxSingleDamage > short.MaxValue)

@@ -13,37 +13,25 @@ using System.Threading.Tasks;
 
 namespace TerraAuth.Concurrency;
 
-#region 1. WorkerPool：网络 I/O + 解码并行
-/// <summary>Worker 池：把 CPU 密集的解码/校验从网络 I/O 线程剥离。</summary>
+#region 1. WorkerPool：网络 I/O + 解码并行（全系统唯一的节流执行模型）
+/// <summary>
+/// 节流执行器：把 CPU 密集的解码 / 校验从网络 I/O 线程剥离，并保证并发上限。
+/// 单一调度契约（§9 收敛后的模型）：<c>EnqueueAsync</c> 返回的 Task 在 <paramref name="work"/>
+/// 真正完成后才完成，异常向上传播；并发由 <see cref="SemaphoreSlim"/> 限制为 <paramref name="size"/>。
+/// 快照广播 / 分片权威校验等并行组件遵循同一「节流 + Task.Run」并发纪律，不再另造语义。
+/// </summary>
 public sealed class WorkerPool : IDisposable
 {
     private readonly SemaphoreSlim _throttle;
     private readonly CancellationTokenSource _cts = new();
-    private readonly List<Task> _workers = new();
-    private readonly ConcurrentQueue<Func<CancellationToken, Task>> _queue = new();
-    private readonly int _size;
-
-    public int Pending => _queue.Count;
 
     public WorkerPool(int size)
     {
-        _size = size;
-        _throttle = new SemaphoreSlim(size, size);
+        _throttle = new SemaphoreSlim(Math.Max(1, size), Math.Max(1, size));
     }
 
-    /// <summary>提交工作项（异步，受信号量限流）。</summary>
+    /// <summary>提交异步工作项；返回的 Task 在 <paramref name="work"/> 完成后完成（异常向上传播）。</summary>
     public async Task EnqueueAsync(Func<CancellationToken, Task> work)
-    {
-        await _throttle.WaitAsync(_cts.Token).ConfigureAwait(false);
-        _ = Task.Run(async () =>
-        {
-            try { await work(_cts.Token).ConfigureAwait(false); }
-            finally { _throttle.Release(); }
-        }, _cts.Token);
-    }
-
-    /// <summary>提交工作项并等待其完成（调用方据此保持逐包顺序）。</summary>
-    public async Task EnqueueAndWaitAsync(Func<CancellationToken, Task> work)
     {
         await _throttle.WaitAsync(_cts.Token).ConfigureAwait(false);
         try
@@ -56,12 +44,18 @@ public sealed class WorkerPool : IDisposable
         }
     }
 
+    /// <summary>提交异步工作项并等待其完成（调用方据此保持逐包顺序；语义与 <see cref="EnqueueAsync"/> 一致）。</summary>
+    public Task EnqueueAndWaitAsync(Func<CancellationToken, Task> work) => EnqueueAsync(work);
+
     /// <summary>提交同步工作项。</summary>
     public Task Enqueue(Action work) => EnqueueAsync(_ => { work(); return Task.CompletedTask; });
 
-    /// <summary>并行执行一批独立工作（如批量解码）。</summary>
-    public Task WhenAllAsync(IEnumerable<Func<CancellationToken, Task>> items)
-        => Task.WhenAll(items.Select(EnqueueAsync));
+    /// <summary>并行执行一批独立工作（如批量解码）；合并全部异常。</summary>
+    public async Task WhenAllAsync(IEnumerable<Func<CancellationToken, Task>> items)
+    {
+        var tasks = items.Select(EnqueueAsync);
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+    }
 
     public void Dispose() => _cts.Cancel();
 }

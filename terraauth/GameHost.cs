@@ -116,7 +116,7 @@ public sealed class GameHost : IDisposable
         _world = simulator.State; // 供热重载同步全局开关（SSC 等）
         _pipelineDisposable = pipelineDisposable;
 
-        // 配置热更新 → 动态调整阈值（如 MaxWalkSpeed / MaxSingleDamage）
+        // 配置热更新 → 动态调整阈值（如 MaxFlightSpeed / MaxSingleDamage）
         config.OnChanged += OnConfigurationChanged;
     }
 
