@@ -297,7 +297,7 @@ public sealed class WorldState
     /// 进度位映射与 NPC 类型 ID 均按**原版客户端行为**逐项核对（协议字段比对，不含第三方源码）。
     /// 由仿真线程调用（NPC 死亡处）。
     /// </summary>
-    public void NotifyNpcKilled(int npcType, float x = 0f, float y = 0f)
+    public void NotifyNpcKilled(int npcType, float x, float y, IRng rng)
     {
         switch (npcType)
         {
@@ -321,59 +321,104 @@ public sealed class WorldState
             default: return;
         }
 
-        DropBossLoot(npcType, x, y);
+        DropBossLoot(npcType, x, y, rng);
         ProgressDirty = true;
     }
 
-    /// <summary>
-    /// Boss 掉落表（**简化模型**：每 Boss 给标志性/必定掉落，数量为简化值）。
-    /// 物品 ID 依原版掉落数据库与 NPC.NPCLoot 逐项核对，均有原版依据；未逐条复刻概率与专家/大师袋。
+    /// <summary>Boss 掉落数据库（**原版模型**：概率 + 堆叠范围 + 专家/大师袋）。
+    /// <see cref="DropEntry.Chance"/> 为命中概率（1.0 = 必掉）；堆叠在 [MinStack, MaxStack] 间均匀随机。
+    /// 眼魔（4）按腐化 / 猩红 / 专家三套完整建模；其余 Boss 暂以「必掉固定数量」包装（等价旧行为），
+    /// 未逐条复刻概率与专家袋，留待后续逐项核对扩表。
+    /// <paramref name="ClassicCorrupt"/> / <see cref="BossLootSpec.ClassicCrimson"/> 依 <see cref="Crimson"/> 选择；
+    /// 专家 / 大师模式优先取 <see cref="BossLootSpec.ExpertOrMaster"/>（非空时）。
     /// </summary>
-    private static readonly Dictionary<int, (int ItemId, int Stack)[]> BossLoot = new()
+    private readonly record struct DropEntry(int ItemId, int MinStack, int MaxStack, double Chance);
+
+    /// <summary>单个 Boss 的掉落规范：腐化世界 / 猩红世界 / 专家或大师三条通道。</summary>
+    private sealed record BossLootSpec(DropEntry[] ClassicCorrupt, DropEntry[] ClassicCrimson, DropEntry[] ExpertOrMaster);
+
+    /// <summary>把「必掉固定数量」包装为等价的数据库条目（Chance=1、堆叠固定），用于尚未逐项核对的 Boss。</summary>
+    private static BossLootSpec Fixed(params (int ItemId, int Stack)[] drops)
     {
-        [4]   = new[] { (56, 30) },                    // Eye of Cthulhu → Demonite Ore（腐化；猩红世界为 CrimtaneOre 880）
-        [13]  = new[] { (56, 30), (86, 5) },           // Eater of Worlds → Demonite Ore + Shadow Scale
-        [266] = new[] { (880, 30) },                   // Brain of Cthulhu → Crimtane Ore
-        [50]  = new[] { (23, 50), (998, 1) },          // King Slime → Gel + Solidifier
-        [222] = new[] { (2431, 10), (1121, 1) },       // Queen Bee → Bee Wax + Beegun
-        [35]  = new[] { (1313, 1) },                   // Skeletron → Book of Skulls
-        [113] = new[] { (367, 1), (490, 1) },          // Wall of Flesh → Pwnhammer + Warrior Emblem（必掉）
-        [125] = new[] { (549, 25), (1225, 15) },       // The Twins → Soul of Sight + Hallowed Bar
-        [126] = new[] { (549, 25), (1225, 15) },       // The Twins(Spazmatism) 同上
-        [134] = new[] { (548, 25), (1225, 15) },       // The Destroyer → Soul of Might + Hallowed Bar
-        [127] = new[] { (547, 25), (1225, 15) },       // Skeletron Prime → Soul of Fright + Hallowed Bar
-        [262] = new[] { (1141, 1), (1157, 1) },        // Plantera → Temple Key（必掉）+ Pygmy Staff
-        [245] = new[] { (1294, 1), (2218, 18) },       // Golem → Picksaw + Beetle Husk
-        [370] = new[] { (2624, 1), (2609, 1) },        // Duke Fishron → Tsunami + Fishron Wings
-        [657] = new[] { (4986, 50), (4980, 1) },       // Queen Slime → Gel Balloon + Hook of Dissonance
-        [636] = new[] { (4923, 1) },                   // Empress of Light → 武器(4选一)
-        [668] = new[] { (5098, 1) },                   // Deerclops → Chester 宠物(1/3)
-        [439] = new[] { (3549, 1) },                   // Lunatic Cultist → Lunar Crafting Station（必掉）
-        [398] = new[] { (3460, 90), (3384, 1) },       // Moon Lord → Lunar Ore（必掉）+ Portal Gun
+        var entries = drops.Select(d => new DropEntry(d.ItemId, d.Stack, d.Stack, 1.0)).ToArray();
+        return new BossLootSpec(entries, entries, System.Array.Empty<DropEntry>());
+    }
+
+    private static readonly Dictionary<int, BossLootSpec> BossLoot = new()
+    {
+        // 眼魔 4 —— 原版掉落全表（腐化 / 猩红 / 专家袋），数值据 Terraria 1.4.5 校验：
+        //   腐化：魔矿(56) 30-90、邪箭(47) 20-50、腐化种子(37) 1-3（均 100%）；通用 望远镜(1990)、眼面具(1991) 各 1/7。
+        //   猩红：猩红矿(880) 30-90（100%）+ 望远镜 / 眼面具 1/7。
+        //   专家/大师：眼魔宝袋(3381) 必掉。
+        [4] = new BossLootSpec(
+            new[]
+            {
+                new DropEntry(56, 30, 90, 1.0),
+                new DropEntry(47, 20, 50, 1.0),
+                new DropEntry(37, 1, 3, 1.0),
+                new DropEntry(1990, 1, 1, 1.0 / 7),
+                new DropEntry(1991, 1, 1, 1.0 / 7),
+            },
+            new[]
+            {
+                new DropEntry(880, 30, 90, 1.0),
+                new DropEntry(1990, 1, 1, 1.0 / 7),
+                new DropEntry(1991, 1, 1, 1.0 / 7),
+            },
+            new[] { new DropEntry(3381, 1, 1, 1.0) }),
+
+        [13]  = Fixed((56, 30), (86, 5)),        // Eater of Worlds → Demonite + Shadow Scale
+        [266] = Fixed((880, 30)),                // Brain of Cthulhu → Crimtane
+        [50]  = Fixed((23, 50), (998, 1)),       // King Slime → Gel + Solidifier
+        [222] = Fixed((2431, 10), (1121, 1)),    // Queen Bee → Bee Wax + Beegun
+        [35]  = Fixed((1313, 1)),                // Skeletron → Book of Skulls
+        [113] = Fixed((367, 1), (490, 1)),       // Wall of Flesh → Pwnhammer + Warrior Emblem
+        [125] = Fixed((549, 25), (1225, 15)),    // The Twins → Soul of Sight + Hallowed Bar
+        [126] = Fixed((549, 25), (1225, 15)),    // The Twins(Spazmatism)
+        [134] = Fixed((548, 25), (1225, 15)),    // The Destroyer → Soul of Might + Hallowed Bar
+        [127] = Fixed((547, 25), (1225, 15)),    // Skeletron Prime → Soul of Fright + Hallowed Bar
+        [262] = Fixed((1141, 1), (1157, 1)),     // Plantera → Temple Key + Pygmy Staff
+        [245] = Fixed((1294, 1), (2218, 18)),    // Golem → Picksaw + Beetle Husk
+        [370] = Fixed((2624, 1), (2609, 1)),     // Duke Fishron → Tsunami + Fishron Wings
+        [657] = Fixed((4986, 50), (4980, 1)),    // Queen Slime → Gel Balloon + Hook of Dissonance
+        [636] = Fixed((4923, 1)),                // Empress of Light → 武器(4选一)
+        [668] = Fixed((5098, 1)),                // Deerclops → Chester 宠物(1/3)
+        [439] = Fixed((3549, 1)),                // Lunatic Cultist → Lunar Crafting Station
+        [398] = Fixed((3460, 90), (3384, 1)),    // Moon Lord → Lunar Ore + Portal Gun
     };
 
     /// <summary>世界掉落物槽位上限（与原版 <c>Main.item[400]</c> 一致）。</summary>
     private const int MaxItemSlots = 400;
 
-    /// <summary>服务端主动生成掉落物（Boss 掉落）：标记待下发，由世界同步补发包 21。</summary>
-    private void DropBossLoot(int npcType, float x, float y)
+    /// <summary>服务端主动生成掉落物（Boss 掉落）：按概率 / 堆叠范围 / 模式抛掷，标记待下发（包 21 补发）。</summary>
+    private void DropBossLoot(int npcType, float x, float y, IRng rng)
     {
-        if (!BossLoot.TryGetValue(npcType, out var loot)) return;
+        if (!BossLoot.TryGetValue(npcType, out var spec)) return;
+
+        // 世界难度（0=经典、1=专家、2=大师、3=旅途）：专家/大师掉落走宝袋分支。
+        var pool = GameMode >= 1 && spec.ExpertOrMaster.Length > 0
+            ? spec.ExpertOrMaster
+            : (Progress.Crimson ? spec.ClassicCrimson : spec.ClassicCorrupt);
 
         lock (ItemsLock)
         {
-            foreach (var drop in loot)
+            foreach (var drop in pool)
             {
+                if (rng.NextDouble() >= drop.Chance) continue;                 // 概率抛掷
                 if (Items.Count >= MaxItemSlots) return;
 
                 int slot = 0;
                 while (Items.Any(i => i.Slot == slot)) slot++;
 
+                int stack = drop.MinStack == drop.MaxStack
+                    ? drop.MinStack
+                    : drop.MinStack + rng.NextInt32(drop.MaxStack - drop.MinStack + 1); // [Min, Max] 均匀
+
                 Items.Add(new WorldItemEntity
                 {
                     Slot = slot,
                     ItemId = drop.ItemId,
-                    Stack = drop.Stack,
+                    Stack = stack,
                     Position = new Vector2(x, y),
                     Velocity = new Vector2(0f, 0f),
                     Prefix = 0,

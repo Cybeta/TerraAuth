@@ -2959,19 +2959,19 @@ public class VanillaFeatureTests
         Assert.True(await TickUntilAsync(server, () => !boss.Active, TimeSpan.FromSeconds(5)),
             "Boss 未被击杀");
 
-        // 服务端生成掉落物：Demonite Ore（物品 56）× 30
+        // 服务端生成掉落物：Demonite Ore（物品 56），堆叠按原版 30-90 均匀随机
         WorldItemEntity? loot;
         lock (world.ItemsLock)
             loot = world.Items.FirstOrDefault(i => i.ItemId == 56);
         Assert.NotNull(loot);
-        Assert.Equal(30, loot!.Stack);
+        Assert.InRange(loot!.Stack, 30, 90);
 
         // 服务端主动生成的掉落物必须补发包 21（否则客户端看不到）
         await server.Host.FlushNewItemsAsync();
         var got = await s.ReadUntilAsync(p => p is ItemDropPacket { ItemId: 56 }, TimeSpan.FromSeconds(5));
 
         var drop = Assert.Single(got.OfType<ItemDropPacket>().Where(p => p.ItemId == 56));
-        Assert.Equal(30, drop.Stack);
+        Assert.InRange(drop.Stack, 30, 90);
         Assert.Equal(loot.Slot, drop.ItemSlotIndex);
     }
 
