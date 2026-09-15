@@ -787,7 +787,7 @@ public sealed record NpcStrikeCommand(
                 npc.Active = false; // 由世界同步下发 life=0，客户端据此移除
                 npc.DeadTick = Tick;
                 Console.WriteLine($"[Kill] slot={NpcIndex} gen={npc.Generation} type={npc.Type} dmg={Damage} def={npc.Defense} applied={applied} @{npc.X:F0},{npc.Y:F0}");
-                world.NotifyNpcKilled(npc.Type, npc.X, npc.Y); // Boss 击杀 → 世界进度与掉落 // Boss 击杀 → 世界进度 + 掉落
+                world.NotifyNpcKilled(npc.Type, npc.X, npc.Y, rng); // Boss 击杀 → 世界进度 + 掉落
             }
             else
             {
@@ -905,6 +905,10 @@ public sealed record SpawnProjectileCommand(
                 return new(true);
             }
 
+            // 弹幕伤害的服务端权威推导结果（默认沿用客户端上报；近战 / 魔法等可精确推导的通道则覆盖为
+            // 服务端推导值，使阶段 C 命中匹配以服务端权威值而非客户端上报值为基准）。
+            int derivedDamage = Damage;
+
             // 阶段 H：召唤 / 哨兵弹幕 spawn 伤害权威校验——堵住「虚报弹幕伤害 → 命中上界随之上抬」漏洞。
             // 原版仆从伤害 = **召唤时**武器伤害（GetWeaponDamage 含前缀 / Buff / 饰品 / 套装），创建时一次确定，
             // 之后不随背包 / 手持变化；阶段 G 依此用弹幕 Damage 计算命中上界（ceil(p.Damage × 1.15) × crit）。
@@ -947,6 +951,39 @@ public sealed record SpawnProjectileCommand(
                 }
                 // 未收录武器（heldHasItem && !heldIsKnown）→ 放行。
             }
+            else
+            {
+                // 阶段 H2：非召唤 / 非哨兵弹幕的创建时伤害权威接入。
+                // 普通弹幕伤害 = 发射时刻武器伤害（原版 ItemCheck_Shoot 把武器权威伤害传给 NewProjectile），
+                // 服务端在创建时用「手持已收录武器」推导权威伤害，并对客户端上报值做上界校验（±15% 命中浮动容差）——
+                // 堵住「虚报高伤害普通弹幕 → 阶段 C 用其 Damage 抬命中上界」的漏洞。
+                //   · 近战 / 魔法：弹幕伤害 == 武器伤害（无弹药合并），可精确推导 → 校验 + 覆盖 derivedDamage；
+                //   · 远程：弹幕伤害含弹药合并（原版 PickAmmo），RangedDamageBound 已取最高弹药合并上界，
+                //     仅作校验（更宽容，不覆盖，避免写低值误拒）；
+                //   · 手持未知 / 空手 / Buff 弹幕：无推导来源 → 放行（绝不误拒未知物品）。
+                if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
+                {
+                    int heldItem = player.Items[player.SelectedSlot];
+                    byte heldPrefix = player.ItemPrefixes[player.SelectedSlot];
+                    if (heldItem > 0 && ItemDamageTable.Of.TryGetValue(heldItem, out var heldStats)
+                        && heldStats.Class is WeaponClass.Melee or WeaponClass.Magic or WeaponClass.Ranged)
+                    {
+                        if (heldStats.Class is WeaponClass.Melee or WeaponClass.Magic)
+                        {
+                            int wd = CombatResolver.GetWeaponDamage(player, heldItem, heldPrefix);
+                            if (Damage > (int)Math.Ceiling(wd * 1.15f))
+                                return new(false, CommandFailures.ProjectileDamageAboveBound);
+                            derivedDamage = wd;   // 精确推导 → 服务端权威覆盖
+                        }
+                        else if (CombatResolver.RangedDamageBound(player, heldItem, false, heldPrefix) is int rb
+                                 && Damage > (int)Math.Ceiling(rb * 1.15f))
+                        {
+                            return new(false, CommandFailures.ProjectileDamageAboveBound);
+                        }
+                        // 远程仅校验（上界已含弹药合并），不覆盖 storeDamage。
+                    }
+                }
+            }
 
             // 碰撞盒按原版逐类型尺寸（Sizes），未登记类型沿用 16×16 近似。
             var size = ProjectileCapabilityTable.Sizes.TryGetValue(Type, out var s)
@@ -958,7 +995,7 @@ public sealed record SpawnProjectileCommand(
                 Type = Type,
                 Position = Position,
                 Velocity = Velocity,
-                Damage = Damage,
+                Damage = derivedDamage,
                 Width = size.Width,
                 Height = size.Height,
                 NewNotified = false,   // 由世界同步循环推送给其他玩家（包 27）

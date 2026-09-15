@@ -209,6 +209,46 @@ public class SimulationTests
     }
 
     [Fact]
+    public void NonSummon_Projectile_Spawn_Validates_HeldWeapon()
+    {
+        // 阶段 H2：非召唤 / 非哨兵弹幕创建时，按「手持已收录武器」权威推导伤害——
+        // 假报超高伤害应拒绝（堵住用高 Damage 弹幕抬阶段 C 命中上界）；合理上报则被服务端覆盖为权威值。
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
+        var player = world.Players[1];
+        var rng = new XoshiroRng(1);
+
+        // 手持近战武器（木剑 24），spawn 非召唤弹幕（类型 20 = 恶魔飞刀）
+        player.Items[3] = 24;
+        player.ItemPrefixes[3] = 0;
+        player.SelectedSlot = 3;
+        int authoritative = CombatResolver.GetWeaponDamage(player, 24, 0);
+        Assert.True(authoritative > 0);
+
+        // 1) 合理上报（≤ ceil(权威×1.15)）→ 接受，且弹幕伤害被覆盖为服务端权威值
+        var ok = new SpawnProjectileCommand(1, 1, 1, 20, new Vector2(0, 0), new Vector2(0, 0), authoritative)
+            .Apply(world, rng);
+        Assert.True(ok.Applied);
+        lock (world.ProjectilesLock)
+        {
+            var placed = world.Projectiles.Single(p => p.Key == 1);
+            Assert.Equal(authoritative, placed.Damage);
+        }
+
+        // 2) 假报超高伤害（> ceil(权威×1.15)）→ 拒绝，杜绝虚报弹幕伤害抬命中上界
+        int tooHigh = (int)Math.Ceiling(authoritative * 1.15f) + 1;
+        Assert.Equal("projectile_damage_above_bound",
+            new SpawnProjectileCommand(2, 1, 2, 20, new Vector2(0, 0), new Vector2(0, 0), tooHigh)
+                .Apply(world, rng).Reason);
+
+        // 3) 空手 spawn 非召唤弹幕 → 无推导来源，仍放行（不误拒非武器弹幕）
+        player.Items[3] = 0;
+        Assert.True(new SpawnProjectileCommand(3, 1, 3, 9, new Vector2(0, 0), new Vector2(0, 0), 30)
+            .Apply(world, rng).Applied);
+    }
+
+    [Fact]
     public void ChestSession_RejectsStaleConnectionAndPreservesReplacement()
     {
         var world = new WorldState();
@@ -2542,6 +2582,56 @@ public class WorldGeneratorTests
             Assert.Equal(4f, p20.Width);  Assert.Equal(4f, p20.Height);
             Assert.Equal(6f, p101.Width); Assert.Equal(6f, p101.Height);
             Assert.Equal(16f, pFallback.Width); Assert.Equal(16f, pFallback.Height);
+        }
+    }
+
+    /// <summary>
+    /// ① Boss 掉落改为原版数据库（眼魔样板）：经典腐化世界必掉 魔矿(56)30-90 / 邪箭(47)20-50 / 腐化种子(37)1-3，
+    /// 并出现概率物品（望远镜 1990 / 眼面具 1991，1/7）可能为空；不进 3381 宝袋。
+    /// </summary>
+    [Fact]
+    public void BossLoot_EyeOfCthulhu_ClassicCorrupt_DropsVanilla()
+    {
+        var world = new WorldState(); // 默认经典、腐化
+        var rng = new XoshiroRng(9001);
+        world.NotifyNpcKilled(4, 100, 100, rng);
+
+        lock (world.ItemsLock)
+        {
+            Assert.Contains(world.Items, it => it.ItemId == 56 && it.Stack >= 30 && it.Stack <= 90);   // 魔矿必掉
+            Assert.Contains(world.Items, it => it.ItemId == 47 && it.Stack >= 20 && it.Stack <= 50);   // 邪箭必掉
+            Assert.Contains(world.Items, it => it.ItemId == 37 && it.Stack >= 1 && it.Stack <= 3);     // 腐化种子必掉
+            Assert.DoesNotContain(world.Items, it => it.ItemId == 3381);                              // 经典无宝袋
+        }
+    }
+
+    /// <summary>眼魔经典猩红世界：掉猩红矿(880)30-90，不掉魔矿(56)。</summary>
+    [Fact]
+    public void BossLoot_EyeOfCthulhu_ClassicCrimson_DropsCrimtane()
+    {
+        var world = new WorldState();
+        world.Progress.Crimson = true;
+        var rng = new XoshiroRng(3005);
+        world.NotifyNpcKilled(4, 100, 100, rng);
+
+        lock (world.ItemsLock)
+        {
+            Assert.Contains(world.Items, it => it.ItemId == 880 && it.Stack >= 30 && it.Stack <= 90);
+            Assert.DoesNotContain(world.Items, it => it.ItemId == 56);
+        }
+    }
+
+    /// <summary>眼魔专家模式（GameMode=1）：必掉宝袋(3381)。</summary>
+    [Fact]
+    public void BossLoot_EyeOfCthulhu_Expert_DropsTreasureBag()
+    {
+        var world = new WorldState { GameMode = 1 }; // 专家
+        var rng = new XoshiroRng(7001);
+        world.NotifyNpcKilled(4, 100, 100, rng);
+
+        lock (world.ItemsLock)
+        {
+            Assert.Contains(world.Items, it => it.ItemId == 3381); // 宝袋必掉
         }
     }
 }
