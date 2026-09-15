@@ -9,6 +9,7 @@ using System.IO.Pipelines;
 using TerraAuth.Protocol; // PacketId / PlayerPositionPacket
 using TerraAuth.Net.Transport;
 using TerraAuth.Simulation; // SnapshotFrame / EntityState / RemovedEntity
+using TerraAuth.Concurrency; // WorkerPool
 using Xunit;
 
 namespace TerraAuth.Tests;
@@ -1268,4 +1269,58 @@ public class TileSectionCodecTests
         Assert.Equal((short)0, br.ReadInt16()); // 图格实体列表为空
         return tiles;
     }
+}
+
+/// <summary>
+/// 握手超时看门狗验收：客户端在 <c>HandshakeTimeout</c> 内未进入 <c>Playing</c>
+/// 时，服务器应主动断开并回收槽位（防「占住连接不放」的握手停滞攻击）。
+/// </summary>
+public class HandshakeTimeoutTests
+{
+    [Fact]
+    public async Task Connection_StallsInHandshake_IsDisconnectedAfterTimeout()
+    {
+        var decoder = new PacketDecoder();
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        using var pool = new WorkerPool(2);
+        // 客户端保持握手中（流永不产生数据，ReadAsync 阻塞），握手超时极短 → 应被看门狗断开。
+        using var stalledStream = new StallingStream();
+
+        var connection = new Connection(
+            stalledStream, decoder, encoder, ProtocolVersion.Current, pool,
+            handshakeTimeout: TimeSpan.FromMilliseconds(120));
+
+        // Start run loop on a stalled stream（never completing handshake）
+        await connection.RunAsync(
+            onPacket: static (_, _, _) => Task.CompletedTask,
+            ct: CancellationToken.None);
+
+        // 看门狗到期后连接应收敛到 Disconnected
+        Assert.Equal(ConnectionState.Disconnected, connection.State);
+    }
+}
+
+/// <summary>ReadAsync 一直阻塞（Task.Delay 随取消令牌失效），用于模拟「握手停滞」的客户端。</summary>
+file sealed class StallingStream : Stream
+{
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => 0;
+    public override long Position { get; set; }
+
+    public override int Read(byte[] buffer, int offset, int count) => BlockingRead();
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+        => BlockReadAsync(ct);
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        => new(BlockReadAsync(ct));
+
+    private static int BlockingRead() => 0;
+    private static Task<int> BlockReadAsync(CancellationToken ct)
+        => Task.Delay(Timeout.InfiniteTimeSpan, ct).ContinueWith(_ => 0, ct);
+
+    public override void Write(byte[] buffer, int offset, int count) { }
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => 0;
+    public override void SetLength(long value) { }
 }

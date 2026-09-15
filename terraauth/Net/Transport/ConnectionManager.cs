@@ -14,14 +14,16 @@ public sealed class ConnectionManager
 {
     private readonly ConcurrentDictionary<int, Connection> _connections = new();
     private readonly SemaphoreSlim _capacity;
-    private readonly TimeSpan _handshakeTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>握手阶段超时（客户端进入 Playing 前的停留时长上限）；据 ServerConfig.HandshakeTimeoutSeconds 注入。</summary>
+    public TimeSpan HandshakeTimeout { get; }
 
     public int MaxConnections { get; }
     public int ActiveCount => _connections.Count;
 
-    public ConnectionManager(int maxConnections = 64)
+    public ConnectionManager(int maxConnections = 64, TimeSpan? handshakeTimeout = null)
     {
         MaxConnections = maxConnections;
+        HandshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(10);
         _capacity = new SemaphoreSlim(maxConnections, maxConnections);
     }
 

@@ -101,7 +101,7 @@
 7. **缺少背压**：出站已有界；**入站 `CommandQueue`（无界优先队列）、分片入站队列与审计 `Channel`（均无界）仍无容量上限 / 过载策略** → **本项已落地**：出入站 / 分片入站 / 审计 channel 均已改有界；`CommandQueue` 新增可配置 `MaxCount`，超限入队返回 false 由管线拒绝该操作（防恶意超大未来 tick 堆积），生产以 8192 接线。
 8. **锁契约不统一**：`WorldState` 的锁契约（持锁范围 / 可重入性 / 快照一致性）与调用方假设不一致，存在竞态与死锁风险 → **本会话核实：当前无锁顺序死锁**。`KillSummonedProjectiles` 对 `ProjectilesLock` 与 `PlayersLock` 为**顺序获取**（两个独立 lock 块，非嵌套）；`MarkPlayerOffline`/命令路径均在锁外调用它；全仓无「先 PlayersLock 再 ProjectilesLock」的反向嵌套。契约仍以 public 锁对象暴露，属可加固点（收敛为私有 + 封装方法），非当前已触发缺陷。
 9. **WorkerPool 设计分裂**：两套 WorkerPool 的调度、生命周期与错误处理语义不一致，应收敛为单一模型。
-10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效。
+10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效 → **已接线两项**：`MetricsEnabled`/`MetricsPort` → 条件创建 `MetricsHttpServer`；`HandshakeTimeoutSeconds` → `ConnectionManager`/`Connection` 握手看门狗（超时未进 Playing 主动断开并回收槽位，含测试）。其余配置项需对照消费映射表逐一核实。
 11. **快照缓冲与批量限制未落地**：`SnapshotConfig.MaxEntitiesPerPacket` 分包与 `SnapshotStore` 环形缓冲**均已落地**（见 §附「下一步建议」第 3 项）；本项已完成。
 12. **协议元数据与分层约束分散**：包元数据分散多处，单程序集结构无法有效约束分层依赖与包契约边界。
 

@@ -51,6 +51,9 @@ public sealed class Connection : IAsyncDisposable
     private readonly DecodeContext _decodeContext;
     private readonly WorkerPool _workers;
     private readonly CancellationTokenSource _lifetimeCts = new();
+    // 握手阶段超时：在进入 Playing 前保持链接若超时则拒绝，防「占住连接/槽位」的握手停滞攻击。
+    // 由 ConnectionManager 据 ServerConfig.HandshakeTimeoutSeconds 注入（默认 10s = 原默认值）。
+    internal readonly TimeSpan HandshakeTimeout;
     private readonly TaskCompletionSource _runCompleted =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _disposeStarted;
@@ -83,7 +86,8 @@ public sealed class Connection : IAsyncDisposable
         IPacketDecoder decoder,
         IPacketEncoder encoder,
         ProtocolVersion version,
-        WorkerPool workers)
+        WorkerPool workers,
+        TimeSpan? handshakeTimeout = null)
     {
         _stream = stream;
         _reader = PipeReader.Create(stream);
@@ -91,6 +95,7 @@ public sealed class Connection : IAsyncDisposable
         _encoder = encoder;
         _decodeContext = new DecodeContext { Version = version };
         _workers = workers;
+        HandshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(10); // 默认与原行为一致
     }
 
     /// <summary>
@@ -104,6 +109,13 @@ public sealed class Connection : IAsyncDisposable
         var loopCt = connectionCts.Token;
         try
         {
+            // 握手超时看门狗：进入 Playing 前停留超时即主动断开（防占住连接/槽位的握手停滞攻击）。
+            // 进入 Playing 后该任务到期检查 State 判定无需断开，仅随连接关闭而取消。
+            if (HandshakeTimeout > TimeSpan.Zero)
+            {
+                _ = HandshakeWatchdogAsync(connectionCts);
+            }
+
             var readTask = ReadLoopAsync(onPacket, loopCt);
             var writeTask = WriteLoopAsync(loopCt);
 
@@ -131,6 +143,29 @@ public sealed class Connection : IAsyncDisposable
             _outbound.Writer.TryComplete();
             _runCompleted.TrySetResult();
             Console.WriteLine($"[Net] 断开 {RemoteEndPoint} 玩家 #{PlayerId}");
+        }
+    }
+
+    /// <summary>
+    /// 握手看门狗：若在 <see cref="HandshakeTimeout"/> 内未进入 <see cref="ConnectionState.Playing"/>，
+    /// 则主动取消连接（关闭 RunAsync 读写循环并回收槽位），防止「占住连接不放」的握手停滞攻击。
+    /// 已进入 Playing 时到期判定无需断开，仅随连接关闭而随 <paramref name="connectionCts"/> 一并取消。
+    /// </summary>
+    private async Task HandshakeWatchdogAsync(CancellationTokenSource connectionCts)
+    {
+        var ct = connectionCts.Token;
+        try
+        {
+            await Task.Delay(HandshakeTimeout, ct).ConfigureAwait(false);
+            // 到期时仍未请求关闭且尚未完成握手 → 主动断开
+            if (Volatile.Read(ref _closeRequested) == 0 && State != ConnectionState.Playing)
+            {
+                connectionCts.Cancel();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 连接已关闭 / Watchdog 被取消：无需处理
         }
     }
 

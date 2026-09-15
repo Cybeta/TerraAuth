@@ -135,9 +135,11 @@ public sealed class GameHost : IDisposable
         // 2. 持久化（SQLite；无 NuGet 时走内嵌 LiteDb）
         var db = new SqlitePersistence(dbPath);
 
-        // 3. 监控（Prometheus 风格 + /metrics HTTP 端点）
+        // 3. 监控（Prometheus 风格 + /metrics HTTP 端点）；由 ServerConfig.MetricsEnabled 控制开关
         var metrics = new PrometheusMetrics();
-        var metricsServer = new MetricsHttpServer(metrics, metricsPort);
+        var metricsServer = config.Current.MetricsEnabled
+            ? new MetricsHttpServer(metrics, config.Current.MetricsPort)
+            : null;
 
         // 4. 封禁（SQLite 持久化 + 进程内兜底）
         var banStore = new SqliteBanStore(db);
@@ -213,7 +215,9 @@ public sealed class GameHost : IDisposable
 
         // 6. 网络层（Phase 5）——先建，以便把 SnapshotSender 注入快照广播
         var protocol = new TerrariaProtocol();
-        var connections = new ConnectionManager(config.Current.MaxConnections);
+        var connections = new ConnectionManager(
+            config.Current.MaxConnections,
+            TimeSpan.FromSeconds(config.Current.HandshakeTimeoutSeconds));
         var decoder = new PacketDecoder();
         var encoder = new PacketEncoder(protocol.Version);
         var commandService = new CommandService();
