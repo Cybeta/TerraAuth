@@ -548,6 +548,34 @@ public class SnapshotTests
     }
 
     [Fact]
+    public void SnapshotStore_Ring_WrapAndTrim_PreserveAscendingOrder()
+    {
+        // capacity = 4，写入 6 帧触发绕环覆写
+        var store = new SnapshotStore(capacity: 4);
+        foreach (uint t in new uint[] { 1, 2, 3, 4, 5, 6 })
+            store.Add(SnapshotFrame.Create(t, System.Array.Empty<EntityState>(), System.Array.Empty<RemovedEntity>()));
+
+        // 满后覆写最旧 → 保留 tick 3..6
+        Assert.Equal(4, store.Count);
+        Assert.Equal(new uint[] { 3, 4, 5, 6 }, store.Snapshot().Select(f => f.Tick));
+
+        // TrimBefore(5) → 移除 3、4，head 前移
+        store.TrimBefore(5);
+        Assert.Equal(new uint[] { 5, 6 }, store.Snapshot().Select(f => f.Tick));
+        Assert.Equal(6u, store.LatestOrDefault!.Tick);
+
+        // 继续写入 7、8、9 → 覆盖 5、6、7，保留 8、9
+        foreach (uint t in new uint[] { 7, 8, 9 })
+            store.Add(SnapshotFrame.Create(t, System.Array.Empty<EntityState>(), System.Array.Empty<RemovedEntity>()));
+        Assert.Equal(4, store.Count);
+        Assert.Equal(new uint[] { 6, 7, 8, 9 }, store.Snapshot().Select(f => f.Tick));
+
+        store.Clear();
+        Assert.Equal(0, store.Count);
+        Assert.Same(Array.Empty<SnapshotFrame>(), store.Snapshot());
+    }
+
+    [Fact]
     public void ShadowPredictor_DetectsDeviation()
     {
         var predictor = new ShadowPredictor();
