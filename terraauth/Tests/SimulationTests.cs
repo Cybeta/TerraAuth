@@ -562,6 +562,32 @@ public class SimulationTests
     }
 
     [Fact]
+    public void CommandQueue_Bounded_RejectsBeyondCapacity()
+    {
+        var q = new CommandQueue(maxCount: 2);
+        Assert.True(q.Enqueue(new TestCommand(1, 1, "a")));
+        Assert.True(q.Enqueue(new TestCommand(2, 2, "b")));
+
+        // 已满 → 拒绝入队，不增长
+        Assert.False(q.Enqueue(new TestCommand(3, 3, "c")));
+        Assert.Equal(2, q.Count);
+
+        // 消费后可重新入队
+        Assert.Equal(2, q.DrainThrough(long.MaxValue).Count);
+        Assert.True(q.Enqueue(new TestCommand(1, 4, "d")));
+        Assert.Equal(1, q.Count);
+    }
+
+    [Fact]
+    public void CommandQueue_DefaultUnbounded_AlwaysAccepts()
+    {
+        var q = new CommandQueue();
+        for (int i = 0; i < 10000; i++)
+            Assert.True(q.Enqueue(new TestCommand(1, i, "x")));
+        Assert.Equal(10000, q.Count);
+    }
+
+    [Fact]
     public void XoshiroRng_IsDeterministic()
     {
         var a = new XoshiroRng(123);

@@ -315,7 +315,11 @@ public sealed class InboundPipeline : IInboundPipeline
 
         // 接受 → 将权威层生成的 Command 入队（Phase 3 仿真消费）
         if (result.Decision == AuthorityDecision.Accept && result.Command is not null)
-            commands.Enqueue(result.Command);
+        {
+            // 命令队列有界时，超限返回 false：拒绝该次操作（不吞命令、不计违规，仅防队列被恶愈占用撑爆）。
+            if (!commands.Enqueue(result.Command))
+                return AuthorityResult.Reject(CommandFailures.NotApplied, countsAsViolation: false);
+        }
 
         return result;
     }

@@ -154,7 +154,7 @@ public sealed class GameHost : IDisposable
         // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
         // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
         ApplyPersistedWorldChanges(world, db);
-        var commands = new CommandQueue();
+        var commands = new CommandQueue(maxCount: CommandQueueCapacity);
         var recorder = new EventRecorder();
         var snapshots = new SnapshotStore();
         var auditLogger = new PersistenceAuditLogger(db, metrics);
@@ -602,6 +602,9 @@ public sealed class GameHost : IDisposable
 
     /// <summary>单批液体同步的最大条目数。</summary>
     private const int MaxLiquidChangesPerBatch = 512;
+
+    /// <summary>服务端命令队列容量上限：入站管线写入的 Command 超限即拒绝该操作，防恶意超大未来 tick 堆积。</summary>
+    private const int CommandQueueCapacity = 8192;
 
     /// <summary>图格边长（像素）。</summary>
     private const float TileSizePx = 16f;

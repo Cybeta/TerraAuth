@@ -1103,6 +1103,15 @@ public sealed class CommandQueue
 {
     private readonly object _gate = new();
     private readonly PriorityQueue<QueuedCommand, (long Tick, long Sequence)> _queue = new();
+
+    /// <summary>
+    /// 队列容量上限；0 表示无界。用于阻断「恶意构造超大未来 tick 命令」导致的无限堆积
+    /// （<see cref="DrainThrough"/> 只消费当期命令，未来命令会滞留）。默认无界以保持兼容。
+    /// </summary>
+    public int MaxCount { get; }
+
+    public CommandQueue(int maxCount = 0) => MaxCount = maxCount;
+
     private long _nextSequence;
 
     public int Count
@@ -1115,13 +1124,21 @@ public sealed class CommandQueue
         get { lock (_gate) return _queue.Count == 0; }
     }
 
-    public void Enqueue(Command command)
+    /// <summary>
+    /// 入队命令。超出 <see cref="MaxCount"/>（且非 0）时**拒绝入队并返回 false**，
+    /// 由调用方决定回退策略（通常拒绝该客户端操作）；队列不无限增长。无界（MaxCount==0）时恒为 true。
+    /// </summary>
+    public bool Enqueue(Command command)
     {
         ArgumentNullException.ThrowIfNull(command);
         lock (_gate)
         {
+            if (MaxCount > 0 && _queue.Count >= MaxCount)
+                return false;
+
             var sequence = _nextSequence++;
             _queue.Enqueue(new QueuedCommand(command, sequence), (command.Tick, sequence));
+            return true;
         }
     }
 
