@@ -165,7 +165,7 @@ public partial class WorldSimulator
     private const float SlimeJumpThreshold = -1000f;
 
     /// <summary>
-    /// 原版 AI_001_Slimes 的移动核心（逐条对照原版源码，去掉了仅客户端表现与特殊变体分支）：
+    /// 原版 AI_001_Slimes 的移动核心（逐条对照原版实现，去掉了仅客户端表现与特殊变体分支）：
     /// <list type="bullet">
     ///   <item>`ai[2] == 0` 时一次性初始化：`ai[0] = -100`、`ai[2] = 1`、选定目标方向。</item>
     ///   <item>贴地：`ai[2]` 递减；`ai[3] == position.X` → 判定卡住 → 反向；地面摩擦 `velocity.X *= 0.8`；

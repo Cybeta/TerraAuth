@@ -247,6 +247,8 @@ public sealed class TerminalStage : IPipelineStage
         PlayerManaPacket mana => new SetManaCommand(context.Tick, context.PlayerId, mana.Mana, mana.MaxMana),
         // 包 50 PlayerBuffs → 服务端持有增益列表
         PlayerBuffsPacket buffs => new SetBuffsCommand(context.Tick, context.PlayerId, buffs.BuffTypes),
+        // 包 53 AddNPCBuff → 命中给 NPC 施加单条减益（服务端权威并入该 NPC 增益列表）
+        AddNpcBuffPacket nbc => new ApplyNpcBuffCommand(context.Tick, context.PlayerId, nbc.NpcId, nbc.BuffType, nbc.Time),
         // 包 12 PlayerSpawn（Playing 阶段）→ 复活请求（服务端划定复活点）
         PlayerSpawnPacket => new RespawnCommand(context.Tick, context.PlayerId),
         // 包 27 SyncProjectile → 弹幕生成 / 更新（服务端登记生命周期）

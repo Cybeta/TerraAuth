@@ -267,6 +267,17 @@ public sealed class PacketEncoder : IPacketEncoder
                     bw.Write((ushort)0);
                     break;
 
+                case NpcBuffSyncPacket nbc:
+                    // NpcBuffSync（包 54）：Int16 npcId + [UInt16 type, UInt16 time]… + UInt16 0 结束
+                    bw.Write((short)nbc.NpcId);
+                    foreach (var buff in nbc.Buffs)
+                    {
+                        bw.Write((ushort)buff.Type);
+                        bw.Write((ushort)buff.Time);
+                    }
+                    bw.Write((ushort)0);
+                    break;
+
                 case TeleportEntityPacket teleport:
                     WriteTeleportEntity(bw, teleport);
                     break;

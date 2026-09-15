@@ -1,8 +1,10 @@
 // TerraAuth — Phase 3 验收测试
 
 using System;
+using System.Buffers;
 using System.Threading;
 using System.Threading.Tasks;
+using TerraAuth.Net.Transport;
 using TerraAuth.Protocol;
 using TerraAuth.Simulation;
 using Xunit;
@@ -2295,5 +2297,195 @@ public class WorldGeneratorTests
         Assert.Equal(idA, b.UniqueId);
         Assert.Equal(spawnXA, b.SpawnTileX);
         Assert.Equal(typeA, b.Tiles[1234, b.SpawnTileY].Type);
+    }
+
+    // ---------- 3B：NPC 增益同步（包 53 入站并入 + 包 54 全量回写） ----------
+
+    /// <summary>服务端有权威 NPC 时，包 53 上报并入增益并触发包 54 变更标记。</summary>
+    [Fact]
+    public void ApplyNpcBuff_StoresBuff_And_MarksBuffsChanged()
+    {
+        var world = new WorldState();
+        int index;
+        lock (world.NpcsLock)
+        {
+            var npc = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                Active = true,
+                Life = 25,
+                LifeMax = 25,
+            };
+            world.Npcs.Add(npc);
+            index = world.Npcs.IndexOf(npc);
+        }
+        var rng = new XoshiroRng(1);
+
+        // 并入一条减益（包 53 语义）
+        Assert.True(new ApplyNpcBuffCommand(1, 1, index, 24, Time: 480).Apply(world, rng).Applied);
+        lock (world.NpcsLock)
+        {
+            var npc = world.Npcs[index];
+            Assert.Equal(480, npc.Buffs[24]);
+        }
+        Assert.Contains(index, world.DrainNpcBuffsChanged(8));
+
+        // 同类型已存在 → 应该不超 5 槽上限（覆盖更新）
+        Assert.True(new ApplyNpcBuffCommand(2, 1, index, 24, Time: 900).Apply(world, rng).Applied);
+        Assert.True(new ApplyNpcBuffCommand(3, 1, index, 30, Time: 300).Apply(world, rng).Applied);
+        Assert.True(new ApplyNpcBuffCommand(4, 1, index, 33, Time: 600).Apply(world, rng).Applied);
+        Assert.True(new ApplyNpcBuffCommand(5, 1, index, 35, Time: 120).Apply(world, rng).Applied);
+        lock (world.NpcsLock)
+        {
+            var npc = world.Npcs[index];
+            Assert.True(npc.Buffs.Count <= 5, "NPC 增益槽超过 5");
+            Assert.Equal(900, npc.Buffs[24]);
+            Assert.Equal(4, npc.Buffs.Count);
+        }
+
+        // 时长 ≤0 → 移除该减益
+        Assert.True(new ApplyNpcBuffCommand(6, 1, index, 24, Time: 0).Apply(world, rng).Applied);
+        lock (world.NpcsLock) Assert.False(world.Npcs[index].Buffs.ContainsKey(24));
+    }
+
+    /// <summary>无玩家身份 / NPC 槽越界 / 目标已死 → 拒接且不误标记。</summary>
+    [Fact]
+    public void ApplyNpcBuff_Rejects_InvalidTargets()
+    {
+        var world = new WorldState();
+        lock (world.NpcsLock)
+        {
+            world.Npcs.Add(new WorldNpc { Type = 1, NetId = 1, Active = false });
+        }
+        var rng = new XoshiroRng(1);
+
+        // 槽越界
+        Assert.False(new ApplyNpcBuffCommand(1, 1, 99, 24, 300).Apply(world, rng).Applied);
+        // 目标 inactive
+        Assert.False(new ApplyNpcBuffCommand(2, 1, 0, 24, 300).Apply(world, rng).Applied);
+        // 未标记任何变更
+        Assert.Empty(world.DrainNpcBuffsChanged(8));
+    }
+
+    /// <summary>包 54（编码 → 解码）对称：NpcBuffSync 载荷往返一致。</summary>
+    [Fact]
+    public void NpcBuffSync_RoundTrips_In_Codec()
+    {
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var decoder = new PacketDecoder();
+        var memory = new ArrayBufferWriter<byte>();
+
+        var packet = new NpcBuffSyncPacket(NpcId: 7, new[] { new NpcBuffEntry(24, 480), new NpcBuffEntry(30, 300) });
+        encoder.Encode(memory, PacketId.NpcBuffSync, packet);
+
+        var buffer = new ReadOnlySequence<byte>(memory.WrittenMemory);
+        Assert.True(decoder.TryDecodeFrame(ref buffer, new DecodeContext(), out var decoded));
+        var typed = Assert.IsType<NpcBuffSyncPacket>(decoded);
+
+        Assert.Equal(7, typed.NpcId);
+        Assert.Collection(typed.Buffs,
+            e => { Assert.Equal(24, e.Type); Assert.Equal(480, e.Time); },
+            e => { Assert.Equal(30, e.Type); Assert.Equal(300, e.Time); });
+    }
+
+    // ---------- 3C(A)：服务端弹幕权威（图格碰撞 / 追踪 / 反弹） ----------
+
+    /// <summary>
+    /// 追踪弹幕（type 20 Demon Scythe，Homing=true）：向左侧飞行的弹幕，存在右侧敌怪时应逐步转向，
+    /// 速度方向变为朝目标（Velocity.X 转正），且速度模长保持不变、不因追踪被图格误杀。
+    /// </summary>
+    [Fact]
+    public void Projectile_With_Homing_SteersTowardEnemy()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sy = world.SpawnTileY;
+        int sx = world.SpawnTileX;
+
+        // 清出大块空域（含左侧初始漂移方向），避免追踪过程撞地形
+        for (int y = sy - 20; y < sy - 2; y++)
+            for (int x = sx - 40; x < sx + 70; x++)
+            {
+                ref var t = ref world.Tiles[x, y];
+                t.Active = false;
+                t.Type = 0;
+            }
+
+        var enemy = new WorldNpc
+        {
+            Type = 1, NetId = 1, AiStyle = 1, Active = true, Life = 25, LifeMax = 25,
+            X = (sx + 40) * 16f,            // 目标在右侧
+            Y = (sy - 8) * 16f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(enemy);
+
+        var proj = new ProjectileEntity
+        {
+            Key = -1, Owner = -1, Type = 20,
+            Position = new Vector2(sx * 16f, (sy - 8) * 16f),
+            Velocity = new Vector2(-5f, 0f), // 初始向左飞
+            Damage = 20, TimeLeft = 480, Active = true,
+        };
+        lock (world.ProjectilesLock) world.Projectiles.Add(proj);
+
+        float initSpeed = MathF.Sqrt(proj.Velocity.X * proj.Velocity.X + proj.Velocity.Y * proj.Velocity.Y);
+
+        for (int i = 0; i < 60; i++) sim.Tick();
+
+        lock (world.ProjectilesLock)
+        {
+            Assert.True(proj.Active, "追踪弹幕在转向过程中意外失效");
+            Assert.True(proj.Velocity.X > 0f,
+                $"追踪未转向目标：速度仍朝左 (Vx={proj.Velocity.X:F2})");
+        }
+        float speedAfter = MathF.Sqrt(proj.Velocity.X * proj.Velocity.X + proj.Velocity.Y * proj.Velocity.Y);
+        Assert.InRange(speedAfter, initSpeed - 0.01f, initSpeed + 0.01f); // 追踪只转向、不加减速
+    }
+
+    /// <summary>
+    /// 反弹弹幕（type 81 Water Bolt，Bounces&gt;0 + TileCollide）：撞到实心墙应反弹（X 速度翻号），
+    /// 不失效；反弹预算（BouncesLeft）随反弹递减。
+    /// </summary>
+    [Fact]
+    public void Projectile_With_Bounce_ReflectsOff_Wall()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sy = world.SpawnTileY;
+        int sx = world.SpawnTileX;
+        int wallCol = sx + 24;
+
+        // 清空墙左侧空域（测试区横带）
+        for (int y = sy - 10; y < sy + 1; y++)
+            for (int x = sx - 2; x < wallCol; x++)
+            {
+                ref var t = ref world.Tiles[x, y];
+                t.Active = false; t.Type = 0;
+            }
+        // 竖起一面实心墙（从地表延伸到空域带）
+        for (int y = sy - 12; y < sy + 20; y++)
+        {
+            ref var t = ref world.Tiles[wallCol, y];
+            t.Active = true; t.Type = 0;
+        }
+
+        var proj = new ProjectileEntity
+        {
+            Key = -1, Owner = -1, Type = 81,
+            Position = new Vector2((wallCol - 4) * 16f, (sy - 4) * 16f), // 墙左侧，朝右飞
+            Velocity = new Vector2(6f, 0f),
+            Damage = 15, TimeLeft = 180, Active = true,
+        };
+        lock (world.ProjectilesLock) world.Projectiles.Add(proj);
+
+        for (int i = 0; i < 25; i++) sim.Tick(); // 让弹幕飞抵墙并反弹
+
+        lock (world.ProjectilesLock)
+        {
+            Assert.True(proj.Active, "反弹弹幕应反射而非失效");
+            Assert.True(proj.Velocity.X < 0f, $"撞墙后未反弹：Vx={proj.Velocity.X:F2}（应为负）");
+            Assert.True(proj.BouncesLeft >= 0 && proj.BouncesLeft <= 20, $"反弹预算异常：{proj.BouncesLeft}");
+        }
     }
 }

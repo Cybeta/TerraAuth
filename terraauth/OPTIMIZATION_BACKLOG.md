@@ -467,7 +467,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 
 ### 第二十五轮（2026-09-12）：按原版 aiStyle 重建 NPC AI（二）—— aiStyle 31/43 + 服务端弹幕推送框架
 
-**继续移植 Boss aiStyle**（承第二十四轮的「剩余清单」第 1、2 项，逐条对照原版源码行号）：
+**继续移植 Boss aiStyle**（承第二十四轮的「剩余清单」第 1、2 项，逐条对照原版实现行号）：
 
 - **aiStyle 31（Spazmatism，type 126）** —— `Ai031Spazmatism`：
   - 一阶段 `ai[1] == 0`：绕到「玩家中心 ±400px」的侧面（加速 0.4 / 限速 12），每 **60 帧**发 1 枚 type 96 魔焰弹
@@ -518,7 +518,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 
 ### 第二十四轮（2026-09-12）：按原版 aiStyle 重建 NPC AI（一）—— 地基 + aiStyle 1 + ai 下发
 
-**目标**（用户要求）：怪物 AI 全部参考原版源码实现、重新构建；含框架、并把 `ai[0..3]` 下发。
+**目标**（用户要求）：怪物 AI 全部参考原版实现、重新构建；含框架、并把 `ai[0..3]` 下发。
 **本轮交付地基 + 第一个 aiStyle**（其余 aiStyle 与框架按同法逐轮补齐，见文末「剩余清单」）。
 
 **结构调整（对齐原版）**：
@@ -528,7 +528,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
   各 aiStyle 实现 + 共用物理步 `StepNpcPhysics`。顺序与原版一致：**AI 只设速度/ai → 物理步走重力与图格碰撞**。
 - 未移植的 aiStyle 走 `AiFallback`（简化追击），Boss 仍走 `SimulateBossStep`（自移动）。
 
-**已移植：aiStyle 1（Slimes，原版 `AI_001_Slimes`）** —— 逐条对照原版源码：
+**已移植：aiStyle 1（Slimes，原版 `AI_001_Slimes`）** —— 逐条对照原版实现：
 
 - 初始化：`ai[2] == 0` → `ai[0] = -100`、`ai[2] = 1`、选定目标方向。
 - 贴地：`ai[2]` 递减；`ai[3] == position.X` → 卡住 → `direction *= -1`、`ai[2] = 200`；

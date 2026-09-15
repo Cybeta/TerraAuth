@@ -89,6 +89,13 @@ public sealed class ProjectileEntity
     /// </summary>
     public bool Destroyed;
 
+    /// <summary>
+    /// 图格反弹剩余次数（-1 = 未初始化 / 该型无反弹）。由行为表首次积分时填充
+    /// （<see cref="WorldSimulator.ProjectileBehavior"/>）为原版 <c>penetrate/bounce</c> 预算，
+    /// 撞图格反弹时递减；归零后再撞即失效。
+    /// </summary>
+    public int BouncesLeft = -1;
+
     /// <summary>失效发生的 tick（用于延后清理）。</summary>
     public long DeadTick;
 

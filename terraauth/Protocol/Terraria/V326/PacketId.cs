@@ -46,6 +46,8 @@ public enum PacketId : byte
     PlayerMana          = 42,   // 原版 PlayerMana：法力 / 法力上限
     InitialSpawn        = 49,   // 原版 InitialSpawn：无 payload
     PlayerBuffs         = 50,   // 原版 PlayerBuffs：增益 / 减益列表
+    AddNpcBuff          = 53,   // 原版 AddNPCBuff：客户端向服务端上报「命中给 NPC 施加单条减益」（Int16 npcId + UInt16 type + Int16 time）
+    NpcBuffSync         = 54,   // 原版 UpdateNPCBuff：服务端下发某 NPC 的**全量**增益列表（Int16 npcId + [UInt16 type, UInt16 time]… + UInt16 0）
     TeleportEntity      = 65,   // 原版 TeleportEntity：玩家 / NPC / 玩家间传送（含确认）
     RequestTeleportationByServer = 73, // 原版 RequestTeleportationByServer：回城药水 / 海螺等
     TilePlace           = 79,   // 原版 PlaceObject

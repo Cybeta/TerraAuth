@@ -315,6 +315,8 @@ public sealed class GameHost : IDisposable
                 await FlushPlayerUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端权威修改的增益列表（如移除召唤 Buff）→ 包 50 回写本人
                 await FlushPlayerBuffsAsync(ct).ConfigureAwait(false);
+                // 服务端权威修改的 NPC 增益列表 → 包 54 向全体玩家回写
+                await FlushNpcBuffsAsync(ct).ConfigureAwait(false);
                 // 箱子改动只在仿真提交后同步给当前打开该箱子的玩家
                 await FlushChestUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端判定的玩家受击（接触 / 下落伤害）→ 包 117 + 包 16
@@ -695,6 +697,43 @@ public sealed class GameHost : IDisposable
             catch (Exception ex) when (IsTransientSendFailure(ex))
             {
                 // 发送失败（连接已断开等）：该玩家已不在线，直接丢弃；重连后按全量状态重新下发。
+            }
+        }
+    }
+
+    /// <summary>单批 NPC 增益变更通知上限。</summary>
+    private const int MaxNpcBuffsPerFlush = 64;
+
+    /// <summary>
+    /// 服务端权威修改某 NPC 增益列表（包 53 上报并入 / 服务端施加）后，向全体玩家下发包 54（NpcBuffSync）
+    /// 回写该 NPC 的**全量**增益列表。原版 <c>NetMessage.SendData(54)</c> 广播给所有玩家；
+    /// 增益状态相对图格/位置不敏感，故不做视口裁剪，统一广播。
+    /// </summary>
+    public async Task FlushNpcBuffsAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var npcIds = world.DrainNpcBuffsChanged(MaxNpcBuffsPerFlush);
+        foreach (var npcId in npcIds)
+        {
+            NpcBuffEntry[] buffs;
+            lock (world.NpcsLock)
+            {
+                if (npcId < 0 || npcId >= world.Npcs.Count || !world.Npcs[npcId].Active)
+                    continue;
+                var npc = world.Npcs[npcId];
+                buffs = npc.Buffs
+                    .Select(kv => new NpcBuffEntry(kv.Key, kv.Value))
+                    .ToArray();
+            }
+
+            try
+            {
+                await Network.BroadcastWhereAsync(PacketId.NpcBuffSync,
+                    new NpcBuffSyncPacket(npcId, buffs), _ => true, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                // 广播失败（无连接/断开）：已不在线，直接丢弃；重连后按全量状态重新下发。
             }
         }
     }

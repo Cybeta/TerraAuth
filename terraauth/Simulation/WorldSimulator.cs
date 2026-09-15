@@ -327,6 +327,9 @@ public partial class WorldSimulator : IWorldViewProvider
                 && (item.RemovalNotified || _world.Tick - item.DeadTick > EntityRemovalGraceTicks));
         }
 
+        // 追踪弹幕锁外刷新敌怪目标快照（含 NpcsLock；须在 ProjectilesLock 之前，见 RefreshProjectileTargets）。
+        RefreshProjectileTargets();
+
         lock (_world.ProjectilesLock)
         {
             foreach (var p in _world.Projectiles)

@@ -314,6 +314,9 @@ public sealed class WorldState
             case 134: Progress.DownedMechBoss1 = true; Progress.DownedMechBossAny = true; break; // The Destroyer
             case 125 or 126: Progress.DownedMechBoss2 = true; Progress.DownedMechBossAny = true; break; // The Twins
             case 127: Progress.DownedMechBoss3 = true; Progress.DownedMechBossAny = true; break; // Skeletron Prime
+            case 657: Progress.DownedQueenSlime = true; break;           // Queen Slime
+            case 636: Progress.DownedEmpressOfLight = true; break;       // Empress of Light
+            case 668: Progress.DownedDeerclops = true; break;            // Deerclops
             case 109: Progress.DownedClown = true; break;                // Clown
             default: return;
         }
@@ -323,15 +326,30 @@ public sealed class WorldState
     }
 
     /// <summary>
-    /// Boss 掉落表（**简化模型**：物品 ID 按原版 <c>ItemID</c> 核对，数量为简化值）。
-    /// 未收录的 Boss 不掉落 —— 原版掉落规则在掉落数据库中，此处不逐条复刻。
+    /// Boss 掉落表（**简化模型**：每 Boss 给标志性/必定掉落，数量为简化值）。
+    /// 物品 ID 依原版掉落数据库与 NPC.NPCLoot 逐项核对，均有原版依据；未逐条复刻概率与专家/大师袋。
     /// </summary>
-    private static readonly Dictionary<int, (int ItemId, int Stack)> BossLoot = new()
+    private static readonly Dictionary<int, (int ItemId, int Stack)[]> BossLoot = new()
     {
-        [4] = (56, 30),      // Eye of Cthulhu → Demonite Ore
-        [13] = (56, 30),     // Eater of Worlds → Demonite Ore
-        [50] = (23, 50),     // King Slime → Gel
-        [222] = (2431, 10),  // Queen Bee → Bee Wax
+        [4]   = new[] { (56, 30) },                    // Eye of Cthulhu → Demonite Ore（腐化；猩红世界为 CrimtaneOre 880）
+        [13]  = new[] { (56, 30), (86, 5) },           // Eater of Worlds → Demonite Ore + Shadow Scale
+        [266] = new[] { (880, 30) },                   // Brain of Cthulhu → Crimtane Ore
+        [50]  = new[] { (23, 50), (998, 1) },          // King Slime → Gel + Solidifier
+        [222] = new[] { (2431, 10), (1121, 1) },       // Queen Bee → Bee Wax + Beegun
+        [35]  = new[] { (1313, 1) },                   // Skeletron → Book of Skulls
+        [113] = new[] { (367, 1), (490, 1) },          // Wall of Flesh → Pwnhammer + Warrior Emblem（必掉）
+        [125] = new[] { (549, 25), (1225, 15) },       // The Twins → Soul of Sight + Hallowed Bar
+        [126] = new[] { (549, 25), (1225, 15) },       // The Twins(Spazmatism) 同上
+        [134] = new[] { (548, 25), (1225, 15) },       // The Destroyer → Soul of Might + Hallowed Bar
+        [127] = new[] { (547, 25), (1225, 15) },       // Skeletron Prime → Soul of Fright + Hallowed Bar
+        [262] = new[] { (1141, 1), (1157, 1) },        // Plantera → Temple Key（必掉）+ Pygmy Staff
+        [245] = new[] { (1294, 1), (2218, 18) },       // Golem → Picksaw + Beetle Husk
+        [370] = new[] { (2624, 1), (2609, 1) },        // Duke Fishron → Tsunami + Fishron Wings
+        [657] = new[] { (4986, 50), (4980, 1) },       // Queen Slime → Gel Balloon + Hook of Dissonance
+        [636] = new[] { (4923, 1) },                   // Empress of Light → 武器(4选一)
+        [668] = new[] { (5098, 1) },                   // Deerclops → Chester 宠物(1/3)
+        [439] = new[] { (3549, 1) },                   // Lunatic Cultist → Lunar Crafting Station（必掉）
+        [398] = new[] { (3460, 90), (3384, 1) },       // Moon Lord → Lunar Ore（必掉）+ Portal Gun
     };
 
     /// <summary>世界掉落物槽位上限（与原版 <c>Main.item[400]</c> 一致）。</summary>
@@ -344,22 +362,25 @@ public sealed class WorldState
 
         lock (ItemsLock)
         {
-            if (Items.Count >= MaxItemSlots) return;
-
-            int slot = 0;
-            while (Items.Any(i => i.Slot == slot)) slot++;
-
-            Items.Add(new WorldItemEntity
+            foreach (var drop in loot)
             {
-                Slot = slot,
-                ItemId = loot.ItemId,
-                Stack = loot.Stack,
-                Position = new Vector2(x, y),
-                Velocity = new Vector2(0f, 0f),
-                Prefix = 0,
-                OwnedBy = -1,
-                NewNotified = false, // 服务端生成 → 客户端尚不知情，需补发包 21
-            });
+                if (Items.Count >= MaxItemSlots) return;
+
+                int slot = 0;
+                while (Items.Any(i => i.Slot == slot)) slot++;
+
+                Items.Add(new WorldItemEntity
+                {
+                    Slot = slot,
+                    ItemId = drop.ItemId,
+                    Stack = drop.Stack,
+                    Position = new Vector2(x, y),
+                    Velocity = new Vector2(0f, 0f),
+                    Prefix = 0,
+                    OwnedBy = -1,
+                    NewNotified = false, // 服务端生成 → 客户端尚不知情，需补发包 21
+                });
+            }
         }
     }
 
@@ -624,6 +645,38 @@ public sealed class WorldState
                 if (result.Count >= max) break;
             }
             foreach (var playerId in result) _pendingPlayerBuffs.Remove(playerId);
+            return result;
+        }
+    }
+
+    // ---- NPC 增益列表变更推送（仿真修改 NPC 增益后生成原版包 54）----
+
+    public object NpcBuffsLock { get; } = new();
+    private readonly HashSet<int> _pendingNpcBuffs = new();
+
+    /// <summary>
+    /// 标记某 NPC 的增益列表已由服务端权威修改（如服务端施加减益 / 移除增益），
+    /// 世界同步线程据此向全体玩家下发包 54（NpcBuffSync）回写该 NPC 的全量列表。
+    /// </summary>
+    public void MarkNpcBuffsChanged(int npcId)
+    {
+        lock (NpcBuffsLock) _pendingNpcBuffs.Add(npcId);
+    }
+
+    public List<int> DrainNpcBuffsChanged(int max)
+    {
+        if (max <= 0)
+            return new List<int>();
+
+        lock (NpcBuffsLock)
+        {
+            var result = new List<int>(Math.Min(max, _pendingNpcBuffs.Count));
+            foreach (var npcId in _pendingNpcBuffs)
+            {
+                result.Add(npcId);
+                if (result.Count >= max) break;
+            }
+            foreach (var npcId in result) _pendingNpcBuffs.Remove(npcId);
             return result;
         }
     }
@@ -1451,6 +1504,14 @@ public sealed class WorldNpc
 
     public float VelocityX;
     public float VelocityY;
+
+    // ---- 增益 / 减益（原版 NPC.buffType / NPC.buffTime，最多 5 槽）----
+
+    /// <summary>
+    /// NPC 当前增益 / 减益：buffType → 剩余时长（tick）。原版上限 5 槽（包 54 下发全量）。
+    /// 服务端权威增减，改动后须调用 <see cref="WorldState.MarkNpcBuffsChanged"/> 触发包 54 回写。
+    /// </summary>
+    public readonly Dictionary<int, int> Buffs = new();
 
     /// <summary>是否存活；false 时同步 <c>life=0</c> 让客户端移除。</summary>
     public bool Active = true;

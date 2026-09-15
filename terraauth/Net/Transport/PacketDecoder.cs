@@ -88,6 +88,8 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.PlayerHeal        => DecodePlayerHeal(reader),
             PacketId.SyncPlayerZone    => DecodeSyncPlayerZone(reader),
             PacketId.PlayerBuffs       => DecodePlayerBuffs(reader),
+            PacketId.AddNpcBuff        => DecodeAddNpcBuff(reader),
+            PacketId.NpcBuffSync       => DecodeNpcBuffSync(reader),
             PacketId.TeleportEntity    => DecodeTeleportEntity(reader),
             PacketId.RequestTeleportationByServer => DecodeRequestTeleportationByServer(reader),
             PacketId.PlayerHurtV2      => DecodePlayerHurtV2(reader),
@@ -606,6 +608,31 @@ public sealed class PacketDecoder : IPacketDecoder
             buffs.Add(buffType);
         }
         return new PlayerBuffsPacket(playerId, buffs);
+    }
+
+    private INetworkPacket DecodeAddNpcBuff(BinaryReader r)
+    {
+        // AddNPCBuff（包 53）：Int16 npcId + UInt16 type + Int16 time
+        var npcId = r.ReadInt16();
+        var buffType = r.ReadUInt16();
+        var time = r.ReadInt16();
+        return new AddNpcBuffPacket(npcId, buffType, time);
+    }
+
+    private INetworkPacket DecodeNpcBuffSync(BinaryReader r)
+    {
+        // UpdateNPCBuff（包 54）：Int16 npcId + [UInt16 type, UInt16 time]… + UInt16 0 结束
+        var npcId = r.ReadInt16();
+        var buffs = new List<NpcBuffEntry>();
+        while (true)
+        {
+            var buffType = r.ReadUInt16();
+            if (buffType == 0)
+                break;
+            var time = r.ReadUInt16();
+            buffs.Add(new NpcBuffEntry(buffType, time));
+        }
+        return new NpcBuffSyncPacket(npcId, buffs);
     }
 
     private INetworkPacket DecodeTeleportEntity(BinaryReader r)

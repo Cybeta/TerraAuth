@@ -50,27 +50,42 @@ public static class SummonProjectileTable
     };
 
     /// <summary>
-    /// 召唤武器（物品 ID）→ 其召唤 Buff（原版 <c>Item.SetDefaults</c> 的 <c>buffType</c> 字段）。
+    /// 召唤武器（物品 ID）→ 其召唤 Buff（原版 <c>Item.SetDefaults</c> 的 <c>buffType</c> 字段，逐条核对原版实现）。
     /// 用于「移除召唤武器即销毁」（<see cref="WorldState.DestroySummonsOnWeaponRemoval"/>）时
     /// 同步移除客户端对应召唤 Buff：原版仆从由该 Buff 驱动存活，**只销毁服务端弹幕（包 29）不够**——
     /// 客户端 Buff 未移除时仆从不消失，仍持续发射弹幕并造成伤害（用户实测：必须手动点掉 Buff 提示）。
-    /// 哨兵法杖（1572 FrostHydra / 3569 LunarPortal / 3571 RainbowCrystal）无玩家 Buff，不在此列。
+    /// 覆盖全部召唤武器（含 1.4.5+/交叉内容）。下列**哨兵炮台**在 <c>Item.SetDefaults</c> 里只设
+    /// <c>sentry = true</c>、无 <c>buffType</c>，即无玩家召唤 Buff——无需清，故刻意不入表：
+    /// 1572 FrostHydra / 3569 MoonlordTurret / 3571 RainbowCrystal / 3834 DD2Trap /
+    /// 5119 HoundiusShootius / 5463 DeadCellsBarnacle。
     /// </summary>
     public static readonly IReadOnlyDictionary<int, int> SummonWeaponBuff = new Dictionary<int, int>
     {
-        [1157] = 49,   // PygmyStaff → Pygmy
-        [1309] = 64,   // SlimeStaff → BabySlime
-        [1802] = 83,   // RavenStaff → Raven
-        [3249] = 161,  // DeadlySphereStaff → DeadlySphere
-        [3474] = 182,  // StardustCellStaff → StardustMinion
-        [3531] = 188,  // StardustDragonStaff → StardustDragon
+        [1157] = 49,   // Pygmy Staff → Pygmies                (Item.cs:14284)
+        [1309] = 64,   // Slime Staff → BabySlime              (Item.cs:16240)
+        [1802] = 83,   // Raven Staff → Ravens                 (Item.cs:20046)
+        [3249] = 161,  // Deadly Sphere Staff → DeadlySphere  (Item.cs:29965)
+        [3474] = 182,  // Stardust Cell Staff → StardustMinion(Item.cs:31197)
+        [3531] = 188,  // Stardust Dragon Staff → Dragon      (Item.cs:31766)
+        [4269] = 213,  // Sanguine Staff → Sanguine Bat        (Item.cs:36769)
+        [4273] = 214,  // Vampire Frog Staff → VampireFrog    (Item.cs:36840)
+        [4281] = 216,  // Finch Staff → BabyBird               (Item.cs:36898)
+        [4607] = 263,  // Desert Tiger Staff → StormTiger     (Item.cs:38190)
+        [4758] = 271,  // Blade Staff → Smolstar               (Item.cs:39167)
+        [5005] = 322,  // Empress' Blade → EmpressBlade       (Item.cs:40337)
+        [5069] = 325,  // Flinx Staff → FlinxMinion            (Item.cs:40690)
+        [5114] = 335,  // Abigail's Flower → AbigailMinion    (Item.cs:41025)
+        [5456] = 355,  // Dead Cells Mushroom Boi             (Item.cs:43062)
+        [5663] = 385,  // Palworld Cattiva                     (Item.cs:44532)
+        [5664] = 386,  // Palworld Foxsparks                   (Item.cs:44551)
+        [6148] = 389,  // Palworld Trusty Cattiva              (Item.cs:47405)
+        [6149] = 390,  // Palworld Trusty Foxsparks            (Item.cs:47425)
+        [6161] = 393,  // Clay Pot Minion                      (Item.cs:47548)
+        [6164] = 394,  // Forbidden Minion                     (Item.cs:47567)
     };
 
+    private static readonly HashSet<int> SummonBuffSet = new(SummonWeaponBuff.Values);
+
     /// <summary>判断 Buff 是否为召唤 Buff（供 <see cref="WorldState.KillSummonedProjectiles"/> 移除）。</summary>
-    public static bool IsSummonBuff(int buffId)
-    {
-        foreach (var buff in SummonWeaponBuff.Values)
-            if (buff == buffId) return true;
-        return false;
-    }
+    public static bool IsSummonBuff(int buffId) => SummonBuffSet.Contains(buffId);
 }

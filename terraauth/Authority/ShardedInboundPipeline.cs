@@ -32,19 +32,28 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _dispatcher;
     private readonly int _maxBatchSize;
+    private readonly int _queueCapacity;
 
-    public ShardedInboundPipeline(IInboundPipeline inner, int shardCount, int maxBatchSize = 64)
+    public ShardedInboundPipeline(IInboundPipeline inner, int shardCount, int maxBatchSize = 64,
+        int queueCapacity = 4096)
     {
         ArgumentNullException.ThrowIfNull(inner);
         _inner = inner;
         _maxBatchSize = Math.Max(1, maxBatchSize);
+        _queueCapacity = Math.Max(1, queueCapacity);
         _processor = new ShardedAuthorityProcessor<InboundWork, AuthorityResult>(
             shardCount,
             (_, work) => work.IsReset
                 ? ResetPlayerCore(work.PlayerId, work.SessionId)
                 : inner.ProcessAsync(work.Packet!, work.PlayerId, work.Commands!, work.Ct, work.SessionId)
                     .GetAwaiter().GetResult());
-        _queue = Channel.CreateUnbounded<InboundWork>(new UnboundedChannelOptions { SingleReader = true });
+        // 入站有界：容量上限 + FullMode.Wait，满时阻塞写入（背压传导）。
+        // 见 OPTIMIZATION_BACKLOG §三 第 7 项（原为无界，剔除无界内存风险）。
+        _queue = Channel.CreateBounded<InboundWork>(new BoundedChannelOptions(_queueCapacity)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
         _dispatcher = Task.Run(() => DispatchLoopAsync(_cts.Token));
     }
 
@@ -52,17 +61,34 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
         INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct = default)
         => ProcessAsync(packet, playerId, commands, ct, 0);
 
-    public Task<AuthorityResult> ProcessAsync(
+    public async Task<AuthorityResult> ProcessAsync(
         INetworkPacket packet, int playerId, CommandQueue commands, CancellationToken ct, long sessionId)
     {
         if (ct.IsCancellationRequested)
-            return Task.FromCanceled<AuthorityResult>(ct);
+            return await Task.FromCanceled<AuthorityResult>(ct).ConfigureAwait(false);
 
         var completion = new TaskCompletionSource<AuthorityResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_queue.Writer.TryWrite(new InboundWork(packet, playerId, commands, ct, completion, SessionId: sessionId)))
-            completion.TrySetException(new ObjectDisposedException(nameof(ShardedInboundPipeline)));
-        return completion.Task;
+        // 满则阻塞写入（FullMode.Wait）：把背压传导到网络读取端——权威校验跟不上时
+        // 不再无界堆积入站包，而是让慢消费者反过来拖慢供应商（真实服务端标准行为）。
+        try
+        {
+            await _queue.Writer.WriteAsync(
+                new InboundWork(packet, playerId, commands, ct, completion, SessionId: sessionId),
+                ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            completion.TrySetCanceled(ct);
+            throw;
+        }
+        catch (Exception ex) when (ex is ChannelClosedException or ObjectDisposedException)
+        {
+            var disposed = new ObjectDisposedException(nameof(ShardedInboundPipeline));
+            completion.TrySetException(disposed);
+            throw disposed;
+        }
+        return await completion.Task.ConfigureAwait(false);
     }
 
     /// <summary>
@@ -70,7 +96,17 @@ public sealed class ShardedInboundPipeline : IInboundPipeline, IAsyncDisposable
     /// （否则在途的旧位置包会把基线重新写回，重连后仍被判超速）。
     /// </summary>
     public void ResetPlayer(int playerId) => ResetPlayer(playerId, 0);
-    public void ResetPlayer(int playerId, long sessionId) => _queue.Writer.TryWrite(InboundWork.Reset(playerId, sessionId));
+    public void ResetPlayer(int playerId, long sessionId)
+    {
+        var work = InboundWork.Reset(playerId, sessionId);
+        // 有界队列若已满：重置**必须送达**（丢弃会使重连后旧基线未清 → 误判超速），
+        // 故短自旋等待腾位。重置极低频，仅极端过载时才可能短暂占用网络线程——正是有界背压的预期。
+        while (!_queue.Writer.TryWrite(work))
+        {
+            if (_cts.IsCancellationRequested) return;
+            Thread.SpinWait(256);
+        }
+    }
 
     private AuthorityResult ResetPlayerCore(int playerId, long sessionId)
     {

@@ -336,6 +336,28 @@ public sealed record PlayerBuffsPacket(int PlayerId, IReadOnlyList<int> BuffType
     public PacketId Type => PacketId.PlayerBuffs;
 }
 
+/// <summary>NPC 身上单条增益 / 减益（类型 + 剩余时长）。</summary>
+public readonly record struct NpcBuffEntry(int Type, int Time);
+
+/// <summary>
+/// 服务端下发某 NPC 的全量增益列表（NpcBuffSync，包 54，服务端 → 客户端）。
+/// 布局：Int16 npcId + [UInt16 type, UInt16 time]… + UInt16 0 结束。
+/// </summary>
+public sealed record NpcBuffSyncPacket(int NpcId, IReadOnlyList<NpcBuffEntry> Buffs) : INetworkPacket
+{
+    public PacketId Type => PacketId.NpcBuffSync;
+}
+
+/// <summary>
+/// 客户端上报「命中给 NPC 施加单条减益」（AddNpcBuff，包 53，客户端 → 服务端）。
+/// 布局：Int16 npcId + UInt16 type + Int16 time。
+/// 服务端权威校验后并入该 NPC 的增益列表。
+/// </summary>
+public sealed record AddNpcBuffPacket(int NpcId, int BuffType, int Time) : INetworkPacket
+{
+    public PacketId Type => PacketId.AddNpcBuff;
+}
+
 /// <summary>传送目标种类（TeleportEntity，包 65）：由线格式标志位 bit0 / bit1 组合得到。</summary>
 public enum TeleportEntityKind : byte
 {

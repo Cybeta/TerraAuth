@@ -51,8 +51,16 @@ internal interface IDbExecutor
 public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IWorldRepository, IDisposable
 {
     private readonly IDbExecutor _db;
-    private readonly Channel<AuditEntry> _auditChannel = Channel.CreateUnbounded<AuditEntry>(
-        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    /// <summary>审计队列容量上限。审计为 best-effort：落盘循环跟不上时丢弃新条，
+    /// 记忆体有界、不阻塞关键路径（原为无界，见 OPTIMIZATION_BACKLOG §三 第 7 项）。</summary>
+    private const int BoundedChannelCapacity = 4096;
+    private readonly Channel<AuditEntry> _auditChannel = Channel.CreateBounded<AuditEntry>(
+        new BoundedChannelOptions(BoundedChannelCapacity)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropWrite,
+        });
     private readonly CancellationTokenSource _batchCts = new();
     private readonly Task _batchTask;
 

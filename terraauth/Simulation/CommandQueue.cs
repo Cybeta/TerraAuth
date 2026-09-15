@@ -1051,6 +1051,48 @@ public sealed record SetBuffsCommand(long Tick, int? PlayerId, IReadOnlyList<int
     }
 }
 
+/// <summary>
+/// 客户端上报「命中给 NPC 施加单条减益」（包 53 AddNPCBuff）。
+/// 服务端权威并入该 NPC 的增益列表，并触发包 54 全量下发回写；时长 ≤0 视为移除该减益。
+/// 原版 NPC.buff 槽上限 5：超限按「替换首个迟到减益」的懒策略合并，避免客户端入队溢出。
+/// </summary>
+public sealed record ApplyNpcBuffCommand(long Tick, int? PlayerId, int NpcId, int BuffType, int Time)
+    : Command(Tick, PlayerId, "apply_npc_buff")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        lock (world.NpcsLock)
+        {
+            if (NpcId < 0 || NpcId >= world.Npcs.Count)
+                return new(false, CommandFailures.NotApplied);
+
+            var npc = world.Npcs[NpcId];
+            if (!npc.Active)
+                return new(false, CommandFailures.NotApplied);
+
+            if (Time <= 0)
+            {
+                npc.Buffs.Remove(BuffType);
+            }
+            else
+            {
+                if (npc.Buffs.Count >= 5 && !npc.Buffs.ContainsKey(BuffType))
+                {
+                    using (var e = npc.Buffs.Keys.GetEnumerator())
+                    {
+                        e.MoveNext();
+                        npc.Buffs.Remove(e.Current); // 懒替换首个（近似原版扫空槽取负值）
+                    }
+                }
+                npc.Buffs[BuffType] = Time;
+            }
+
+            world.MarkNpcBuffsChanged(NpcId);
+        }
+        return new(true);
+    }
+}
+
 /// <summary>命令队列：按 (tick, sequence) 线程安全、稳定排序。</summary>
 public sealed class CommandQueue
 {
