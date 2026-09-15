@@ -90,17 +90,20 @@ public partial class WorldSimulator
 
     /// <summary>
     /// 逐类型重力覆盖（原版 <c>NPC.UpdateNPC_UpdateGravity</c>）：默认 gravity 0.3 / maxFall 10，
-    /// 少数类型按 <c>ai</c> 状态覆盖（258 重力 0.1 且下落限速 3；425/427（ai[2]==1）重力 0.1；
-    /// 426 重力 0.1 且限速 3；541 无重力；576/577（ai[0]&gt;0 且 ai[1]==2）重力 0.45 且限速 32）。
+    /// 少数类型按 <c>ai</c> 状态覆盖（258 重力 0.1 且下落限速 3；425（ai[2]==1）重力 0.1；
+    /// 427（ai[2]==1）重力 0.1 且下落限速 4；426 重力 0.1 且限速 3；541 无重力；
+    /// 576/577（ai[0]&gt;0 且 ai[1]==2）重力 0.45 且限速 32；城镇 NPC 坐下（aiStyle==7 且 ai[0]==25）重力归零）。
     /// 液体 / 空间高度因子（乘 0.25~1）未建模，保持原版地面默认口径。
     /// </summary>
     private (float Gravity, float MaxFall) NpcGravityOf(WorldNpc npc) => npc.Type switch
     {
         258 => (0.1f, 3f),
-        425 or 427 => npc.Ai[2] == 1f ? (0.1f, 10f) : (NpcGravity, NpcMaxFallSpeed),
+        425 => npc.Ai[2] == 1f ? (0.1f, NpcMaxFallSpeed) : (NpcGravity, NpcMaxFallSpeed),
+        427 => npc.Ai[2] == 1f ? (0.1f, 4f) : (NpcGravity, NpcMaxFallSpeed),   // 原版 427 命中额外下落限速 4
         426 => (0.1f, 3f),
-        541 => (0f, 10f),
+        541 => (0f, NpcMaxFallSpeed),
         576 or 577 => npc.Ai[0] > 0f && npc.Ai[1] == 2f ? (0.45f, 32f) : (NpcGravity, NpcMaxFallSpeed),
+        _ when npc.AiStyle == 7 && npc.Ai[0] == 25f => (0f, NpcMaxFallSpeed), // 城镇 NPC 坐下(ai[0]==25)重力归零
         _ => (NpcGravity, NpcMaxFallSpeed),
     };
 
