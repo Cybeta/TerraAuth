@@ -127,11 +127,50 @@ public sealed class SnapshotBroadcaster
         await _parallel.FlushAllAsync(_sender.ActivePlayers, ct).ConfigureAwait(false);
     }
 
-    private byte[] Encode(SnapshotFrame frame)
+    private IReadOnlyList<byte[]> Encode(SnapshotFrame frame)
     {
-        var writer = new ArrayBufferWriter<byte>();
-        _encoder.EncodeSnapshot(writer, frame);
-        return writer.WrittenSpan.ToArray();
+        // 分包：一个快照帧按 MaxEntitiesPerPacket 拆成多个帧各自编码（缓解单包体积随实体数增长）。
+        // 被裁剪帧（Cull 返回）或超 65k 实体的极端帧，split 仍逐一编码为独立快照包。
+        var packets = new List<byte[]>();
+        foreach (var part in SplitFrame(frame, _config.MaxEntitiesPerPacket))
+        {
+            var writer = new ArrayBufferWriter<byte>();
+            _encoder.EncodeSnapshot(writer, part);
+            packets.Add(writer.WrittenSpan.ToArray());
+        }
+        return packets;
+    }
+
+    /// <summary>
+    /// 把帧按实体数量上限拆为若干子帧（每份 &lt;= <paramref name="maxPerPacket"/>）。
+    /// 每个子帧保留相同的 BaseTick / Tick / Checksum 语义，客户端按各自分帧独立解码；
+    /// 移除项并入首份，避免空实体帧（若实体量极少仍只产生 1 份）。
+    /// </summary>
+    internal static IReadOnlyList<SnapshotFrame> SplitFrame(SnapshotFrame frame, int maxPerPacket)
+    {
+        if (maxPerPacket <= 0)
+            maxPerPacket = int.MaxValue;
+
+        int total = frame.Entities.Count;
+        if (total <= maxPerPacket)
+            return new[] { frame };
+
+        int partCount = (int)Math.Ceiling((double)total / maxPerPacket);
+        var parts = new List<SnapshotFrame>(partCount);
+        for (int start = 0, i = 0; start < total; start += maxPerPacket, i++)
+        {
+            int count = Math.Min(maxPerPacket, total - start);
+            var entities = new List<EntityState>(count);
+            for (int k = 0; k < count; k++)
+                entities.Add(frame.Entities[start + k]);
+
+            parts.Add(SnapshotFrame.Create(
+                frame.Tick,
+                entities,
+                i == 0 ? frame.Removed : Array.Empty<RemovedEntity>(), // 移除项并入首份
+                baseTick: frame.BaseTick));
+        }
+        return parts;
     }
 
     /// <summary>
@@ -341,7 +380,8 @@ public sealed class SnapshotBroadcaster
             try
             {
                 var full = Cull(SnapshotFrame.BuildDelta(_world, previous: null), playerId);
-                await _sender.SendEncodedAsync(playerId, Encode(full)).ConfigureAwait(false);
+                foreach (var bytes in Encode(full))
+                    await _sender.SendEncodedAsync(playerId, bytes).ConfigureAwait(false);
             }
             catch
             {
@@ -357,7 +397,10 @@ public sealed class SnapshotBroadcaster
 
             try
             {
-                await _sender.SendEncodedAsync(playerId, Encode(frame)).ConfigureAwait(false);
+                foreach (var bytes in Encode(frame))
+                {
+                    await _sender.SendEncodedAsync(playerId, bytes).ConfigureAwait(false);
+                }
             }
             catch
             {

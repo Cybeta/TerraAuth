@@ -102,7 +102,7 @@
 8. **锁契约不统一**：`WorldState` 的锁契约（持锁范围 / 可重入性 / 快照一致性）与调用方假设不一致，存在竞态与死锁风险。
 9. **WorkerPool 设计分裂**：两套 WorkerPool 的调度、生命周期与错误处理语义不一致，应收敛为单一模型。
 10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效。
-11. **快照缓冲与批量限制未落地**：`SnapshotStore` 仍为 `List` + `RemoveAt/RemoveRange`（非环形缓冲）；`SnapshotConfig.MaxEntitiesPerPacket` **已定义但未被引用**（无实体分包）。
+11. **快照缓冲与批量限制未落地**：`SnapshotConfig.MaxEntitiesPerPacket` 指代的部分**已落地**（分包拆多元件见 §附「下一步建议」第 3 项）；`SnapshotStore` 仍为 `List` + `RemoveAt/RemoveRange`（非环形缓冲）仍为待办。
 12. **协议元数据与分层约束分散**：包元数据分散多处，单程序集结构无法有效约束分层依赖与包契约边界。
 
 > 结论：第 1~4 项已落地（依据见 §附第十九轮「代码侧核对结论」）；第 5 项部分落地；第 6~12 项仍为未完成风险，不应计入已完成。
@@ -736,14 +736,14 @@ Listening on port 7778
 - `CommandQueue` 确为 `PriorityQueue<Command, (long Tick, long Sequence)>`（无界）。
 - `Connection._outbound` 确为 `CreateBounded(2048)` + `FullMode = Wait`。
 - `PacketDecoder.DecodeNetModule` 确在 `new List<LiquidChange>(count)` **之前**校验 `maxChanges = 128` 与剩余长度。
-- `SnapshotConfig.MaxEntitiesPerPacket` 仅有定义，**全仓无引用**（仍为待办）。
+- `SnapshotConfig.MaxEntitiesPerPacket` 仅有定义，**全仓无引用**（仍为待办）→ **已落地**（见 §三 第 11 项标注）；`SplitFrame` 按上限拆分子帧，编码层逐包发送。
 - `ShardedInboundPipeline._queue` 与 `SqlitePersistence._auditChannel` 均为 `CreateUnbounded`（仍为待办）。
 
 **下一步建议**（按收益 / 风险排序，均属 §三「仍待修正」）：
 
 1. **提交后广播一致性**（§三 第 6 项）：让实体 / 图格 / 箱子广播绑定「已提交状态」，避免客户端先看到未确认结果——与既有「发送成功后才置位」重试机制衔接。
 2. **入站 / 审计队列背压**（§三 第 7 项）：为分片入站队列与审计 `Channel` 加容量上限 + 过载策略（丢弃 / 合并 / 断连）。
-3. **快照实体分包**（§三 第 11 项）：落地 `MaxEntitiesPerPacket`，把大帧拆分为多包，配合 `SnapshotStore` 环形缓冲消除搬移。
+3. **快照实体分包**（§三 第 11 项）：`MaxEntitiesPerPacket` 已落地（本会话）；`SplitFrame` 按上限拆分实体为多子帧、移除项并入首份，编码层逐包发送（`ParallelSnapshotBroadcaster._encode` 改为返回多包）。「`SnapshotStore` 环形缓冲消除搬移」仍为待办。
 4. **玩法向补全**（`VANILLA_COVERAGE.md` §二）：树木 / 生命水晶 / 生物群系 / 结构体、液体压力模型、电路门·定时器·压力板、敌怪远程弹幕与更完整的掉落库。
 5. **`.wld` 双向互操作已通过**（第二十轮：导出 → 原版；原版 → TerraAuth），剩余为「原版**客户端**真的进图游玩」；
    以及可选补全：读取段 6..10（图格实体 / 图鉴等）以避免「原版世界 → 再导出」丢段。

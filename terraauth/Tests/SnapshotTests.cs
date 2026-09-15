@@ -437,6 +437,61 @@ public class SnapshotTests
         Assert.Equal(3u, frame.Tick);
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(5)]
+    [InlineData(2)]
+    public void SplitFrame_Respects_MaxEntitiesPerPacket(int maxPer)
+    {
+        // 构造 7 个实体 + 2 个移除项
+        var entities = Enumerable.Range(0, 7)
+            .Select(i => new EntityState(i, new Vector2(i, 0), default, EntityStateType.Active))
+            .ToList();
+        var removed = new List<RemovedEntity>
+        {
+            new(100, RemoveReason.Despawn),
+            new(101, RemoveReason.OutOfRange),
+        };
+        var frame = SnapshotFrame.Create(tick: 9, entities, removed, baseTick: 3);
+
+        var parts = SnapshotBroadcaster.SplitFrame(frame, maxPer);
+
+        // 实体总量守恒
+        int total = parts.Sum(p => p.Entities.Count);
+        Assert.Equal(7, total);
+
+        // 每份实体数不超上限
+        foreach (var part in parts)
+        {
+            Assert.True(part.Entities.Count <= maxPer, $"子帧实体数 {part.Entities.Count} 超过上限 {maxPer}");
+            Assert.Equal(3u, part.BaseTick);
+            Assert.Equal(9u, part.Tick);
+        }
+
+        // 移除项并入首份；其余子帧无移除
+        Assert.Equal(2, parts[0].Removed.Count);
+        for (int i = 1; i < parts.Count; i++)
+            Assert.Empty(parts[i].Removed);
+
+        // 实体子集与原帧一致（顺序保持）
+        var flatten = parts.SelectMany(p => p.Entities).Select(e => e.Id).ToList();
+        Assert.Equal(Enumerable.Range(0, 7), flatten);
+    }
+
+    [Fact]
+    public void SplitFrame_UnderLimit_ReturnsSingleFrame()
+    {
+        var entities = new List<EntityState>
+        {
+            new(1, default, default, EntityStateType.Active),
+            new(2, default, default, EntityStateType.Active),
+        };
+        var frame = SnapshotFrame.Create(tick: 5, entities, System.Array.Empty<RemovedEntity>());
+        var parts = SnapshotBroadcaster.SplitFrame(frame, maxPerPacket: 256);
+        Assert.Single(parts);
+        Assert.Same(frame, parts[0]);
+    }
+
     [Fact]
     public void Broadcaster_EmptyStore_FallsBackToFullSnapshot_WithoutThrowing()
     {

@@ -135,14 +135,14 @@ public sealed class ShardedAuthorityProcessor<TInput, TOutput>
 /// <summary>并行快照广播：每个玩家的快照生成/编码相互独立。</summary>
 public sealed class ParallelSnapshotBroadcaster<TSnapshot>
 {
-    private readonly Func<int, TSnapshot> _buildSnapshot; // playerId => snapshot
-    private readonly Func<TSnapshot, byte[]> _encode;     // snapshot => bytes
-    private readonly Func<int, byte[], Task> _send;        // playerId, bytes => send
+    private readonly Func<int, TSnapshot> _buildSnapshot;        // playerId => snapshot
+    private readonly Func<TSnapshot, IReadOnlyList<byte[]>> _encode; // snapshot => 分片后若干个包
+    private readonly Func<int, byte[], Task> _send;               // playerId, bytes => send
     private readonly SemaphoreSlim _throttle;
 
     public ParallelSnapshotBroadcaster(
         Func<int, TSnapshot> buildSnapshot,
-        Func<TSnapshot, byte[]> encode,
+        Func<TSnapshot, IReadOnlyList<byte[]>> encode,
         Func<int, byte[], Task> send,
         int maxConcurrency)
     {
@@ -152,7 +152,7 @@ public sealed class ParallelSnapshotBroadcaster<TSnapshot>
         _throttle = new SemaphoreSlim(maxConcurrency, maxConcurrency);
     }
 
-    /// <summary>对所有在线玩家并行生成+编码+发送快照。</summary>
+    /// <summary>对所有在线玩家并行生成+编码+发送快照（编码层已按实体数分包）。</summary>
     public async Task FlushAllAsync(IEnumerable<int> playerIds, CancellationToken ct)
     {
         // 生成 + 编码属 CPU 密集工作：投递线程池执行，避免阻塞调用方（网络/仿真线程）
@@ -162,8 +162,8 @@ public sealed class ParallelSnapshotBroadcaster<TSnapshot>
             try
             {
                 var snap = _buildSnapshot(playerId);
-                var bytes = _encode(snap);
-                await _send(playerId, bytes).ConfigureAwait(false);
+                foreach (var bytes in _encode(snap))
+                    await _send(playerId, bytes).ConfigureAwait(false);
             }
             finally { _throttle.Release(); }
         }, ct));
