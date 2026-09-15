@@ -19,9 +19,15 @@ jobs:
           - os: windows-latest
             rid: win-x64
             asset: TerraAuth-win-x64.zip
+          - os: windows-latest
+            rid: win-arm64
+            asset: TerraAuth-win-arm64.zip
           - os: ubuntu-latest
             rid: linux-x64
             asset: TerraAuth-linux-x64.zip
+          - os: ubuntu-latest
+            rid: linux-arm64
+            asset: TerraAuth-linux-arm64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
