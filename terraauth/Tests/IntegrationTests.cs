@@ -948,6 +948,41 @@ public class EndToEndTests
         }
     }
 
+    /// <summary>
+    /// 换图清空：<c>ClearWorldChangesAsync</c> 必须把图格改动与箱子内容一并清掉（换种子重开地图用），
+    /// 且清空后重开连接仍为空（即真正落盘，而非仅清内存）。
+    /// </summary>
+    [Fact]
+    public async Task Persistence_ClearWorldChanges_DropsTilesAndChests()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-clear-{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                await db.SaveTileChangesAsync(new[] { new WorldTileRecord(10, 20, new byte[] { 1, 2 }) });
+                await db.SaveChestChangesAsync(new[] { new WorldChestRecord(3, 40, 50, new byte[] { 7 }) });
+                Assert.Single(await db.LoadTileChangesAsync());
+                Assert.Single(await db.LoadChestChangesAsync());
+
+                await db.ClearWorldChangesAsync();
+                Assert.Empty(await db.LoadTileChangesAsync());
+                Assert.Empty(await db.LoadChestChangesAsync());
+            }
+
+            // 重开（模拟重启）：清空必须已落盘
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                Assert.Empty(await db.LoadTileChangesAsync());
+                Assert.Empty(await db.LoadChestChangesAsync());
+            }
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
     /// <summary>清理 DB 及其附属文件（SQLite 的 -wal/-shm、内嵌 LiteDb 的 .tmp）。</summary>
     private static void CleanupDb(string dbPath)
     {

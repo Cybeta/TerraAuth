@@ -351,26 +351,29 @@ public sealed class WorldState
 
     private static readonly Dictionary<int, BossLootSpec> BossLoot = new()
     {
-        // 眼魔 4 —— 原版掉落全表（腐化 / 猩红 / 专家袋），数值据 Terraria 1.4.5 校验：
-        //   腐化：魔矿(56) 30-90、邪箭(47) 20-50、腐化种子(37) 1-3（均 100%）；通用 望远镜(1990)、眼面具(1991) 各 1/7。
-        //   猩红：猩红矿(880) 30-90（100%）+ 望远镜 / 眼面具 1/7。
-        //   专家/大师：眼魔宝袋(3381) 必掉。
+        // 眼魔 4 —— 原版掉落全表（腐化 / 猩红 / 专家袋），逐条核对 <c>ItemDropDatabase.RegisterBoss_EOC</c>：
+        //   经典腐化（NotExpert + IsCorruption）：恶魔矿(56) 30-90、邪箭(47) 20-50、腐化种子(59) 1-3（均 100%）。
+        //   经典猩红（NotExpert + IsCrimson）：猩红矿(880) 30-90、猩红种子(2171) 1-3（均 100%）。
+        //   两套通用：眼面具(2112) 1/7、望远镜(1299) 1/40。
+        //   专家/大师：眼魔宝袋(3319) 必掉（原版 BossBag 为 DropBasedOnExpertMode(无,  宝袋)，
+        //   且上述经典掉落均带 NotExpert 条件 → 专家模式**只**掉宝袋，内容由客户端开袋产生）。
         [4] = new BossLootSpec(
             new[]
             {
                 new DropEntry(56, 30, 90, 1.0),
                 new DropEntry(47, 20, 50, 1.0),
-                new DropEntry(37, 1, 3, 1.0),
-                new DropEntry(1990, 1, 1, 1.0 / 7),
-                new DropEntry(1991, 1, 1, 1.0 / 7),
+                new DropEntry(59, 1, 3, 1.0),
+                new DropEntry(2112, 1, 1, 1.0 / 7),
+                new DropEntry(1299, 1, 1, 1.0 / 40),
             },
             new[]
             {
                 new DropEntry(880, 30, 90, 1.0),
-                new DropEntry(1990, 1, 1, 1.0 / 7),
-                new DropEntry(1991, 1, 1, 1.0 / 7),
+                new DropEntry(2171, 1, 3, 1.0),
+                new DropEntry(2112, 1, 1, 1.0 / 7),
+                new DropEntry(1299, 1, 1, 1.0 / 40),
             },
-            new[] { new DropEntry(3381, 1, 1, 1.0) }),
+            new[] { new DropEntry(3319, 1, 1, 1.0) }),
 
         [13]  = Fixed((56, 30), (86, 5)),        // Eater of Worlds → Demonite + Shadow Scale
         [266] = Fixed((880, 30)),                // Brain of Cthulhu → Crimtane
@@ -432,6 +435,136 @@ public sealed class WorldState
                 });
             }
         }
+    }
+
+    /// <summary>
+    /// 生成一个掉落物（原版 <c>Item.NewItem</c> 的服务端侧）：分配槽位 + 标记待下发
+    /// （包 21 / 22 由世界同步循环的 <c>FlushNewItemsAsync</c> 补发）。
+    /// 供挖砖掉落（<see cref="TileDropTable"/>）使用；<paramref name="itemId"/> ≤ 0 或槽位已满则不做任何事。
+    /// </summary>
+    public void SpawnItemDrop(int itemId, int stack, int tileX, int tileY, IRng rng)
+    {
+        if (itemId <= 0 || stack <= 0) return;
+
+        lock (ItemsLock)
+        {
+            if (Items.Count >= MaxItemSlots) return;
+
+            int slot = 0;
+            while (Items.Any(i => i.Slot == slot)) slot++;
+
+            Items.Add(new WorldItemEntity
+            {
+                Slot = slot,
+                ItemId = itemId,
+                Stack = stack,
+                Position = new Vector2(tileX * 16 + 8, tileY * 16 + 8),   // 图格中心（原版 Item.NewItem 的碰撞盒中心）
+                // 原版初速：X ±3.0、Y -4.0..-1.5（px/tick），落地前有轻微抛物线
+                Velocity = new Vector2((rng.NextInt32(61) - 30) * 0.1f, -(rng.NextInt32(25) + 15) * 0.1f),
+                Prefix = 0,
+                OwnedBy = -1,          // 无归属 → 刷新循环按原版 FindOwner 就近分配（见 FlushItemOwnersAsync）
+                NewNotified = false,   // 服务端生成 → 客户端尚不知情，需补发包 21
+            });
+        }
+    }
+
+    // ---- 玩家提示（聊天框）----
+
+    private readonly object _noticesLock = new();
+    private readonly Queue<(int PlayerId, string Text)> _pendingNotices = new();
+
+    /// <summary>待发提示上限（防刷屏拖内存，超出丢最旧）。</summary>
+    private const int MaxPendingNotices = 256;
+
+    /// <summary>
+    /// 排队一条发给单个玩家的聊天提示（如拾取物品）。由世界同步循环
+    /// <c>GameHost.FlushPlayerNoticesAsync</c> 取走并经包 82（NetTextModule）下发。
+    /// </summary>
+    public void NotifyPlayer(int playerId, string text)
+    {
+        if (playerId <= 0 || string.IsNullOrEmpty(text)) return;
+
+        lock (_noticesLock)
+        {
+            if (_pendingNotices.Count >= MaxPendingNotices) _pendingNotices.Dequeue();
+            _pendingNotices.Enqueue((playerId, text));
+        }
+    }
+
+    /// <summary>取出至多 <paramref name="max"/> 条待发提示（FIFO）。</summary>
+    public List<(int PlayerId, string Text)> DrainPlayerNotices(int max)
+    {
+        var result = new List<(int PlayerId, string Text)>();
+        if (max <= 0) return result;
+
+        lock (_noticesLock)
+            while (result.Count < max && _pendingNotices.Count > 0)
+                result.Add(_pendingNotices.Dequeue());
+        return result;
+    }
+
+    /// <summary>单棵树最多清除的树干格数（防异常图格造成大面积破坏）。</summary>
+    private const int MaxTreeTiles = 400;
+
+    /// <summary>
+    /// 让一棵树整棵倒下：从 (x, y) 的 4 邻接出发收集**同类型树干**图格并全部清除，返回额外清掉的格数
+    /// （不含起点 (x, y)——它已由挖砖命令清除）。
+    /// <para>
+    /// 原版一棵树由多格树干（含枝条）组成，砍掉任意一格即整棵倒下并**逐格**产出木材；
+    /// 4 邻接不会跨到邻树：生成器保证树间距 ≥ 4 列、枝条最远只伸到 ±1 列。
+    /// </para>
+    /// </summary>
+    public int FellTreeAt(int x, int y, int treeType)
+    {
+        var pending = new Stack<(int X, int Y)>();
+        var seen = new HashSet<(int X, int Y)>();
+
+        void PushTreeNeighbor(int px, int py)
+        {
+            if (px < 0 || py < 0 || px >= MaxTilesX || py >= MaxTilesY) return;
+            if (Tiles[px, py].Active && Tiles[px, py].Type == treeType && seen.Add((px, py)))
+                pending.Push((px, py));
+        }
+
+        PushTreeNeighbor(x - 1, y);
+        PushTreeNeighbor(x + 1, y);
+        PushTreeNeighbor(x, y - 1);
+        PushTreeNeighbor(x, y + 1);
+
+        int removed = 0;
+        while (pending.Count > 0 && removed < MaxTreeTiles)
+        {
+            var (px, py) = pending.Pop();
+
+            bool isTree;
+            Sections.EnterWrite(px, py);
+            try
+            {
+                ref var tile = ref Tiles[px, py];
+                isTree = tile.Active && tile.Type == treeType;
+                if (isTree)
+                {
+                    tile.Active = false;
+                    tile.Type = 0;
+                    tile.Wall = 0;
+                    removed++;
+                }
+            }
+            finally
+            {
+                Sections.ExitWrite(px, py);
+            }
+
+            if (!isTree) continue;
+
+            MarkTileChanged(px, py);
+            PushTreeNeighbor(px - 1, py);
+            PushTreeNeighbor(px + 1, py);
+            PushTreeNeighbor(px, py - 1);
+            PushTreeNeighbor(px, py + 1);
+        }
+
+        return removed;
     }
 
     // ---- 入侵 / 沙尘暴 / 冷却 ----

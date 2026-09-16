@@ -43,6 +43,8 @@ internal interface IDbExecutor
     IReadOnlyList<WorldTileRecord> LoadWorldTiles();
     void SaveWorldChests(IReadOnlyList<WorldChestRecord> chests);
     IReadOnlyList<WorldChestRecord> LoadWorldChests();
+    /// <summary>清空全部世界改动（图格 + 箱子）——换种子重开地图时使用（见 <c>ServerConfig.ResetWorldChangesOnStart</c>）。</summary>
+    void ClearWorldChanges();
 }
 
 // ============================================================================
@@ -120,6 +122,9 @@ public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IWo
 
     public Task<IReadOnlyList<WorldChestRecord>> LoadChestChangesAsync()
         => Task.Run(() => _db.LoadWorldChests());
+
+    public Task ClearWorldChangesAsync()
+        => Task.Run(() => _db.ClearWorldChanges());
 
     // ========================================================================
     // 后台批量落盘
@@ -261,6 +266,13 @@ internal sealed class LiteDbPersistence : IDbExecutor
     }
 
     public IReadOnlyList<WorldChestRecord> LoadWorldChests() => _worldChests.Values.ToList();
+
+    public void ClearWorldChanges()
+    {
+        _worldTiles.Clear();
+        _worldChests.Clear();
+        SaveToDisk();
+    }
 
     // ---- 磁盘持久化（JSON，模拟 SQLite 文件）----
     private void LoadFromDisk()
@@ -642,6 +654,14 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         while (r.Read())
             list.Add(new WorldChestRecord(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), (byte[])r[3]));
         return list;
+    }
+
+    public void ClearWorldChanges()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM WorldTiles; DELETE FROM WorldChests;";
+        cmd.ExecuteNonQuery();
     }
 
     public void Dispose() { /* 连接池已禁用：连接随 using 释放，无跨连接资源需清理 */ }

@@ -149,8 +149,17 @@ public sealed class GameHost : IDisposable
         var bans = new BanManager(banStore, config, db);
 
         // 5. 权威层（Phase 2）+ 审计桥接
-        // 世界数据：优先加载配置指定的 .wld；未配置则按 WorldSize 程序化生成（见 WorldGenerator 注释）
-        var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize);
+        // 世界数据：优先加载配置指定的 .wld；未配置则按 WorldSize + WorldSeed 程序化生成
+        // 换图（改种子 / 换 .wld）时必须先清掉旧地图的改动，否则按旧坐标记录的图格 / 箱子会落到新地形上
+        if (config.Current.ResetWorldChangesOnStart)
+        {
+            db.ClearWorldChangesAsync().GetAwaiter().GetResult();
+            Console.WriteLine(
+                "[World] 已按 ResetWorldChangesOnStart 清空持久化的世界改动（图格 + 箱子）——" +
+                "请把 server.json 的该项改回 false，否则每次重启都会丢弃玩家改动");
+        }
+
+        var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize, config.Current.WorldSeed);
         world.GameMode = (int)config.Current.GameMode; // 阶段 D：玩家受击公式按难度取分支（经典/专家/大师），117 上界与接触兜底共用
         world.SscEnabled = config.Current.SscEnabled;   // 全局 SSC 开关：开=服务器背包权威，关=原版客户端本地背包
         world.DestroySummonsOnWeaponRemoval =
@@ -232,7 +241,8 @@ public sealed class GameHost : IDisposable
                 config.Current.MaxViolationsBeforeBan,
                 config.Current.ViolationWindowMinutes * 60),
             sessionResumeGraceSeconds: config.Current.SessionResumeGraceSeconds,
-            commandService: commandService);
+            commandService: commandService,
+            playerProfiles: db);   // SSC 玩家档案（背包 / 生命 / 法力）跨重进持久化
         networkForNames = network; // HookedPipeline 的玩家名解析延迟绑定到此
 
         // 6.5 保留未来兼容层对象，但不进入当前 Vanilla-only 生产能力。
@@ -243,9 +253,9 @@ public sealed class GameHost : IDisposable
 
         // 7. 插件上下文 + 加载器
         // 必须在网络层之后：ServerApi 需要连接管理（踢出/在线查询）与封禁管理器才能真实生效
-        // 命令子系统：内置 say / who / kick / help / give；插件可经 IServerApi.ExecuteCommand 调用
+        // 命令子系统：内置 say / who / kick / help / give / boss；插件可经 IServerApi.ExecuteCommand 调用
         var serverApi = new ServerApi(auditLogger, metrics, network, connections, bans, world, commandService);
-        RegisterBuiltinCommands(commandService, serverApi, world, network);
+        RegisterBuiltinCommands(commandService, serverApi, world, network, simulator);
 
         var pluginContext = new PluginContext(
             hooks: hooks,
@@ -332,6 +342,8 @@ public sealed class GameHost : IDisposable
                 await FlushNpcDamageAcksAsync(ct).ConfigureAwait(false);
                 // 服务端主动生成的掉落物（Boss 掉落等）→ 包 21
                 await FlushNewItemsAsync(ct).ConfigureAwait(false);
+                // 玩家提示（拾取物品等）→ 包 82 单独发给该玩家
+                await FlushPlayerNoticesAsync(ct).ConfigureAwait(false);
                 // 周期刷新掉落物归属（原版 FindOwner 循环）→ 包 22（归属变更才发）
                 await FlushItemOwnersAsync(ct).ConfigureAwait(false);
                 // 新增弹幕（客户端上报 / Boss AI 发射）→ 包 27
@@ -409,9 +421,9 @@ public sealed class GameHost : IDisposable
 
     /// <summary>
     /// 载入基准世界：配置了 <see cref="ServerConfig.WorldPath"/> 且文件存在 → 解析该 `.wld`；
-    /// 否则按 <see cref="ServerConfig.WorldSize"/> 程序化生成（小 / 中 / 大三档）。
+    /// 否则按 <see cref="ServerConfig.WorldSize"/> + <see cref="ServerConfig.WorldSeed"/> 程序化生成（小 / 中 / 大三档）。
     /// </summary>
-    private static WorldState LoadBaseWorld(string worldPath, WorldSize size)
+    private static WorldState LoadBaseWorld(string worldPath, WorldSize size, int seed)
     {
         if (!string.IsNullOrWhiteSpace(worldPath) && File.Exists(worldPath))
         {
@@ -425,9 +437,9 @@ public sealed class GameHost : IDisposable
         if (!string.IsNullOrWhiteSpace(worldPath))
             Console.WriteLine($"[World] 世界文件不存在，回退为程序化生成：{worldPath}");
 
-        var generated = WorldGenerator.Generate(size);
+        var generated = WorldGenerator.Generate(size, seed: seed);
         Console.WriteLine(
-            $"[World] 程序化生成（{size}）{generated.WorldName} {generated.MaxTilesX}×{generated.MaxTilesY}，" +
+            $"[World] 程序化生成（{size}，种子 {seed}）{generated.WorldName} {generated.MaxTilesX}×{generated.MaxTilesY}，" +
             $"出生点 ({generated.SpawnTileX},{generated.SpawnTileY})，区块 {generated.MaxTilesX / 200}×{generated.MaxTilesY / 150}");
         return generated;
     }
@@ -855,6 +867,29 @@ public sealed class GameHost : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// 下发玩家提示（拾取物品等）为聊天行（包 82，仅发给该玩家）。
+    /// 单轮上限 <see cref="MaxPlayerNoticesPerFlush"/>：拾取可能每秒多次，避免一次刷屏。
+    /// </summary>
+    public async Task FlushPlayerNoticesAsync(CancellationToken ct = default)
+    {
+        var notices = Simulator.State.DrainPlayerNotices(MaxPlayerNoticesPerFlush);
+        foreach (var (playerId, text) in notices)
+        {
+            try
+            {
+                await Network.SendChatAsync(playerId, text, "White", ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                // 提示属 best-effort：发送失败直接丢弃（不重排队，避免刷屏放大）
+            }
+        }
+    }
+
+    /// <summary>单轮下发的玩家提示上限。</summary>
+    private const int MaxPlayerNoticesPerFlush = 8;
 
     /// <summary>无主掉落物归属搜索间隔（tick）：原版 Main.UpdateServer 对无主物品每 5 tick 重跑 FindOwner。</summary>
     private const int ItemOwnerUnreservedRefreshTicks = 5;
@@ -1470,9 +1505,9 @@ public sealed class GameHost : IDisposable
         return path;
     }
 
-    /// <summary>注册内置命令（say / who / kick / help / give）；插件可另注册自己的命令。</summary>
+    /// <summary>注册内置命令（say / who / kick / help / give / boss）；插件可另注册自己的命令。</summary>
     private static void RegisterBuiltinCommands(CommandService commands, ServerApi server,
-        WorldState world, NetworkHost network)
+        WorldState world, NetworkHost network, WorldSimulator simulator)
     {
         commands.Register("say", "广播一条消息：say <text>", (_, args) =>
         {
@@ -1558,6 +1593,36 @@ public sealed class GameHost : IDisposable
                 new InventorySlotPacket(Slot: (short)slot, ItemId: itemId, Stack: 1) { PlayerId = pid });
             Console.WriteLine($"[Give] 已向 #{pid} 下发包5 slot={slot} type={itemId}");
             return CommandResult.Ok($"已给 #{pid} 槽 {slot} 放置物品 {itemId}");
+        });
+
+        // 召唤 NPC / Boss（真机调试用）：npcId 为原版 NPC 类型 ID，生命 / 伤害 / 防御取 NpcStatsTable
+        // （未收录类型按 1000 生命兜底，见 WorldSimulator.SpawnBoss），出生点对齐包 23 的同步口径。
+        commands.Register("boss", "召唤 NPC / Boss：boss <npcId> [x y]（省略坐标则在发起者上方 8 格）", (playerId, args) =>
+        {
+            if (args.Length == 0 || !int.TryParse(args[0], out var npcType) || npcType <= 0)
+                return CommandResult.Fail("用法：boss <npcId> [x y]（4=眼魔 35=骷髅王 50=史莱姆王 222=蜂后 113=血肉墙）");
+
+            float x, y;
+            if (args.Length >= 3 && float.TryParse(args[1], out var px) && float.TryParse(args[2], out var py))
+            {
+                (x, y) = (px, py);                       // 显式像素坐标（左上角锚点由 SpawnBoss 换算）
+            }
+            else
+            {
+                lock (world.PlayersLock)
+                {
+                    if (!world.Players.TryGetValue(playerId, out var p))
+                        return CommandResult.Fail("发起者不在线，请显式给出坐标：boss <npcId> <x> <y>");
+
+                    x = p.AimPosition.X;
+                    y = p.AimPosition.Y - 8f * 16f;      // 发起者上方 8 格（与夜晚自然刷眼魔同口径）
+                }
+            }
+
+            var boss = simulator.SpawnBoss(npcType, x, y);
+            int slot;
+            lock (world.NpcsLock) slot = world.Npcs.IndexOf(boss);
+            return CommandResult.Ok($"已召唤 NPC {npcType}（槽位 {slot}，生命 {boss.Life}/{boss.LifeMax}）");
         });
     }
 

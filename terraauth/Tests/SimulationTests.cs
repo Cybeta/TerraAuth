@@ -559,6 +559,31 @@ public class SimulationTests
         Assert.False(Assert.Single(world.Items).Active);
     }
 
+    /// <summary>拾取成功 → 排队一条聊天提示（「获取 Wood ×N」，名称取原版标识名）。</summary>
+    [Fact]
+    public void PickupItem_Queues_Chat_Notice()
+    {
+        var world = new WorldState { InventoryLedger = new AcceptingInventoryLedger() };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+        lock (world.ItemsLock)
+            world.Items.Add(new WorldItemEntity
+            {
+                Slot = 0,
+                ItemId = 9,
+                Stack = 3,
+                Position = new Vector2(8, 8),
+            });
+
+        var result = new PickupItemCommand(1, 1, 0).Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        var notice = Assert.Single(world.DrainPlayerNotices(8));
+        Assert.Equal(1, notice.PlayerId);
+        Assert.Equal("获取 Wood ×3", notice.Text);
+        Assert.Empty(world.DrainPlayerNotices(8));   // 取走即清空
+    }
+
     [Fact]
     public void CommandQueue_Drains_InStableOrder()
     {
@@ -2586,8 +2611,8 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// ① Boss 掉落改为原版数据库（眼魔样板）：经典腐化世界必掉 魔矿(56)30-90 / 邪箭(47)20-50 / 腐化种子(37)1-3，
-    /// 并出现概率物品（望远镜 1990 / 眼面具 1991，1/7）可能为空；不进 3381 宝袋。
+    /// ① Boss 掉落改为原版数据库（眼魔样板）：经典腐化世界必掉 魔矿(56)30-90 / 邪箭(47)20-50 / 腐化种子(59)1-3，
+    /// 并出现概率物品（眼面具 2112 = 1/7、望远镜 1299 = 1/40）可能为空；不进 3319 宝袋。
     /// </summary>
     [Fact]
     public void BossLoot_EyeOfCthulhu_ClassicCorrupt_DropsVanilla()
@@ -2600,12 +2625,13 @@ public class WorldGeneratorTests
         {
             Assert.Contains(world.Items, it => it.ItemId == 56 && it.Stack >= 30 && it.Stack <= 90);   // 魔矿必掉
             Assert.Contains(world.Items, it => it.ItemId == 47 && it.Stack >= 20 && it.Stack <= 50);   // 邪箭必掉
-            Assert.Contains(world.Items, it => it.ItemId == 37 && it.Stack >= 1 && it.Stack <= 3);     // 腐化种子必掉
-            Assert.DoesNotContain(world.Items, it => it.ItemId == 3381);                              // 经典无宝袋
+            Assert.Contains(world.Items, it => it.ItemId == 59 && it.Stack >= 1 && it.Stack <= 3);     // 腐化种子必掉
+            Assert.DoesNotContain(world.Items, it => it.ItemId == 3319);                              // 经典无宝袋
+            Assert.DoesNotContain(world.Items, it => it.ItemId == 880);                               // 腐化世界不掉猩红矿
         }
     }
 
-    /// <summary>眼魔经典猩红世界：掉猩红矿(880)30-90，不掉魔矿(56)。</summary>
+    /// <summary>眼魔经典猩红世界：掉猩红矿(880)30-90 + 猩红种子(2171)1-3，不掉魔矿(56) / 腐化种子(59)。</summary>
     [Fact]
     public void BossLoot_EyeOfCthulhu_ClassicCrimson_DropsCrimtane()
     {
@@ -2617,11 +2643,13 @@ public class WorldGeneratorTests
         lock (world.ItemsLock)
         {
             Assert.Contains(world.Items, it => it.ItemId == 880 && it.Stack >= 30 && it.Stack <= 90);
+            Assert.Contains(world.Items, it => it.ItemId == 2171 && it.Stack >= 1 && it.Stack <= 3);
             Assert.DoesNotContain(world.Items, it => it.ItemId == 56);
+            Assert.DoesNotContain(world.Items, it => it.ItemId == 59);
         }
     }
 
-    /// <summary>眼魔专家模式（GameMode=1）：必掉宝袋(3381)。</summary>
+    /// <summary>眼魔专家模式（GameMode=1）：只掉宝袋(3319)，且不再直接掉矿 / 种子（原版 NotExpert 条件）。</summary>
     [Fact]
     public void BossLoot_EyeOfCthulhu_Expert_DropsTreasureBag()
     {
@@ -2631,7 +2659,9 @@ public class WorldGeneratorTests
 
         lock (world.ItemsLock)
         {
-            Assert.Contains(world.Items, it => it.ItemId == 3381); // 宝袋必掉
+            Assert.Contains(world.Items, it => it.ItemId == 3319);                                    // 宝袋必掉
+            Assert.DoesNotContain(world.Items, it => it.ItemId == 56);                                // 矿在袋内，不直接掉
+            Assert.DoesNotContain(world.Items, it => it.ItemId == 59);
         }
     }
 
@@ -2658,6 +2688,146 @@ public class WorldGeneratorTests
     [InlineData(4558, 4558)]
     public void NetIdMap_Resolves_BaseType(int netId, int expected)
         => Assert.Equal(expected, NpcNetIdMap.FromNetId(netId));
+
+    /// <summary>
+    /// 挖砖掉落（原版 <c>WorldGen.KillTile_DropItems</c> → <c>Item.NewItem</c>）：被挖掉的图格按
+    /// <see cref="TileDropTable"/> 生成掉落物。真机反馈：挖掉树木 / 地块后没有掉落木块与泥土。
+    /// </summary>
+    [Theory]
+    [InlineData(0, 2)]    // 泥土 → 泥土块
+    [InlineData(2, 2)]    // 草地 → 泥土块
+    [InlineData(1, 3)]    // 石头 → 石块
+    [InlineData(5, 9)]    // 树干 → 木材
+    [InlineData(30, 9)]   // 木板 → 木材
+    [InlineData(53, 169)] // 沙 → 沙块
+    public void TileBreakCommand_Drops_TileItem(int tileType, int expectedItem)
+    {
+        var world = NewTileWorld(tileType, out int tx, out int ty);
+
+        var result = new TileBreakCommand(1, 1, tx, ty, 0, 0).Apply(world, new XoshiroRng(7));
+
+        Assert.True(result.Applied);
+        Assert.False(world.Tiles[tx, ty].Active);
+        lock (world.ItemsLock)
+            Assert.Contains(world.Items, i => i.ItemId == expectedItem && !i.NewNotified);   // 待补发包 21/22
+    }
+
+    /// <summary>动作 4（KillTileNoItem）与 fail 标志（第 5 字段非 0 = 仅命中）都不得生成掉落物。</summary>
+    [Fact]
+    public void TileBreakCommand_NoItem_And_HitOnly_DoNotDrop()
+    {
+        var noItem = NewTileWorld(0, out int nx, out int ny);
+        new TileBreakCommand(1, 1, nx, ny, 4, 0).Apply(noItem, new XoshiroRng(7));
+        Assert.False(noItem.Tiles[nx, ny].Active);
+        Assert.Empty(noItem.Items);
+
+        var hitOnly = NewTileWorld(0, out int hx, out int hy);
+        new TileBreakCommand(1, 1, hx, hy, 0, 1).Apply(hitOnly, new XoshiroRng(7));
+        Assert.True(hitOnly.Tiles[hx, hy].Active, "fail=1（仅命中）不应改动世界");
+        Assert.Empty(hitOnly.Items);
+    }
+
+    /// <summary>构造成 8×8 世界：玩家在 (1,1)、(3,3) 为指定类型的实心图格。</summary>
+    private static WorldState NewTileWorld(int tileType, out int tx, out int ty)
+    {
+        var world = new WorldState { MaxTilesX = 8, MaxTilesY = 8, Tiles = new TileMap(8, 8) };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+
+        tx = 3;
+        ty = 3;
+        world.Tiles[tx, ty] = new Tile { Active = true, Type = (ushort)tileType };
+        return world;
+    }
+
+    /// <summary>
+    /// 砍树整棵倒下：砍掉任意一格树干 → 连通树干（含枝条）全部清除，木材数量 = 清掉的树干格数。
+    /// 真机反馈：挖掉一棵树只给 1 个木块。
+    /// </summary>
+    [Fact]
+    public void TileBreakCommand_Fells_Whole_Tree_And_Drops_Wood_Per_Tile()
+    {
+        const int bx = 8, baseY = 10, height = 6;
+        var world = new WorldState { MaxTilesX = 16, MaxTilesY = 16, Tiles = new TileMap(16, 16) };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+
+        for (int y = baseY; y > baseY - height; y--)                              // 树干
+            world.Tiles[bx, y] = new Tile { Active = true, Type = 5 };
+        world.Tiles[bx - 1, baseY - 2] = new Tile { Active = true, Type = 5 };     // 枝条（4 邻接）
+        world.Tiles[bx, baseY + 1] = new Tile { Active = true, Type = 0 };         // 树下泥土：不得被清掉
+
+        new TileBreakCommand(1, 1, bx, baseY, 0, 0).Apply(world, new XoshiroRng(3));
+
+        for (int y = baseY; y > baseY - height; y--)
+            Assert.False(world.Tiles[bx, y].Active, $"树干 ({bx},{y}) 未随整棵倒下清除");
+        Assert.False(world.Tiles[bx - 1, baseY - 2].Active, "枝条未随整棵倒下清除");
+        Assert.True(world.Tiles[bx, baseY + 1].Active, "树下地面不应被清除");
+
+        lock (world.ItemsLock)
+        {
+            var wood = Assert.Single(world.Items);
+            Assert.Equal(9, wood.ItemId);                     // 木材
+            Assert.Equal(height + 1, wood.Stack);             // 6 格树干 + 1 格枝
+        }
+    }
+
+    /// <summary>
+    /// SSC 玩家档案编解码往返：背包（含前缀）+ 生命 / 法力逐字段还原；空 / 截断存档按「无档案」处理；
+    /// 存档里生命为 0（断线时已死亡）→ 重进按满血复活。
+    /// </summary>
+    [Fact]
+    public void PlayerProfileCodec_RoundTrips_Inventory_And_Vitals()
+    {
+        var source = new PlayerRuntime { Hp = 73, HpMax = 120, Mp = 45, MpMax = 60 };
+        source.Items[3] = 122;        // 熔岩镐
+        source.ItemPrefixes[3] = 5;
+        source.Items[58] = 3319;      // 眼魔宝袋
+
+        var restored = new PlayerRuntime();
+        Assert.True(PlayerProfileCodec.TryApply(PlayerProfileCodec.Encode(source), restored));
+
+        Assert.Equal(73, restored.Hp);
+        Assert.Equal(120, restored.HpMax);
+        Assert.Equal(45, restored.Mp);
+        Assert.Equal(60, restored.MpMax);
+        Assert.Equal(122, restored.Items[3]);
+        Assert.Equal(5, restored.ItemPrefixes[3]);
+        Assert.Equal(3319, restored.Items[58]);
+
+        Assert.False(PlayerProfileCodec.TryApply(null, new PlayerRuntime()));
+        Assert.False(PlayerProfileCodec.TryApply(new byte[] { 9, 1, 2 }, new PlayerRuntime())); // 版本不符/截断
+
+        var dead = new PlayerRuntime { Hp = 0, HpMax = 100 };
+        var revived = new PlayerRuntime();
+        Assert.True(PlayerProfileCodec.TryApply(PlayerProfileCodec.Encode(dead), revived));
+        Assert.Equal(100, revived.Hp);
+    }
+
+    /// <summary>
+    /// 负 netID 变体的**生命上限**必须与客户端一致。包 23 不下发 lifeMax，客户端血条 =
+    /// 「服务端发的当前生命 ÷ 客户端按 netID 自己算的 lifeMax」，而客户端对变体走
+    /// <c>SetDefaultsFromNetId</c>（末尾 <c>lifeMax = life</c>，即变体上限）。
+    /// 服务端沿用基础类型上限会让「当前生命 &gt; 客户端上限」→ 血条被截断为满
+    /// （真机：绿史莱姆掉一半血后血条回到满）。
+    /// </summary>
+    [Theory]
+    [InlineData(-3, 1, 14)]    // 绿史莱姆（基础蓝史莱姆 25）
+    [InlineData(-4, 1, 150)]   // Pinky
+    [InlineData(-6, 1, 45)]    // 黑史莱姆
+    [InlineData(-7, 1, 40)]    // 紫史莱姆
+    [InlineData(-10, 1, 60)]   // 丛林史莱姆
+    [InlineData(-13, 31, 72)]  // AngryBones 小体型
+    [InlineData(-56, 231, 42)] // HornetFatty 小体型
+    [InlineData(1, 1, 25)]     // 正值 netID：基础类型上限
+    [InlineData(5, 5, 8)]      // 克苏鲁之仆（客户端上限 8）
+    [InlineData(211, 211, 10)] // 小蜜蜂
+    public void NpcStats_OfNetId_Uses_Variant_LifeMax(int netId, int expectedType, int expectedLifeMax)
+    {
+        var stats = NpcStatsTable.OfNetId(netId);
+        Assert.Equal(expectedType, NpcNetIdMap.FromNetId(netId));
+        Assert.Equal(expectedLifeMax, stats.LifeMax);
+    }
 
     /// <summary>
     /// 生物群系度量：阈值取原版（腐化 300 / 神圣 125），且**神圣与邪恶互相抵消**；

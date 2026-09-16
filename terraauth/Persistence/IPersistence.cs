@@ -41,6 +41,11 @@ public interface IWorldRepository
     Task SaveChestChangesAsync(IReadOnlyList<WorldChestRecord> chests);
     /// <summary>读取全部箱子内容改动（启动时回放）。</summary>
     Task<IReadOnlyList<WorldChestRecord>> LoadChestChangesAsync();
+    /// <summary>
+    /// 清空全部世界改动（图格 + 箱子）。基准世界换掉（改 <c>WorldSeed</c> / 换 .wld）时必须调用，
+    /// 否则按旧地图坐标记录的改动会落到新地形上。
+    /// </summary>
+    Task ClearWorldChangesAsync();
 }
 
 /// <summary>单格图格改动：坐标 + 定长序列化图格（见 <c>Tile.Serialize</c>）。</summary>

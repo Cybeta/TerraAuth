@@ -362,6 +362,78 @@ public class VanillaFeatureTests
             "挖砖权威通过后图格未变空");
     }
 
+    /// <summary>
+    /// 真机回归：原版客户端的包 17 在「挖」时第 5 字段是 **fail 标志**而非图格类型
+    /// （<c>Player.PickTile</c> 未挖穿发 <c>SendData(17, …, 0, x, y, 1f)</c>、挖穿时省略该参数 = 0）。
+    /// 服务端曾拿它与服务端图格类型对账 → 草(2) 等一切非 0/1 的图格永远被判 <c>tile_type_mismatch</c>，
+    /// 真机表现即「挖不动地表的砖块」。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_TileBreak_HitOnly_Flag_Is_Not_Rejected_As_TypeMismatch()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+
+        int tx = sx, ty = sy + 3;          // 地表下 3 格（160px 挖掘半径内）
+        while (ty < world.MaxTilesY && !world.Tiles[tx, ty].Active) ty++;
+        world.Tiles[tx, ty].Type = 2;      // 草：非 0/1，正是旧实现对账必失的类型
+
+        // 1) fail=1（仅命中特效）→ 接受、不改动世界、且不得计入 tile_type_mismatch
+        await s.SendAsync(PacketId.TileBreak, new TileBreakPacket(tx, ty, 0) { TileType = 1 });
+        for (int i = 0; i < 5; i++) { server.Host.Simulator.Tick(); await Task.Delay(10); }
+        Assert.True(world.Tiles[tx, ty].Active, "fail=1（仅命中）不应移除图格");
+        Assert.DoesNotContain("tile_type_mismatch", MetricsText(server));
+
+        // 2) fail=0（真正挖穿）→ 图格被移除
+        await s.SendAsync(PacketId.TileBreak, new TileBreakPacket(tx, ty, 0));
+        Assert.True(await TickUntilAsync(server, () => !world.Tiles[tx, ty].Active, TimeSpan.FromSeconds(5)),
+            "真正挖穿的包 17 未生效（草等非 0/1 类型被误判为篡改）");
+    }
+
+    /// <summary>
+    /// 挖砖掉落：包 17 挖掉泥土后服务端生成掉落物并下发包 21（原版 WorldGen.KillTile_DropItems）。
+    /// 真机反馈：挖掉地块 / 树木后什么都没有掉。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_TileBreak_Drops_Item_To_Client()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+
+        int tx = sx, ty = sy + 3;                       // 地表下 3 格（挖掘半径内）
+        while (ty < world.MaxTilesY && !world.Tiles[tx, ty].Active) ty++;
+        world.Tiles[tx, ty] = new Tile { Active = true, Type = 0 };   // 泥土
+
+        await s.SendAsync(PacketId.TileBreak, new TileBreakPacket(tx, ty, 0));
+
+        // 先让仿真提交该命令（本夹具的仿真由测试驱动），再显式触发掉落物下发（与 Boss 掉落测试同口径）
+        Assert.True(await TickUntilAsync(server, () => !world.Tiles[tx, ty].Active, TimeSpan.FromSeconds(5)),
+            "挖砖未生效");
+
+        await server.Host.FlushNewItemsAsync();
+        var got = await s.ReadUntilAsync(p => p is ItemDropPacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p is ItemDropPacket { ItemId: 2 });   // 泥土块
+
+        // 拾取 → 服务端排队一条聊天提示，经 FlushPlayerNoticesAsync 以包 82 下发
+        int dropSlot;
+        lock (world.ItemsLock) dropSlot = world.Items.Last(i => i.ItemId == 2).Slot;
+        await s.SendAsync(PacketId.ItemPickup, new ItemPickupPacket(dropSlot));
+
+        Assert.True(await TickUntilAsync(server,
+            () => { lock (world.ItemsLock) return !world.Items.Any(i => i.ItemId == 2 && i.Active); },
+            TimeSpan.FromSeconds(5)), "拾取未生效");
+
+        await server.Host.FlushPlayerNoticesAsync();
+        var chat = await s.ReadUntilAsync(p => p is NetTextPacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(chat, p => p is NetTextPacket t && t.Text.Contains("DirtBlock"));
+    }
+
     [Fact]
     public async Task Vanilla_TileBreak_OutOfReach_IsRejected()
     {
@@ -2165,6 +2237,60 @@ public class VanillaFeatureTests
         Assert.Contains(progress, p => p.Type == PacketId.WorldInfo);
     }
 
+    /// <summary>
+    /// 调试命令 /boss：在发起者上方召唤 Boss（生命取 NpcStatsTable），并同步给客户端（包 23）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_BossCommand_Spawns_Boss_Near_Caller()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        await s.SendAsync(PacketId.NetModule, new NetTextPacket("/boss 4") { IsClientMessage = true });
+
+        Assert.True(await TickUntilAsync(server,
+            () => { lock (world.NpcsLock) return world.Npcs.Any(n => n.Type == 4 && n.Active); },
+            TimeSpan.FromSeconds(5)), "/boss 4 未召唤出眼魔");
+
+        WorldNpc boss;
+        lock (world.NpcsLock) boss = world.Npcs.First(n => n.Type == 4 && n.Active);
+        Assert.Equal(2800, boss.LifeMax);   // 生命上限取 NpcStatsTable（眼魔 2800）
+
+        await server.Host.BroadcastNpcUpdatesAsync();
+        var seen = await s.ReadUntilAsync(p => p is NpcUpdatePacket { NetId: 4 }, TimeSpan.FromSeconds(5));
+        Assert.Contains(seen, p => p is NpcUpdatePacket { NetId: 4 });
+    }
+
+    /// <summary>
+    /// Boss 召唤的小怪：生命上限取原版基准（克苏鲁之仆 = 8），与客户端上限一致。
+    /// 曾硬编码 20 —— 包 23 只下发当前生命，客户端血条 =「当前 ÷ 自己的上限」，
+    /// 于是打掉一半（10）时显示「10/8」且血条被截断成满。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_EyeOfCthulhu_Servant_Uses_Vanilla_LifeMax()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 眼魔一阶段在玩家上方 200px 悬停 → 满足「玩家在下方且距离 < 500」，每 110 帧召唤 1 只仆从
+        var pos = world.Players[1].Position;
+        server.Host.Simulator.SpawnBoss(4, pos.X, pos.Y - 200f);
+
+        bool spawned = await TickUntilAsync(server,
+            () => { lock (world.NpcsLock) return world.Npcs.Any(n => n.Type == 5 && n.Active); },
+            TimeSpan.FromSeconds(10));
+        Assert.True(spawned, "眼魔未召唤出克苏鲁之仆");
+
+        WorldNpc servant;
+        lock (world.NpcsLock) servant = world.Npcs.First(n => n.Type == 5 && n.Active);
+        Assert.Equal(8, servant.LifeMax);   // 客户端 NPCID 5 上限 = 8（NpcStatsTable[5]）
+        Assert.Equal(8, servant.Life);
+    }
+
     [Fact]
     public async Task Vanilla_Invasion_Spawns_Enemies_Then_Ends()
     {
@@ -2822,10 +2948,39 @@ public class VanillaFeatureTests
         await using var b = await server.ConnectAsync("Alice");
         Assert.Single(world.Players);
 
-        // 重连后是全新运行时：满血、而非断线前的 42
+        // 判据是**位置**：未接管 → 新运行时落在出生点（旧会话被移到 +320px）。
         var fresh = world.Players.Values.Single();
-        Assert.Equal(100, fresh.Hp);
-        Assert.NotEqual(42, fresh.Hp);
+        Assert.Equal(world.SpawnTileX * 16f, fresh.Position.X);
+
+        // 生命则来自 SSC 档案回读（跨会话持久化，与"会话接管"无关）：断线前把血量压到 42，
+        // 重进后仍是 42。若这里为 100，说明档案没落盘 / 没回读。
+        Assert.Equal(42, fresh.Hp);
+    }
+
+    /// <summary>
+    /// SSC 背包跨重进持久化：宽限期 0（不接管运行时）下重进，背包必须从落盘档案回读。
+    /// 真机反馈：不落盘时 SSC 下「每次重进物品全部消失」。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_SscInventory_Survives_Reconnect()
+    {
+        using var server = VanillaServer.Start(configJson: "{\"SessionResumeGraceSeconds\": 0}");
+        var world = server.Host.Simulator.State;
+
+        var a = await server.ConnectAsync("Alice");
+        await a.SendAsync(PacketId.NetModule, new NetTextPacket("/give 1 122") { IsClientMessage = true });
+        Assert.True(await TickUntilAsync(server,
+            () => world.Players.TryGetValue(1, out var p) && p.Items.Contains(122),
+            TimeSpan.FromSeconds(5)), "/give 未写入服务端背包");
+
+        await a.DisposeAsync();
+        Assert.True(await TickUntilAsync(server, () => world.Players.Count == 0, TimeSpan.FromSeconds(5)),
+            "断线后在线运行时未释放");
+
+        // 宽限期 0 → 新会话（非接管）→ 只能靠档案回读拿到物品
+        await using var b = await server.ConnectAsync("Alice");
+        var fresh = world.Players.Values.Single();
+        Assert.Contains(122, fresh.Items);
     }
 
     [Fact]

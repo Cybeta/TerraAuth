@@ -931,10 +931,15 @@ public partial class WorldSimulator
         }
     }
 
-    /// <summary>在玩家附近生成一只 NPC（原版 NewNPC + 初速 5）：暂存到本 tick 末尾统一入队。</summary>
+    /// <summary>
+    /// 在玩家附近生成一只 NPC（原版 NewNPC + 初速 5）：暂存到本 tick 末尾统一入队。
+    /// 生命上限取 <see cref="NpcStatsTable"/>（仆从 type 5 = 8、蜜蜂 210 = 20、小蜜蜂 211 = 10）——
+    /// 曾硬编码 20，比客户端上限大 → 包 23 只发当前生命，血条被截断显示为满（实测「10/8」）。
+    /// </summary>
     private void SpawnNpcNear(int type, PlayerRuntime target, float upwardSpeed)
     {
         var (width, height) = NpcSizes.Of(type);
+        var stats = NpcStatsTable.OfNetId(type);
         float cx = target.AimPosition.X + 10f + (_rng.NextUInt32() % 2 == 0 ? -40f : 40f);   // 玩家碰撞盒中心 ±40
         float cy = target.AimPosition.Y + PlayerHalfHeight;                                   // 玩家碰撞盒中心
 
@@ -946,8 +951,8 @@ public partial class WorldSimulator
             X = cx - width / 2f,     // 原版：X/Y = 碰撞盒左上角
             Y = cy - height / 2f,
             Active = true,
-            Life = 20,
-            LifeMax = 20,
+            Life = stats.LifeMax,
+            LifeMax = stats.LifeMax,
             VelocityX = 0f,
             VelocityY = -upwardSpeed,
             Generation = (byte)(_rng.NextUInt32() & 0xFF),

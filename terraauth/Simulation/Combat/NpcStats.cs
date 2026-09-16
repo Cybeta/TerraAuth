@@ -688,4 +688,26 @@ public static class NpcStatsTable
     [695] = new NpcStats(0, 15, 250),   // PalworldCattivaDistressed
     [696] = new NpcStats(0, 15, 250),   // PalworldFoxsparksDistressed
     };
+
+    /// <summary>
+    /// 按 **netID**（可为原版负值变体）解析刷怪用权威属性：类型由 <see cref="NpcNetIdMap"/> 解析，
+    /// 生命上限对负 netID 取 <see cref="NpcVariantLifeTable"/> 的变体值。
+    /// <para>
+    /// 必要性：包 23 不下发 lifeMax，客户端血条按「服务端发的当前生命 ÷ 客户端自己的 lifeMax」绘制，
+    /// 而客户端对负 netID 走 <c>SetDefaultsFromNetId</c>（<c>lifeMax = life</c>，即变体上限）。
+    /// 服务端若用基础类型上限（如蓝史莱姆 25），绿史莱姆（客户端 14）打掉一半后血条会显示为满。
+    /// </para>
+    /// 变体的伤害 / 防御仍取基础类型（未建模，与改动前一致）。
+    /// </summary>
+    public static NpcStats OfNetId(int netId)
+    {
+        int type = NpcNetIdMap.FromNetId(netId);
+        var stats = Of.TryGetValue(type, out var s) ? s : Unknown;
+        return NpcVariantLifeTable.TryLifeMax(netId, out int lifeMax)
+            ? stats with { LifeMax = lifeMax }
+            : stats;
+    }
+
+    /// <summary>未收录类型的兜底（与原版 <c>NewNPC</c> 未知名口径一致：100 上限、无伤害 / 防御）。</summary>
+    private static readonly NpcStats Unknown = new(0, 0, 100);
 }

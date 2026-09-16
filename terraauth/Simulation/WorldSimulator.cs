@@ -857,11 +857,14 @@ public partial class WorldSimulator : IWorldViewProvider
         return true;
     }
 
-    /// <summary>按挑选出的 netID 落地一只 NPC（属性取 <see cref="NpcStatsTable"/> 的经典难度基准）。</summary>
+    /// <summary>
+    /// 按挑选出的 netID 落地一只 NPC（属性取 <see cref="NpcStatsTable"/> 的经典难度基准；
+    /// **负 netID 变体**按 <see cref="NpcVariantLifeTable"/> 的变体生命上限，与客户端血条口径一致）。
+    /// </summary>
     private void SpawnPickedNpc(int netId, int spawnTileX, int spawnTileY)
     {
         int type = NpcNetIdMap.FromNetId(netId);
-        var stats = NpcStatsTable.Of.TryGetValue(type, out var s) ? s : new NpcStats(0, 0, 100);
+        var stats = NpcStatsTable.OfNetId(netId);
         var (width, height) = NpcSizes.Of(type);
 
         AddNpc(new WorldNpc

@@ -26,6 +26,19 @@ public record ServerConfig
     public WorldSize WorldSize { get; init; } = WorldSize.Small;
 
     /// <summary>
+    /// 程序化生成的随机种子（决定地形 / 群系选择 / 矿脉分布）。**改种子 = 换一张新地图**，重启生效。
+    /// 仅在 <see cref="WorldPath"/> 为空或文件不存在时生效。
+    /// 换种子后请同时把 <see cref="ResetWorldChangesOnStart"/> 置 true 跑一次，清掉旧地图坐标上的改动。
+    /// </summary>
+    public int WorldSeed { get; init; } = 20260909;
+
+    /// <summary>
+    /// 启动时清空持久化的世界改动（图格 + 箱子内容）——换种子 / 换 .wld 重开地图时置 true 用一次，
+    /// 避免旧地图坐标上的改动叠加到新地形。**用完请改回 false**：置 true 期间每次重启都会丢弃玩家改动。
+    /// </summary>
+    public bool ResetWorldChangesOnStart { get; init; }
+
+    /// <summary>
     /// 世界导出路径（.wld）；为空则不导出。设置后：停机时导出一次，且在**无人在线**时按
     /// <see cref="WorldExportIntervalSeconds"/> 周期导出（全量遍历 O(世界大小)，故避开在线时段）。
     /// 与 <see cref="WorldPath"/> 相同即「原地保存」（导出前旧文件滚动为 .bak）。

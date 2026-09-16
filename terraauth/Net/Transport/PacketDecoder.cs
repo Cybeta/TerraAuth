@@ -438,6 +438,8 @@ public sealed class PacketDecoder : IPacketDecoder
     private INetworkPacket DecodeTileBreak(BinaryReader r)
     {
         // TileManipulation（包 17）：Byte action + Int16 x + Int16 y + Int16 tileType + Byte style
+        // ⚠️ tileType 语义随 action 两用：0/2/4（挖）= KillTile 的 fail 标志（0 真挖穿 / 非 0 仅命中特效）；
+        //    1/3（放）= 图格 / 墙类型。详见 TileBreakPacket 的注释与 AuthoritySubsystems.ValidateBreak。
         var action = r.ReadByte();
         var x = r.ReadInt16();
         var y = r.ReadInt16();

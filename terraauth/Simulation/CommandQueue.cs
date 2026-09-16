@@ -321,6 +321,11 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
                     item.OwnedBy = playerId;
                     item.DeadTick = world.Tick;   // 用仿真 tick（命令的 Tick 可能落后于当前世界 tick）
                     item.RemovalNotified = false; // 由世界同步下发包 21（stack=0）通知其他客户端移除
+
+                    // 聊天框提示（「获取 Wood ×1」）：SSC 下拾取是服务端行为，客户端不会弹原生拾取提示，
+                    // 故由服务端经包 82 给该玩家一条提示（世界同步循环统一取走下发）。
+                    world.NotifyPlayer(playerId,
+                        $"获取 {ItemNameTable.NameOf(item.ItemId)} ×{item.Stack}");
                     return new(true);
                 }
             }
@@ -482,6 +487,9 @@ return new(false, CommandFailures.NotApplied);
 
         // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
         bool changed = false;
+        // 挖掉的图格（用于掉落查表；泥土类型就是 0，故用独立标志而非「类型 > 0」）
+        bool killedTile = false;
+        ushort killedType = 0;
         world.Sections.EnterWrite(X, Y);
         try
         {
@@ -495,8 +503,19 @@ return new(false, CommandFailures.NotApplied);
             //   15 FrameTrack / 16 PlaceWire4 / 17 KillWire4 / 18 PokeLogicGate / 19 Actuate
             switch (Action)
             {
-                case 0:  // KillTile
-                case 4:  // KillTileNoItem
+                case 0:  // KillTile（掉落地图格对应的物品）
+                    // 包 17 第 5 字段在「挖」时不是图格类型，而是 fail 标志（1 = 仅命中特效，尚未挖穿）。
+                    // 原版此时调 KillTile(x, y, fail: true)：只播击打效果、**不改动世界**（详见 ValidateBreak）。
+                    if (TileType != 0) break;
+                    killedType = before.Type;
+                    killedTile = true;
+                    tile.Active = false;
+                    tile.Type = 0;
+                    tile.Wall = 0;
+                    break;
+
+                case 4:  // KillTileNoItem：原版语义即「挖掉但**不掉落**」（如雕像破坏 / 系统清理）
+                    if (TileType != 0) break;
                     tile.Active = false;
                     tile.Type = 0;
                     tile.Wall = 0;
@@ -548,6 +567,21 @@ return new(false, CommandFailures.NotApplied);
         }
 
         if (changed) world.MarkTileChanged(X, Y);
+
+        // 掉落物（原版 WorldGen.KillTile_DropItems → Item.NewItem）：
+        // 放在**区块锁之外**生成，避免与 ItemsLock 形成新的锁序（拾取路径是 PlayersLock → ItemsLock）。
+        if (killedTile && TileDropTable.IsTreeTile(killedType))
+        {
+            // 树：砍掉任意一格即**整棵倒下**（原版一棵树由多格树干组成，逐格产木材），
+            // 故木材数量 = 本次清掉的树干格数（含刚挖掉的这一格）。
+            int extra = world.FellTreeAt(X, Y, killedType);
+            world.SpawnItemDrop(TileDropTable.Wood, 1 + extra, X, Y, rng);
+        }
+        else if (killedTile && TileDropTable.TryGet(killedType, out int dropItem, out int dropStack))
+        {
+            world.SpawnItemDrop(dropItem, dropStack, X, Y, rng);
+        }
+
         return changed ? new(true) : new(false, CommandFailures.NoChange);
     }
 }

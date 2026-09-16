@@ -996,26 +996,34 @@ internal sealed class WorldAuthority : IWorldAuthority
         if (!IsWithinReach(playerId, brk.X, brk.Y, DigReachPx))
             return Deny(playerId, "tile_rejected", "out_of_reach", new { brk.X, brk.Y });
 
-        // 目标 tile 必须存在且为实心（Action=0 挖实心砖；2/3 挖墙；>=5 电线/斜坡类跳过实体检查）
-        // brk.Action=0 → 实心砖；TileType=客户端声称的类型，服务端需对账
+        // 目标 tile 必须存在（Action=0/4 挖实心砖；2 挖墙；>=5 电线/斜坡类跳过实体检查）
         // 区块读锁内取一份图格副本：仿真线程可能正在改同一格（详见 SectionLocks）
         Tile tile;
         using (_world.Sections.EnterRead(brk.X, brk.Y, brk.X, brk.Y))
             tile = _world.Tiles[brk.X, brk.Y];
-        if (brk.Action == 0)
+
+        // 包 17 第 5 字段的语义**随 Action 变化**（逐条核对原版调用点 Player/DelegateMethods）：
+        //   Action 0/2/4（KillTile / KillWall / KillTileNoItem）：**fail 标志**——1 = 仅命中特效（尚未挖穿），
+        //     0 = 真正破坏。原版 Player.PickTile 未挖穿时发 `SendData(17, …, 0, x, y, 1f)`、挖穿时省略该参数（=0）；
+        //     服务端原版读作 `bool flag14 = num163 == 1` 并传给 `KillTile(x, y, fail: flag14)`。
+        //   Action 1/3（PlaceTile / PlaceWall）：图格 / 墙的**类型**（原版把它交给 WorldGen.PlaceTile/PlaceWall）。
+        // 故「挖」绝不能拿该字段与 tile.Type 对账：曾经的 tile_type_mismatch 会把草(2)等一切非 0/1 类型
+        // 判成篡改而拒绝——真机表现即「挖不动地表的砖块」（地表多为草/土/石）。
+        if (brk.Action is 0 or 4)
         {
             if (!tile.Active)
                 return Deny(playerId, "tile_rejected", "tile_not_found", new { brk.X, brk.Y });
-            // 类型对账：客户端声称挖 TileType，服务端实际是 tile.Type，不一致视为篡改
-            if (brk.TileType >= 0 && brk.TileType != tile.Type)
-                return AuthorityResult.Reject(
-                    "tile_type_mismatch",
-                    countsAsViolation: false,
-                    detail: $"坐标=({brk.X},{brk.Y}) Action={brk.Action} ClientType={brk.TileType} ServerType={tile.Type} ServerActive={tile.Active} ServerWall={tile.Wall}");
+        }
+        else if (brk.Action is 1 or 3 && (brk.TileType < 0 || brk.TileType > MaxTileType))
+        {
+            return Deny(playerId, "tile_rejected", "invalid_tile_type", new { brk.TileType });
         }
 
         return AuthorityResult.Accept(brk);
     }
+
+    /// <summary>原版有效图格 / 墙类型上限（1.4.5.8：图格 0..556）。</summary>
+    private const int MaxTileType = 556;
 
     private AuthorityResult ValidatePlace(TilePlacePacket place, int playerId)
     {
@@ -1028,7 +1036,7 @@ internal sealed class WorldAuthority : IWorldAuthority
             return Deny(playerId, "tile_rejected", "out_of_reach", new { place.X, place.Y });
 
         // tile 类型合法性：Terraria 有效砖类型 0..556（1.4.5.8），负数或超上限拒
-        if (place.TileType < 0 || place.TileType > 556)
+        if (place.TileType < 0 || place.TileType > MaxTileType)
             return Deny(playerId, "tile_rejected", "invalid_tile_type", new { place.TileType });
 
         // 先检查放置目标，再检查背包。验证阶段不得产生副作用，避免目标格已占用时扣除物品。

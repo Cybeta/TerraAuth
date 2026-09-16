@@ -22,9 +22,9 @@
 | 玩家激活在线 / 离线 | 14 | 进服广播激活；断线广播 `Active=false` | `Vanilla_PlayerDisconnect_Broadcasts_Inactive` |
 | **断线会话保留 + 槽位回收** | 14 | 断线不销毁运行时：按玩家名保留位置 / 血量 / 增益（`SessionResumeGraceSeconds`，默认 60s），宽限期内同身份重连**认回原运行时**并下发**携带恢复坐标**的出生包（12）；超期 / 被顶号回收。断开时释放连接槽位与并发容量，新连接复用**最小空闲 ID**（与原版一致）。注：原版客户端断线即回主菜单，故为「手动重进的会话接管」而非自动重连 | `Vanilla_SessionResume_Restores_Position_And_Hp` / `..._Off_When_Grace_Is_Zero` / `SessionResume_Expires_After_Grace` |
 | 移动 / 位置 | 13 | **分轴**超速校验（水平 `maxSpeed×60×Δt`；垂直 `max(maxSpeed, MaxFallSpeed)×60×Δt`，均 + 容差）；超上限在 **×4 可疑带**内放行（原版受击击退 / 被挤出方块 / 斜坡校正的合法大位移），只有真瞬移量级才拒绝 → Command → 仿真 → 快照 15；并转发其他玩家 | `Vanilla_Movement_Accepted_And_Applied` / `..._Overspeed_IsRejected` / `MovementAuthority_Accepts_KnockbackScale_Step` |
-| 挖砖 | 17 | 越界 / 超距 / 图格类型对账 → TileBreakCommand → 图格变更 → 转发 | `Vanilla_TileBreak_Removes_Solid_Tile` / `..._OutOfReach_IsRejected` |
+| 挖砖 | 17 | 越界 / 超距（包 17 第 5 字段在「挖」时是 **fail 标志**而非图格类型，不作类型对账）→ TileBreakCommand → 图格变更 + **图格掉落**（`TileDropTable`，树木整棵倒下）→ 转发 | `Vanilla_TileBreak_Removes_Solid_Tile` / `..._OutOfReach_IsRejected` / `..._HitOnly_Flag_Is_Not_Rejected_As_TypeMismatch` / `..._Drops_Item_To_Client` |
 | 放砖 | 79 | 越界 / 超距 / 类型范围 / **背包扣减（SSC）** → TilePlaceCommand | `Vanilla_InventoryReport_Then_TilePlace_Succeeds` / `..._Without_InventoryItem_IsRejected` |
-| 背包同步 | 5 | 槽位 / 堆叠 / 物品校验；SSC 下服务端持有唯一真相 | `Vanilla_InventorySlot_InvalidSlot_IsRejected` |
+| 背包同步 | 5 | 槽位 / 堆叠 / 物品校验；SSC 下服务端持有唯一真相；**断线时按玩家名把背包 / 生命 / 法力落盘，新会话进服时回读**（`PlayerProfileCodec`，否则重进即清空） | `Vanilla_InventorySlot_InvalidSlot_IsRejected` / `Vanilla_SscInventory_Survives_Reconnect` / `PlayerProfileCodec_RoundTrips_Inventory_And_Vitals` |
 | 物品丢弃 | 21 | 物品 ID / 堆叠校验；并中继给他人 | `Vanilla_ItemDrop_UnknownItem_IsRejected` / `..._Is_Relayed_To_OtherPlayers` |
 | 开箱 | 31 | 坐标越界校验 | `Vanilla_Chest_OutOfBounds_IsRejected` |
 | 攻击 NPC | 28 | 单次伤害上限 + 窗口内 DPS 上限 | `Vanilla_NpcStrike_Above_SingleDamage_Limit_IsRejected` / `..._Within_Limit_IsAccepted` |
@@ -45,7 +45,7 @@
 | **治疗（上限钳制）** | 35 | 非负校验 → `HealPlayerCommand`：回血上限钳制到服务端 HpMax，客户端超额治疗不会让服务端生命越界 | `Vanilla_Heal_Is_Clamped_To_Server_Max_Hp` / `Vanilla_Negative_Heal_Is_Rejected` |
 | **增益（服务端持有）** | 50 | 条目数 ≤ 44（原版增益槽位）且 ID ∈ [1,400] 校验通过后，由服务端持有增益列表（唯一真相） | `Vanilla_Buffs_Are_Held_Server_Side` / `Vanilla_Invalid_Buff_Id_Is_Rejected` |
 | **弹幕生成校验** | 27 | 弹幕类型须在 [1,1135]；伤害超单次上限即判为作弊拒绝（与包 28 共用阈值）；通过后由服务端登记实体 | `Vanilla_Projectile_Damage_Above_Limit_Is_Rejected` / `Vanilla_Projectile_Invalid_Type_Is_Rejected` |
-| **掉落物拾取** | 22 | 槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC）→ 移除世界实体并下发包 21（stack=0） | `Vanilla_ItemPickup_Removes_WorldItem` / `Vanilla_ItemPickup_OutOfReach_Is_Rejected` |
+| **掉落物拾取** | 22 | 槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC）→ 移除世界实体并下发包 21（stack=0），并给拾取者一条聊天提示（包 82，`ItemNameTable`） | `Vanilla_ItemPickup_Removes_WorldItem` / `Vanilla_ItemPickup_OutOfReach_Is_Rejected` / `PickupItem_Queues_Chat_Notice` |
 | **弹幕命中判定** | 27 | 服务端按弹幕 / 敌怪距离判定命中并扣血，不再采信客户端声明 | `Vanilla_Projectile_Hit_Damages_Enemy` |
 | 请求传送（回城类） | 73 | 类型 / 频率校验（与 65 共窗口） | `Vanilla_TeleportRequest_Is_Accepted` / `Vanilla_TeleportRequest_RateExceeded_Is_Rejected` |
 | **箱子内容（服务端持有 + 持久化）** | 31 / 32 / 34 | 开箱校验（存在 / 距离）→ 服务端逐槽下发权威内容（包 34 + 包 32×N）；包 32 校验箱子 / 槽位 / 堆叠 / 物品 / 距离后写入服务端箱子，并**登记增量落盘**（重启后回放，按索引 + 坐标校验） | `Vanilla_ChestOpen_Sends_Authoritative_Contents` / `Vanilla_ChestItem_Is_Applied_Authoritatively` / `..._Invalid_Slot_...` / `..._OutOfReach_...` / `Vanilla_ChestContent_Survives_ServerRestart` |

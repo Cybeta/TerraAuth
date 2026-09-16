@@ -23,4 +23,17 @@ public static class PlayerIdentity
         var bytes = id.ToByteArray();
         return BitConverter.ToInt32(bytes, 0);
     }
+
+    /// <summary>
+    /// 玩家名 → **档案**身份 Guid（玩家档案：SSC 背包 / 生命 / 法力，跨会话与槽位复用）。
+    /// 不能复用 <see cref="ToGuid"/>：那是按连接槽位构造的，槽位会被下一位玩家复用、
+    /// 会话接管还会换槽位，用它会「A 的背包存到 B 名下」。玩家名是跨会话稳定的身份
+    /// （会话恢复同样按玩家名认回），故取它的确定性哈希；仅作身份键，非安全用途。
+    /// </summary>
+    public static Guid FromName(string name)
+    {
+        Span<byte> hash = stackalloc byte[32];
+        System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(name), hash);
+        return new Guid(hash[..16]);
+    }
 }

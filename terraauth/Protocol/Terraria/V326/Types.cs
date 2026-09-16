@@ -115,12 +115,22 @@ public sealed record NpcStrikePacket(int NpcId, int Damage) : INetworkPacket
 /// Tile 操作包（TileManipulation，包 17，上行）。
 /// 布局：Byte Action + Int16 X + Int16 Y + Int16 TileType + Byte Style。
 /// Action 语义见原版 <c>MessageBuffer</c> case 17（0=挖、1=放、2/3=墙、5+=电线/斜坡等）。
+/// <para>
+/// ⚠️ <see cref="TileType"/> 这个 Int16 的语义**随 Action 两用**（原版同一字段）：
+/// Action 0/2/4（挖砖 / 挖墙 / 无掉落挖砖）时它是 <c>KillTile</c> 的 **fail 标志**
+/// （1 = 仅命中特效、尚未挖穿；0 = 真正破坏——原版 Player.PickTile 正是这样发的）；
+/// Action 1/3（放砖 / 放墙）时它才是图格 / 墙的**类型**。
+/// 早期实现把它恒当作图格类型并与服务端对账，导致草(2)等一切非 0/1 的图格挖不动。
+/// </para>
 /// </summary>
 public sealed record TileBreakPacket(int X, int Y, byte Action) : INetworkPacket
 {
     public PacketId Type => PacketId.TileBreak;
 
-    /// <summary>目标图格类型 / 斜坡值（依 Action 语义不同）。</summary>
+    /// <summary>
+    /// 第 4 个 Int16：Action 0/2/4 = fail 标志（0 真正破坏 / 非 0 仅命中特效）；
+    /// Action 1/3 = 图格 / 墙类型。见类型注释。
+    /// </summary>
     public int TileType { get; init; }
 
     /// <summary>样式变体（依 Action 语义不同）。</summary>

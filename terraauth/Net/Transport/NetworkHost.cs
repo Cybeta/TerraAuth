@@ -90,6 +90,9 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>服务端命令子系统（游戏内 / 前缀命令分发）；null = 关闭。</summary>
     private readonly Authority.CommandService? _commandService;
 
+    /// <summary>SSC 玩家档案仓储（背包 / 生命 / 法力落盘）；null = 不持久化。</summary>
+    private readonly TerraAuth.Persistence.IPlayerRepository? _playerProfiles;
+
     /// <summary>实际监听端口（endpoint 端口传 0 时由 OS 分配）；<see cref="Start"/> 之后有效。</summary>
     public int BoundPort => ((IPEndPoint)_listener.LocalEndpoint).Port;
 
@@ -124,7 +127,8 @@ public sealed class NetworkHost : IAsyncDisposable
         IHookRegistry? hooks = null,
         ViolationKickLimits? violationKick = null,
         int sessionResumeGraceSeconds = 0,
-        Authority.CommandService? commandService = null)
+        Authority.CommandService? commandService = null,
+        TerraAuth.Persistence.IPlayerRepository? playerProfiles = null)
     {
         _sessionResumeGraceTicks = Math.Max(0, sessionResumeGraceSeconds) * TicksPerSecond;
         _listener = new TcpListener(endpoint);
@@ -140,6 +144,7 @@ public sealed class NetworkHost : IAsyncDisposable
         _hooks = hooks;
         _violationKick = violationKick ?? ViolationKickLimits.Default;
         _commandService = commandService;
+        _playerProfiles = playerProfiles;
 
         SnapshotSender = new ConnectionSnapshotSender(connections, encoder);
     }
@@ -241,6 +246,10 @@ public sealed class NetworkHost : IAsyncDisposable
         // 通知其他玩家该玩家已离线（包 14 置为未激活），否则原版客户端会残留幽灵玩家
         if (connection.PlayerId > 0)
         {
+            // SSC 档案落盘：必须在 MarkPlayerOffline 之前取运行时（之后它会被移出在线集合）。
+            // 不落盘的话 SSC（服务端持有背包唯一真相）下每次重进背包都会归零。
+            SavePlayerProfile(connection, name);
+
             // 权威侧：清掉该槽位上的按玩家状态（移动基线等）。否则槽位复用时，
             // 上一次会话的位置会被当作基准，使重连玩家的首个位置包被判超速。
             _pipeline.ResetPlayer(connection.PlayerId, connection.SessionId);
@@ -266,6 +275,34 @@ public sealed class NetworkHost : IAsyncDisposable
             Reason = "Disconnected",
             SessionDuration = duration,
         });
+    }
+
+    /// <summary>
+    /// SSC 玩家档案落盘（背包 + 生命 / 法力），按玩家名作为档案身份。
+    /// 同步等待写入完成：断线清理紧随其后，异步写会让「立刻重进」读到旧档案。
+    /// </summary>
+    private void SavePlayerProfile(Connection connection, string name)
+    {
+        if (_playerProfiles is null || string.IsNullOrEmpty(name)) return;
+
+        PlayerRuntime? runtime;
+        lock (_world.PlayersLock)
+            _world.Players.TryGetValue(connection.PlayerId, out runtime);
+        if (runtime is null || runtime.SessionId != connection.SessionId) return;
+
+        try
+        {
+            _playerProfiles.SaveAsync(new TerraAuth.Persistence.PlayerData(
+                TerraAuth.Security.PlayerIdentity.FromName(name),
+                name,
+                PlayerProfileCodec.Encode(runtime),
+                runtime.HpMax,
+                runtime.MpMax)).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SSC] 玩家档案写入失败（{name}）：{ex.Message}");
+        }
     }
 
     /// <summary>广播玩家离线（包 14 Active=false）给其余玩家。</summary>
@@ -1004,20 +1041,36 @@ public sealed class NetworkHost : IAsyncDisposable
 
         if (!resumed)
         {
-            lock (_world.PlayersLock)
+            var created = new PlayerRuntime
             {
-                _world.Players[connection.PlayerId] = new PlayerRuntime
+                Id = connection.PlayerId,
+                SessionId = connection.SessionId,
+                Active = true,
+                Position = new Vector2(
+                    _world.SpawnTileX * 16f,
+                    _world.SpawnTileY * 16f),
+                AimPosition = new Vector2(
+                    _world.SpawnTileX * 16f,
+                    _world.SpawnTileY * 16f),
+            };
+            lock (_world.PlayersLock)
+                _world.Players[connection.PlayerId] = created;
+
+            // SSC 档案回读：新会话（非接管）按**玩家名**取回背包 / 生命 / 法力。
+            // 锁外做 I/O；读失败按出生默认值继续（不阻断进服）。
+            if (_playerProfiles is not null)
+            {
+                try
                 {
-                    Id = connection.PlayerId,
-                    SessionId = connection.SessionId,
-                    Active = true,
-                    Position = new Vector2(
-                        _world.SpawnTileX * 16f,
-                        _world.SpawnTileY * 16f),
-                    AimPosition = new Vector2(
-                        _world.SpawnTileX * 16f,
-                        _world.SpawnTileY * 16f),
-                };
+                    var profile = await _playerProfiles
+                        .GetAsync(TerraAuth.Security.PlayerIdentity.FromName(name)).ConfigureAwait(false);
+                    if (profile is not null && PlayerProfileCodec.TryApply(profile.InventoryBlob, created))
+                        Console.WriteLine($"[SSC] 已恢复玩家 \"{name}\"（#{connection.PlayerId}）的背包与状态");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[SSC] 玩家档案读取失败（按新玩家继续）：{ex.Message}");
+                }
             }
         }
 
