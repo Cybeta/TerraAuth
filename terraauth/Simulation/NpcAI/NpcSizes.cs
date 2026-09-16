@@ -38,6 +38,32 @@ public static class NpcSizes
         210 => (12, 12),    // Hornet
         211 => (8, 8),      // Hornet（小）
         222 => (66, 66),    // Queen Bee
+
+        // ---- 小动物（原版 NPC.SetDefaults 逐类核对）----
+        46 or 303 or 337 or 540 or 230 => (18, 20),   // Bunny（含万圣节/圣诞/派对换皮）/ Turtle 换皮
+        299 or 538 or 539 => (18, 20),         // Squirrel
+        74 or 297 or 298 or 442 or >= 671 and <= 675 => (14, 14),  // Bird / GoldBird / 新鸟系列
+        148 or 149 => (16, 34),                // Penguin
+        185 => (28, 28),                       // SnowFlinx
+        217 or 218 => (28, 20),                // CochinealBeetle / CyanBeetle
+        355 or 356 or 444 or 653 or 654 or 661 or 669 or 677 or 604 or 605 or 612 or 613 => (10, 10),  // Firefly / Butterfly / Ladybug / WaterStrider
+        357 or 448 => (10, 4),                 // Worm / GoldWorm
+        358 => (12, 12),                       // LightningBug
+        359 => (12, 12),                       // Snail
+        360 or 655 => (14, 14),                // GlowingSnail
+        361 or 445 => (12, 10),                // Frog / GoldFrog
+        363 or 365 or 603 or 609 => (28, 22),  // Duck / GoldDuck / MallardDuck
+        377 or 446 => (14, 10),                // Grasshopper
+        583 or 584 or 585 => (18, 20),         // FairyCritter
+        593 => (18, 20),                       // Goldfish 换皮（aiStyle 7）
+        602 => (22, 26),                       // Seagull
+        606 => (10, 4),                        // Worm（青）
+        611 or 689 => (18, 34),                // Seagull / GoldSeagull（aiStyle 24）
+        616 or 617 or 625 => (22, 20),         // 城镇鸭（aiStyle 7）
+        626 or 627 => (16, 20),                // Seahorse（aiStyle 118）
+        55 or 592 or 607 or 615 => (20, 18),   // Goldfish / Frog（aiStyle 16）
+        688 => (32, 16),                       // Frog（大，aiStyle 16）
+
         _ => (FallbackWidth, FallbackHeight),
     };
 }

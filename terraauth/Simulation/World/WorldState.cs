@@ -318,6 +318,9 @@ public sealed class WorldState
             case 636: Progress.DownedEmpressOfLight = true; break;       // Empress of Light
             case 668: Progress.DownedDeerclops = true; break;            // Deerclops
             case 109: Progress.DownedClown = true; break;                // Clown
+            // 血肉墙（113）：原版 WorldGen.StartHardmode() —— 世界进入困难模式，
+            // 地形转换（神圣带 + 邪恶带刷新）由仿真层在检测到该进度位时执行一次。
+            case 113: Progress.HardMode = true; break;                    // Wall of Flesh
             default: return;
         }
 
@@ -1584,14 +1587,37 @@ public sealed class WorldNpc
     /// </summary>
     public readonly float[] Ai = new float[4];
 
-    /// <summary>原版 <c>NPC.localAI[0..1]</c>：不参与网络同步的本地计时/暂存槽（如弹幕发射节流）。</summary>
-    public readonly float[] LocalAi = new float[2];
+    /// <summary>原版 <c>NPC.localAI[0..3]</c>：不参与网络同步的本地计时/暂存槽（如弹幕发射节流 / 小动物卡住判定）。</summary>
+    public readonly float[] LocalAi = new float[4];
 
     /// <summary>朝向（原版 <c>NPC.direction</c>，1 = 右 / -1 = 左）。</summary>
     public int Direction = 1;
 
+    /// <summary>垂直朝向（原版 <c>NPC.directionY</c>，1 = 下 / -1 = 上；蜗牛爬墙状态机使用）。</summary>
+    public int DirectionY = 1;
+
     /// <summary>上一帧是否贴地（由图格碰撞结果维护）：决定是否进入「等待 → 起跳」。</summary>
     public bool Grounded;
+
+    // ---- 帧内瞬态（由图格碰撞 / 液体探测填写，AI 下一帧读取；对应原版 collideX/collideY/wet）----
+
+    /// <summary>上一帧水平速度是否被图格碰撞清零（原版 <c>NPC.collideX</c>）。</summary>
+    public bool CollideX;
+
+    /// <summary>上一帧垂直速度是否被图格碰撞清零（原版 <c>NPC.collideY</c>；落地 / 撞顶都会置位）。</summary>
+    public bool CollideY;
+
+    /// <summary>上一帧是否处于液体中（原版 <c>NPC.wet</c>，物理步用新位置探测）。</summary>
+    public bool Wet;
+
+    /// <summary>原版 <c>NPC.oldVelocity</c>：碰撞清零之前的水平速度（AI 反弹计算用）。</summary>
+    public float PrevVelocityX;
+
+    /// <summary>原版 <c>NPC.oldVelocity.Y</c>。</summary>
+    public float PrevVelocityY;
+
+    /// <summary>原版 <c>noTileCollide</c>：跳过图格碰撞（与 <see cref="NoGravity"/> 独立）。</summary>
+    public bool NoTileCollide;
 
     /// <summary>上一次已下发的状态；用于「变化才发」（未变化时按心跳周期补发）。</summary>
     public float SyncedX;
@@ -1613,4 +1639,12 @@ public sealed class WorldNpc
 
     /// <summary>上一次下发所在 tick（心跳判定：未变化也每 1s 补发一次，保证新入服玩家能看到静止 NPC）。</summary>
     public long SyncedTick;
+
+    /// <summary>
+    /// 强制下一轮同步下发（包 23）。用于「不在状态变化判据里」的字段改动 —— 目前是
+    /// <see cref="Type"/> / <see cref="NetId"/>（换型：<c>NPC.Transform</c>）。
+    /// 客户端只在包 23 的 netID 与本地不一致时重建外观（<c>MessageBuffer</c> 包 23 分支），
+    /// 所以换型必须无条件重发一次，否则客户端会一直画旧形态。
+    /// </summary>
+    public bool SyncForced;
 }

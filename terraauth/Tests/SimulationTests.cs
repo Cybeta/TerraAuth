@@ -2634,4 +2634,917 @@ public class WorldGeneratorTests
             Assert.Contains(world.Items, it => it.ItemId == 3381); // 宝袋必掉
         }
     }
+
+    // ========================================================================
+    // 二十、原版刷怪规则（生物群系 / 昼夜细分 / 事件触发）
+    // ========================================================================
+
+    /// <summary>负 netID → 基础类型：原版 <c>NPCID.FromNetId</c>（NetIdMap 65 项）。</summary>
+    [Theory]
+    [InlineData(-1, 81)]    // Slimeling
+    [InlineData(-3, 1)]     // Green Slime
+    [InlineData(-4, 1)]     // Pinky
+    [InlineData(-7, 1)]     // Purple Slime
+    [InlineData(-10, 1)]    // Jungle Slime
+    [InlineData(-13, 31)]   // Short Bones
+    [InlineData(-26, 3)]    // Small Zombie
+    [InlineData(-27, 3)]    // Big Zombie
+    [InlineData(-43, 2)]    // Demon Eye 2
+    [InlineData(-46, 21)]   // Small Skeleton
+    [InlineData(-56, 231)]  // Little Hornet Fatty
+    [InlineData(-65, 235)]  // Big Hornet Stingy
+    [InlineData(0, 0)]
+    [InlineData(1, 1)]
+    [InlineData(4558, 4558)]
+    public void NetIdMap_Resolves_BaseType(int netId, int expected)
+        => Assert.Equal(expected, NpcNetIdMap.FromNetId(netId));
+
+    /// <summary>
+    /// 生物群系度量：阈值取原版（腐化 300 / 神圣 125），且**神圣与邪恶互相抵消**；
+    /// 深度带按地表 / 岩层 / 地狱分层。
+    /// </summary>
+    [Fact]
+    public void BiomeScanner_Applies_Vanilla_Thresholds_And_DepthBands()
+    {
+        var world = new WorldState
+        {
+            MaxTilesX = 400,
+            MaxTilesY = 500,
+            Tiles = new TileMap(400, 500),
+            WorldSurface = 100,
+            RockLayer = 200,
+        };
+
+        var scanner = new BiomeScanner();
+
+        // 无群系图格 → 全部 false；y=150 落在泥土层
+        var clean = scanner.Scan(world, 200, 150);
+        Assert.False(clean.Corrupt);
+        Assert.False(clean.Crimson);
+        Assert.False(clean.Hallow);
+        Assert.False(clean.Desert);
+        Assert.True(clean.BelowSurface);
+        Assert.Equal(DepthBand.Dirt, clean.Depth);
+
+        // 铺 300 格黑檀石（23）→ 腐化达标
+        for (int i = 0; i < 300; i++)
+        {
+            ref var t = ref world.Tiles[200 + (i % 80), 150 + (i / 80)];
+            t.Active = true;
+            t.Type = 23;
+        }
+        var corrupt = scanner.Scan(world, 200, 150);
+        Assert.True(corrupt.Corrupt);
+        Assert.False(corrupt.Hallow);
+
+        // 再叠 125 格珍珠石（109）→ 神圣与邪恶互相抵消：holy(125) 被 evil(300) 抹平、
+        // evil 也被 holyRaw(125) 扣减到 175 < 300 → 两者都不成立（原版 AggregateTileCounts 行为）
+        for (int i = 0; i < 125; i++)
+        {
+            ref var t = ref world.Tiles[200 + (i % 80), 160 + (i / 80)];
+            t.Active = true;
+            t.Type = 109;
+        }
+        var mixed = scanner.Scan(world, 200, 150);
+        Assert.False(mixed.Corrupt);
+        Assert.False(mixed.Hallow);
+
+        // 深度带：天空 ≤ 0.35×地表、地表 ≤ 地表、泥土 ≤ 岩层、岩层 ≤ (世界高−200)、其余为地狱
+        Assert.Equal(DepthBand.Sky, scanner.Scan(world, 200, 30).Depth);
+        Assert.Equal(DepthBand.Overworld, scanner.Scan(world, 200, 50).Depth);
+        Assert.Equal(DepthBand.Dirt, scanner.Scan(world, 200, 150).Depth);
+        Assert.Equal(DepthBand.Rock, scanner.Scan(world, 200, 250).Depth);
+        Assert.Equal(DepthBand.Underworld, scanner.Scan(world, 200, 350).Depth);
+    }
+
+    /// <summary>
+    /// 刷怪速率（原版 <c>GetSpawnRate</c>）：白天基准 600/5；夜晚 ×0.6/×1.3；血月再 ×0.3/×1.8；
+    /// 日食 ×0.2/×1.9；困难模式基准 540/6；最后叠「附近怪少 → 刷得快」的阶梯。
+    /// </summary>
+    [Fact]
+    public void SpawnRate_Applies_DayNight_And_Event_Modifiers()
+    {
+        var zones = new SceneZones(false, false, false, false, false, false, false, false,
+            false, false, false, false, DepthBand.Overworld);
+
+        SpawnRateContext Ctx(bool day, bool blood, bool eclipse, bool hard) => new()
+        {
+            HardMode = hard,
+            PlayerCenterY = 101 * 16f,
+            WorldSurface = 100,
+            RockLayer = 200,
+            UnderworldLayer = 300,
+            DayTime = day,
+            BloodMoon = blood,
+            Eclipse = eclipse,
+            Zones = zones,
+            TownNpcs = 0,
+            NearbyActiveNpcs = 0,
+            Invaders = false,
+            ActivePlayers = 1,
+        };
+
+        Assert.Equal((360, 5), SpawnRate.Compute(Ctx(day: true, blood: false, eclipse: false, hard: false)));
+        Assert.Equal((216, 6), SpawnRate.Compute(Ctx(day: false, blood: false, eclipse: false, hard: false)));
+        Assert.Equal((64, 10), SpawnRate.Compute(Ctx(day: false, blood: true, eclipse: false, hard: false)));
+        Assert.Equal((72, 9), SpawnRate.Compute(Ctx(day: true, blood: false, eclipse: true, hard: false)));
+        Assert.Equal((324, 6), SpawnRate.Compute(Ctx(day: true, blood: false, eclipse: false, hard: true)));
+
+        // 入侵：固定 spawnRate = 20，上限按人数放宽（5 × (2 + 0.3 × 1) = 11）
+        var invasion = SpawnRate.Compute(new SpawnRateContext
+        {
+            HardMode = false,
+            PlayerCenterY = 101 * 16f,
+            WorldSurface = 100,
+            RockLayer = 200,
+            UnderworldLayer = 300,
+            DayTime = true,
+            BloodMoon = false,
+            Eclipse = false,
+            Zones = zones,
+            TownNpcs = 0,
+            NearbyActiveNpcs = 0,
+            Invaders = true,
+            ActivePlayers = 1,
+        });
+        Assert.Equal(20, invasion.SpawnRate);
+        Assert.Equal(11, invasion.MaxSpawns);
+    }
+
+    /// <summary>构造一个「地表 / 泥土层」通用上下文；<paramref name="day"/> 决定昼夜分支。</summary>
+    private static EnemySpawnContext SurfaceCtx(bool day) => new()
+    {
+        Zones = default,
+        Progress = new WorldProgress(),
+        Npcs = new List<WorldNpc>(),
+        CavernMonsterTypes = EnemySpawnPool.BuildCavernMonsterTypes(1),
+        DayTime = day,
+        HardMode = false,
+        ExpertMode = false,
+        Raining = false,
+        Invaders = false,
+        InvasionType = 0,
+        WaterTile = false,
+        NoWorms = false,
+        SkyMob = false,
+        MoonPhase = 1,
+        TimeOfDay = 27000,     // 正午（原版鸟类只在 time < 18000 的清晨刷）
+        WindSpeedTarget = 0f,
+        SpawnTileX = 200,
+        SpawnTileY = 100,
+        GroundTileType = 2, // 草地
+        WallType = 0,
+        MaxTilesX = 4200,
+        MaxTilesY = 1200,
+        WorldSpawnTileX = 2100,
+        WorldSurface = 100,
+        RockLayer = 300,
+        ActivePlayers = 1,
+        PlayerHasStartingHealth = true,
+    };
+
+    /// <summary>
+    /// 地表白天：原版这一段以**小动物**为主（1/15 的分支），其余是史莱姆家族兜底。
+    /// 小动物含飞行型（鸟）。原版鸟群只在清晨（<c>Main.time &lt; 18000</c>）且距出生点近时出现。
+    /// </summary>
+    [Fact]
+    public void SpawnPool_SurfaceDay_SpawnsCrittersAndSlimes()
+    {
+        var allowed = new HashSet<int>
+        {
+            // 小动物：兔 / 企鹅 / 松鼠 / 蝴蝶 / 金蝴蝶 / 瓢虫 / 椿象 / 鸟（含黄金变体）
+            46, 148, 149, 299, 356, 444, 538, 539, 443, 604, 605, 669, 74, 297, 298, 442,
+            // 史莱姆家族兜底（原始 netID；-3 绿 / -7 紫 解析后同为 1）
+            -3, -7, 1,
+        };
+        var seen = new HashSet<int>();
+        var rng = new XoshiroRng(2024);
+        var ctx = SurfaceCtx(day: true);
+        ctx.WorldSpawnTileX = ctx.SpawnTileX;   // 距出生点近 → 鸟群分支可达
+        ctx.TimeOfDay = 6000;                   // 清晨
+
+        for (int i = 0; i < 3000; i++)
+        {
+            int netId = EnemySpawnPool.Pick(rng, ctx);
+            Assert.Contains(netId, allowed);
+            seen.Add(netId);
+        }
+        Assert.Contains(-3, seen);  // 绿史莱姆（出生点附近非专家时原版必定给绿史莱姆，解析后为 1）
+        Assert.Contains(46, seen);  // 兔（贴地型小动物）
+        Assert.Contains(74, seen);  // 鸟（飞行型小动物）
+    }
+
+    /// <summary>地表夜晚：僵尸家族（含 <c>zombieStyle</c> 换皮）、恶魔眼、萤火虫与 1/5 概率的火把僵尸。</summary>
+    [Fact]
+    public void SpawnPool_SurfaceNight_IsZombieFamily()
+    {
+        var allowed = new HashSet<int> { 3, 132, 186, 187, 188, 189, 200, 590, 355, 358, 2 };
+        var rng = new XoshiroRng(777);
+        var ctx = SurfaceCtx(day: false);
+
+        for (int i = 0; i < 600; i++)
+            Assert.Contains(NpcNetIdMap.FromNetId(EnemySpawnPool.Pick(rng, ctx)), allowed);
+    }
+
+    /// <summary>血月（非困难）：僵尸照常，但 2/5 概率换成血僵尸 / 滴血者。</summary>
+    [Fact]
+    public void SpawnPool_BloodMoon_SpawnsBloodZombieAndDrippler()
+    {
+        var allowed = new HashSet<int>
+        {
+            2, 3, 53, 132, 186, 187, 188, 189, 200, 355, 358, 489, 490, 536, 590,
+        };
+        var seen = new HashSet<int>();
+        var rng = new XoshiroRng(999);
+        var ctx = SurfaceCtx(day: false);
+        ctx.BloodMoon = true;
+
+        for (int i = 0; i < 800; i++)
+        {
+            int type = NpcNetIdMap.FromNetId(EnemySpawnPool.Pick(rng, ctx));
+            Assert.Contains(type, allowed);
+            seen.Add(type);
+        }
+        Assert.Contains(489, seen); // BloodZombie
+        Assert.Contains(490, seen); // Drippler
+    }
+
+    /// <summary>日食（未击败世纪之花）：只应出现日食专属池的成员。</summary>
+    [Fact]
+    public void SpawnPool_Eclipse_UsesEclipsePool()
+    {
+        var allowed = new HashSet<int> { 251, 159, 469, 162, 461, 462, 166 };
+        var rng = new XoshiroRng(31337);
+        var ctx = SurfaceCtx(day: true);
+        ctx.Eclipse = true;
+
+        for (int i = 0; i < 400; i++)
+            Assert.Contains(NpcNetIdMap.FromNetId(EnemySpawnPool.Pick(rng, ctx)), allowed);
+    }
+
+    /// <summary>高空刷怪：飞龙需困难模式，故普通难度只出哈比（与 1/25 的紫史莱姆解锁位）。</summary>
+    [Fact]
+    public void SpawnPool_Sky_UsesSkyPool()
+    {
+        var allowed = new HashSet<int> { 48, 686 };
+        var rng = new XoshiroRng(4242);
+        var ctx = SurfaceCtx(day: true);
+        ctx.SkyMob = true;
+
+        for (int i = 0; i < 200; i++)
+            Assert.Contains(NpcNetIdMap.FromNetId(EnemySpawnPool.Pick(rng, ctx)), allowed);
+    }
+
+    /// <summary>地狱层（y &gt; 世界高 − 190）：恶魔 / 岩浆史莱姆 / 骨蛇 / 火焰小鬼。</summary>
+    [Fact]
+    public void SpawnPool_Underworld_UsesHellPool()
+    {
+        var allowed = new HashSet<int> { 24, 39, 59, 60, 62, 66 };
+        var rng = new XoshiroRng(555);
+        var ctx = SurfaceCtx(day: true);
+        ctx.SpawnTileY = ctx.MaxTilesY - 100;
+
+        for (int i = 0; i < 400; i++)
+            Assert.Contains(NpcNetIdMap.FromNetId(EnemySpawnPool.Pick(rng, ctx)), allowed);
+    }
+
+    /// <summary>入侵（哥布林）：只应出现原版 <c>invasionType == 1</c> 分支的成员。</summary>
+    [Fact]
+    public void SpawnPool_GoblinInvasion_UsesGoblinPool()
+    {
+        var allowed = new HashSet<int> { 26, 27, 28, 29, 111 };
+        var seen = new HashSet<int>();
+        var rng = new XoshiroRng(808);
+        var ctx = SurfaceCtx(day: true);
+        ctx.Invaders = true;
+        ctx.InvasionType = 1;
+
+        for (int i = 0; i < 400; i++)
+        {
+            int type = NpcNetIdMap.FromNetId(EnemySpawnPool.Pick(rng, ctx));
+            Assert.Contains(type, allowed);
+            seen.Add(type);
+        }
+        Assert.Contains(26, seen); // GoblinPeon
+        Assert.Contains(28, seen); // GoblinWarrior
+    }
+
+    /// <summary>
+    /// 岩层 + 丛林群系：丛林史莱姆（netID −10）与丛林蝙蝠（51）都应出现（原版的群系专属分支）。
+    /// 注意断言用**原始 netID**：负向变体的解析类型可能与其它变体相同（−6 / −10 都解析为 1）。
+    /// </summary>
+    [Fact]
+    public void SpawnPool_JungleCavern_SpawnsJungleMonsters()
+    {
+        var allowed = new HashSet<int>
+        {
+            10, 16, 21, 44, 51, 195, 201, 202, 203, 217, 218, 453, // 洞穴主力（含洞穴甲虫）
+            -6, -10, -46, -47, -48, -49, -50, -51, -52, -53,
+            494, 495, 496, 497, 498, 499, 500, 501, 502, 503, 504, 505, 506,
+        };
+        var seen = new HashSet<int>();
+        var rng = new XoshiroRng(60606);
+        var ctx = SurfaceCtx(day: true);
+        ctx.SpawnTileY = 400;          // 岩层（rockLayer = 300）
+        ctx.Zones = ctx.Zones with { Jungle = true };
+
+        for (int i = 0; i < 400; i++)
+        {
+            int netId = EnemySpawnPool.Pick(rng, ctx);
+            Assert.Contains(netId, allowed);
+            seen.Add(netId);
+        }
+        Assert.Contains(-10, seen); // JungleSlime（丛林群系专属）
+        Assert.Contains(51, seen);  // JungleBat（丛林群系专属）
+    }
+
+    /// <summary>
+    /// 群系图格：原版「生成阶段就该有」的群系必须真的产出，且能被服务端场景度量判出来。
+    /// 判据直接走 <see cref="BiomeScanner"/> —— 与刷怪读的是同一条链路（所以这同时验证了
+    /// 群系刷怪池在生成世界里「可达」）。
+    /// </summary>
+    [Fact]
+    public void Generate_Produces_Biomes_DetectedBySceneMetrics()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var scanner = new BiomeScanner();
+        int w = world.MaxTilesX;
+        int surface = (int)world.WorldSurface;
+        int mushroomY = Math.Min((int)world.RockLayer + 120, world.MaxTilesY - 200 - 120);
+
+        // 邪恶群系（腐化 / 猩红二选一，与原版一致），且 Progress.Crimson 与图格一致
+        var evil = scanner.Scan(world, w * 20 / 100, surface + 20);
+        Assert.True(evil.Corrupt ^ evil.Crimson, "邪恶群系未产出（应恰有腐化或猩红之一）");
+        Assert.Equal(world.Progress.Crimson, evil.Crimson);
+
+        // 雪原
+        Assert.True(scanner.Scan(world, w * 30 / 100, surface + 20).Snow, "雪原未产出");
+
+        // 沙漠 + 地下沙漠（后者要求沙岩 / 硬化沙墙）
+        var desert = scanner.Scan(world, w * 63 / 100, surface + 40);
+        Assert.True(desert.Desert, "沙漠未产出");
+        Assert.True(desert.UndergroundDesert, "地下沙漠未产出（缺沙岩 / 硬化沙墙）");
+
+        // 丛林
+        Assert.True(scanner.Scan(world, w * 80 / 100, surface + 20).Jungle, "丛林未产出");
+
+        // 发光蘑菇地
+        Assert.True(scanner.Scan(world, w * 41 / 100, mushroomY).Glowshroom, "发光蘑菇地未产出");
+
+        // 地牢（地牢砖 + 地牢墙），并写下了包 7 的 DungeonX/Y
+        Assert.True(scanner.Scan(world, world.DungeonX, world.DungeonY).Dungeon, "地牢未产出");
+        Assert.True(world.DungeonX > 420, "地牢 X 未写入 / 落点异常");
+        Assert.True(world.DungeonY > surface, "地牢 Y 应在地表之下");
+    }
+
+    // ========================================================================
+    // 二十二、困难模式转换 与 陨石
+    // ========================================================================
+
+    /// <summary>
+    /// 地下生命水晶（原版 <c>WorldGen.AddLifeCrystal</c>）：2×2 摆放、帧 (0/18, 0/18)、
+    /// 坐在两块实心砖上；数量与世界宽度成比例。
+    /// </summary>
+    [Fact]
+    public void Generate_Places_Life_Crystals()
+    {
+        var world = WorldGenerator.GenerateSmall();
+
+        int hearts = CountTiles(world, t => t == 12);
+        Assert.True(hearts >= 16, $"生命水晶过少：{hearts} 格（应 ≥ 4 颗）");
+        Assert.Equal(0, hearts % 4);   // 2×2 摆放 ⇒ 图格数必为 4 的倍数
+
+        Assert.True(TryFindTile(world, t => t == 12, out int hx, out int hy), "未找到生命水晶");
+        Assert.Equal((short)0, world.Tiles[hx, hy].FrameX);
+        Assert.Equal((short)0, world.Tiles[hx, hy].FrameY);
+        Assert.Equal(12, world.Tiles[hx + 1, hy].Type);
+        Assert.Equal(12, world.Tiles[hx, hy + 1].Type);
+        Assert.Equal((short)18, world.Tiles[hx + 1, hy + 1].FrameX);
+    }
+
+    /// <summary>血肉墙（113）被击杀 → 世界进度置为困难模式（原版 <c>WorldGen.StartHardmode</c>）。</summary>
+    [Fact]
+    public void WallOfFlesh_Kill_Sets_HardMode()
+    {
+        var world = new WorldState();
+        Assert.False(world.Progress.HardMode);
+
+        world.NotifyNpcKilled(113, 100, 100, new XoshiroRng(1));
+
+        Assert.True(world.Progress.HardMode);
+        Assert.True(world.ProgressDirty); // 包 7 需要重新下发
+    }
+
+    /// <summary>
+    /// 困难模式地形转换（原版 <c>initializeHardMode</c>）：进入困难模式后
+    /// 世界应凭空多出**神圣带**（珍珠石 / 神圣草 / 珍珠沙…），且能被子群系度量判为 <c>ZoneHallow</c>
+    /// —— 这正是「神圣池可达」的前提。
+    /// </summary>
+    [Fact]
+    public void Hardmode_Conversion_Creates_Hallow_Band()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        int hallowBefore = CountTiles(world, t => t is 117 or 109 or 116 or 164);
+        Assert.Equal(0, hallowBefore); // 生成阶段不产出神圣（与原版一致）
+
+        int evilBefore = CountTiles(world, t => t is 23 or 25 or 199 or 203);
+
+        // 走真实路径：服务端先跑起来 → 血肉墙被击杀（进度置位）→ 下一次 tick 执行转换
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, HpMax = 100, Hp = 100 };
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        world.NotifyNpcKilled(113, 100, 100, new XoshiroRng(3));
+        sim.Tick();
+
+        int hallowAfter = CountTiles(world, t => t is 117 or 109 or 116 or 164);
+        Assert.True(hallowAfter >= 300, $"神圣带未产出（神圣图格仅 {hallowAfter}）");
+        Assert.True(CountTiles(world, t => t is 23 or 25 or 199 or 203) > evilBefore, "邪恶带未刷新");
+
+        // 在神圣带内找一个点，场景度量必须判出 Hallow
+        var scanner = new BiomeScanner();
+        Assert.True(TryFindTile(world, t => t == 117, out int hx, out int hy), "未找到珍珠石");
+        Assert.True(scanner.Scan(world, hx, hy).Hallow, "神圣带内未判出 ZoneHallow");
+    }
+
+    /// <summary>困难模式转换只执行一次（原版 <c>StartHardmode</c>：已是困难模式则直接返回）。</summary>
+    [Fact]
+    public void Hardmode_Conversion_Runs_Only_Once()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, HpMax = 100, Hp = 100 };
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+
+        world.NotifyNpcKilled(113, 100, 100, new XoshiroRng(3));
+        sim.Tick();
+        int after = CountTiles(world, t => t is 117 or 109 or 116 or 164);
+        Assert.True(after > 0, "首次 tick 未执行困难模式转换");
+
+        for (int i = 0; i < 5; i++) sim.Tick();
+        Assert.Equal(after, CountTiles(world, t => t is 117 or 109 or 116 or 164));
+    }
+
+    /// <summary>
+    /// 陨石坠落（原版 <c>WorldGen.meteor</c>）：在指定落点生成陨石坑，
+    /// 陨石图格数量足以让场景度量判出 <c>ZoneMeteor</c>（阈值 75）—— 即陨石池可达。
+    /// </summary>
+    [Fact]
+    public void Meteor_Creates_Crater_And_Unlocks_MeteorZone()
+    {
+        var world = WorldGenerator.GenerateSmall();   // 无玩家：落点检查不因玩家屏幕拒绝
+
+        int x = world.SpawnTileX + 700;               // 远离向导（NPC 附近会被拒绝）
+        int y = (int)world.WorldSurface + 60;
+        Assert.True(WorldGenerator.TryPlaceMeteor(world, new XoshiroRng(2024), x, y), "陨石落点被拒绝");
+
+        int meteorite = CountTiles(world, t => t == 37);
+        Assert.True(meteorite > 200, $"陨石图格过少：{meteorite}");
+        Assert.True(new BiomeScanner().Scan(world, x, y).Meteor, "陨石坑内未判出 ZoneMeteor");
+    }
+
+    /// <summary>统计全世界满足条件的图格数。</summary>
+    private static int CountTiles(WorldState world, Func<ushort, bool> match)
+    {
+        int n = 0;
+        for (int x = 0; x < world.MaxTilesX; x++)
+            for (int y = 0; y < world.MaxTilesY; y++)
+            {
+                ref var tile = ref world.Tiles[x, y];
+                if (tile.Active && match(tile.Type)) n++;
+            }
+        return n;
+    }
+
+    /// <summary>找第一个满足条件的图格坐标（自左向右、自上向下）。</summary>
+    private static bool TryFindTile(WorldState world, Func<ushort, bool> match, out int tx, out int ty)
+    {
+        for (int x = 1; x < world.MaxTilesX - 1; x++)
+            for (int y = 1; y < world.MaxTilesY - 1; y++)
+            {
+                ref var tile = ref world.Tiles[x, y];
+                if (tile.Active && match(tile.Type)) { tx = x; ty = y; return true; }
+            }
+        tx = 0;
+        ty = 0;
+        return false;
+    }
+
+    /// <summary>群系锚点必须避开出生点周围（否则出生点会被群系包住，初始刷怪与出生保护都受影响）。</summary>
+    [Fact]
+    public void Generate_Keeps_SpawnArea_Free_Of_Biomes()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var scanner = new BiomeScanner();
+        int surface = (int)world.WorldSurface;
+
+        var at = scanner.Scan(world, world.SpawnTileX, surface - 2); // 出生点所在的地表
+        Assert.False(at.Corrupt);
+        Assert.False(at.Crimson);
+        Assert.False(at.Hallow);
+        Assert.False(at.Jungle);
+        Assert.False(at.Snow);
+        Assert.False(at.Desert);
+        Assert.False(at.Glowshroom);
+        Assert.False(at.Meteor);
+        Assert.False(at.Dungeon);
+        Assert.False(at.Graveyard);
+    }
+
+    // ========================================================================
+    // 二十一、小动物（critter）分支
+    // ========================================================================
+
+    /// <summary>小动物集合取原版 <c>NPCID.Sets.CountsAsCritter</c>；飞行 / 贴地按原版 aiStyle 分派。</summary>
+    [Theory]
+    [InlineData(46, false)]    // Bunny（aiStyle 7 → 贴地）
+    [InlineData(148, false)]   // Penguin（7）
+    [InlineData(299, false)]   // Squirrel（7）
+    [InlineData(377, false)]   // Grasshopper（1）
+    [InlineData(357, false)]   // Worm（66）
+    [InlineData(359, false)]   // Snail（67）
+    [InlineData(74, true)]     // Bird（24）
+    [InlineData(442, true)]    // GoldBird（24）
+    [InlineData(355, true)]    // Firefly（64）
+    [InlineData(356, true)]    // Butterfly（65）
+    [InlineData(583, true)]    // FairyCritter（112）
+    [InlineData(596, true)]    // Dragonfly（114）
+    public void CritterSet_Classifies_Flyers_ByVanillaAiStyle(int type, bool flyer)
+    {
+        Assert.True(NpcCritterSet.Is(type));
+        Assert.Equal(flyer, NpcCritterSet.IsFlyer(type));
+    }
+
+    /// <summary>敌对 NPC 不得被误判为小动物（否则会被套上非敌对行为）。</summary>
+    [Theory]
+    [InlineData(1)]    // BlueSlime
+    [InlineData(3)]    // Zombie
+    [InlineData(26)]   // GoblinPeon
+    [InlineData(222)]  // QueenBee
+    public void CritterSet_Excludes_Hostiles(int type) => Assert.False(NpcCritterSet.Is(type));
+
+    /// <summary>
+    /// 小动物**不追玩家**：贴在玩家旁边的兔子会背向逃离（原版小动物受惊逃走），
+    /// 而不是像僵尸一样扑上来 —— 这正是「小动物分支修复」要保证的行为。
+    /// </summary>
+    [Fact]
+    public void Critter_FleesFromPlayer_InsteadOfChasing()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        float playerX = sx * 16f + 8f;
+
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(playerX, sy * 16f - 42f),
+                AimPosition = new Vector2(playerX, sy * 16f - 42f),
+            };
+
+        // 兔子放在玩家右侧 2 格（受惊距离 8 格内）
+        var bunny = new WorldNpc
+        {
+            Type = 46,
+            NetId = 46,
+            Active = true,
+            Life = 5,
+            LifeMax = 5,
+            X = playerX + 32f,
+            Y = sy * 16f - 20f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(bunny);
+
+        float startDistance = MathF.Abs(bunny.X - playerX);
+        for (int i = 0; i < 60; i++) sim.Tick();
+        float endDistance = MathF.Abs(bunny.X - playerX);
+
+        Assert.True(endDistance > startDistance,
+            $"小动物未远离玩家（{startDistance:F0} → {endDistance:F0}），疑似套用了敌对追击");
+        Assert.True(bunny.Direction > 0, "玩家在左侧，兔子应向右逃离（Direction > 0）");
+    }
+
+    /// <summary>小动物 type → 原版 aiStyle 的映射必须逐个正确（分派错就会套上敌对 AI）。</summary>
+    [Theory]
+    [InlineData(46, 7)]    // Bunny
+    [InlineData(303, 7)]   // 万圣节兔（非 TownCritter）
+    [InlineData(377, 1)]   // Grasshopper（走 AI_001 的蚂蚱分支）
+    [InlineData(446, 1)]   // GoldGrasshopper
+    [InlineData(55, 16)]   // Goldfish
+    [InlineData(688, 16)]  // 青蛙（大）
+    [InlineData(74, 24)]   // Bird
+    [InlineData(611, 24)]  // Seagull
+    [InlineData(355, 64)]  // Firefly
+    [InlineData(677, 64)]  // LightningBug
+    [InlineData(356, 65)]  // Butterfly
+    [InlineData(357, 66)]  // Worm
+    [InlineData(374, 66)]  // MagmaSnail 变体
+    [InlineData(359, 67)]  // Snail
+    [InlineData(360, 67)]  // GlowingSnail
+    [InlineData(363, 68)]  // Duck
+    [InlineData(609, 68)]  // MallardDuck
+    [InlineData(583, 112)] // FairyCritter
+    [InlineData(596, 114)] // Dragonfly
+    [InlineData(604, 115)] // Ladybug
+    [InlineData(669, 115)] // GoldLadybug
+    [InlineData(612, 116)] // WaterStrider
+    [InlineData(626, 118)] // Seahorse
+    public void CritterSet_Maps_To_Vanilla_AiStyle(int type, int style)
+    {
+        Assert.True(NpcCritterSet.Is(type));
+        Assert.Equal(style, NpcCritterSet.AiStyleOf(type));
+    }
+
+    /// <summary>
+    /// 鸟（aiStyle 24，贴地态）在玩家靠近时起飞：`ai[0]` 由 0 变 1，并向上获得初速。
+    /// </summary>
+    [Fact]
+    public void Critter_Bird_TakesOff_WhenPlayerApproaches()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        float playerX = sx * 16f + 8f;
+
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(playerX, sy * 16f - 42f),
+                AimPosition = new Vector2(playerX, sy * 16f - 42f),
+            };
+
+        // 鸟（14×14）放在玩家右侧 2 格，脚底贴地
+        var bird = new WorldNpc
+        {
+            Type = 74,
+            NetId = 74,
+            Active = true,
+            Life = 5,
+            LifeMax = 5,
+            X = playerX + 32f,
+            Y = sy * 16f - 14f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(bird);
+
+        float startY = bird.Y;
+        for (int i = 0; i < 30; i++) sim.Tick();
+
+        Assert.Equal(1f, bird.Ai[0]);
+        Assert.True(bird.Y < startY - 8f, $"鸟未起飞（Y {startY:F0} → {bird.Y:F0}）");
+    }
+
+    /// <summary>
+    /// 蚯蚓（aiStyle 66）在「爬行态」（ai[0] == 1）会水平位移，且贴地不下坠。
+    /// </summary>
+    [Fact]
+    public void Critter_Worm_Crawls_When_Awake()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+
+        var worm = new WorldNpc
+        {
+            Type = 357,
+            NetId = 357,
+            Active = true,
+            Life = 5,
+            LifeMax = 5,
+            X = sx * 16f,
+            Y = sy * 16f - 4f,      // 蚯蚓 10×4，脚底贴地
+        };
+        worm.Ai[0] = 1f;            // 直接进入爬行态
+        worm.LocalAi[1] = 600f;     // 远离下次状态切换
+        lock (world.NpcsLock) world.Npcs.Add(worm);
+
+        float startX = worm.X;
+        for (int i = 0; i < 60; i++) sim.Tick();
+
+        Assert.True(MathF.Abs(worm.X - startX) > 3f,
+            $"蚯蚓在爬行态未水平移动（X {startX:F0} → {worm.X:F0}）");
+        Assert.True(worm.Y < sy * 16f, "蚯蚓不应穿地");
+    }
+
+    /// <summary>
+    /// 蜗牛（aiStyle 67）是 noGravity + 需图格碰撞的典型：爬行 / 爬墙都不能穿透地面。
+    /// 这条同时覆盖「NoGravity 与 NoTileCollide 解耦」的物理步改动。
+    /// </summary>
+    [Fact]
+    public void Critter_Snail_DoesNotSinkThroughGround()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+
+        var snail = new WorldNpc
+        {
+            Type = 359,
+            NetId = 359,
+            Active = true,
+            Life = 5,
+            LifeMax = 5,
+            X = sx * 16f,
+            Y = sy * 16f - 12f,   // 蜗牛 12×12
+        };
+        lock (world.NpcsLock) world.Npcs.Add(snail);
+
+        float startY = snail.Y;
+        for (int i = 0; i < 120; i++) sim.Tick();
+
+        Assert.True(snail.Y < startY + 64f,
+            $"蜗牛穿透地面下坠（Y {startY:F0} → {snail.Y:F0}），疑似 noTileCollide 与 noGravity 未解耦");
+        Assert.True(MathF.Abs(snail.VelocityY) <= 1f, "蜗牛垂直速度不应失控");
+    }
+
+    /// <summary>
+    /// 蚂蚱（aiStyle 1 的蚂蚱分支）在玩家逼近时**背向跳跃**（而不是像史莱姆一样扑向玩家）。
+    /// </summary>
+    [Fact]
+    public void Critter_Grasshopper_HopsAway_FromPlayer()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        float playerX = sx * 16f + 8f;
+
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(playerX, sy * 16f - 42f),
+                AimPosition = new Vector2(playerX, sy * 16f - 42f),
+            };
+
+        // 蚂蚱（14×10）置于玩家右侧
+        var grasshopper = new WorldNpc
+        {
+            Type = 377,
+            NetId = 377,
+            Active = true,
+            Life = 5,
+            LifeMax = 5,
+            X = playerX + 32f,
+            Y = sy * 16f - 10f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(grasshopper);
+
+        float startDistance = MathF.Abs(grasshopper.X - playerX);
+        for (int i = 0; i < 60; i++) sim.Tick();
+        float endDistance = MathF.Abs(grasshopper.X - playerX);
+
+        Assert.True(endDistance > startDistance,
+            $"蚂蚱未背向玩家跳开（{startDistance:F0} → {endDistance:F0}），疑似套用了史莱姆追击");
+        Assert.True(grasshopper.Direction > 0, "玩家在左侧，蚂蚱应向右跳开（Direction > 0）");
+    }
+
+    /// <summary>
+    /// 物理步口径：<c>NoGravity</c> 只管重力，<c>NoTileCollide</c> 才跳图格碰撞。
+    /// 只设 <c>NoGravity = true</c> 的 NPC 仍必须落地并置位 <c>CollideY</c> / <c>Grounded</c>
+    /// （旧实现把两者混在一起，导致蜗牛 / 仙灵 / 蜻蜓永远拿不到碰撞标志）。
+    /// </summary>
+    [Fact]
+    public void Physics_NoGravity_Still_Collides_WithTiles()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+
+        var npc = new WorldNpc
+        {
+            Type = 9999,          // 未登记类型 → AiFallback（不写 NoGravity / NoTileCollide）
+            NetId = 9999,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            X = sx * 16f,
+            Y = sy * 16f - 32f - 40f,
+            VelocityY = 4f,
+            NoGravity = true,     // 无重力
+            NoTileCollide = false, // 但要图格碰撞
+        };
+        lock (world.NpcsLock) world.Npcs.Add(npc);
+
+        for (int i = 0; i < 30; i++) sim.Tick();
+
+        Assert.True(npc.Grounded, "NoGravity 的 NPC 仍应落地（Grounded）");
+        // NoGravity 下重力不会改写 velocity.Y，因此速度归零只可能来自图格碰撞 —— 这正是解耦的判据。
+        Assert.Equal(0f, npc.VelocityY);
+        Assert.Equal(0f, (npc.Y + 32f) % 16f);   // 脚底精确贴到图格上沿
+    }
+
+    /// <summary>
+    /// 换型（原版 <c>NPC.Transform</c>）必须同时同步 <c>netID</c>：客户端只在包 23 的 netID
+    /// 与本机不一致时才 <c>SetDefaults</c> 重建外观，只改 <c>Type</c> 会让客户端一直画旧形态
+    /// （海鸥 603 ↔ 602 这类形态往返正是靠它）。
+    /// 同时校验原版 Transform 的两个不变量：**脚底不动**（Y += 旧高 − 新高）与 ai 覆写。
+    /// </summary>
+    [Fact]
+    public void NpcTransform_SyncsNetId_And_KeepsFootAnchored()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+
+        // 游动形态海鸥（603，28×22）停在陆地；ai[0]=1 飞行态 + ai[1]=300 → 本轮落地换型回 602（22×26）
+        var gull = new WorldNpc
+        {
+            Type = 603,
+            NetId = 603,
+            Active = true,
+            Life = 5,
+            LifeMax = 5,
+            X = sx * 16f,
+            Y = sy * 16f - 22f,
+        };
+        gull.Ai[0] = 1f;
+        gull.Ai[1] = 300f;
+        lock (world.NpcsLock) world.Npcs.Add(gull);
+
+        float footBefore = gull.Y + 22f;   // 脚底 = Y + 旧高
+        sim.Tick();
+
+        Assert.Equal(602, gull.Type);
+        Assert.Equal((short)602, gull.NetId);          // ★ netID 必须跟着换
+        Assert.True(gull.SyncForced, "换型后必须强制补发一次包 23");
+        Assert.Equal(0f, gull.Ai[0]);
+        Assert.InRange(gull.Ai[1], 200f, 399f);        // 原版 Transform(type-1, 0f, 200 + rand(200))
+        Assert.Equal(footBefore, gull.Y + 26f, 3);     // 脚底不动（新高 26）
+    }
+
+    // ========================================================================
+    // 二十二、地表树木（原版 GrowTree 的树干部分）
+    // ========================================================================
+
+    /// <summary>
+    /// 世界生成必须长出地表树木（TileID.Trees = 5），且帧值必须落在原版树干 / 枝条 / 树顶帧表内
+    /// —— 帧值写错会让客户端画出碎片。
+    /// </summary>
+    [Fact]
+    public void WorldGenerator_Places_Surface_Trees_WithVanillaFrames()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        short[] validFrameX = { 0, 22, 44, 66, 88, 110 };
+        short[] validFrameY = { 0, 22, 44, 66, 88, 110, 132, 154, 176, 198, 220, 242 };
+
+        int treeTiles = 0;
+        for (int x = 0; x < world.MaxTilesX; x++)
+        {
+            for (int y = 0; y < world.MaxTilesY; y++)
+            {
+                ref var tile = ref world.Tiles[x, y];
+                if (!tile.Active || tile.Type != 5) continue;
+
+                treeTiles++;
+                Assert.Contains(tile.FrameX, validFrameX);
+                Assert.Contains(tile.FrameY, validFrameY);
+            }
+        }
+
+        Assert.True(treeTiles > 100, $"地表树木过少（{treeTiles} 格），疑似未生成");
+    }
+
+    /// <summary>树的根部必须落在地表「可长树」图格上（草地 / 腐化 / 猩红 / 丛林 / 神圣 / 蘑菇草 / 雪块）。</summary>
+    [Fact]
+    public void WorldGenerator_Tree_Trunks_Are_Rooted_OnTreeGround()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        int rooted = 0;
+
+        for (int x = 0; x < world.MaxTilesX; x++)
+        {
+            for (int y = 1; y < world.MaxTilesY - 1; y++)
+            {
+                ref var tile = ref world.Tiles[x, y];
+                if (!tile.Active || tile.Type != 5) continue;
+
+                ref var below = ref world.Tiles[x, y + 1];
+                if (!below.Active) continue;
+                if (below.Type is 2 or 23 or 199 or 60 or 70 or 109 or 147) rooted++;
+            }
+        }
+
+        Assert.True(rooted > 20, $"落在可长树地表上的树干过少（{rooted} 格）");
+    }
+
+    /// <summary>出生点保护半径内不长树（否则树会挡在出生点正上方）。</summary>
+    [Fact]
+    public void WorldGenerator_Keeps_SpawnArea_Free_OfTrees()
+    {
+        var world = WorldGenerator.GenerateSmall();
+
+        for (int x = world.SpawnTileX - 10; x <= world.SpawnTileX + 10; x++)
+            for (int y = 1; y < world.MaxTilesY; y++)
+                Assert.False(world.Tiles[x, y].Active && world.Tiles[x, y].Type == 5,
+                    $"出生点范围内出现树木图格（{x}, {y}）");
+    }
 }

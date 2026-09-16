@@ -74,7 +74,6 @@ public static class TileIdSets
     }.ToFrozenSet();
 
     public static bool IsTileSolid(ushort type) => Solid.Contains(type);
-
     /// <summary>原版 <c>TileID.Sets.SaveSlopes[type]</c>：仅这些图格会存档斜坡 / 半砖。</summary>
     public static bool SaveSlopes(ushort type) => Solid.Contains(type) || NonSolidSaveSlopes.Contains(type);
 
@@ -83,6 +82,12 @@ public static class TileIdSets
 
     /// <summary>原版 <c>TileID.Sets.BasicChest</c>（包 10 尾部宝箱收集用）。</summary>
     public static bool IsBasicChest(ushort type) => BasicChest.Contains(type);
+
+    /// <summary>原版 <c>Main.tileDungeon</c>（地牢砖，陨石落点与地牢判定用）。</summary>
+    public static bool IsDungeonBrick(ushort type) => DungeonBrick.Contains(type);
+
+    /// <summary>原版 <c>Main.tileDungeon</c> 中我们建模的地牢砖集合（与 <c>SceneMetrics.DungeonTileCount</c> 同口径）。</summary>
+    private static readonly FrozenSet<ushort> DungeonBrick = new HashSet<ushort> { 41, 43, 44, 481, 482, 483 }.ToFrozenSet();
 
     /// <summary>原版 <c>Main.tileSign</c>（牌子收集 / 校验用）。</summary>
     public static bool IsSign(ushort type) => Sign.Contains(type);

@@ -989,24 +989,80 @@ public class VanillaFeatureTests
             TimeSpan.FromSeconds(20));
         Assert.True(spawned, "未在超时内刷出敌怪");
 
-        WorldNpc slime;
-        lock (world.NpcsLock) slime = world.Npcs.First(n => !n.IsTownNpc);
-        Assert.Equal((short)1, slime.NetId); // NPCID.BlueSlime
+        WorldNpc enemy;
+        lock (world.NpcsLock) enemy = world.Npcs.First(n => !n.IsTownNpc);
 
-        // 客户端应能收到该敌怪（netID=1）
+        // 地表白天的刷怪池：1/15 是小动物（原版 NPC.SpawnAnNPC 4242-4345），其余是史莱姆家族兜底
+        // （原版 NPC.GetBasicSlimeToSpawn，netID 可能为 1 / -3 绿 / -7 紫，解析后均为 1）。
+        Assert.True(NpcCritterSet.Is(enemy.Type) || NpcNetIdMap.FromNetId(enemy.NetId) == 1,
+            $"白天地表刷出了池外类型：type={enemy.Type} netId={enemy.NetId}");
+
+        // 客户端应能收到该敌怪（下发的 netID 含负向变体，与原版一致）
+        short spawnedNetId = enemy.NetId;
         await server.Host.BroadcastWorldStateAsync();
-        var got = await s.ReadUntilAsync(p => p is NpcUpdatePacket { NetId: 1 }, TimeSpan.FromSeconds(5));
-        Assert.Contains(got, p => p is NpcUpdatePacket { NetId: 1 });
+        var got = await s.ReadUntilAsync(
+            p => p is NpcUpdatePacket npc && npc.NetId == spawnedNetId, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p is NpcUpdatePacket npc && npc.NetId == spawnedNetId);
 
-        // 包 28 击杀（史莱姆 25 血，防御 2 → 26 − round(2×0.5)=1 → 25 恰好击杀）→ 服务端扣血并置为死亡
+        // 包 28 击杀：26 点伤害足以击杀白天池的任一成员（小动物 5 血 / 史莱姆 25 血 + 防御 2）
         int index;
-        lock (world.NpcsLock) index = world.Npcs.IndexOf(slime);
+        lock (world.NpcsLock) index = world.Npcs.IndexOf(enemy);
         await s.SendAsync(PacketId.NpcStrike,
-            new NpcStrikePacket(index, 26) { Generation = slime.Generation });
+            new NpcStrikePacket(index, 26) { Generation = enemy.Generation });
 
-        Assert.True(await TickUntilAsync(server, () => !slime.Active, TimeSpan.FromSeconds(5)),
+        Assert.True(await TickUntilAsync(server, () => !enemy.Active, TimeSpan.FromSeconds(5)),
             "NPC 受击后未被击杀");
-        Assert.Equal(0, slime.Life);
+        Assert.Equal(0, enemy.Life);
+    }
+
+    /// <summary>
+    /// 回归：NPC 换型（原版 <c>NPC.Transform</c>，如海鸥 603 ↔ 602 的形态往返）后，服务端必须
+    /// **补发一次包 23 且携带新的 netID**。客户端只在包 23 的 netID 与本机不一致时才
+    /// <c>SetDefaults</c> 重建外观；而 netID / Type 不在同步的「变化才发」判据里 ——
+    /// 靠位置变化碰运气会漏（原地不动的 NPC 永远换不了形态）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_NpcTransform_PushesNewNetId_To_Client()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+
+        // 游动形态海鸥（603，28×22）：ai[0]=1 飞行态 + ai[1]=300 → 下一次 AI 落地换型回 602
+        var gull = new WorldNpc
+        {
+            Type = 603,
+            NetId = 603,
+            Active = true,
+            Life = 5,
+            LifeMax = 5,
+            X = sx * 16f,
+            Y = sy * 16f - 22f,
+        };
+        gull.Ai[0] = 1f;
+        gull.Ai[1] = 300f;
+
+        int index;
+        lock (world.NpcsLock)
+        {
+            world.Npcs.Add(gull);
+            index = world.Npcs.IndexOf(gull);
+        }
+
+        Assert.True(await TickUntilAsync(server, () => gull.Type == 602, TimeSpan.FromSeconds(5)),
+            "海鸥未在超时内换型");
+        Assert.True(gull.SyncForced, "换型后应置强制同步标记（netID 不在「变化才发」判据里）");
+
+        // 推进一轮同步：强制标记必须让这只**没怎么移动**的 NPC 也带新 netID 下发
+        await server.Host.BroadcastWorldStateAsync();
+
+        var got = await s.ReadUntilAsync(
+            p => p is NpcUpdatePacket n && n.NetId == 602, TimeSpan.FromSeconds(5));
+        var packet = got.OfType<NpcUpdatePacket>().Single(n => n.NetId == 602);
+        Assert.Equal((byte)index, packet.Index);
+        Assert.False(gull.SyncForced, "下发成功后应清除强制标记");
     }
 
     /// <summary>
@@ -2093,13 +2149,13 @@ public class VanillaFeatureTests
         Assert.Equal(1, world.InvasionType);
         Assert.Equal(2, world.InvasionSize);
 
-        Assert.True(await TickUntilAsync(server, () => world.Npcs.Any(n => n.Type == 26),
-            TimeSpan.FromSeconds(20)), "入侵怪未刷新");
-
+        // 配额耗尽（项目侧按刷新扣减，见 WorldSimulator.ConsumeInvasionQuota）→ 入侵结束
         Assert.True(await TickUntilAsync(server, () => world.InvasionType == 0 && world.InvasionSize == 0,
             TimeSpan.FromSeconds(20)), "入侵未在配额耗尽后结束");
 
-        Assert.Equal(2, world.Npcs.Count(n => n.Type == 26));
+        // 刷出的类型必须来自原版哥布林入侵池（NPC.SpawnAnNPC 的 invasionType == 1 分支）
+        var goblins = world.Npcs.Where(n => n.NetId is 26 or 27 or 28 or 29 or 111 or 471).ToList();
+        Assert.Equal(2, goblins.Count);
     }
 
     [Fact]
@@ -2959,18 +3015,20 @@ public class VanillaFeatureTests
         Assert.True(await TickUntilAsync(server, () => !boss.Active, TimeSpan.FromSeconds(5)),
             "Boss 未被击杀");
 
-        // 服务端生成掉落物：Demonite Ore（物品 56），堆叠按原版 30-90 均匀随机
+        // 服务端生成掉落物：眼魔按世界邪恶类型给 魔矿(56) 或 猩红矿(880)，堆叠 30-90 均匀随机
+        // （生成的世界的邪恶类型由世界种子决定，两种都合法）
+        short lootItem = world.Progress.Crimson ? (short)880 : (short)56;
         WorldItemEntity? loot;
         lock (world.ItemsLock)
-            loot = world.Items.FirstOrDefault(i => i.ItemId == 56);
+            loot = world.Items.FirstOrDefault(i => i.ItemId == lootItem);
         Assert.NotNull(loot);
         Assert.InRange(loot!.Stack, 30, 90);
 
         // 服务端主动生成的掉落物必须补发包 21（否则客户端看不到）
         await server.Host.FlushNewItemsAsync();
-        var got = await s.ReadUntilAsync(p => p is ItemDropPacket { ItemId: 56 }, TimeSpan.FromSeconds(5));
+        var got = await s.ReadUntilAsync(p => p is ItemDropPacket { ItemId: var id } && id == lootItem, TimeSpan.FromSeconds(5));
 
-        var drop = Assert.Single(got.OfType<ItemDropPacket>().Where(p => p.ItemId == 56));
+        var drop = Assert.Single(got.OfType<ItemDropPacket>().Where(p => p.ItemId == lootItem));
         Assert.InRange(drop.Stack, 30, 90);
         Assert.Equal(loot.Slot, drop.ItemSlotIndex);
     }

@@ -1263,7 +1263,7 @@ public sealed class GameHost : IDisposable
         {
             var npc = npcs[i];
             var life = npc.Active ? npc.Life : 0;   // 已死亡 → life=0，客户端据此移除
-            var changed = npc.X != npc.SyncedX || npc.Y != npc.SyncedY
+            var changed = npc.SyncForced || npc.X != npc.SyncedX || npc.Y != npc.SyncedY
                           || npc.VelocityX != npc.SyncedVelocityX || npc.VelocityY != npc.SyncedVelocityY
                           || life != npc.SyncedLife || npc.Active != npc.SyncedActive
                           || npc.Direction != npc.SyncedDirection
@@ -1297,6 +1297,7 @@ public sealed class GameHost : IDisposable
                 Ai: npc.Ai);
 
             var baselineKey = (Index: i, Generation: npc.Generation);
+            var sent = 0;
             await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet, playerId =>
             {
                 if (!IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq))
@@ -1308,8 +1309,13 @@ public sealed class GameHost : IDisposable
                     return false;
 
                 baselines[baselineKey] = 0;
+                sent++;
                 return true;
             }, ct).ConfigureAwait(false);
+
+            // 换型（netID 变化）的强制同步：只有在确实发出后才清除标记，
+            // 否则该 NPC 不在任何玩家视野内时标记会被白清掉，客户端将一直停在旧形态。
+            if (sent > 0) npc.SyncForced = false;
         }
     }
 

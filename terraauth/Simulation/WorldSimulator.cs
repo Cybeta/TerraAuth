@@ -112,6 +112,49 @@ public partial class WorldSimulator : IWorldViewProvider
         Console.WriteLine($"[Slot] 追加 {_world.Npcs.Count - 1}：gen={npc.Generation} type={npc.Type}");
     }
 
+    /// <summary>
+    /// 原版 <c>NPC.Transform(newType, ai0, ai1)</c>：换成另一类型并保持**脚底位置不变**
+    /// （原版实现是 <c>position.Y += 旧 height → SetDefaults → position.Y -= 新 height</c>），
+    /// 当前生命按生命上限比例折算（至少 1），并覆写 <c>ai[0..3]</c>。
+    /// <para>
+    /// **必须同时改 <see cref="WorldNpc.NetId"/>**：客户端收到包 23 后，只在
+    /// <c>npc.netID != 包内 netID</c> 时调用 <c>SetDefaults</c> 重建外观（见 <c>MessageBuffer</c> 的包 23 分支），
+    /// 只改 <see cref="WorldNpc.Type"/> 而不同步 netID 会让客户端一直画旧形态。
+    /// </para>
+    /// 另外置 <see cref="WorldNpc.SyncForced"/>：netID / Type 不在同步的「变化才发」判据里，
+    /// 换型后必须无条件补发一次包 23（原版 <c>Transform</c> 同样会立刻 <c>SendData(23)</c>）。
+    /// 调用方须持有 <see cref="WorldState.NpcsLock"/>。
+    /// </summary>
+    private void TransformNpc(WorldNpc npc, int newType, float ai0 = 0f, float ai1 = 0f)
+    {
+        var (_, oldHeight) = NpcSizes.Of(npc.Type);
+        var (_, newHeight) = NpcSizes.Of(newType);
+
+        int oldLifeMax = Math.Max(1, npc.LifeMax);
+        int oldLife = npc.Life;
+
+        npc.Y += oldHeight;          // 抬到脚底
+        npc.Type = newType;
+        npc.NetId = (short)newType;  // 客户端据此重建外观
+        npc.Y -= newHeight;          // 脚底回位
+
+        var stats = NpcStatsTable.Of.TryGetValue(newType, out var s)
+            ? s
+            : new NpcStats(npc.Damage, npc.Defense, oldLifeMax);
+        npc.LifeMax = Math.Max(1, stats.LifeMax);
+        npc.Damage = stats.Damage;
+        npc.Defense = stats.Defense;
+        npc.Life = Math.Max(1, oldLife * npc.LifeMax / oldLifeMax);
+
+        npc.AiStyle = NpcAiStyleOf(newType);
+        npc.Ai[0] = ai0;
+        npc.Ai[1] = ai1;
+        npc.Ai[2] = 0f;
+        npc.Ai[3] = 0f;
+
+        npc.SyncForced = true;
+    }
+
     public WorldSimulator(
         WorldState world,
         CommandQueue commands,
@@ -124,7 +167,21 @@ public partial class WorldSimulator : IWorldViewProvider
         _recorder = recorder;
         _snapshots = snapshots;
         _config = config;
+
+        // 载入时若世界已经是困难模式（存档 / 真实 .wld），视为转换已完成 —— 与原版 StartHardmode
+        // 的守卫一致（已困难模式不会再跑一次地形转换）。
+        _hardmodeConverted = world.Progress.HardMode;
     }
+
+    /// <summary>困难模式地形转换是否已执行（见 <see cref="WorldGenerator.ApplyHardmode"/>）。</summary>
+    private bool _hardmodeConverted;
+
+    /// <summary>
+    /// 在指定图格位置坠落一颗陨石。原版由「砸碎第 3 颗暗影珠 / 猩红之心」触发落点搜索
+    /// （<c>WorldGen.meteor</c>），我们的世界尚未生成暗影珠，故先以服务端 API 暴露，
+    /// 供运维 / 插件 / 测试触发（触发链属独立专项）。
+    /// </summary>
+    public bool TryDropMeteor(int tileX, int tileY) => WorldGenerator.TryPlaceMeteor(_world, _rng, tileX, tileY);
 
     /// <summary>推进一个固定 timestep（架构 §4.3）。</summary>
     public void Tick()
@@ -134,6 +191,9 @@ public partial class WorldSimulator : IWorldViewProvider
 
         // 1. Input：应用本 tick 的 Command
         ApplyCommandsForTick(_world.Tick);
+
+        // 1.5 Spawn：原版 NPC.SpawnNPC（生物群系 / 昼夜 / 事件规则）
+        SimulateSpawning();
 
         // 2. AI：NPC / 敌怪逻辑（确定性，走 IRng）
         SimulateAi();
@@ -275,20 +335,11 @@ public partial class WorldSimulator : IWorldViewProvider
 
     /// <summary>同屏敌怪上限的兜底值（未注入配置时使用）；生产路径取 server.json 的 <c>MaxEnemies</c>。</summary>
     private const int DefaultMaxEnemies = 8;
-    /// <summary>刷怪 / 死亡清理间隔（tick）。</summary>
-    private const int SpawnIntervalTicks = 60;
     /// <summary>敌怪清理延迟（tick）：确保 life=0 已通过世界同步下发后再从列表移除。</summary>
     private const long EnemyRemovalDelayTicks = 120;
-    /// <summary>史莱姆（原版 NPC 类型 ID 1）与其生命值。</summary>
-    private const short BlueSlimeType = 1;
-    private const int BlueSlimeLife = 25;
 
     /// <summary>眼魔（Boss，原版 NPC 类型 ID 4）。</summary>
     private const short EyeOfCthulhuType = 4;
-
-    /// <summary>哥布林苦工（入侵怪，原版 NPC 类型 ID 26）与其生命值。</summary>
-    private const short GoblinPeonType = 26;
-    private const int GoblinPeonLife = 60;
 
     /// <summary>Boss 飞行速度（像素 / tick）。</summary>
     private const float BossSpeed = 2f;
@@ -576,12 +627,7 @@ public partial class WorldSimulator : IWorldViewProvider
     {
         lock (_world.NpcsLock)
         {
-            if (_world.Tick % SpawnIntervalTicks == 0)
-            {
-                TrySpawnEnemy();
-                // 死亡 NPC 不再整表移除（会前移下标导致包 28 错位）；槽位原位保留，由 AddNpc 复用。
-            }
-
+            // 死亡 NPC 不再整表移除（会前移下标导致包 28 错位）；槽位原位保留，由 AddNpc 复用。
             _pendingNpcSpawns.Clear();
             _pendingProjectiles.Clear();
 
@@ -656,16 +702,54 @@ public partial class WorldSimulator : IWorldViewProvider
         return false;
     }
 
-    /// <summary>
-    /// 确定性刷怪：入侵期内优先刷新入侵怪（消耗入侵配额）；夜晚且未击败 Boss 时小概率刷新 Boss；
-    /// 否则在随机在线玩家附近的地表生成一只史莱姆。
-    /// </summary>
-    private void TrySpawnEnemy()
-    {
-        if (_world.InvasionType != 0 && _world.InvasionSize > 0 && TrySpawnInvasionEnemy())
-            return;
+    // ==================== 阶段 1.5：刷怪（原版 NPC.Spawner） ====================
 
-        // 简化 Boss 触发条件：夜晚 + 未击败眼魔 + 无存活 Boss + 低概率
+    /// <summary>玩家中心生物群系扫描缓存（标志变化极慢，按 <see cref="ZoneRefreshTicks"/> 刷新）。</summary>
+    private sealed class PlayerSpawnCache
+    {
+        public SceneZones Zones;
+        public long ZonesTick = long.MinValue;
+    }
+
+    private readonly Dictionary<int, PlayerSpawnCache> _spawnCaches = new();
+    private readonly BiomeScanner _biomeScanner = new();
+    private readonly List<PlayerRuntime> _spawnOrder = new();
+
+    /// <summary>原版 <c>NPC.cavernMonsterType[2,3]</c>（按世界 ID 固定；<see cref="_cavernMonsterWorldId"/> 变更时重建）。</summary>
+    private int[] _cavernMonsterTypes = Array.Empty<int>();
+    private int _cavernMonsterWorldId = int.MinValue;
+
+    /// <summary>原版屏幕尺寸假设（1920×1200）：与 <c>SceneMetrics.ZoneScanSize</c> 及 NPC 的 <c>sWidth</c>/<c>sHeight</c> 同源。</summary>
+    private const int ScreenWidth = 1920;
+    private const int ScreenHeight = 1200;
+
+    /// <summary>
+    /// 生物群系标志刷新间隔（tick）。原版由客户端每帧扫描玩家周围 169×124 图格；
+    /// 服务端若每 tick 对每个玩家全量重扫（8 人 × 2.1 万格 × 60Hz）代价过高，而群系标志变化极慢，
+    /// 故按此间隔刷新，其余 tick 复用上次结果（刷怪掷骰仍每 tick 进行）。
+    /// </summary>
+    private const int ZoneRefreshTicks = 15;
+
+    /// <summary>
+    /// 阶段 1.5：刷怪。对应原版每帧的 <c>NPC.SpawnNPC()</c>：
+    /// 遍历在线玩家 → <c>GetSpawnRate</c> → 掷骰 → 挑落点 → 按生物群系 / 昼夜 / 事件挑类型。
+    /// **一次调用最多刷一只**（原版 <c>TrySpawnAnNPC</c> 成功即 break）。
+    /// </summary>
+    private void SimulateSpawning()
+    {
+        if (_world.MaxTilesX <= 1 || _world.Players.Count == 0) return;
+
+        // 困难模式地形转换（原版 WorldGen.StartHardmode → initializeHardMode）：
+        // 血肉墙被击杀 → Progress.HardMode 置位 → 这里执行**一次**地形转换（神圣带 + 邪恶带刷新 + 地下群系墙）。
+        // 放在刷怪阶段前、不持任何锁（转换会写整条带，须避免与 NPC / 弹幕锁嵌套）。
+        if (_world.Progress.HardMode && !_hardmodeConverted)
+        {
+            _hardmodeConverted = true;
+            WorldGenerator.ApplyHardmode(_world, _rng);
+            _world.ProgressDirty = true; // 困难模式位 → 包 7 重新下发
+        }
+
+        // 项目侧的简化 Boss 触发：夜晚 + 未击败眼魔 + 无存活 Boss + 低概率（原版在 Boss 专属流程里）
         if (!_world.DayTime && !_world.Progress.DownedBoss1 && !AnyBossAlive()
             && _rng.NextUInt32() % 120 == 0)
         {
@@ -677,80 +761,350 @@ public partial class WorldSimulator : IWorldViewProvider
             }
         }
 
-        int enemies = 0;
-        foreach (var n in _world.Npcs)
-            if (n.Active && !n.IsTownNpc) enemies++;
-        if (enemies >= (_config?.Current.MaxEnemies ?? DefaultMaxEnemies)) return;
+        _spawnOrder.Clear();
+        foreach (var p in _world.Players.Values) _spawnOrder.Add(p);
+        _spawnOrder.Sort(static (a, b) => a.Id.CompareTo(b.Id)); // 确定性顺序（原版按 Main.player 下标）
 
-        var target = PickPlayer();
-        if (target is null) return;
+        // 会话结束后玩家 Id 不再复用：缓存条数超过当前在线数即整体重建，避免长期运行下缓慢增长。
+        if (_spawnCaches.Count > _spawnOrder.Count) _spawnCaches.Clear();
 
-        int spawnTileX = (int)(target.AimPosition.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
-        if (spawnTileX < 1 || spawnTileX >= _world.MaxTilesX - 1) return;
-
-        // 自上而下找第一个实心格作为落脚点
-        for (int y = 1; y < _world.MaxTilesY - 1; y++)
+        foreach (var player in _spawnOrder)
         {
-            ref var tile = ref _world.Tiles[spawnTileX, y];
-            if (!tile.Active || !TileIdSets.IsTileSolid(tile.Type)) continue;
-
-            var (slimeW, slimeH) = NpcSizes.Of(BlueSlimeType);
-            AddNpc(new WorldNpc
-            {
-                Type = BlueSlimeType,
-                NetId = BlueSlimeType,
-                AiStyle = 1,            // 原版 aiStyle 1（Slimes）
-                X = (spawnTileX + 0.5f) * TileSize - slimeW / 2f,   // 原版：X/Y = 碰撞盒左上角
-                Y = y * TileSize - slimeH,                          // 脚底贴地表上沿（脚底 = Y + height）
-                IsTownNpc = false,
-                Life = BlueSlimeLife,
-                LifeMax = BlueSlimeLife,
-                Active = true,
-                Generation = (byte)(_rng.NextUInt32() & 0xFF),
-            });
-            return;
+            if (!player.Active || player.Dead) continue;
+            if (TrySpawnNearPlayer(player)) return;
         }
     }
 
-    /// <summary>刷新一只入侵怪（哥布林）并消耗 1 个入侵配额；配额归零则结束入侵。</summary>
-    private bool TrySpawnInvasionEnemy()
+    /// <summary>对单个玩家执行一次原版 <c>TrySpawnAnNPC</c>；返回是否刷出了 NPC。</summary>
+    private bool TrySpawnNearPlayer(PlayerRuntime player)
     {
-        var target = PickPlayer();
-        if (target is null) return false;
+        var zones = ZonesOf(player);
 
-        int spawnTileX = (int)(target.AimPosition.X / TileSize) + ((_rng.NextUInt32() & 1) == 0 ? -12 : 12);
-        if (spawnTileX < 1 || spawnTileX >= _world.MaxTilesX - 1) return false;
+        int nearby;
+        lock (_world.NpcsLock) nearby = NearbyActiveNpcSlots(player);
 
-        for (int y = 1; y < _world.MaxTilesY - 1; y++)
+        bool invaders = _world.InvasionType != 0 && _world.InvasionSize > 0;
+        var (spawnRate, maxSpawns) = SpawnRate.Compute(new SpawnRateContext
         {
-            ref var tile = ref _world.Tiles[spawnTileX, y];
-            if (!tile.Active || !TileIdSets.IsTileSolid(tile.Type)) continue;
+            HardMode = _world.Progress.HardMode,
+            PlayerCenterY = player.AimPosition.Y,
+            WorldSurface = _world.WorldSurface,
+            RockLayer = _world.RockLayer,
+            UnderworldLayer = BiomeScanner.UnderworldLayerOf(_world),
+            DayTime = _world.DayTime,
+            BloodMoon = _world.BloodMoon,
+            Eclipse = _world.Eclipse,
+            Zones = zones,
+            TownNpcs = CountTownNpcs(),
+            NearbyActiveNpcs = nearby,
+            Invaders = invaders,
+            ActivePlayers = ActivePlayerCount(),
+            MaxSpawnsCap = _config?.Current.MaxEnemies ?? DefaultMaxEnemies,
+        });
 
-            var (goblinW, goblinH) = NpcSizes.Of(GoblinPeonType);
-            AddNpc(new WorldNpc
+        if (nearby >= maxSpawns) return false;          // 原版：附近敌怪槽位已满
+        if (_rng.NextInt32(spawnRate) != 0) return false; // 原版：Main.rand.Next(spawnRate) != 0
+
+        if (!TryFindSpawnTile(player, out int spawnTileX, out int spawnTileY, out bool skyMob)) return false;
+        if (!IsOffScreen(spawnTileX, spawnTileY)) return false;
+
+        FindGroundTile(spawnTileX, spawnTileY, out int groundTileY);
+        ushort groundType = _world.Tiles[spawnTileX, groundTileY].Type;
+        ushort wall = WallOf(spawnTileX, spawnTileY);
+        bool waterTile = IsWaterTile(spawnTileX, spawnTileY);
+
+        int netId;
+        lock (_world.NpcsLock)
+        {
+            netId = EnemySpawnPool.Pick(_rng, new EnemySpawnContext
             {
-                Type = GoblinPeonType,
-                NetId = GoblinPeonType,
-                AiStyle = 3,            // 原版 aiStyle 3（Fighters）
-                X = (spawnTileX + 0.5f) * TileSize - goblinW / 2f,   // 原版：X/Y = 碰撞盒左上角
-                Y = y * TileSize - goblinH,                          // 脚底贴地表上沿
-                IsTownNpc = false,
-                Life = GoblinPeonLife,
-                LifeMax = GoblinPeonLife,
-                Active = true,
-                Generation = (byte)(_rng.NextUInt32() & 0xFF),
+                Zones = zones,
+                Progress = _world.Progress,
+                Npcs = _world.Npcs,
+                CavernMonsterTypes = CavernMonsterTypes(),
+                DayTime = _world.DayTime,
+                BloodMoon = _world.BloodMoon,
+                Eclipse = _world.Eclipse,
+                HardMode = _world.Progress.HardMode,
+                ExpertMode = _world.GameMode >= 1,
+                Raining = _world.Raining,
+                Invaders = invaders,
+                InvasionType = _world.InvasionType,
+                WaterTile = waterTile,
+                // 简化：落点位于有墙处即视为「房屋墙」→ 不刷蠕虫（原版精确判定 Main.wallHouse）
+                NoWorms = wall != 0,
+                SkyMob = skyMob,
+                MoonPhase = _world.MoonPhase,
+                TimeOfDay = _world.Time,
+                WindSpeedTarget = _world.WindSpeedTarget,
+                SpawnTileX = spawnTileX,
+                SpawnTileY = spawnTileY,
+                GroundTileType = groundType,
+                WallType = wall,
+                MaxTilesX = _world.MaxTilesX,
+                MaxTilesY = _world.MaxTilesY,
+                WorldSpawnTileX = _world.SpawnTileX,
+                WorldSurface = _world.WorldSurface,
+                RockLayer = _world.RockLayer,
+                ActivePlayers = ActivePlayerCount(),
+                PlayerHasStartingHealth = player.HpMax <= 100,
             });
 
-            if (--_world.InvasionSize <= 0)
+            if (netId == 0) return false;
+            SpawnPickedNpc(netId, spawnTileX, spawnTileY);
+        }
+
+        // 项目侧的入侵配额语义：按刷新扣减（原版按击杀点数扣减，见 NPC.cs:92056；入侵专项再对齐）
+        if (invaders) ConsumeInvasionQuota();
+        return true;
+    }
+
+    /// <summary>按挑选出的 netID 落地一只 NPC（属性取 <see cref="NpcStatsTable"/> 的经典难度基准）。</summary>
+    private void SpawnPickedNpc(int netId, int spawnTileX, int spawnTileY)
+    {
+        int type = NpcNetIdMap.FromNetId(netId);
+        var stats = NpcStatsTable.Of.TryGetValue(type, out var s) ? s : new NpcStats(0, 0, 100);
+        var (width, height) = NpcSizes.Of(type);
+
+        AddNpc(new WorldNpc
+        {
+            Type = type,
+            NetId = (short)netId,
+            AiStyle = NpcAiStyleOf(type),
+            X = (spawnTileX + 0.5f) * TileSize - width / 2f,   // 原版：X/Y = 碰撞盒左上角，脚底 = Y + height
+            Y = spawnTileY * TileSize - height,
+            IsTownNpc = false,
+            HomeTileX = -1,   // 原版 NewNPC 默认 -1；aiStyle 7 的小动物在首次落地时自行落位
+            HomeTileY = -1,
+            Life = stats.LifeMax,
+            LifeMax = stats.LifeMax,
+            Damage = stats.Damage,
+            Defense = stats.Defense,
+            Active = true,
+            Generation = (byte)(_rng.NextUInt32() & 0xFF),
+        });
+    }
+
+    /// <summary>消耗 1 个入侵配额；归零则结束入侵（→ 包 7 重新下发）。</summary>
+    private void ConsumeInvasionQuota()
+    {
+        if (--_world.InvasionSize <= 0)
+        {
+            _world.InvasionSize = 0;
+            _world.InvasionType = 0;
+            _world.ProgressDirty = true;
+        }
+    }
+
+    /// <summary>取得玩家中心的生物群系标志（按 <see cref="ZoneRefreshTicks"/> 缓存）。</summary>
+    private SceneZones ZonesOf(PlayerRuntime player)
+    {
+        if (!_spawnCaches.TryGetValue(player.Id, out var cache))
+        {
+            cache = new PlayerSpawnCache();
+            _spawnCaches[player.Id] = cache;
+        }
+
+        if (_world.Tick - cache.ZonesTick < ZoneRefreshTicks) return cache.Zones;
+
+        int cx = (int)(player.AimPosition.X / TileSize);
+        int cy = (int)(player.AimPosition.Y / TileSize);
+        cache.Zones = _biomeScanner.Scan(_world, cx, cy);
+        cache.ZonesTick = _world.Tick;
+        return cache.Zones;
+    }
+
+    /// <summary>原版 <c>NPC.cavernMonsterType[2,3]</c>：按世界 ID 固定（首次使用时构建）。</summary>
+    private int[] CavernMonsterTypes()
+    {
+        if (_cavernMonsterWorldId != _world.WorldId || _cavernMonsterTypes.Length == 0)
+        {
+            _cavernMonsterTypes = EnemySpawnPool.BuildCavernMonsterTypes(_world.WorldId);
+            _cavernMonsterWorldId = _world.WorldId;
+        }
+        return _cavernMonsterTypes;
+    }
+
+    /// <summary>
+    /// 原版 <c>player.nearbyActiveNPCs</c>：附近存活敌怪的 <c>npcSlots</c> 之和。
+    /// 原版按 <c>activeRangeX/Y = sWidth·sHeight × 2.1</c> 的矩形与玩家碰撞盒相交判定，且**不计城镇 NPC**
+    /// （与原版同一处提前 return 的 townNPC 判定一致）；这里同样只统计非城镇 NPC。
+    /// </summary>
+    private int NearbyActiveNpcSlots(PlayerRuntime player)
+    {
+        int activeRangeX = (int)(ScreenWidth * 2.1);
+        int activeRangeY = (int)(ScreenHeight * 2.1);
+        int count = 0;
+
+        foreach (var n in _world.Npcs)
+        {
+            if (!n.Active || n.IsTownNpc || n.LifeMax <= 0) continue;
+
+            var (w, h) = NpcSizes.Of(n.Type);
+            float npcCx = n.X + w / 2f, npcCy = n.Y + h / 2f;
+            float playerCx = player.AimPosition.X + NpcSizes.PlayerWidth / 2f;
+            float playerCy = player.AimPosition.Y + NpcSizes.PlayerHeight / 2f;
+
+            if (Math.Abs(npcCx - playerCx) <= activeRangeX + (w + NpcSizes.PlayerWidth) / 2f
+                && Math.Abs(npcCy - playerCy) <= activeRangeY + (h + NpcSizes.PlayerHeight) / 2f)
             {
-                _world.InvasionSize = 0;
-                _world.InvasionType = 0;
-                _world.ProgressDirty = true; // 入侵结束 → 包 7 重新下发
+                count++;
             }
-            return true;
+        }
+        return count;
+    }
+
+    private int CountTownNpcs()
+    {
+        int n = 0;
+        foreach (var npc in _world.Npcs)
+            if (npc.Active && npc.IsTownNpc) n++;
+        return n;
+    }
+
+    private int ActivePlayerCount()
+    {
+        int n = 0;
+        foreach (var p in _world.Players.Values)
+            if (p.Active && !p.Dead) n++;
+        return n;
+    }
+
+    /// <summary>
+    /// 落点搜索（原版 <c>Spawner.FindSpawnTile</c>）：在玩家周围 168×104 图格的刷怪区内随机取点，
+    /// 沿列向下找到第一个实心格作为落点；要求落点不在安全区（124×78 图格）内且上方有 2×3 的空间。
+    /// </summary>
+    private bool TryFindSpawnTile(PlayerRuntime player, out int spawnTileX, out int spawnTileY, out bool skyMob)
+    {
+        spawnTileX = 0;
+        spawnTileY = 0;
+        skyMob = false;
+
+        int px = (int)(player.AimPosition.X / TileSize);
+        int py = (int)(player.AimPosition.Y / TileSize);
+
+        int spanX = (int)(ScreenWidth / 16 * 0.7);   // 84
+        int spanY = (int)(ScreenHeight / 16 * 0.7);  // 52
+        int safeX = (int)(ScreenWidth / 16 * 0.52);  // 62
+        int safeY = (int)(ScreenHeight / 16 * 0.52); // 39
+
+        int left = Math.Max(0, px - spanX), right = Math.Min(_world.MaxTilesX - 1, px + spanX);
+        int top = Math.Max(0, py - spanY), bottom = Math.Min(_world.MaxTilesY - 1, py + spanY);
+        if (right <= left || bottom <= top) return false;
+
+        int safeLeft = px - safeX, safeRight = px + safeX;
+        int safeTop = py - safeY, safeBottom = py + safeY;
+        bool hardMode = _world.Progress.HardMode;
+
+        using (_world.Sections.EnterRead(left, top, right, bottom))
+        {
+            for (int attempt = 0; attempt < 50; attempt++)
+            {
+                int x = left + _rng.NextInt32(right - left);
+                int y = top + _rng.NextInt32(bottom - top);
+
+                if (IsSolidAt(x, y)) continue; // 实心格不能作为落点
+
+                if (y < _world.WorldSurface * 0.35
+                    && (x < _world.MaxTilesX * 0.45 || x > _world.MaxTilesX * 0.55 || hardMode))
+                {
+                    skyMob = true;             // 原版：天空层命中 → 直接以该空中格为落点
+                }
+                else if (y < _world.WorldSurface * 0.45 && hardMode && _rng.NextInt32(10) == 0)
+                {
+                    skyMob = true;
+                }
+                else
+                {
+                    while (y < bottom && !IsSolidAt(x, y)) y++;
+                    if (y >= bottom) continue;
+                }
+
+                if (x >= safeLeft && x < safeRight && y >= safeTop && y < safeBottom) continue; // 安全区（玩家视野）内不刷
+                if (!HasTileSpawnSpace(x, y)) continue;
+
+                spawnTileX = x;
+                spawnTileY = y;
+                return true;
+            }
         }
         return false;
     }
+
+    /// <summary>原版 <c>HasTileSpawnSpace</c>：落点上方 2×3 图格内不得有实心格或岩浆。</summary>
+    private bool HasTileSpawnSpace(int x, int y)
+    {
+        int left = x - 1, top = y - 3;
+        if (left < 0 || top < 0 || x >= _world.MaxTilesX || y >= _world.MaxTilesY) return false;
+
+        for (int i = left; i <= left + 1; i++)
+        {
+            for (int j = top; j <= top + 2; j++)
+            {
+                ref var tile = ref _world.Tiles[i, j];
+                if (tile.Active && TileIdSets.IsTileSolid(tile.Type)) return false;
+                if (tile.Liquid > 0 && tile.LiquidType == 1) return false; // 岩浆
+            }
+        }
+        return true;
+    }
+
+    /// <summary>原版 <c>CheckNotSpawningOnScreen</c>：落点不得落在任一玩家的屏幕矩形（含安全边距）内。</summary>
+    private bool IsOffScreen(int spawnTileX, int spawnTileY)
+    {
+        int safeRangeX = (int)(ScreenWidth / 16 * 0.52);
+        int safeRangeY = (int)(ScreenHeight / 16 * 0.52);
+        float px = spawnTileX * TileSize, py = spawnTileY * TileSize;
+
+        foreach (var p in _world.Players.Values)
+        {
+            if (!p.Active) continue;
+            float cx = p.AimPosition.X + NpcSizes.PlayerWidth / 2f;
+            float cy = p.AimPosition.Y + NpcSizes.PlayerHeight / 2f;
+
+            if (px + TileSize > cx - ScreenWidth / 2f - safeRangeX && px < cx + ScreenWidth / 2f + safeRangeX
+                && py + TileSize > cy - ScreenHeight / 2f - safeRangeY && py < cy + ScreenHeight / 2f + safeRangeY)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>原版 <c>FindGroundTile</c>：确定实际「脚下实地」那一格（默认即落点本身）。</summary>
+    private void FindGroundTile(int x, int y, out int groundTileY)
+    {
+        groundTileY = y;
+        if (IsSolidAt(x, y)) return;
+        for (int i = y + 1; i < y + 30 && i < _world.MaxTilesY; i++)
+        {
+            if (IsSolidAt(x, i))
+            {
+                groundTileY = i;
+                return;
+            }
+        }
+    }
+
+    /// <summary>原版 <c>GetSpawnWallType</c>：落点上方一格的墙（活树墙 244 特判略去，我们的世界没有该墙）。</summary>
+    private ushort WallOf(int x, int y)
+        => y - 1 >= 0 ? _world.Tiles[x, y - 1].Wall : (ushort)0;
+
+    /// <summary>原版 <c>waterTile</c>：落点上方两格均有水。</summary>
+    private bool IsWaterTile(int x, int y)
+    {
+        if (y - 2 < 0) return false;
+        ref var a = ref _world.Tiles[x, y - 1];
+        ref var b = ref _world.Tiles[x, y - 2];
+        return a.Liquid > 0 && b.Liquid > 0 && a.LiquidType == 0;
+    }
+
+    private bool IsSolidAt(int x, int y)
+    {
+        ref var tile = ref _world.Tiles[x, y];
+        return tile.Active && TileIdSets.IsTileSolid(tile.Type);
+    }
+
 
     /// <summary>距 (x, y) 最近的在线玩家；无在线玩家时返回 <c>null</c>。</summary>
     private PlayerRuntime? NearestPlayer(float x, float y)
