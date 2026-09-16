@@ -91,7 +91,8 @@ public sealed class WorldState
                     destroyed++;
                 }
             }
-            Console.WriteLine($"[DIAG] KillSummonedProjectiles pid={playerId} destroyed={destroyed}");
+            if (DiagnosticLog.Enabled)
+                Console.WriteLine($"[DIAG] KillSummonedProjectiles pid={playerId} destroyed={destroyed}");
         }
 
         // 召唤 Buff 移除：原版仆从由 Buff 驱动（客户端仆从 AI 每帧检查、Buff 消失则仆从自杀），
@@ -115,7 +116,8 @@ public sealed class WorldState
             {
                 player.RecalculateDefense();   // 防御型 Buff 移除后即时并入 statDefense
                 MarkPlayerBuffsChanged(playerId);
-                Console.WriteLine($"[DIAG] KillSummonedProjectiles pid={playerId} removed_buffs={removed}");
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[DIAG] KillSummonedProjectiles pid={playerId} removed_buffs={removed}");
             }
         }
     }

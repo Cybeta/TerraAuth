@@ -88,7 +88,7 @@
 
 - ✅ **P0**：网络 I/O 与解码分离（已实装：`Connection` 在 I/O 线程分帧后，把解码 + 处理投递 `WorkerPool`）
 - ✅ **P0**：快照序列化并行（已实装：`SnapshotBroadcaster.FlushAsync` 走 `ParallelSnapshotBroadcaster`，每帧编码一次后并行下发）
-- ✅ **P1**：持久化异步化（已实装：`SqlitePersistence.AppendAsync` 写入无界 `Channel` 零等待，后台 `DrainAuditLoop` 每 250ms / 100 条批量落盘）
+- ✅ **P1**：持久化异步化（已实装：`SqlitePersistence.AppendAsync` 写入有界 `Channel`，后台 `DrainAuditLoop` 每 250ms / 100 条批量落盘，队列满时按过载策略处理）
 - ✅ **P2**：权威校验分片（已实装：`ShardedInboundPipeline` 把单包契约桥接到 `ShardedAuthorityProcessor`，按 `PlayerId % ShardCount` 分片并行、同玩家保序）
 - ✅ **P2**：双缓冲 WorldState（已实装：`WorldSimulator.Tick` 末把玩家 + NPC 提取为**不可变** `WorldEntityView` 并发布；`SnapshotBroadcaster` 只读该视图构建全量帧与判定裁剪中心，广播线程不再触碰活动 `WorldState`）
 - ✅ **P4（可验证子集）**：区块分区锁 —— 仿真线程写图格与包 10 编码 / 权威校验的读互斥，消除 `Tile`（约 20B）撕裂读导致的客户端错乱图格（确定性测试：持写锁时编码被阻塞）

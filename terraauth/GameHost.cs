@@ -132,6 +132,9 @@ public sealed class GameHost : IDisposable
         if (File.Exists(configPath)) config.Load(configPath);
         else config.Load(CreateDefaultConfig(configPath)); // 首次生成默认配置
 
+        // 热路径诊断开关（逐包 / 逐次受伤等明细）：默认关闭，由配置驱动，见 DiagnosticLog.cs
+        DiagnosticLog.Enabled = config.Current.VerboseDiagnostics;
+
         // 2. 持久化（SQLite；无 NuGet 时走内嵌 LiteDb）
         var db = new SqlitePersistence(dbPath);
 
@@ -772,7 +775,8 @@ public sealed class GameHost : IDisposable
 
             if (player is not null)
             {
-                Console.WriteLine($"[HP] 玩家 #{playerId} 下发包16 hp={player.Hp}/{player.HpMax}");
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[HP] 玩家 #{playerId} 下发包16 hp={player.Hp}/{player.HpMax}");
                 await Network.SendToPlayerAsync(playerId, PacketId.PlayerHealth,
                     new PlayerHealthPacket(playerId, player.Hp, player.HpMax), ct).ConfigureAwait(false);
             }
@@ -1130,7 +1134,7 @@ public sealed class GameHost : IDisposable
         {
             try
             {
-                if (p.Destroyed)
+                if (DiagnosticLog.Enabled && p.Destroyed)
                     Console.WriteLine($"[DIAG] Pkt29 destroy key={p.Key} (spawner={p.Key & 0xFF}, idx={(p.Key >> 8) & 0x3FF}, gen={(p.Key >> 18) & 0x3FFF})");
                 await Network.BroadcastAsync(PacketId.ProjectileDestroy,
                     new ProjectileDestroyPacket(p.Key, p.Position), ct).ConfigureAwait(false);
@@ -1230,8 +1234,10 @@ public sealed class GameHost : IDisposable
     /// <paramref name="fullRate"/> 为真时才发（调用方按 <see cref="NpcSyncRateDivisor"/> 分频 → 20Hz）。
     /// 原版用令牌桶把普通 NPC 压到 ≈2 包/秒（Boss ≈12Hz），这里取 20Hz 折中：约省 3 倍带宽，
     /// 同时让接触判定相关的 NPC 保持逐 tick 对齐（接触判定用服务端位置，同步越稀疏、位置差越大）。
-    /// 带宽控制：**状态变化才发**（X/Y/速度/生命/存活），未变化时按 <see cref="NpcSyncHeartbeatTicks"/>
-    /// 补发一次心跳，保证中途入服的玩家也能看到静止 NPC。
+    /// 带宽控制：**状态变化才发**（X/Y/速度/生命/存活）；未变化时按 <see cref="NpcSyncHeartbeatTicks"/>
+    /// 补发一次心跳。心跳覆盖的是「客户端仍持有旧基线」的情形（如走远再回来、或该 NPC 在其他玩家
+    /// 视野内移动过），这类客户端不会因为基线存在而永远收不到新状态；中途入服的玩家靠
+    /// 「无基线即全量下发」即可看到静止 NPC。
     /// </summary>
     public async Task BroadcastNpcUpdatesAsync(CancellationToken ct = default, bool fullRate = true)
     {
@@ -1246,7 +1252,14 @@ public sealed class GameHost : IDisposable
         if (!fullRate)
         {
             lock (world.PlayersLock)
+            {
                 players = world.Players.Values.Where(p => p.Active && !p.Dead).ToArray();
+
+                // 基线自清理：玩家 id 不复用，会话接管还会换新 id，离线玩家的条目再无读者。
+                // 不清理则每名玩家每见过一代 NPC 都会留下一条永不释放的记录（20Hz 扫一次足够）。
+                foreach (var id in _npcBaselines.Keys)
+                    if (!world.Players.ContainsKey(id)) _npcBaselines.TryRemove(id, out _);
+            }
         }
 
         // 先在锁内取一致快照（仿真线程会增删 NPC），再在锁外逐个下发（不在持锁期间做 I/O）
@@ -1263,7 +1276,11 @@ public sealed class GameHost : IDisposable
         {
             var npc = npcs[i];
             var life = npc.Active ? npc.Life : 0;   // 已死亡 → life=0，客户端据此移除
-            var changed = npc.SyncForced || npc.X != npc.SyncedX || npc.Y != npc.SyncedY
+            // 心跳：距上次**实际下发**已超过 NpcSyncHeartbeatTicks（≈1s）时，即使状态未变化也补发一次。
+            // 必要性：Synced* 每轮都会推进（与「是否真的发给了谁」无关），故玩家离开视野期间发生的位移
+            // 不会留下「未发送的差值」；该玩家回到视野内时，若没有心跳就再也收不到这个 NPC 的新位置。
+            var heartbeatDue = world.Tick - npc.SyncedTick >= NpcSyncHeartbeatTicks;
+            var changed = npc.SyncForced || heartbeatDue || npc.X != npc.SyncedX || npc.Y != npc.SyncedY
                           || npc.VelocityX != npc.SyncedVelocityX || npc.VelocityY != npc.SyncedVelocityY
                           || life != npc.SyncedLife || npc.Active != npc.SyncedActive
                           || npc.Direction != npc.SyncedDirection
@@ -1278,7 +1295,6 @@ public sealed class GameHost : IDisposable
             npc.SyncedActive = npc.Active;
             npc.SyncedDirection = npc.Direction;
             npc.Ai.CopyTo(npc.SyncedAi, 0);
-            npc.SyncedTick = world.Tick;
 
             var packet = new NpcUpdatePacket(
                 Index: (byte)i,
@@ -1313,9 +1329,13 @@ public sealed class GameHost : IDisposable
                 return true;
             }, ct).ConfigureAwait(false);
 
-            // 换型（netID 变化）的强制同步：只有在确实发出后才清除标记，
-            // 否则该 NPC 不在任何玩家视野内时标记会被白清掉，客户端将一直停在旧形态。
-            if (sent > 0) npc.SyncForced = false;
+            // 换型（netID 变化）的强制同步 + 心跳基线：都只在**确实发出**后才清除 / 推进，
+            // 否则该 NPC 不在任何玩家视野内时会被白清，客户端会一直停在旧形态、心跳也随之失效。
+            if (sent > 0)
+            {
+                npc.SyncForced = false;
+                npc.SyncedTick = world.Tick;
+            }
         }
     }
 
@@ -1418,10 +1438,12 @@ public sealed class GameHost : IDisposable
         _enforcers.UpdateThresholds(t.Rate, t.Player, t.Movement, t.Combat, t.Inventory, t.World);
         _world.SscEnabled = cfg.SscEnabled; // 全局 SSC 开关热重载（新连接 / 下次 WorldInfo 生效）
         _world.DestroySummonsOnWeaponRemoval = cfg.DestroySummonsOnWeaponRemoval; // 移除召唤武器即销毁（即时生效）
+        DiagnosticLog.Enabled = cfg.VerboseDiagnostics; // 诊断日志开关热重载（排障时无需重启）
 
         Console.WriteLine(
             $"[Config] 热重载已生效：MaxSingleDamage={cfg.MaxSingleDamage}, " +
-            $"MaxTileBreakPerSecond={cfg.MaxTileBreakPerSecond}, MaxPlayerHp={cfg.MaxPlayerHp}");
+            $"MaxTileBreakPerSecond={cfg.MaxTileBreakPerSecond}, MaxPlayerHp={cfg.MaxPlayerHp}, " +
+            $"VerboseDiagnostics={cfg.VerboseDiagnostics}");
     }
 
     public void Dispose()

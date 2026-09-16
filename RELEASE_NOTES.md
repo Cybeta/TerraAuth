@@ -32,7 +32,7 @@
 - `Tests/SimulationTests.cs`、`Tests/VanillaFeatureTests.cs`（378 行新增用例）
 
 ## 测试
-332 个测试全部通过，新增覆盖：召唤 Buff 移除、包 50 回写、包 22 就近归属、弹幕永久销毁不复活等场景。
+当前全量测试为 438/438 通过；本版本新增覆盖：召唤 Buff 移除、包 50 回写、包 22 就近归属、弹幕永久销毁不复活等场景。
 
 ## 使用
 - 下载对应平台的 `TerraAuth-win-x64.zip` / `TerraAuth-linux-x64.zip`，解压后运行

@@ -5,7 +5,7 @@
 > 原版功能覆盖见 [`terraauth/VANILLA_COVERAGE.md`](terraauth/VANILLA_COVERAGE.md)，
 > 逐轮回溯见 [`terraauth/OPTIMIZATION_BACKLOG.md`](terraauth/OPTIMIZATION_BACKLOG.md)。
 >
-> 生成日期：2026-09-14 ｜ 当前测试：**329 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
+> 生成日期：2026-09-16 ｜ 当前测试：**438 用例通过**（默认 SQLite 后端全绿；非 SQLite 兜底后端需单独执行验证）
 
 ---
 
@@ -34,7 +34,7 @@
 
 ### 验证结果
 
-- 自动化测试：**329/329 通过**，失败 0，跳过 0。
+- 自动化测试：**438/438 通过**，失败 0，跳过 0。
 - 真机验证：SSC 关闭下 `/give 1 3474` 掉落物显示在脚下并可拾取入包（非归属玩家拾取被服务端拒绝）。
 
 ---
@@ -61,7 +61,7 @@
 
 ### 验证结果
 
-- 自动化测试：329/329 通过，失败 0，跳过 0。
+- 自动化测试：438/438 通过，失败 0，跳过 0。
 - Release 构建：成功，错误 0。
 - 本轮重点验证：NPC Generation、玩家级 NPC 同步基线、原版客户端连接兼容和项目目录整理。
 
@@ -77,7 +77,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 - 技术栈：C# / .NET 10（`net10.0`）
 - 解决方案与源码：`terraauth/terraauth/`（`TerraAuth.sln` 与 `TerraAuth.csproj` 同目录）
-- 已实测：原版 Terraria 客户端（协议 326）可完成 握手 → 进入世界 → 正常断开，双客户端互相可见
+- 已实测：原版 Terraria 客户端（协议 326）可完成握手 → 进入世界 → 正常断开；SSC 关闭时 `/give` 掉落物可显示并被归属玩家拾取，双客户端互相可见；完整游玩回归仍待完成
 
 ---
 
@@ -142,7 +142,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 ### 7. 测试与对抗自动化
 
-- 套件 **329 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
+- 套件 **438 用例**，默认后端 `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` 全部通过。
 - `VanillaFeatureTests` 以**真实权威管线 + 真实 TCP** 逐项验证原版功能；
   `AntiCheat_*` 覆盖 Phase 7 可自动化部分：DPS 窗口、非法堆叠 / 箱内未知物品、无身份包丢弃、
   恶意包重放不推进权威、洪水限流 → 违规累计踢出、高熵区块拆分下的登录完整性。
@@ -446,8 +446,8 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 
 | 项 | 命令 | 结果 |
 |---|---|---|
-| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **329 / 329 通过** |
-| Vanilla-only 网络与集成过滤 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore --filter "FullyQualifiedName~IntegrationTests|FullyQualifiedName~VanillaFeatureTests"` | **94 / 94 通过** |
+| 默认后端 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore` | **438 / 438 通过** |
+| Vanilla-only 网络与集成过滤 | `dotnet test "terraauth\Tests\TerraAuth.Tests.csproj" --no-restore --filter "FullyQualifiedName~IntegrationTests|FullyQualifiedName~VanillaFeatureTests"` | **110 / 110 通过** |
 
 > 说明：解决方案文件位于 `terraauth/terraauth/TerraAuth.sln`（与源码同目录），不在仓库根。
 
@@ -471,9 +471,9 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 **仍待修正**：
 
 7. **提交后广播一致性**：客户端原包仍可能在仿真提交前广播，需让广播绑定已提交状态。
-8. **背压**：入站 `CommandQueue` / 分片入站队列 / 审计 `Channel` 仍无界，缺容量上限与过载策略。
-9. **容量与架构边界**：慢客户端策略、`WorldState` 并发契约、WorkerPool 收敛、`SnapshotStore` 环形缓冲与
-   `MaxEntitiesPerPacket` 实体分包、协议元数据集中及程序集拆分。
+8. **容量与架构边界**：慢客户端策略、`WorldState` 并发契约、WorkerPool 收敛、协议元数据集中及程序集拆分。
+
+> 背压项已落地：出入站、分片入站与审计队列均有界；`CommandQueue` 生产上限为 8192，超限操作会被拒绝并记录审计。
 
 > 第十九轮为**文档与代码一致性核对**：修正了文档中过期的测试数（263 → 283）、测试文件数（7 → 9）、
 > `PacketId` 常量数（39 → 41）、编解码覆盖数（入站 35 / 出站 37）、持久化后端与 Vanilla-only 边界表述，
@@ -498,7 +498,7 @@ TerraAuth 是 **Terraria 协议（协议 326）的服务端权威代理 / 反作
 - **导出的 `.wld` 验证程度**：已通过**逐格 round-trip** + **严格分段走查** + **双向原版互操作实测**
   （第二十轮：修正元数据文件类型字节后，原版 `TerrariaServer.exe` 加载本服务端导出世界成功：`Loading world data: 100%` / `Server started`；
   反向本服务端加载原版自建世界成功，逐段指针断言全过，含原版 RLE 压缩图格段）。
-  **双向 `.wld` 格式互操作性均已确认**；「原版客户端进图」仍待验证。
+  **双向 `.wld` 格式互操作性均已确认**；原版客户端已完成连接、进图及 `/give` 掉落物拾取验证，完整游玩回归仍待验证。
   注意：读取器跳过段 6..10，故「原版世界 → TerraAuth → 再导出」会把这些段写为空编码。
 - **对端一致性**：原版客户端不支持预测协议，延迟只能靠快照频率缓解；Phase 7 的「内存修改类」条目仍需手工实验。
 - **断线会话保留范围**：仅保留**运行时状态**（位置 / 血量 / 法力 / 增益 / 速度清零），不含「在线期间尚未落盘的临时实体归属」；

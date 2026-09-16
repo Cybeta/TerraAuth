@@ -102,14 +102,12 @@ public partial class WorldSimulator : IWorldViewProvider
             var slot = _world.Npcs[i];
             if (!slot.IsTownNpc && !slot.Active && _world.Tick - slot.DeadTick > EnemyRemovalDelayTicks)
             {
-                Console.WriteLine($"[Slot] 复用 {i}：旧 gen={slot.Generation} type={slot.Type} → 新 gen={npc.Generation} type={npc.Type}");
                 _world.Npcs[i] = npc;
                 return;
             }
         }
 
         _world.Npcs.Add(npc);
-        Console.WriteLine($"[Slot] 追加 {_world.Npcs.Count - 1}：gen={npc.Generation} type={npc.Type}");
     }
 
     /// <summary>
@@ -1290,9 +1288,10 @@ public partial class WorldSimulator : IWorldViewProvider
         }
     }
 
-    /// <summary>诊断输出：玩家受伤来源（含接触方位置），用于定位「没碰到却掉血」。</summary>
+    /// <summary>诊断输出（<see cref="DiagnosticLog.Enabled"/>）：玩家受伤来源（含接触方位置），用于定位「没碰到却掉血」。</summary>
     private void LogPlayerDamage(PlayerRuntime player, int damage, string kind, string detail)
     {
+        if (!DiagnosticLog.Enabled) return;
         if (Interlocked.Increment(ref _damageLogCount) > 500) return;
         Console.WriteLine($"[Damage] 玩家 #{player.Id} -{damage}（{kind}）HP={player.Hp} {detail}");
     }
@@ -1300,11 +1299,12 @@ public partial class WorldSimulator : IWorldViewProvider
     private int _damageLogCount;
 
     /// <summary>
-    /// 诊断输出：玩家 300px 内的全部 NPC（槽位 / 代数 / 存活 / 血量 / 坐标），用于对照
-    /// 「服务端认为这里有怪」与「客户端画面里到底有没有」——幽灵碰撞排查用。
+    /// 诊断输出（<see cref="DiagnosticLog.Enabled"/>）：玩家 300px 内的全部 NPC（槽位 / 代数 / 存活 / 血量 / 坐标），
+    /// 用于对照「服务端认为这里有怪」与「客户端画面里到底有没有」——幽灵碰撞排查用。
     /// </summary>
     private void DumpNearbyNpcs(PlayerRuntime player, WorldNpc contactNpc)
     {
+        if (!DiagnosticLog.Enabled) return;
         if (Interlocked.Increment(ref _dumpLogCount) > 200) return;
 
         var sb = new System.Text.StringBuilder();

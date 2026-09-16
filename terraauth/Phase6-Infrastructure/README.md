@@ -26,7 +26,10 @@
 
 ## §3. 配置驱动
 
-`ServerConfig` 是所有阈值的唯一真相源（MaxWalkSpeed / MaxSingleDamage / MaxTileBreakPerSecond / MaxViolationsBeforeBan…）。`GameHost` 把限流与六个子系统的阈值全部显式映射注入（`RateLimits` / `PlayerLimits` / `MovementLimits` / `CombatLimits` / `InventoryLimits` / `WorldLimits`），**启动注入与热重载共用同一映射**（`AuthorityThresholds.From`），避免两处各写一份而漂移。
+`ServerConfig` 是所有阈值的唯一真相源（MaxFlightSpeed / MaxSingleDamage / MaxTileBreakPerSecond / MaxViolationsBeforeBan…）。`GameHost` 把限流与六个子系统的阈值全部显式映射注入（`RateLimits` / `PlayerLimits` / `MovementLimits` / `CombatLimits` / `InventoryLimits` / `WorldLimits`），**启动注入与热重载共用同一映射**（`AuthorityThresholds.From`），避免两处各写一份而漂移。
+
+> 非阈值开关同样由 `ServerConfig` 驱动并各自接线：`MetricsEnabled/MetricsPort`（条件创建 `/metrics` 端点）、`SscEnabled`、`DestroySummonsOnWeaponRemoval`、
+> `VerboseDiagnostics`（热路径诊断日志，见 `Diagnostics.cs`；默认关闭，排障时可热重载打开）。
 
 `ConfigurationService` 用 `FileSystemWatcher` 重新加载并触发 `OnChanged`；`GameHost.OnConfigurationChanged` 随即调用 `AuthorityEnforcers.UpdateThresholds`，把新阈值推送给**已构造**的子系统 —— **改 `server.json` 无需重启即生效**。实现要点：阈值对象为不可变 record（引用类型），子系统以 `volatile` 字段持有，热更新时整体替换引用，故读取端无锁、无撕裂；更新瞬间正在执行的校验可能仍用旧值，属热重载的正常语义。
 
@@ -54,7 +57,7 @@
 
 ## §6. P0 优先级
 
-1. ✅ SqlitePersistence 审计异步化（无界 `Channel` + `DrainAuditLoop` 每 250ms / 100 条批量落盘）；`SqliteImpl` 已完整实装（玩家 / 审计 / 封禁 / WorldTiles / WorldChests 五表）
+1. ✅ SqlitePersistence 审计异步化（有界 `Channel` + `DrainAuditLoop` 每 250ms / 100 条批量落盘）；`SqliteImpl` 已完整实装（玩家 / 审计 / 封禁 / WorldTiles / WorldChests 五表）
 2. ✅ 真实 IBanStore（`SqliteBanStore` 复用同一 `IDbExecutor`）
 3. ✅ PrometheusMetrics.ExportAsText + `HttpListener` /metrics 端点
 4. ✅ GameHost 注入真实实现（`Bootstrap` 组装 Phase 2/3/4/5 + 基础设施 + 扩展层）

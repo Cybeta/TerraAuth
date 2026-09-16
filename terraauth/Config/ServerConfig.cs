@@ -111,4 +111,12 @@ public record ServerConfig
     // ---- 监控 (Phase 6 IMetrics) ----
     public bool MetricsEnabled { get; init; } = true;
     public int MetricsPort { get; init; } = 9090;          // Prometheus 抓取端口
+
+    // ---- 诊断 ----
+    /// <summary>
+    /// 热路径诊断日志开关（真机排障用）：开启后输出逐包 / 逐次受伤 / 逐次命中 / 召唤销毁等明细，
+    /// 供定位「没碰到却掉血」「掉落物拾取」类问题。**默认关闭**——这些输出正常游玩时是纯噪声。
+    /// 生产部署保持默认即可；排障时置 true（支持热重载，见 <c>DiagnosticLog</c>）。
+    /// </summary>
+    public bool VerboseDiagnostics { get; init; }
 }

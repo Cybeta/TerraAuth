@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-12（第三十五轮：接触判定回归原版整型 AABB + 接触免伤帧修正为 40 + NPC 同步分档）
+> 最后更新：2026-09-16（第三十六轮：NPC 同步心跳真正生效 + 热路径诊断日志收敛为 `VerboseDiagnostics` 开关；438/438 通过）
 
 ---
 
@@ -37,7 +37,7 @@
 （`WorldExportPath` / `WorldExportIntervalSeconds`，停机 + 空服导出）。详见第十轮回溯。
 
 **遗留**：写出文件已通过**逐格 round-trip** + **严格分段走查** + **原版服务端实测加载**（第二十轮）；
-**双向 `.wld` 格式互操作性均已确认**（导出 → 原版；原版 → TerraAuth）；「原版客户端进图」仍待验证。
+**双向 `.wld` 格式互操作性均已确认**（导出 → 原版；原版 → TerraAuth）；原版客户端已完成连接、进图及 `/give` 掉落物拾取验证，完整游玩回归仍待验证。
 
 ---
 
@@ -100,7 +100,7 @@
 ### 仍待修正（风险保留）
 
 6. **提交前广播**：客户端原包仍可能在仿真提交前广播，其他客户端会先观察到未被权威状态确认的结果；广播应绑定已提交状态 → **本会话核实：当前实现无「客户端原包即时中继」路径**。`WorldSimulator.Tick` 先 `ApplyCommandsForTick` 提交命令，再产出 Snapshot 并 `Publish` 实体视图（L163-164）；`NetworkHost` 标记「从服务端最终状态生成原版同步包，不存在客户端原包即时中继路径」（L358）；`GameHost` 备注「客户端上报位置不直接中继，避免在 Apply 前看到未提交状态」（L656）。出站帧均源自已提交态，本项不再构成当前缺陷。
-7. **缺少背压**：出站已有界；**入站 `CommandQueue`（无界优先队列）、分片入站队列与审计 `Channel`（均无界）仍无容量上限 / 过载策略** → **本项已落地**：出入站 / 分片入站 / 审计 channel 均已改有界；`CommandQueue` 新增可配置 `MaxCount`，超限入队返回 false 由管线拒绝该操作（防恶意超大未来 tick 堆积），生产以 8192 接线。
+7. **背压**：出站已有界；**入站 `CommandQueue`、分片入站队列与审计 `Channel` 的容量与过载策略** → **本项已落地**：出入站 / 分片入站 / 审计 channel 均已改有界；`CommandQueue` 新增可配置 `MaxCount`，超限入队返回 false 由管线拒绝该操作（防恶意超大未来 tick 堆积），生产以 8192 接线。
 8. **锁契约不统一**：`WorldState` 的锁契约（持锁范围 / 可重入性 / 快照一致性）与调用方假设不一致，存在竞态与死锁风险 → **本会话核实：当前无锁顺序死锁**。`KillSummonedProjectiles` 对 `ProjectilesLock` 与 `PlayersLock` 为**顺序获取**（两个独立 lock 块，非嵌套）；`MarkPlayerOffline`/命令路径均在锁外调用它；全仓无「先 PlayersLock 再 ProjectilesLock」的反向嵌套。契约仍以 public 锁对象暴露，属可加固点（收敛为私有 + 封装方法），非当前已触发缺陷。
 9. **WorkerPool 设计分裂**：两套 WorkerPool 的调度、生命周期与错误处理语义不一致，应收敛为单一模型 → **本会话收敛**：`WorkerPool` 统一为「节流 + Task.Run」单一执行契约——`EnqueueAsync` 返回的 Task 现在等待工作真正完成并传播异常（此前立即返回，仅靠测试里的 500ms 延时掩盖，属语义缺陷）；移除从未被进队的 `_queue`/从未使用的 `_workers` 死字段。快照广播 / 分片权威校验与 WorkerPool 沿用同一并发纪律。
 10. **配置链路不完整**：缺少配置项到消费者的完整映射表；部分运行时参数可能无法进入实际组件，或热重载后不生效 → **本会话已核实并修掉一处死配置**：逐字段对照生产消费者（`GameHost` 组合根 + `AuthorityThresholds.From`）。除 `MaxWalkSpeed` 外均被消费——其从未进入 `MovementLimits`（生产用 `MaxFlightSpeed` 单一覆盖步行/冲刺以降低误判，见 `AuthorityThresholds.From` 注释），属死配置字段，已从 `ServerConfig`/`Validate` 移除。另已接线 `MetricsEnabled/MetricsPort`（条件创建 `MetricsHttpServer`）与 `HandshakeTimeoutSeconds`（握手看门狗）。
@@ -112,6 +112,34 @@
 ---
 
 ## 附：本轮回溯
+
+### 第三十六轮（2026-09-16）：NPC 同步心跳真正生效 + 热路径诊断日志收敛为开关
+
+**一、NPC 同步心跳此前「只写在文档里」**
+
+- **缺陷**：`WorldNpc.SyncedTick` 只写不读 —— 广播循环每轮无条件推进它，且「变化才发」判据里**没有**心跳项。
+  后果：NPC 状态长时间不变（静止的城镇 NPC、埋伏不动的敌怪）时，只要玩家离开过视野、客户端基线仍在，
+  该玩家回到视野内就**再也收不到**这个 NPC 的新状态（客户端停在旧位置，实测表现为「走远再回来 NPC 不动」）。
+- **修复**：`changed` 判据加入 `heartbeatDue = world.Tick - npc.SyncedTick >= NpcSyncHeartbeatTicks`（60 tick ≈ 1s）；
+  且 `SyncedTick` / `SyncForced` 都只在**该轮确实发出**（`sent > 0`）后推进 —— 否则 NPC 不在任何玩家视野内时会被白清，
+  换型标记与心跳基线同时失效。顺带回收离线玩家的同步基线（`_npcBaselines`：玩家 id 不复用 + 会话接管换新 id，旧条目再无读者）。
+- **测试**：`Vanilla_NpcSync_Resends_AfterHeartbeat_Interval`（首次下发 → 未变且未到心跳不发 → 越过心跳周期补发）。
+
+**二、诊断日志收敛（原「调试打印未回收」项）**
+
+- **问题**：真机联调期加的 `[DIAG]` / `[Pkt28]` / `[HP]` / `[Strike]` / `[Hurt]` / `[Damage]` / `[Near]` 输出
+  **无开关且落在热路径**：入站包诊断逐包打印（含包 5 背包同步、包 22 拾取、未知包），包 28 每命中一次打印，
+  且部分打印发生在 `NpcsLock` 持锁区间内。正常游玩时是纯噪声，也白费字符串构造。
+- **方案**：保留全部诊断代码（它们正是「没碰到却掉血」「掉落物拾不到」的定位依据），改为**开关驱动**：
+  新增 `DiagnosticLog.Enabled`（根命名空间，见 `Diagnostics.cs`，避免各层反向依赖）+ `ServerConfig.VerboseDiagnostics`
+  （**默认关闭**），由 `GameHost.Bootstrap` 接线、`OnConfigurationChanged` 热重载 —— 排障时改 `server.json` 即时生效、无需重启。
+  调用约定 `if (DiagnosticLog.Enabled) Console.WriteLine(...)`：关闭时连字符串都不构造。
+  入站包诊断整体抽为 `NetworkHost.LogInboundPacket`（由开关守卫一次，替代原来 5 个 case 分支）。
+- **保持不变**：启动 / 错误 / 审计 / 世界落盘等低频管理性输出照旧；`[Authority] 拒绝` 本就限频（首次 50 次 + 每 1000 次）。
+- **顺带**：`server.json` 移除 `MaxWalkSpeed`（第七轮已从 `ServerConfig` 删除的失效键，JSON 反序列化会静默忽略）；
+  `Phase6-Infrastructure/README.md` 同步「ServerConfig 唯一真相源」示例字段。
+
+**测试**：**438 / 438 通过**（新增心跳用例；诊断开关为纯输出门控，不新增断言）。
 
 ### 第三十五轮（2026-09-12）：接触判定回归原版 + 免伤帧取错分支的修正 + NPC 同步分档
 
@@ -729,22 +757,22 @@ Listening on port 7778
 - **编解码覆盖**：入站「31 / 28 个」→ **35 个**；出站「32 类」→ **37 类**（按 `PacketDecoder` / `PacketEncoder` 实际 case 统计）。
 - **持久化后端表述**：多处「默认内嵌 LiteDb / 可选 SQLite」→ **默认 SQLite（`USE_SQLITE`），`-p:NoSqlite=true` 降级 LiteDb**；删除 `SqliteImpl`「骨架」表述（第二轮已完整实装）。
 - **Vanilla-only 边界**：`Net/Transport/README.md` 与 `DELIVERY.md` 中「未建模包透明透传 / 编码侧原样写回 / 编解码无缺口」→ 改为与代码一致（**未建模包默认拒绝**）。
-- **背压表述**：「`CommandQueue` 满 → 丢弃最旧」「`Channel` 满 → 跳过增量快照」→ 与代码一致（出站有界 `Channel(2048, FullMode = Wait)`；入站无界，上限仍为待办）。
+- **背压表述（第十九轮历史快照）**：「`CommandQueue` 满 → 丢弃最旧」「`Channel` 满 → 跳过增量快照」→ 当时记录为出站有界 `Channel(2048, FullMode = Wait)`、入站无界且上限待办；**后续已落地入站 `CommandQueue.MaxCount`、分片入站与审计队列有界策略，当前状态见本文 §三第 7 项。**
 - **文件树**：补 `WorldGenerator.cs` / `WorldFileWriter.cs` / `WorldEntities.cs` / `Authority/CommandService.cs`。
 - **`OPTIMIZATION_BACKLOG.md` §三**：把第十七轮列出的 12 项按「已修正 / 部分修正 / 仍待修正」重新标注（此前全部标为待办，与代码不符）。
 
 **代码侧核对结论（未改动，作为上述标注的依据）**：
 
-- `CommandQueue` 确为 `PriorityQueue<Command, (long Tick, long Sequence)>`（无界）。
+- `CommandQueue` 在第十九轮核对时确为 `PriorityQueue<Command, (long Tick, long Sequence)>`（当时无界）；**当前已增加可配置 `MaxCount`，生产上限为 8192。**
 - `Connection._outbound` 确为 `CreateBounded(2048)` + `FullMode = Wait`。
 - `PacketDecoder.DecodeNetModule` 确在 `new List<LiquidChange>(count)` **之前**校验 `maxChanges = 128` 与剩余长度。
 - `SnapshotConfig.MaxEntitiesPerPacket` 仅有定义，**全仓无引用**（仍为待办）→ **已落地**（见 §三 第 11 项标注）；`SplitFrame` 按上限拆分子帧，编码层逐包发送。
-- `ShardedInboundPipeline._queue` 与 `SqlitePersistence._auditChannel` 均为 `CreateUnbounded`（仍为待办）。
+- `ShardedInboundPipeline._queue` 与 `SqlitePersistence._auditChannel` 在第十九轮核对时均为 `CreateUnbounded`（历史快照）；**当前已改为有界队列，容量与过载策略见本文 §三第 7 项。**
 
 **下一步建议**（按收益 / 风险排序，均属 §三「仍待修正」）：
 
 1. **提交后广播一致性**（§三 第 6 项）：让实体 / 图格 / 箱子广播绑定「已提交状态」，避免客户端先看到未确认结果——与既有「发送成功后才置位」重试机制衔接。
-2. **入站 / 审计队列背压**（§三 第 7 项）：为分片入站队列与审计 `Channel` 加容量上限 + 过载策略（丢弃 / 合并 / 断连）。
+2. **入站 / 审计队列背压（第十九轮历史建议）**：为分片入站队列与审计 `Channel` 加容量上限 + 过载策略；**已完成，当前状态见本文 §三第 7 项。**
 3. **快照实体分包**（§三 第 11 项）：**已完成**。`SplitFrame` 按 `MaxEntitiesPerPacket` 拆分实体为多子帧、移除项并入首份，编码层逐包发送；`SnapshotStore` 改为定长环形数组（Add 满时覆写最旧 / TrimBefore 前移 head，无元素搬移），含绕环 + Trim 顺序测试。
 4. **玩法向补全**（`VANILLA_COVERAGE.md` §二）：树木 / 生命水晶 / 生物群系 / 结构体、液体压力模型、电路门·定时器·压力板、敌怪远程弹幕与更完整的掉落库。
 5. **`.wld` 双向互操作已通过**（第二十轮：导出 → 原版；原版 → TerraAuth），剩余为「原版**客户端**真的进图游玩」；

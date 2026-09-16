@@ -60,7 +60,7 @@ NetworkHost.AcceptLoop
 
 - **单帧一个包**：每个 `INetworkPacket` 独立走管线，**不在网络层攒批**
 - **异常隔离**：单个包处理异常 → 关闭该连接，**不影响其他玩家**
-- **背压**：出站为每连接**有界** `Channel`（容量 2048，`FullMode = Wait`，满时发送方等待）；入站 `CommandQueue` 当前为无界 `(Tick, Sequence)` 优先队列。入站 / 审计队列的容量上限与过载策略仍为待办（见 `OPTIMIZATION_BACKLOG.md` §三 第 6 条）
+- **背压**：出站为每连接**有界** `Channel`（容量 2048，`FullMode = Wait`，满时发送方等待）；入站 `CommandQueue` 为带 `MaxCount` 上限的 `(Tick, Sequence)` 优先队列，生产配置为 8192，超限拒绝操作；分片入站与审计队列同样使用有界 `Channel`。
 
 ---
 
@@ -245,7 +245,7 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 
 | 场景 | 策略 |
 |---|---|
-| 入站洪水 | 出站为有界 `Channel`（2048，满时等待）；入站 / 审计队列容量上限与过载策略待补 |
+| 入站洪水 | 入站命令队列有 `MaxCount` 上限（生产为 8192），分片入站与审计队列有界；超限拒绝操作并记录审计 |
 | 出站堆积 | 每连接有界 `Channel`（2048）满 → 发送方等待（`FullMode = Wait`），不做丢弃 |
 | 恶意连接 | 握手超时（默认 10s）自动断开 |
 
@@ -290,7 +290,7 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 4. ✅ 握手包编解码：ConnectionRequest(1) / ContinueConnecting(3) / PlayerInfo(4) / RequestWorldInfo(6) / WorldInfo(7) / TileGetSection(8) / StatusText(9) / PlayerSpawn(12) / InitialSpawn(49) / FinishedConnecting(129) / Disconnect(2)
 5. ✅ `ISnapshotSender` 的 TCP 实现（对接 Snapshots）
 
-**P1（完善）**：
+### P1（完善）
 - ✅ 包编解码：权威白名单 **13 包** + 状态同步包已结构化（含传送 `TeleportEntity(65)` / `RequestTeleportationByServer(73)`、治疗 35 / 法力 42 / 增益 50、时间 18 / NPC 23 / 弹幕销毁 29 / 拾取 22 / 箱子索引 34 等，共 **35 个入站包 / 37 类出站包**）；未建模包统一 `UnknownPacket` 且**默认拒绝**（Vanilla-only），不再透传；⚠️ 按需增量结构化
 - ✅ 变长整数（`Read/Write7BitEncodedInt`）；⚠️ 特殊类型：`Vector2` / 图格 `Color` 已覆盖，独立 `Rectangle` 读写器待补
 - ✅ 连接认证白名单（`NetworkHost` 按 `PlayerWhitelist` 踢出）；⏳ SteamTicket 未实现
@@ -302,12 +302,12 @@ TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 �
 
 > ⚠️ **协议版本跟进**：每次 Terraria 更新客户端，本文件的包 ID 映射 + Phase 2 对应包处理都要更新。这是架构文档反复强调的持续成本。
 
-> ✅ **原版客户端兼容性（已实测）**：2026-09-09 原版 Terraria 客户端（协议 326）连接 `127.0.0.1:7777`，握手成功 → 解析玩家名 → 进入世界（出生点 2100,352）→ 正常断开，全程无异常/畸形包。编解码严格遵循 terraria-protocol。
+> ✅ **原版客户端兼容性（已实测）**：2026-09-09 原版 Terraria 客户端（协议 326）连接 `127.0.0.1:7777`，握手成功 → 解析玩家名 → 进入世界（出生点 2100,352）→ 正常断开，全程无异常/畸形包。编解码严格遵循 terraria-protocol。已进一步完成 SSC 关闭下 `/give` 掉落物显示与拾取真机验证。
 > ✅ **移动链路已闭环**：位置包 13 → Phase 2 校验 → Phase 3 仿真 → Snapshots 快照 → TCP 下发的往返已由 `IntegrationTests.TcpRoundTrip_Packet13_Reaches_SnapshotOverWire` 覆盖。
 > ✅ **移动权威限距（防作弊优先）**：Δt 上限 1.0s → 10.0s，覆盖客户端失焦/卡顿导致的 4~7s 稀疏发包；但**不做静默超时无条件放行**——超过 10s 的间隔一律按 10s 计，单包允许位移上限 `8.0 × 60 × 10 + 4 = 4804px`，长时静默后的大位移仍会被拒，防止其成为穿墙/瞬移缺口。
 > ⏳ **后续事项：失焦误杀**：客户端失焦 >30s 且激活后位置距基准 >4804px 时会被判 `speed_exceeded`，且拒绝不更新基准会导致后续包连续被拒（原「基准冻结」现象）。彻底解决需引入服务端权威移动/碰撞校验（见 `architecture.md` §9），当前按防作弊优先取舍，暂不实施。
 > ⚠️ **玩家间可见性**：原版客户端仅当 `Main.player[i].active == true` 时才绘制该玩家，故进服/断线必须下发包 14（`PlayerActive`，含 `Active=false` 反激活防幽灵）。仅发包 4（外观）不足以互相看见——这是「相互看不到」的根因。
-> ⚠️ 挖掘 / 战斗 → 权威校验 → 仿真 → 快照回传仍待验证，接入真实客户端前建议先用自定义测试客户端覆盖。
+> ⏳ 原版客户端完整游玩回归仍待完成：需继续验证挖掘 / 放置 / 箱子 / 战斗 / NPC / 区块流送 / 重启持久化等组合流程，并依据 `UnmodeledPacketCounts` 补充必要协议覆盖。
 
 > ⚠️ **不做加密 / 防逆向**：原始 TCP 无加密是 Terraria 协议现状。如需防包伪造，可在 Framing 层加 HMAC（但增加延迟）。
 

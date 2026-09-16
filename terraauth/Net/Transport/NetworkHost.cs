@@ -297,25 +297,8 @@ public sealed class NetworkHost : IAsyncDisposable
         if (!await HandleConnectionStateAsync(packet, connection, ct).ConfigureAwait(false))
             return;
 
-        // [DIAG] 入站关键包诊断（真机排障用）：确认客户端丢弃 / 拾取实际发的包与内容
-        switch (packet)
-        {
-            case ItemDropPacket drop:
-                Console.WriteLine($"[DIAG] 21 ItemDrop pid={connection.PlayerId} slot={drop.ItemSlotIndex} id={drop.ItemId} stack={drop.Stack} pos=({drop.Position.X:0},{drop.Position.Y:0}) vel=({drop.Velocity.X:0},{drop.Velocity.Y:0})");
-                break;
-            case ItemDestroyPacket des:
-                Console.WriteLine($"[DIAG] 151 ItemDestroy pid={connection.PlayerId} slot={des.ItemSlotIndex}");
-                break;
-            case ItemPickupPacket pick:
-                Console.WriteLine($"[DIAG] 22 ItemPickup pid={connection.PlayerId} slot={pick.ItemSlotIndex} owner={pick.PlayerId}");
-                break;
-            case InventorySlotPacket slot:
-                Console.WriteLine($"[DIAG] 5 InventorySlot pid={connection.PlayerId} slot={slot.Slot} id={slot.ItemId} stack={slot.Stack}");
-                break;
-            case UnknownPacket unk:
-                Console.WriteLine($"[DIAG] UNKNOWN pid={connection.PlayerId} type={unk.Type}");
-                break;
-        }
+        // [DIAG] 入站关键包诊断（真机排障用，默认关闭）：确认客户端丢弃 / 拾取实际发的包与内容
+        if (DiagnosticLog.Enabled) LogInboundPacket(packet, connection);
 
         // 走 Phase 2 权威管线
         var result = await _pipeline.ProcessAsync(
@@ -405,6 +388,32 @@ public sealed class NetworkHost : IAsyncDisposable
                         CancellationToken.None,
                         connection).ConfigureAwait(false);
                 }
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 入站关键包明细（真机排障用，由 <see cref="DiagnosticLog.Enabled"/> 守卫）：
+    /// 确认客户端「丢弃 / 拾取 / 背包写入」实际发的是哪种包、内容是什么，以及未建模包的包号分布。
+    /// </summary>
+    private static void LogInboundPacket(INetworkPacket packet, Connection connection)
+    {
+        switch (packet)
+        {
+            case ItemDropPacket drop:
+                Console.WriteLine($"[DIAG] 21 ItemDrop pid={connection.PlayerId} slot={drop.ItemSlotIndex} id={drop.ItemId} stack={drop.Stack} pos=({drop.Position.X:0},{drop.Position.Y:0}) vel=({drop.Velocity.X:0},{drop.Velocity.Y:0})");
+                break;
+            case ItemDestroyPacket des:
+                Console.WriteLine($"[DIAG] 151 ItemDestroy pid={connection.PlayerId} slot={des.ItemSlotIndex}");
+                break;
+            case ItemPickupPacket pick:
+                Console.WriteLine($"[DIAG] 22 ItemPickup pid={connection.PlayerId} slot={pick.ItemSlotIndex} owner={pick.PlayerId}");
+                break;
+            case InventorySlotPacket slot:
+                Console.WriteLine($"[DIAG] 5 InventorySlot pid={connection.PlayerId} slot={slot.Slot} id={slot.ItemId} stack={slot.Stack}");
+                break;
+            case UnknownPacket unk:
+                Console.WriteLine($"[DIAG] UNKNOWN pid={connection.PlayerId} type={unk.Type}");
                 break;
         }
     }

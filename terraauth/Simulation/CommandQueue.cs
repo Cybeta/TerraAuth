@@ -147,14 +147,16 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
         // 客户端本地 Hurt 上报的包 117 与服务端接触兜底是「同一次伤害的两条表达」，只扣一次）
         if (player.HurtCooldown > 0)
         {
-            Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage}（包117）但免伤帧中，忽略");
+            if (DiagnosticLog.Enabled)
+                Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage}（包117）但免伤帧中，忽略");
             return new(false, CommandFailures.NotApplied);
         }
 
         // 前置：此刻必须确实接触着敌怪（防伪造远程受伤；判定口径与服务端接触兜底一致）
         if (!CombatResolver.IsPlayerInContact(world, player))
         {
-            Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage}（包117）但未接触敌怪，忽略");
+            if (DiagnosticLog.Enabled)
+                Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage}（包117）但未接触敌怪，忽略");
             return new(false, CommandFailures.NotApplied);
         }
 
@@ -165,7 +167,8 @@ public sealed record DamagePlayerCommand(long Tick, int? PlayerId, int Damage)
 
         if (Damage > upper)
         {
-            Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage} 超上界 {upper}（接触={contact} def={player.Defense}），拒绝");
+            if (DiagnosticLog.Enabled)
+                Console.WriteLine($"[Hurt] 玩家 #{id} 上报伤害 {Damage} 超上界 {upper}（接触={contact} def={player.Defense}），拒绝");
             return new(false, CommandFailures.HurtDamageAboveLimit);
         }
 
@@ -689,12 +692,14 @@ public sealed record NpcStrikeCommand(
             var npc = world.Npcs[NpcIndex];
             if (!npc.Active)
             {
-                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 客户端gen={Generation} 服务端已死(type={npc.Type}) dmg={Damage}");
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 客户端gen={Generation} 服务端已死(type={npc.Type}) dmg={Damage}");
                 return new(false, CommandFailures.NotApplied);
             }
             if ((byte)Generation != npc.Generation)
             {
-                Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 客户端gen={Generation} 服务端gen={npc.Generation} dmg={Damage}");
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 客户端gen={Generation} 服务端gen={npc.Generation} dmg={Damage}");
                 return new(false, CommandFailures.NotApplied);
             }
 
@@ -709,14 +714,16 @@ public sealed record NpcStrikeCommand(
                 var proj = FindPlayerProjectileNearNpc(world, playerId, npc);
                 if (proj is null)
                 {
-                    Console.WriteLine($"[Strike] slot={NpcIndex} 未找到归属玩家 #{playerId} 的存活弹幕（近战挥砍？），交棒武器校验 dmg={Damage}");
+                    if (DiagnosticLog.Enabled)
+                        Console.WriteLine($"[Strike] slot={NpcIndex} 未找到归属玩家 #{playerId} 的存活弹幕（近战挥砍？），交棒武器校验 dmg={Damage}");
                 }
                 else
                 {
                     int bound = (int)Math.Ceiling(proj.Damage * 1.15f) * (Crit ? 2 : 1);
                     if (Damage > bound)
                     {
-                        Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 上报伤害 {Damage} 超弹幕上界 {bound}（弹幕key={proj.Key} dmg={proj.Damage} crit={Crit}）");
+                        if (DiagnosticLog.Enabled)
+                            Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 上报伤害 {Damage} 超弹幕上界 {bound}（弹幕key={proj.Key} dmg={proj.Damage} crit={Crit}）");
                         return new(false, CommandFailures.StrikeDamageMismatch);
                     }
                     projectileMatched = true;
@@ -769,7 +776,8 @@ public sealed record NpcStrikeCommand(
 
                 if (upperBound is int ub && Damage > ub)
                 {
-                    Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 上报 {Damage} 超上界 {ub}（crit={Crit}）");
+                    if (DiagnosticLog.Enabled)
+                        Console.WriteLine($"[Strike] 拒绝 slot={NpcIndex} 上报 {Damage} 超上界 {ub}（crit={Crit}）");
                     return new(false, CommandFailures.StrikeDamageMismatch);
                 }
             }
@@ -786,12 +794,14 @@ public sealed record NpcStrikeCommand(
                 npc.Life = 0;
                 npc.Active = false; // 由世界同步下发 life=0，客户端据此移除
                 npc.DeadTick = Tick;
-                Console.WriteLine($"[Kill] slot={NpcIndex} gen={npc.Generation} type={npc.Type} dmg={Damage} def={npc.Defense} applied={applied} @{npc.X:F0},{npc.Y:F0}");
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[Kill] slot={NpcIndex} gen={npc.Generation} type={npc.Type} dmg={Damage} def={npc.Defense} applied={applied} @{npc.X:F0},{npc.Y:F0}");
                 world.NotifyNpcKilled(npc.Type, npc.X, npc.Y, rng); // Boss 击杀 → 世界进度 + 掉落
             }
             else
             {
-                Console.WriteLine($"[Strike] slot={NpcIndex} gen={npc.Generation} dmg={Damage} def={npc.Defense} applied={applied} → life={npc.Life}");
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[Strike] slot={NpcIndex} gen={npc.Generation} dmg={Damage} def={npc.Defense} applied={applied} → life={npc.Life}");
             }
         }
 

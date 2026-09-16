@@ -1148,6 +1148,34 @@ public class VanillaFeatureTests
     }
 
     /// <summary>
+    /// NPC 同步（包 23）心跳：状态长时间未变化也按 <c>NpcSyncHeartbeatTicks</c>（60 tick ≈ 1s）补发一次。
+    /// 覆盖「走远再回来」——客户端仍持有旧基线，只靠「变化才发」会永远收不到该 NPC 的新状态。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_NpcSync_Resends_AfterHeartbeat_Interval()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        // 首次必然下发（向导 NPC 22）
+        await server.Host.BroadcastNpcUpdatesAsync();
+        var first = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(first, p => p is NpcUpdatePacket { NetId: 22 });
+
+        // 状态未变化 + 心跳未到（60 tick）→ 不重复下发
+        await server.Host.BroadcastNpcUpdatesAsync();
+        var none = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromMilliseconds(300));
+        Assert.DoesNotContain(none, p => p is NpcUpdatePacket);
+
+        // 越过心跳周期 → 状态未变化也补发一次
+        world.Tick += 60;
+        await server.Host.BroadcastNpcUpdatesAsync();
+        var heartbeat = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(heartbeat, p => p is NpcUpdatePacket { NetId: 22 });
+    }
+
+    /// <summary>
     /// NPC 同步（包 23）必须携带原版 <c>ai[0..3]</c>：客户端对未置位的 ai 位会**显式置 0**，
     /// 依赖 ai 的 aiStyle（如史莱姆的跳跃状态）不下发就会与服务端不一致。
     /// </summary>

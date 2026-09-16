@@ -406,7 +406,8 @@ public sealed class PacketDecoder : IPacketDecoder
         var knockback = r.ReadSingle();
         var direction = r.ReadByte() - 1;
         var crit = r.ReadByte() != 0;
-        Console.WriteLine($"[Pkt28] idx={npcId} gen={generation} dmg={damage} crit={(crit ? 1 : 0)} kb={knockback:F1}");
+        if (DiagnosticLog.Enabled)
+            Console.WriteLine($"[Pkt28] idx={npcId} gen={generation} dmg={damage} crit={(crit ? 1 : 0)} kb={knockback:F1}");
         return new NpcStrikePacket(npcId, damage)
         {
             Generation = generation,
