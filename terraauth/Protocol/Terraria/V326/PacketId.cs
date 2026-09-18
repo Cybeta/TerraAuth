@@ -5,7 +5,7 @@ namespace TerraAuth.Protocol;
 
 /// <summary>
 /// 包类型标识。数值对应 Terraria 网络协议中的真实包号。
-/// 权威来源：原版客户端（Terraria 1.4.5.8 / Protocol 326）协议中的真实包号。
+/// 协议依据：原版客户端（Terraria 1.4.5.8 / Protocol 326）兼容的包号。
 /// 注释中的 "原版名" 为该包号在原版协议常量中的名称；TerraAuth 侧保留语义化命名。
 /// 仅收录握手与当前已实现管线所需的包；其余包按需补充。
 /// </summary>

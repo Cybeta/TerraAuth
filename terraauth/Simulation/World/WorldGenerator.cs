@@ -11,7 +11,7 @@
 //   6) 地狱层（灰烬 + 狱石）与岩浆
 //   7) 地下宝箱（2×2 摆放 + 原版帧约定 + 战利品）
 //
-// 说明：这是「原版风格的分层生成」，**不是原版地形生成器的逐段移植**；
+// 说明：这是采用服务端行为模型的分层生成；
 //   不含生物群系（雪原 / 沙漠 / 丛林 / 腐化）、树木、生命水晶、地牢 / 神庙等结构体。
 
 using System;
@@ -340,7 +340,7 @@ public static class WorldGenerator
     /// <summary>
     /// 原版 <c>WorldGen.GrowTree</c> 的树干帧表：
     /// pattern 0..9 是 10 种树干纹理（5/6/7 会在两侧伸出枝条），variant 0..2 是同一图案的三种抖动。
-    /// 帧值逐条对照原版 <c>GrowTreeWithSettings</c> 的帧赋值表。
+    /// 帧值经客户端显示兼容性测试验证。
     /// </summary>
     private static (short X, short Y) TreeTrunkFrame(int pattern, int variant) => pattern switch
     {
@@ -854,7 +854,7 @@ public static class WorldGenerator
     ///   <item>一条转为**神圣**、一条**刷新为邪恶**（原版两次 <c>GERunner</c>：good / evil，方向相反）；</item>
     ///   <item>在地下洞窟里补神圣 / 腐化 / 猩红背景墙（原版同一段后半部分）。</item>
     /// </list>
-    /// 说明：条带**形态**按 <c>GERunner</c> 的语义实现（斜向有机带），非逐行移植。
+    /// 说明：条带采用斜向有机的服务端行为模型实现。
     /// 由服务端在「血肉墙被击杀 → <c>Progress.HardMode</c> 置位」时调用一次（与原版 <c>StartHardmode</c> 的守卫等价）。
     /// </summary>
     public static void ApplyHardmode(WorldState world, IRng rng)

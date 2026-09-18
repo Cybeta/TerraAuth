@@ -8,7 +8,7 @@
 //   aiStyle 3  Fighters      —— AI_003_Fighters（哥布林工兵 26）
 //   aiStyle 4  EyeOfCthulhu  —— 眼魔（Boss）
 //   aiStyle 7  TownEntities  —— AI_007_TownEntities（城镇 NPC + 小动物 Ai007Critter）
-//   aiStyle 16/24/64/65/66/67/68/112/114/115/116/118 —— 小动物逐类（见 NpcCritterSet.AiStyleOf）
+//   aiStyle 16/24/64/65/66/67/68/112/114/115/116/118 —— 小动物按类别实现（见 NpcCritterSet.AiStyleOf）
 //   其余（Boss 专属 aiStyle）—— 待移植
 //
 // 说明：原版 AI 中的粉尘 / 音效 / 光照 / rotation / spriteDirection 属客户端表现，
@@ -109,7 +109,7 @@ public partial class WorldSimulator
     // 口径：只移植「服务端权威运动 + 状态」部分（速度 / ai[] / direction / 跳跃 / 液体交互），
     // 跳过粉尘 / 音效 / 光照 / rotation / spriteDirection 等纯客户端表现。
     // 原版把每类小动物的 AI 内联在巨型 AI() 分派里（AI_001 的蚂蚱分支、aiStyle 7 的寻路、
-    // aiStyle 24/64/65/66/67/68/112/114/115/116/118 的飞行/爬行/游泳），此处逐一按行号移植。
+    // aiStyle 24/64/65/66/67/68/112/114/115/116/118 的飞行/爬行/游泳），此处按类别实现。
 
     // ---- 随机数（原版 Main.rand 语义：确定性 RNG 映射，见 Determinism.cs）----
 
@@ -493,7 +493,7 @@ public partial class WorldSimulator
     private const float SlimeJumpThreshold = -1000f;
 
     /// <summary>
-    /// 原版 AI_001_Slimes（type 1 蓝史莱姆路径 + 蚂蚱 377/446 分支，逐条对照原版行号）：
+    /// AI_001_Slimes 的服务端行为模型（type 1 蓝史莱姆路径 + 蚂蚱 377/446 分支）：
     /// <list type="bullet">
     ///   <item>`flag3`（是否「有威胁」）：原版 <c>!dayTime || life != lifeMax || Y &gt; worldSurface*16 || slimeRain</c>；
     ///         蚂蚱 377/446 覆盖为「有玩家在 200px 内且未湿」。</item>
@@ -820,7 +820,7 @@ public partial class WorldSimulator
     private const float EyeChargeSpeed = 6.8f;
 
     /// <summary>
-    /// 原版眼魔（type 4 / aiStyle 4）的运动与攻击节奏（逐条对照原版行号）：
+    /// 眼魔（type 4 / aiStyle 4）的服务端运动与攻击节奏模型：
     /// <list type="bullet">
     ///   <item>阶段：`life &lt; lifeMax * 0.5` → `ai[0] = 1`（原版 25151-25162）。</item>
     ///   <item>`ai[1] == 0` 追击：朝「玩家中心上方 200px」加速 0.04、限速 5（原版 24948-24967）；

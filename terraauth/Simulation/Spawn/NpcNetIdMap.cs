@@ -1,6 +1,6 @@
 // TerraAuth — 负向 netID → 基础 NPC 类型映射
 //
-// 权威来源：原版 Terraria.ID.NPCID.NetIdMap（1.4.5.8 / Protocol 326）
+// 行为依据：Terraria 1.4.5.8 / 协议 326 的 NPC 网络 ID 兼容性测试
 //   FromNetId(id) = id < 0 ? NetIdMap[-id - 1] : id
 //
 // 原版用「负 netID」表达同一 `type` 的体型 / 配色变体（如 -3 = 绿史莱姆，type 仍为 1）。

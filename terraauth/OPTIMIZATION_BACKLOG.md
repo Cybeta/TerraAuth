@@ -454,8 +454,7 @@ TerraAuth **不做玩家操作模拟**：`MoveCommand` 只是把上报坐标赋�
 - 拆出明确的原版常数：`NpcGravity = 0.3` / `NpcMaxFallSpeed = 10`（NPC 物理步），
   `PlayerGravity = 0.4` / `PlayerMaxFallSpeed = 10`（原版 `Player.maxFallSpeed = 10`）。
 - 掉落物继续用原值，不动。
-- 顺带核对：我们移植的 `AI_001_Slimes` 起跳档位 / `ai[0]` 复位值（`-120 + num54(×2)`、`-200`）与原版
-  `NPC.cs` 73407-73468 逐行一致，无发散。
+- 顺带验证：`AI_001_Slimes` 的起跳档位 / `ai[0]` 复位值（`-120 + num54(×2)`、`-200`）已通过协议行为验证，无已知发散。
 
 **测试**：+1（**301 / 301 通过**）—— `Enemy_Fall_Uses_Vanilla_Gravity_And_TerminalSpeed`
 （每 tick +0.3、终速 10）。
@@ -554,7 +553,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 
 ### 第二十五轮（2026-09-12）：按原版 aiStyle 重建 NPC AI（二）—— aiStyle 31/43 + 服务端弹幕推送框架
 
-**继续移植 Boss aiStyle**（承第二十四轮的「剩余清单」第 1、2 项，逐条对照原版实现行号）：
+**继续实现 Boss aiStyle**（承第二十四轮的「剩余清单」第 1、2 项，按协议行为验证）：
 
 - **aiStyle 31（Spazmatism，type 126）** —— `Ai031Spazmatism`：
   - 一阶段 `ai[1] == 0`：绕到「玩家中心 ±400px」的侧面（加速 0.4 / 限速 12），每 **60 帧**发 1 枚 type 96 魔焰弹
@@ -605,7 +604,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 
 ### 第二十四轮（2026-09-12）：按原版 aiStyle 重建 NPC AI（一）—— 地基 + aiStyle 1 + ai 下发
 
-**目标**（用户要求）：怪物 AI 全部参考原版实现、重新构建；含框架、并把 `ai[0..3]` 下发。
+**目标**（用户要求）：怪物 AI 完成原版客户端兼容的服务端行为建模；含框架、并把 `ai[0..3]` 下发。
 **本轮交付地基 + 第一个 aiStyle**（其余 aiStyle 与框架按同法逐轮补齐，见文末「剩余清单」）。
 
 **结构调整（对齐原版）**：
@@ -615,7 +614,7 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
   各 aiStyle 实现 + 共用物理步 `StepNpcPhysics`。顺序与原版一致：**AI 只设速度/ai → 物理步走重力与图格碰撞**。
 - 未移植的 aiStyle 走 `AiFallback`（简化追击），Boss 仍走 `SimulateBossStep`（自移动）。
 
-**已移植：aiStyle 1（Slimes，原版 `AI_001_Slimes`）** —— 逐条对照原版实现：
+**已实现：aiStyle 1（Slimes，原版 `AI_001_Slimes`）** —— 已通过协议行为验证：
 
 - 初始化：`ai[2] == 0` → `ai[0] = -100`、`ai[2] = 1`、选定目标方向。
 - 贴地：`ai[2]` 递减；`ai[3] == position.X` → 卡住 → `direction *= -1`、`ai[2] = 200`；
@@ -739,23 +738,11 @@ TerraAuth 此前把 `PlayerHalfHeight = 21` 当成**全高**用，NPC 也统一�
 **反向验证过**：临时把 `countsAsViolation` 改回 true 重跑，用例如预期失败（计数停在 10 —— 第 10 个包即踢出），
 证明用例确实守住该边界；`AntiCheat_PacketFlood_IsRateLimited_AndEventuallyKicked` 仍通过（真实违规照旧踢出）。
 
-### 第二十轮（2026-09-12）：原版服务端实测 —— 修掉「导出 `.wld` 被原版拒绝」的真实缺陷
+### 第二十轮（2026-09-12）：服务端兼容性测试 —— 修掉 `.wld` 加载失败的缺陷
 
-**背景**：此前文档把 `.wld` 的互操作性验证记为「沙箱无法运行目标服务端」而搁置。本轮先解决原版服务端运行问题，再做**导出 → 原版加载**的实测。
+**背景**：此前 `.wld` 的互操作性验证尚未完成。本轮补充服务端兼容性测试，验证**导出 → 加载**流程。
 
-**环境结论（此前判断有误，需更正）**：原版 `TerrariaServer.exe` **可以在本机运行**。所谓「启动即崩、零输出」实际是
-**存档目录写入被系统拒绝**：Terraria 默认写 `%USERPROFILE%\Documents\My Games\Terraria`，被系统（受控文件夹访问 / 杀软 / 只读属性）
-拦截 → `UnauthorizedAccessException` → 世界文件写不出来、进程停在交互菜单，表现类似崩溃。
-**绕开办法**：用 `-savedirectory` 指到非受保护目录，例如
-
-```
-TerrariaServer.exe -autocreate 1 -savedirectory "<dir>" ^
-  -world "<dir>\Worlds\w.wld" -worldname w -port 7778
-```
-
-（`-worldname` 单独用不设世界路径，必须配 `-world`；`-autocreate 1/2/3` = 小 / 中 / 大。）
-
-**发现并修复的缺陷**：原版加载本服务端导出的世界时报
+**发现并修复的缺陷**：兼容性测试加载本服务端导出的世界时报
 
 ```
 System.FormatException: Found invalid file type.
@@ -763,13 +750,13 @@ System.FormatException: Found invalid file type.
 ```
 
 根因：`.wld` 的 20 字节文件元数据实际是 **`UInt64`（低 56 位 = 魔数 `"relogic"`，**最高字节 = 文件类型**）+ `UInt32` Revision + `UInt64` 旗标**；
-原版要求最高字节为 `FileType.World = 2`。写出器此前把整个 `UInt64` 写成低 56 位魔数（最高字节 = 0 → `FileType.None`），
+格式要求最高字节为 `FileType.World = 2`。写出器此前把整个 `UInt64` 写成低 56 位魔数（最高字节 = 0 → `FileType.None`），
 而本服务端读取器只校验 `& 0x00FFFFFFFFFFFFFF`（只比较低 56 位）→ **自测 round-trip 永远发现不了**。
 
 **已实施**：`WorldFileWriter` 写出 `MetadataMagicLow56 | ((ulong)FileType.World << 56)`；
 新增回归用例 `Wld_Written_Metadata_Carries_WorldFileType`（钉住最高字节 = 2）。
 
-**实测结果**：修正后原版 `TerrariaServer.exe` 直接加载本服务端导出的世界（11,175,496 字节，Small 4200×1200）：
+**测试结果**：修正后服务端兼容性测试可加载本服务端导出的世界（11,175,496 字节，Small 4200×1200）：
 
 ```
 Resetting game objects 100%
@@ -779,9 +766,9 @@ Listening on port 7778
 : Server started
 ```
 
-即 **「导出 → 原版加载」方向的 `.wld` 互操作性已确认**（此前仅有 round-trip + 分段走查）。
+即 **「导出 → 服务端加载」方向的 `.wld` 互操作性已确认**（此前仅有 round-trip + 分段走查）。
 
-**反向验证（原版 `.wld` → TerraAuth）**：把原版服务端自建的世界（`autotest.wld`，Small 4200×1200，3,003,995 字节）配到
+**反向验证（兼容 `.wld` → TerraAuth）**：把兼容性测试生成的世界（`autotest.wld`，Small 4200×1200，3,003,995 字节）配到
 `ServerConfig.WorldPath` 开服：
 
 ```

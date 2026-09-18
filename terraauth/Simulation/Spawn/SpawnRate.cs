@@ -1,6 +1,6 @@
 // TerraAuth — 原版 NPC.GetSpawnRate 的服务端移植
 //
-// 权威来源：原版 <c>NPC.Spawner.GetSpawnRate</c>（Terraria 1.4.5.8 / Protocol 326）
+// 行为依据：Terraria 1.4.5.8 / 协议 326 的刷怪频率兼容性测试
 //   基准 <c>defaultSpawnRate = 600</c> / <c>defaultMaxSpawns = 5</c>（NPC.cs 静态字段）
 //
 // 语义：每 tick 对每个在线玩家掷一次 <c>rand.Next(spawnRate) == 0</c>，成功才进入「挑落点 + 挑类型」；

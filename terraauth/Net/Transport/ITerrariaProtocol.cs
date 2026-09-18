@@ -19,7 +19,7 @@ public sealed record ProtocolVersion(
 {
     /// <summary>
     /// 当前目标版本：Terraria 1.4.5.8 → Protocol 326。
-    /// 权威来源：原版客户端（协议 326）—— 握手中发送/校验的版本串为 <c>"Terraria" + 326</c>。
+    /// 协议依据：原版客户端（协议 326）握手中发送/校验的版本串为 <c>"Terraria" + 326</c>。
     /// </summary>
     public static readonly ProtocolVersion Current = new(1, 4, 5, 326);
 

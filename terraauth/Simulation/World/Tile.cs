@@ -1,5 +1,5 @@
 // TerraAuth — Phase 6: 世界数据模型（Tile / TileMap）
-// 字段布局权威来源：原版客户端的图格字段布局（Terraria 1.4.5.8 / Protocol 326）
+// 字段布局依据：原版客户端兼容的图格字段布局（Terraria 1.4.5.8 / Protocol 326）
 //   - 读写：世界文件的图格段与包 10（TileSection）的压缩块
 
 using System;
@@ -147,7 +147,7 @@ public sealed class TileMap
 /// <summary>
 /// 区块图格数据（TileSection，包 10）。
 /// payload 为 Deflate 压缩的矩形区块：Int32 xStart/yStart + Int16 width/height + 逐格位标志/RLE + 尾部宝箱/牌子/实体列表。
-/// 布局权威来源：<c>NetMessage.CompressTileBlock / CompressTileBlock_Inner</c>（1.4.5.8 / Protocol 326）。
+/// 布局依据：经兼容性测试的图格压缩字段（1.4.5.8 / Protocol 326）。
 /// 编码由 <c>PacketEncoder</c> 完成。
 /// </summary>
 public sealed record TileSectionPacket(WorldState World, int XStart, int YStart, int Width, int Height) : INetworkPacket

@@ -238,7 +238,7 @@ Client                    NetworkHost              Connection
 
 ### 7.2 为什么不用 TShock 的监听
 
-TShock 挂在原版 `TerrariaServer.exe` 之上，监听由游戏内置实现 。
+TShock 依赖既有服务端运行环境提供监听能力。
 我们重写服务端，**必须自己实现监听 + 编解码**——这正是本 Phase 的价值。
 
 ### 7.3 背压与限流

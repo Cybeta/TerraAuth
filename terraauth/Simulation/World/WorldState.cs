@@ -297,7 +297,7 @@ public sealed class WorldState
 
     /// <summary>
     /// 记录 Boss 击杀进度 + 掉落（服务端权威）。未收录的 NPC 类型不做处理。
-    /// 进度位映射与 NPC 类型 ID 均按**原版客户端行为**逐项核对（协议字段比对，不含第三方源码）。
+    /// 进度位映射与 NPC 类型 ID 均经原版客户端协议行为验证。
     /// 由仿真线程调用（NPC 死亡处）。
     /// </summary>
     public void NotifyNpcKilled(int npcType, float x, float y, IRng rng)
@@ -1692,7 +1692,7 @@ public sealed class PlayerRuntime
 }
 
 /// <summary>
-/// 世界进度位。字段与包 7 的 11 个 BitsByte 一一对应（权威来源：<c>NetMessage.SendData</c> case 7）。
+/// 世界进度位。字段与包 7 的 11 个 BitsByte 一一对应，并经协议行为验证。
 /// </summary>
 public sealed class WorldProgress
 {

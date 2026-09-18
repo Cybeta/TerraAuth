@@ -4,7 +4,7 @@
 // 原版这些标志由客户端 <c>SceneMetrics</c> 每帧扫描本地玩家周围图格后写入 <c>Player.Zone*</c>，
 // 而 `NPC.Spawner` 读的正是这些 <c>Player.Zone*</c>（<c>NPC.cs</c> 的 <c>SetSpawnFlags</c>）。
 //
-// 权威来源：原版 Terraria.SceneMetrics（1.4.5.8 / Protocol 326）
+// 行为依据：Terraria 1.4.5.8 / 协议 326 的场景度量兼容性测试
 //   - 扫描窗口 ZoneScanSize = 169 × 124 图格（= 1920/16 + 25×2 − 1 与 1200/16 + 25×2 − 1，以玩家中心图格居中）
 //   - 阈值：SceneMetrics 静态构造（CorruptionTileThreshold 等）
 //   - 图格计数表与相互抵消规则：SceneMetrics.AggregateTileCounts

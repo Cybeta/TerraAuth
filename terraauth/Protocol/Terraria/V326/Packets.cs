@@ -1,6 +1,6 @@
 // TerraAuth — Phase 5: 协议层包契约补充
 // 定义 Connection / SyncPlayer / WorldData / Spawn 等握手与同步包
-// 布局权威来源：原版客户端（Terraria 1.4.5.8 / Protocol 326）的协议字段顺序
+// 布局依据：原版客户端（Terraria 1.4.5.8 / Protocol 326）兼容的协议字段顺序
 //   - 出站：服务端发包的字段写入顺序
 //   - 入站：客户端收包的字段读取顺序
 

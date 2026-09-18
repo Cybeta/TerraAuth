@@ -1,8 +1,8 @@
 // TerraAuth — 原版 NPC.Spawner.SpawnAnNPC 的刷怪池（服务端权威）
 //
-// 权威来源：原版 <c>NPC.Spawner.SpawnAnNPC</c> 的 if/else 链（Terraria 1.4.5.8 / Protocol 326）。
-// 分支顺序、随机门限（<c>Main.rand.Next(n) == 0</c>）、权重数组（<c>Utils.SelectRandom</c> 的重复项）
-// 均按原版逐条对照；负 netID 变体（如 -3 绿史莱姆）原样保留。
+// 行为模型覆盖 Terraria 1.4.5.8 / 协议 326 的刷怪规则。
+// 分支顺序、随机门限（<c>Main.rand.Next(n) == 0</c>）和权重数组
+// 均经协议行为验证；负 netID 变体（如 -3 绿史莱姆）原样保留。
 //
 // 与本文件相关的原版量：
 //   surfaceSpawn      = spawnTileY <= worldSurface

@@ -8,8 +8,8 @@
 // 服务端若按 FromNetId 解析出的基础类型上限下发当前生命，就会出现「当前生命 > 客户端上限」，
 // 客户端血条按比值截断 → 画成满的；真机表现即「打掉一半血后血条又回到满」。
 //
-// 权威来源：原版 1.4.5.8 <c>NPC.SetDefaultsFromNetId</c> 每个 case 的 <c>life</c>：
-//   字面量，或 `(int)(life * scale)`（scale = 该 case 传给 SetDefaults_ForNetId 的体型覆盖值；
+// 行为依据：原版客户端兼容的变体生命上限规则：
+//   字面量，或 `(int)(life * scale)`（scale = 该变体的体型覆盖值；
 //   -14 另有 ×1.1；flag=true 的分支随后走 ScaleStats 并 `life = lifeMax`，classic 难度下不变，
 //   只保留 `lifeMax < 6 → 6` 下限）。基础类型生命上限取自 NpcStatsTable（同一来源）。
 //

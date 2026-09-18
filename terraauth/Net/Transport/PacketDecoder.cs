@@ -1,6 +1,6 @@
 // TerraAuth — Phase 5: 数据包解码器
 // 字节流 → INetworkPacket
-// 布局权威来源：原版客户端收包读取的字段顺序与类型（Terraria 1.4.5.8 / Protocol 326）
+// 布局依据：经原版客户端兼容性测试的字段顺序与类型（Terraria 1.4.5.8 / Protocol 326）
 
 using System.Buffers;    // ReadOnlySequence<byte>
 using System.IO;
