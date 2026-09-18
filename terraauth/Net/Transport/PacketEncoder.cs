@@ -897,7 +897,9 @@ public sealed class PacketEncoder : IPacketEncoder
     {
         // 尾部宝箱 / 牌子按坐标索引（原版通过 Chest.FindChest / Sign.ReadSign 查找）
         var chestByPos = new Dictionary<(int X, int Y), Chest>(world.Chests.Count);
-        foreach (var c in world.Chests) chestByPos[(c.X, c.Y)] = c;
+        foreach (var c in world.Chests)
+            if (!c.Deleted)
+                chestByPos[(c.X, c.Y)] = c;
         var signByPos = new Dictionary<(int X, int Y), Sign>(world.Signs.Count);
         foreach (var s in world.Signs) signByPos[(s.X, s.Y)] = s;
 

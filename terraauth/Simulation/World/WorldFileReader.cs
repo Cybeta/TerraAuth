@@ -87,8 +87,10 @@ public static class WorldFileReader
         LoadNpcs(reader, version, state);
 
         Expect(reader, positions[5], "tile entities");
+        LoadTileEntities(reader, version, state);
+        Expect(reader, positions[6], "weighted pressure plates");
 
-        // section 6..10：图格实体 / 压力板 / 城镇管理 / 图鉴 / 创造之力。
+        // section 6..10：压力板 / 城镇管理 / 图鉴 / 创造之力。
         // 服务端进入世界不依赖这些数据，直接跳到 footer 起始指针。
         reader.BaseStream.Position = positions[10];
         LoadFooter(reader, state);
@@ -828,6 +830,90 @@ public static class WorldFileReader
     {
         _ = reader.ReadString(); // NPCID.FromLegacyName（未移植，忽略）
         return 0;
+    }
+
+    // ---------------- 段 5：图格实体 ----------------
+
+    private static void LoadTileEntities(BinaryReader reader, int version, WorldState state)
+    {
+        int count = reader.ReadInt32();
+        if (count < 0 || count > 100_000)
+            throw new InvalidDataException($"图格实体数量非法：{count}");
+
+        for (int i = 0; i < count; i++)
+        {
+            byte type = reader.ReadByte();
+            if (type > 10)
+                throw new InvalidDataException($"不支持的图格实体类型：{type}");
+
+            var entity = new TileEntity
+            {
+                Type = type,
+                FileId = reader.ReadInt32(),
+                X = reader.ReadInt16(),
+                Y = reader.ReadInt16(),
+            };
+
+            switch (type)
+            {
+                case 0:
+                    entity.NpcSlot = reader.ReadInt16();
+                    break;
+                case 1:
+                case 4:
+                case 6:
+                case 8:
+                    entity.Item = ReadTileEntityItem(reader);
+                    break;
+                case 2:
+                    entity.LogicCheck = reader.ReadByte();
+                    entity.On = reader.ReadBoolean();
+                    break;
+                case 3:
+                    ReadDisplayDoll(reader, entity, version);
+                    break;
+                case 5:
+                    ReadHatRack(reader, entity);
+                    break;
+                case 7:
+                    break;
+                case 9:
+                case 10:
+                    entity.Item.Type = reader.ReadInt16();
+                    break;
+            }
+
+            state.InsertTileEntity(entity, markDirty: false);
+        }
+    }
+
+    private static TileEntityItem ReadTileEntityItem(BinaryReader reader)
+        => new() { Type = reader.ReadInt16(), Prefix = reader.ReadByte(), Stack = reader.ReadInt16() };
+
+    private static void ReadDisplayDoll(BinaryReader reader, TileEntity entity, int version)
+    {
+        byte itemBits = reader.ReadByte();
+        byte dyeBits = reader.ReadByte();
+        entity.DisplayDollPose = version >= 307 ? reader.ReadByte() : (byte)0;
+        byte extraBits = version >= 308 ? reader.ReadByte() : (byte)0;
+
+        for (int i = 0; i < 9; i++)
+            if ((itemBits & (1 << i)) != 0 || (i == 8 && (extraBits & 2) != 0))
+                entity.DisplayDollItems[i] = ReadTileEntityItem(reader);
+        for (int i = 0; i < 9; i++)
+            if ((dyeBits & (1 << i)) != 0 || (i == 8 && (extraBits & 4) != 0))
+                entity.DisplayDollDyes[i] = ReadTileEntityItem(reader);
+        if ((extraBits & 1) != 0)
+            entity.DisplayDollMisc = ReadTileEntityItem(reader);
+    }
+
+    private static void ReadHatRack(BinaryReader reader, TileEntity entity)
+    {
+        byte bits = reader.ReadByte();
+        for (int i = 0; i < 2; i++)
+            if ((bits & (1 << i)) != 0) entity.HatRackHats[i] = ReadTileEntityItem(reader);
+        for (int i = 0; i < 2; i++)
+            if ((bits & (1 << (i + 2))) != 0) entity.HatRackDyes[i] = ReadTileEntityItem(reader);
     }
 
     // ---------------- Footer ----------------

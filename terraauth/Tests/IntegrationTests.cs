@@ -962,12 +962,15 @@ public class EndToEndTests
             {
                 await db.SaveTileChangesAsync(new[] { new WorldTileRecord(10, 20, new byte[] { 1, 2 }) });
                 await db.SaveChestChangesAsync(new[] { new WorldChestRecord(3, 40, 50, new byte[] { 7 }) });
+                await db.SaveTileEntityChangesAsync(new[] { new WorldTileEntityRecord(4, 9, 3, 60, 70, new byte[] { 3, 9 }, false) });
                 Assert.Single(await db.LoadTileChangesAsync());
                 Assert.Single(await db.LoadChestChangesAsync());
+                Assert.Single(await db.LoadTileEntityChangesAsync());
 
                 await db.ClearWorldChangesAsync();
                 Assert.Empty(await db.LoadTileChangesAsync());
                 Assert.Empty(await db.LoadChestChangesAsync());
+                Assert.Empty(await db.LoadTileEntityChangesAsync());
             }
 
             // 重开（模拟重启）：清空必须已落盘
@@ -976,6 +979,84 @@ public class EndToEndTests
                 Assert.Empty(await db.LoadTileChangesAsync());
                 Assert.Empty(await db.LoadChestChangesAsync());
             }
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task Persistence_TileEntityOverlay_UpsertsByAnchor_And_SurvivesReopen()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-te-{Guid.NewGuid():N}.db");
+        var first = new TileEntity { Type = 4, FileId = 20, X = 40, Y = 50, Item = new TileEntityItem { Type = 100, Stack = 1 } };
+        var replacement = new TileEntity { Type = 5, FileId = 21, X = 40, Y = 50 };
+        replacement.HatRackHats[0] = new TileEntityItem { Type = 200, Prefix = 2, Stack = 3 };
+        var other = new TileEntity { Type = 3, FileId = 22, X = 10, Y = 20, DisplayDollPose = 7 };
+        other.DisplayDollItems[8] = new TileEntityItem { Type = 300, Prefix = 1, Stack = 1 };
+
+        try
+        {
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                await db.SaveTileEntityChangesAsync(new[]
+                {
+                    new WorldTileEntityRecord(first.Id, first.FileId, first.Type, first.X, first.Y, first.SerializeFilePayload(), false),
+                    new WorldTileEntityRecord(replacement.Id, replacement.FileId, replacement.Type, replacement.X, replacement.Y, replacement.SerializeFilePayload(), false),
+                    new WorldTileEntityRecord(other.Id, other.FileId, other.Type, other.X, other.Y, other.SerializeFilePayload(), false),
+                });
+            }
+
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                var records = await db.LoadTileEntityChangesAsync();
+                Assert.Equal(new[] { ((short)10, (short)20), ((short)40, (short)50) },
+                    records.Select(static record => (record.X, record.Y)));
+
+                var savedReplacement = Assert.Single(records, static record => record.X == 40 && record.Y == 50);
+                Assert.False(savedReplacement.IsDeleted);
+                var decoded = TileEntity.DeserializeFilePayload(savedReplacement.Data!);
+                Assert.Equal((byte)5, decoded.Type);
+                Assert.Equal((short)200, decoded.HatRackHats[0].Type);
+                Assert.Equal((short)3, decoded.HatRackHats[0].Stack);
+
+                await db.SaveTileEntityChangesAsync(new[]
+                {
+                    new WorldTileEntityRecord(savedReplacement.RuntimeId, savedReplacement.FileId, savedReplacement.Type,
+                        savedReplacement.X, savedReplacement.Y, null, true),
+                });
+            }
+
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                var tombstone = Assert.Single(await db.LoadTileEntityChangesAsync(),
+                    static record => record.X == 40 && record.Y == 50);
+                Assert.True(tombstone.IsDeleted);
+                Assert.Null(tombstone.Data);
+            }
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task Persistence_DeleteChestChanges_RemainsDeletedAfterReopen()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-delete-chest-{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var db = new SqlitePersistence(dbPath))
+            {
+                await db.SaveChestChangesAsync(new[] { new WorldChestRecord(3, 40, 50, new byte[] { 7 }) });
+                await db.DeleteChestChangesAsync(new[] { 3 });
+                Assert.Empty(await db.LoadChestChangesAsync());
+            }
+
+            using (var db = new SqlitePersistence(dbPath))
+                Assert.Empty(await db.LoadChestChangesAsync());
         }
         finally
         {

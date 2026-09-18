@@ -334,6 +334,8 @@ public sealed class GameHost : IDisposable
                 await FlushPlayerBuffsAsync(ct).ConfigureAwait(false);
                 // 服务端权威修改的 NPC 增益列表 → 包 54 向全体玩家回写
                 await FlushNpcBuffsAsync(ct).ConfigureAwait(false);
+                // 服务端受控背包槽位改动仅在仿真提交后回写对应会话。
+                await FlushInventoryUpdatesAsync(ct).ConfigureAwait(false);
                 // 箱子改动只在仿真提交后同步给当前打开该箱子的玩家
                 await FlushChestUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端判定的玩家受击（接触 / 下落伤害）→ 包 117 + 包 16
@@ -475,6 +477,50 @@ public sealed class GameHost : IDisposable
             Console.WriteLine($"[World] 已回放上次运行的世界改动：图格 {applied} 格");
 
         ApplyPersistedChests(world, repo);
+        ApplyPersistedTileEntities(world, repo);
+    }
+
+    private static void ApplyPersistedTileEntities(WorldState world, IWorldRepository repo)
+    {
+        IReadOnlyList<WorldTileEntityRecord> entities;
+        try
+        {
+            entities = repo.LoadTileEntityChangesAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[World] 图格实体回放失败（保留基准世界实体）：{ex.Message}");
+            return;
+        }
+
+        int applied = 0;
+        foreach (var record in entities.OrderBy(static entity => entity.X).ThenBy(static entity => entity.Y))
+        {
+            if (record.X < 0 || record.X >= world.MaxTilesX || record.Y < 0 || record.Y >= world.MaxTilesY) continue;
+            if (record.IsDeleted)
+            {
+                world.RemoveTileEntityAt(record.X, record.Y);
+                applied++;
+                continue;
+            }
+            if (record.Data is null) continue;
+
+            try
+            {
+                var entity = TileEntity.DeserializeFilePayload(record.Data);
+                if (entity.X != record.X || entity.Y != record.Y || entity.Type != record.Type) continue;
+                entity.FileId = record.FileId;
+                world.InsertTileEntity(entity, markDirty: false);
+                applied++;
+            }
+            catch (InvalidDataException ex)
+            {
+                Console.WriteLine($"[World] 跳过无效图格实体覆盖 ({record.X}, {record.Y})：{ex.Message}");
+            }
+        }
+
+        if (applied > 0)
+            Console.WriteLine($"[World] 已回放上次运行的图格实体改动：{applied} 个");
     }
 
     /// <summary>
@@ -546,12 +592,62 @@ public sealed class GameHost : IDisposable
         }
 
         await FlushChestChangesAsync(world).ConfigureAwait(false);
+        await FlushTileEntityChangesAsync(world).ConfigureAwait(false);
+    }
+
+    private async Task FlushTileEntityChangesAsync(WorldState world)
+    {
+        if (WorldRepo is null) return;
+
+        var deleted = world.DrainDeletedTileEntities(WorldState.PersistBatchSize);
+        var ids = world.DrainDirtyTileEntities(WorldState.PersistBatchSize);
+        if (deleted.Count == 0 && ids.Count == 0) return;
+
+        try
+        {
+            var records = new List<WorldTileEntityRecord>(deleted.Count + ids.Count);
+            records.AddRange(deleted.Select(static entity => new WorldTileEntityRecord(
+                entity.RuntimeId, entity.FileId, entity.Type, entity.X, entity.Y, null, IsDeleted: true)));
+            foreach (var id in ids)
+            {
+                if (!world.TryGetTileEntity(id, out var entity) || entity is null) continue;
+                records.Add(new WorldTileEntityRecord(entity.Id, entity.FileId, entity.Type, entity.X, entity.Y,
+                    entity.SerializeFilePayload(), IsDeleted: false));
+            }
+
+            if (records.Count > 0)
+                await WorldRepo.SaveTileEntityChangesAsync(records).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            world.RequeueDeletedTileEntities(deleted);
+            world.RequeueDirtyTileEntities(ids);
+            Simulator.Recorder.Record(new GameEvent(world.Tick, null,
+                GameEventKinds.PersistFailed, deleted.Count + ids.Count, GameEventCategory.Persistence));
+            Console.WriteLine($"[World] 图格实体落盘失败（已重新排队 {deleted.Count + ids.Count} 个）：{ex.Message}");
+        }
     }
 
     /// <summary>把变更过的箱子内容落盘；失败重新排队（同图格语义）。</summary>
     private async Task FlushChestChangesAsync(WorldState world)
     {
         if (WorldRepo is null) return;
+
+        var deletedIndices = world.DrainDeletedPersistChests(WorldState.PersistBatchSize);
+        if (deletedIndices.Count > 0)
+        {
+            try
+            {
+                await WorldRepo.DeleteChestChangesAsync(deletedIndices).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                foreach (var index in deletedIndices) world.MarkPersistChestDeleted(index);
+                Simulator.Recorder.Record(new GameEvent(world.Tick, null,
+                    GameEventKinds.PersistFailed, deletedIndices.Count, GameEventCategory.Persistence));
+                Console.WriteLine($"[World] 箱子删除落盘失败（已重新排队 {deletedIndices.Count} 个）：{ex.Message}");
+            }
+        }
 
         var indices = world.DrainPersistChests(WorldState.PersistBatchSize);
         if (indices.Count == 0) return;
@@ -1009,6 +1105,46 @@ public sealed class GameHost : IDisposable
     /// </summary>
     private static bool IsTransientSendFailure(Exception ex)
         => ex is IOException or ObjectDisposedException or ChannelClosedException;
+
+    private const int MaxInventoryUpdatesPerFlush = 256;
+
+    public async Task FlushInventoryUpdatesAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var updates = world.DrainInventoryUpdates(MaxInventoryUpdatesPerFlush);
+        for (int i = 0; i < updates.Count; i++)
+        {
+            var (playerId, sessionId, slot) = updates[i];
+            PlayerRuntime? player;
+            lock (world.PlayersLock)
+                world.Players.TryGetValue(playerId, out player);
+            if (player is null || !player.Active || player.SessionId != sessionId ||
+                slot < 0 || slot >= PlayerRuntime.InventorySlotCount)
+                continue;
+
+            try
+            {
+                await Network.SendToPlayerAsync(playerId, PacketId.InventorySlot,
+                    new InventorySlotPacket(slot, player.Items[slot], player.ItemStacks[slot])
+                    {
+                        PlayerId = playerId,
+                        Prefix = player.ItemPrefixes[slot],
+                    }, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                for (int retry = i; retry < updates.Count; retry++)
+                    world.MarkInventoryChanged(updates[retry].PlayerId, updates[retry].SessionId, updates[retry].Slot);
+                throw;
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                world.MarkInventoryChanged(playerId, sessionId, slot);
+                Simulator.Recorder.Record(new GameEvent(world.Tick, playerId,
+                    GameEventKinds.BroadcastFailed, "inventory_slot", GameEventCategory.Broadcast));
+            }
+        }
+    }
 
     private const int MaxChestUpdatesPerFlush = 256;
 
@@ -1586,7 +1722,9 @@ public sealed class GameHost : IDisposable
                 else if (slot >= p.Items.Length)
                     return CommandResult.Fail("槽位越界");
                 p.Items[slot] = itemId;
+                p.ItemStacks[slot] = 1;
                 p.ItemPrefixes[slot] = 0;
+                p.RecalculateDefense();
                 Console.WriteLine($"[Give] 玩家 #{pid} 槽 {slot} 物品 {itemId}（背包 Items[{slot}]={p.Items[slot]}）");
             }
             network.SendToPlayerAsync(pid, PacketId.InventorySlot,

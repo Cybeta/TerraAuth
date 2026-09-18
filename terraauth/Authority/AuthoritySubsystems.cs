@@ -655,10 +655,11 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
     private const int MaxItemId = 6000;
 
     private readonly IAuditLogger _audit;
+    private readonly WorldState _world;
     private volatile InventoryLimits _limits;
-    private readonly ConcurrentDictionary<int, ConcurrentDictionary<int, SlotState>> _inventories = new();
 
-    public InventoryAuthority(IAuditLogger audit, InventoryLimits limits) => (_audit, _limits) = (audit, limits);
+    public InventoryAuthority(IAuditLogger audit, InventoryLimits limits, WorldState world)
+        => (_audit, _limits, _world) = (audit, limits, world);
 
     /// <summary>热更新阈值（引用整体替换，读取端无锁）。</summary>
     internal void UpdateLimits(InventoryLimits limits) => _limits = limits;
@@ -667,7 +668,8 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
     {
         ItemDropPacket drop => ValidateDrop(drop, playerId),
         InventorySlotPacket slot => ValidateSlot(slot, playerId),
-        _ => AuthorityResult.Accept(packet),   // 箱子（31/32）由 WorldAuthority 校验（需世界数据）
+        SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId),
+        _ => AuthorityResult.Accept(packet),   // 箱子会话、距离由 WorldAuthority 校验（需世界数据）
     };
 
     public int MaxStackSize => _limits.MaxStackSize;
@@ -681,6 +683,18 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
         return AuthorityResult.Accept(drop);
     }
 
+    private AuthorityResult ValidateChestItem(SyncChestItemPacket chestItem, int playerId)
+    {
+        if (chestItem.Stack < 0 || chestItem.Stack > _limits.MaxStackSize)
+            return Deny(playerId, "chest_item_rejected", "invalid_stack", new { chestItem.Stack, Max = _limits.MaxStackSize });
+        if (chestItem.Stack > 0 && !IsValidItem(chestItem.ItemType))
+            return Deny(playerId, "chest_item_rejected", "unknown_item", new { chestItem.ItemType });
+        if (_limits.SscEnabled)
+            return Deny(playerId, "chest_item_rejected", "chest_snapshot_forbidden", new { chestItem.ChestIndex, chestItem.ItemSlot });
+
+        return AuthorityResult.Accept(chestItem);
+    }
+
     private AuthorityResult ValidateSlot(InventorySlotPacket slot, int playerId)
     {
         if (slot.Slot < 0 || slot.Slot >= InventoryLimits.MaxSlots)
@@ -691,12 +705,10 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
         if (slot.Stack > 0 && !IsValidItem(slot.ItemId))
             return Deny(playerId, "slot_rejected", "unknown_item", new { slot.ItemId });
 
-        // SSC：服务端为唯一真相源，客户端上报仅用于对账
+        // SSC：客户端槽位快照不能覆盖服务端权威背包；物品变更只能来自服务端受控事件。
         if (_limits.SscEnabled)
-        {
-            var inv = _inventories.GetOrAdd(playerId, _ => new ConcurrentDictionary<int, SlotState>());
-            inv[slot.Slot] = new SlotState(slot.ItemId, slot.Stack);
-        }
+            return Deny(playerId, "slot_rejected", "inventory_snapshot_forbidden", new { slot.Slot });
+
         return AuthorityResult.Accept(slot);
     }
 
@@ -709,35 +721,43 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
     public bool IsValidItem(int itemId) => itemId >= 0 && itemId < MaxItemId;
 
     public int GetStackCount(int playerId, int slot)
-        => _inventories.TryGetValue(playerId, out var inv) && inv.TryGetValue(slot, out var s) ? s.Stack : 0;
+    {
+        if (slot < 0 || slot >= InventoryLimits.MaxSlots) return 0;
+        lock (_world.PlayersLock)
+            return _world.Players.TryGetValue(playerId, out var player) ? player.ItemStacks[slot] : 0;
+    }
 
     public bool HasItem(int playerId, int itemId)
     {
-        if (!_inventories.TryGetValue(playerId, out var inv)) return false;
-        foreach (var kv in inv)
-            if (kv.Value.ItemId == itemId && kv.Value.Stack > 0)
-                return true;
-        return false;
+        lock (_world.PlayersLock)
+        {
+            if (!_world.Players.TryGetValue(playerId, out var player)) return false;
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+                if (player.Items[slot] == itemId && player.ItemStacks[slot] > 0)
+                    return true;
+            return false;
+        }
     }
 
     public bool ConsumeItem(int playerId, int itemId)
     {
-        if (!_inventories.TryGetValue(playerId, out var inv)) return false;
-        lock (inv)
+        lock (_world.PlayersLock)
         {
-            foreach (var kv in inv.ToList()) // ToList 避免迭代时修改
+            if (!_world.Players.TryGetValue(playerId, out var player)) return false;
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
             {
-                if (kv.Value.ItemId == itemId && kv.Value.Stack > 0)
+                if (player.Items[slot] != itemId || player.ItemStacks[slot] <= 0) continue;
+                if (--player.ItemStacks[slot] == 0)
                 {
-                    var newStack = kv.Value.Stack - 1;
-                    inv[kv.Key] = newStack == 0
-                        ? new SlotState(ItemId: 0, Stack: 0)
-                        : new SlotState(kv.Value.ItemId, newStack);
-                    return true;
+                    player.Items[slot] = 0;
+                    player.ItemPrefixes[slot] = 0;
                 }
+                player.RecalculateDefense();
+                _world.MarkInventoryChanged(playerId, player.SessionId, slot);
+                return true;
             }
+            return false;
         }
-        return false;
     }
 
     public bool TryAddItem(int playerId, int itemId, int stack)
@@ -750,26 +770,25 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
     {
         if (!IsValidItem(itemId) || stack <= 0) return false;
 
-        var inv = _inventories.GetOrAdd(playerId, _ => new ConcurrentDictionary<int, SlotState>());
-        lock (inv)
+        lock (_world.PlayersLock)
         {
+            if (!_world.Players.TryGetValue(playerId, out var player)) return false;
+
             var remaining = stack;
             var changes = new List<(int Slot, int Stack)>();
-
-            foreach (var kv in inv)
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount && remaining > 0; slot++)
             {
-                if (kv.Value.ItemId != itemId || kv.Value.Stack <= 0 || kv.Value.Stack >= _limits.MaxStackSize)
+                if (player.Items[slot] != itemId || player.ItemStacks[slot] <= 0 || player.ItemStacks[slot] >= _limits.MaxStackSize)
                     continue;
 
-                var add = Math.Min(remaining, _limits.MaxStackSize - kv.Value.Stack);
-                changes.Add((kv.Key, kv.Value.Stack + add));
+                var add = Math.Min(remaining, _limits.MaxStackSize - player.ItemStacks[slot]);
+                changes.Add((slot, player.ItemStacks[slot] + add));
                 remaining -= add;
-                if (remaining == 0) break;
             }
 
-            for (int slot = 0; remaining > 0 && slot < InventoryLimits.MaxSlots; slot++)
+            for (int slot = 0; remaining > 0 && slot < PlayerRuntime.InventorySlotCount; slot++)
             {
-                if (inv.TryGetValue(slot, out var cur) && cur.Stack > 0) continue;
+                if (player.ItemStacks[slot] > 0) continue;
                 var add = Math.Min(remaining, _limits.MaxStackSize);
                 changes.Add((slot, add));
                 remaining -= add;
@@ -779,7 +798,13 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
             if (changes.Count == 0) return false;
 
             foreach (var (slot, newStack) in changes)
-                inv[slot] = new SlotState(itemId, newStack);
+            {
+                player.Items[slot] = itemId;
+                player.ItemStacks[slot] = newStack;
+                player.ItemPrefixes[slot] = 0;
+                _world.MarkInventoryChanged(playerId, player.SessionId, slot);
+            }
+            player.RecalculateDefense();
             return true;
         }
     }
@@ -787,14 +812,20 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
     public void ApplyAuthorizedChange(int playerId, int slot, int delta)
     {
         if (slot < 0 || slot >= InventoryLimits.MaxSlots) return;
-        var inv = _inventories.GetOrAdd(playerId, _ => new ConcurrentDictionary<int, SlotState>());
-        inv.AddOrUpdate(
-            slot,
-            _ => new SlotState(ItemId: 0, Stack: Math.Clamp(delta, 0, _limits.MaxStackSize)),
-            (_, cur) => new SlotState(cur.ItemId, Math.Clamp(cur.Stack + delta, 0, _limits.MaxStackSize)));
+        lock (_world.PlayersLock)
+        {
+            if (!_world.Players.TryGetValue(playerId, out var player)) return;
+            var stack = Math.Clamp(player.ItemStacks[slot] + delta, 0, _limits.MaxStackSize);
+            player.ItemStacks[slot] = stack;
+            if (stack == 0)
+            {
+                player.Items[slot] = 0;
+                player.ItemPrefixes[slot] = 0;
+            }
+            player.RecalculateDefense();
+            _world.MarkInventoryChanged(playerId, player.SessionId, slot);
+        }
     }
-
-    private readonly record struct SlotState(int ItemId, int Stack);
 }
 
 // ---------- 世界权威 ----------

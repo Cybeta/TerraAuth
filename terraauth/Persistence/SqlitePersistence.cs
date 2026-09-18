@@ -43,7 +43,10 @@ internal interface IDbExecutor
     IReadOnlyList<WorldTileRecord> LoadWorldTiles();
     void SaveWorldChests(IReadOnlyList<WorldChestRecord> chests);
     IReadOnlyList<WorldChestRecord> LoadWorldChests();
-    /// <summary>清空全部世界改动（图格 + 箱子）——换种子重开地图时使用（见 <c>ServerConfig.ResetWorldChangesOnStart</c>）。</summary>
+    void DeleteWorldChests(IReadOnlyList<int> chestIndices);
+    void SaveWorldTileEntities(IReadOnlyList<WorldTileEntityRecord> entities);
+    IReadOnlyList<WorldTileEntityRecord> LoadWorldTileEntities();
+    /// <summary>清空全部世界改动（图格 + 箱子 + 图格实体）——换种子重开地图时使用（见 <c>ServerConfig.ResetWorldChangesOnStart</c>）。</summary>
     void ClearWorldChanges();
 }
 
@@ -123,6 +126,15 @@ public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IWo
     public Task<IReadOnlyList<WorldChestRecord>> LoadChestChangesAsync()
         => Task.Run(() => _db.LoadWorldChests());
 
+    public Task DeleteChestChangesAsync(IReadOnlyList<int> chestIndices)
+        => chestIndices.Count == 0 ? Task.CompletedTask : Task.Run(() => _db.DeleteWorldChests(chestIndices));
+
+    public Task SaveTileEntityChangesAsync(IReadOnlyList<WorldTileEntityRecord> entities)
+        => entities.Count == 0 ? Task.CompletedTask : Task.Run(() => _db.SaveWorldTileEntities(entities));
+
+    public Task<IReadOnlyList<WorldTileEntityRecord>> LoadTileEntityChangesAsync()
+        => Task.Run(() => _db.LoadWorldTileEntities());
+
     public Task ClearWorldChangesAsync()
         => Task.Run(() => _db.ClearWorldChanges());
 
@@ -181,6 +193,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
     private readonly ConcurrentDictionary<Guid, BanRecord> _bans = new();
     private readonly ConcurrentDictionary<(int X, int Y), WorldTileRecord> _worldTiles = new();
     private readonly ConcurrentDictionary<int, WorldChestRecord> _worldChests = new();
+    private readonly ConcurrentDictionary<(short X, short Y), WorldTileEntityRecord> _worldTileEntities = new();
 
     public LiteDbPersistence(string dbPath, bool runMigrations)
     {
@@ -267,10 +280,28 @@ internal sealed class LiteDbPersistence : IDbExecutor
 
     public IReadOnlyList<WorldChestRecord> LoadWorldChests() => _worldChests.Values.ToList();
 
+    public void DeleteWorldChests(IReadOnlyList<int> chestIndices)
+    {
+        if (chestIndices.Count == 0) return;
+        foreach (var index in chestIndices) _worldChests.TryRemove(index, out _);
+        SaveToDisk();
+    }
+
+    public void SaveWorldTileEntities(IReadOnlyList<WorldTileEntityRecord> entities)
+    {
+        if (entities.Count == 0) return;
+        foreach (var entity in entities) _worldTileEntities[(entity.X, entity.Y)] = entity;
+        SaveToDisk();
+    }
+
+    public IReadOnlyList<WorldTileEntityRecord> LoadWorldTileEntities()
+        => _worldTileEntities.Values.OrderBy(static entity => entity.X).ThenBy(static entity => entity.Y).ToList();
+
     public void ClearWorldChanges()
     {
         _worldTiles.Clear();
         _worldChests.Clear();
+        _worldTileEntities.Clear();
         SaveToDisk();
     }
 
@@ -293,6 +324,8 @@ internal sealed class LiteDbPersistence : IDbExecutor
                 foreach (var t in dto.WorldTiles) _worldTiles[(t.X, t.Y)] = t;
             if (dto.WorldChests is not null)
                 foreach (var c in dto.WorldChests) _worldChests[c.Index] = c;
+            if (dto.WorldTileEntities is not null)
+                foreach (var entity in dto.WorldTileEntities) _worldTileEntities[(entity.X, entity.Y)] = entity;
         }
         catch { /* 首次启动无文件 / 解析失败，忽略 */ }
     }
@@ -311,6 +344,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
             Bans = _bans.Values.ToList(),
             WorldTiles = _worldTiles.Values.ToList(),
             WorldChests = _worldChests.Values.ToList(),
+            WorldTileEntities = _worldTileEntities.Values.ToList(),
         };
         var tmp = _dbPath + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(dump));
@@ -324,6 +358,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
         public List<BanRecord>? Bans { get; set; }
         public List<WorldTileRecord>? WorldTiles { get; set; }
         public List<WorldChestRecord>? WorldChests { get; set; }
+        public List<WorldTileEntityRecord>? WorldTileEntities { get; set; }
     }
 }
 
@@ -408,6 +443,15 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
                 X INTEGER NOT NULL,
                 Y INTEGER NOT NULL,
                 Data BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS WorldTileEntities (
+                X INTEGER NOT NULL,
+                Y INTEGER NOT NULL,
+                RuntimeId INTEGER NOT NULL,
+                FileId INTEGER NOT NULL,
+                Type INTEGER NOT NULL,
+                Data BLOB,
+                IsDeleted INTEGER NOT NULL,
+                PRIMARY KEY(X, Y));
             """);
     }
 
@@ -656,11 +700,71 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         return list;
     }
 
+    public void DeleteWorldChests(IReadOnlyList<int> chestIndices)
+    {
+        if (chestIndices.Count == 0) return;
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "DELETE FROM WorldChests WHERE ChestIndex = $i;";
+        var pi = cmd.Parameters.Add("$i", SqliteType.Integer);
+        foreach (var index in chestIndices)
+        {
+            pi.Value = index;
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    public void SaveWorldTileEntities(IReadOnlyList<WorldTileEntityRecord> entities)
+    {
+        if (entities.Count == 0) return;
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = """
+            INSERT INTO WorldTileEntities (X, Y, RuntimeId, FileId, Type, Data, IsDeleted)
+            VALUES ($x, $y, $runtimeId, $fileId, $type, $data, $isDeleted)
+            ON CONFLICT(X, Y) DO UPDATE SET
+                RuntimeId = excluded.RuntimeId, FileId = excluded.FileId, Type = excluded.Type,
+                Data = excluded.Data, IsDeleted = excluded.IsDeleted;
+            """;
+        var px = cmd.Parameters.Add("$x", SqliteType.Integer);
+        var py = cmd.Parameters.Add("$y", SqliteType.Integer);
+        var pr = cmd.Parameters.Add("$runtimeId", SqliteType.Integer);
+        var pf = cmd.Parameters.Add("$fileId", SqliteType.Integer);
+        var pt = cmd.Parameters.Add("$type", SqliteType.Integer);
+        var pd = cmd.Parameters.Add("$data", SqliteType.Blob);
+        var deleted = cmd.Parameters.Add("$isDeleted", SqliteType.Integer);
+        foreach (var entity in entities)
+        {
+            px.Value = entity.X; py.Value = entity.Y; pr.Value = entity.RuntimeId; pf.Value = entity.FileId;
+            pt.Value = entity.Type; pd.Value = (object?)entity.Data ?? DBNull.Value; deleted.Value = entity.IsDeleted ? 1 : 0;
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    public IReadOnlyList<WorldTileEntityRecord> LoadWorldTileEntities()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT RuntimeId, FileId, Type, X, Y, Data, IsDeleted FROM WorldTileEntities ORDER BY X, Y;";
+        var list = new List<WorldTileEntityRecord>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            list.Add(new WorldTileEntityRecord(reader.GetInt32(0), reader.GetInt32(1), (byte)reader.GetInt32(2),
+                (short)reader.GetInt32(3), (short)reader.GetInt32(4), reader.IsDBNull(5) ? null : (byte[])reader[5], reader.GetInt32(6) != 0));
+        return list;
+    }
+
     public void ClearWorldChanges()
     {
         using var conn = Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM WorldTiles; DELETE FROM WorldChests;";
+        cmd.CommandText = "DELETE FROM WorldTiles; DELETE FROM WorldChests; DELETE FROM WorldTileEntities;";
         cmd.ExecuteNonQuery();
     }
 

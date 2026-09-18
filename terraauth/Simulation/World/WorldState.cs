@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using TerraAuth.Protocol;
 
 namespace TerraAuth.Simulation;
@@ -442,7 +443,7 @@ public sealed class WorldState
     /// （包 21 / 22 由世界同步循环的 <c>FlushNewItemsAsync</c> 补发）。
     /// 供挖砖掉落（<see cref="TileDropTable"/>）使用；<paramref name="itemId"/> ≤ 0 或槽位已满则不做任何事。
     /// </summary>
-    public void SpawnItemDrop(int itemId, int stack, int tileX, int tileY, IRng rng)
+    public void SpawnItemDrop(int itemId, int stack, int tileX, int tileY, IRng rng, byte prefix = 0)
     {
         if (itemId <= 0 || stack <= 0) return;
 
@@ -461,7 +462,7 @@ public sealed class WorldState
                 Position = new Vector2(tileX * 16 + 8, tileY * 16 + 8),   // 图格中心（原版 Item.NewItem 的碰撞盒中心）
                 // 原版初速：X ±3.0、Y -4.0..-1.5（px/tick），落地前有轻微抛物线
                 Velocity = new Vector2((rng.NextInt32(61) - 30) * 0.1f, -(rng.NextInt32(25) + 15) * 0.1f),
-                Prefix = 0,
+                Prefix = prefix,
                 OwnedBy = -1,          // 无归属 → 刷新循环按原版 FindOwner 就近分配（见 FlushItemOwnersAsync）
                 NewNotified = false,   // 服务端生成 → 客户端尚不知情，需补发包 21
             });
@@ -594,6 +595,124 @@ public sealed class WorldState
     public List<Sign> Signs { get; } = new();
     public List<WorldNpc> Npcs { get; } = new();
 
+    // 图格实体使用独立锁；调用方不得在持有 ChestsLock 时进入此锁，避免锁顺序交错。
+    public object TileEntitiesLock { get; } = new();
+    private readonly Dictionary<int, TileEntity> _tileEntitiesById = new();
+    private readonly Dictionary<(short X, short Y), TileEntity> _tileEntitiesByPosition = new();
+    private readonly HashSet<int> _dirtyTileEntityIds = new();
+    private readonly Dictionary<int, TileEntityDeletion> _deletedTileEntities = new();
+    private int _nextTileEntityId;
+
+    public readonly record struct TileEntityDeletion(int RuntimeId, int FileId, byte Type, short X, short Y);
+
+    public int NextTileEntityId
+    {
+        get { lock (TileEntitiesLock) return _nextTileEntityId; }
+    }
+
+    public bool TryGetTileEntity(int id, out TileEntity? entity)
+    {
+        lock (TileEntitiesLock)
+            return _tileEntitiesById.TryGetValue(id, out entity);
+    }
+
+    public bool TryGetTileEntityAt(short x, short y, out TileEntity? entity)
+    {
+        lock (TileEntitiesLock)
+            return _tileEntitiesByPosition.TryGetValue((x, y), out entity);
+    }
+
+    public List<TileEntity> SnapshotTileEntities()
+    {
+        lock (TileEntitiesLock)
+            return _tileEntitiesById.Values.OrderBy(static entity => entity.Id).ToList();
+    }
+
+    public TileEntity InsertTileEntity(TileEntity entity, bool markDirty = true)
+    {
+        lock (TileEntitiesLock)
+        {
+            if (_tileEntitiesByPosition.TryGetValue((entity.X, entity.Y), out var atPosition))
+            {
+                _tileEntitiesById.Remove(atPosition.Id);
+                _tileEntitiesByPosition.Remove((entity.X, entity.Y));
+                _dirtyTileEntityIds.Remove(atPosition.Id);
+                if (markDirty) _deletedTileEntities[atPosition.Id] = ToTileEntityDeletion(atPosition);
+            }
+
+            entity.Id = _nextTileEntityId++;
+            if (entity.FileId < 0) entity.FileId = entity.Id;
+            _tileEntitiesById.Add(entity.Id, entity);
+            _tileEntitiesByPosition.Add((entity.X, entity.Y), entity);
+            if (markDirty) _dirtyTileEntityIds.Add(entity.Id);
+            return entity;
+        }
+    }
+
+    public bool RemoveTileEntity(int id)
+    {
+        lock (TileEntitiesLock)
+        {
+            if (!_tileEntitiesById.Remove(id, out var entity)) return false;
+            _tileEntitiesByPosition.Remove((entity.X, entity.Y));
+            _dirtyTileEntityIds.Remove(id);
+            _deletedTileEntities[id] = ToTileEntityDeletion(entity);
+            return true;
+        }
+    }
+
+    public bool RemoveTileEntityAt(short x, short y)
+    {
+        lock (TileEntitiesLock)
+            return _tileEntitiesByPosition.TryGetValue((x, y), out var entity) && RemoveTileEntity(entity.Id);
+    }
+
+    public void MarkTileEntityDirty(int id)
+    {
+        lock (TileEntitiesLock)
+            if (_tileEntitiesById.ContainsKey(id)) _dirtyTileEntityIds.Add(id);
+    }
+
+    public List<int> DrainDirtyTileEntities(int max) => DrainTileEntityQueue(_dirtyTileEntityIds, max);
+
+    public List<TileEntityDeletion> DrainDeletedTileEntities(int max)
+    {
+        if (max <= 0) return new List<TileEntityDeletion>();
+        lock (TileEntitiesLock)
+        {
+            var result = _deletedTileEntities.Values.OrderBy(static deletion => deletion.RuntimeId).Take(max).ToList();
+            foreach (var deletion in result) _deletedTileEntities.Remove(deletion.RuntimeId);
+            return result;
+        }
+    }
+
+    public void RequeueDirtyTileEntities(IEnumerable<int> ids) => RequeueTileEntityQueue(_dirtyTileEntityIds, ids);
+    public void RequeueDeletedTileEntities(IEnumerable<TileEntityDeletion> entities)
+    {
+        lock (TileEntitiesLock)
+            foreach (var entity in entities) _deletedTileEntities[entity.RuntimeId] = entity;
+    }
+
+    private static TileEntityDeletion ToTileEntityDeletion(TileEntity entity)
+        => new(entity.Id, entity.FileId, entity.Type, entity.X, entity.Y);
+
+    private List<int> DrainTileEntityQueue(HashSet<int> queue, int max)
+    {
+        if (max <= 0) return new List<int>();
+        lock (TileEntitiesLock)
+        {
+            var result = queue.OrderBy(static id => id).Take(max).ToList();
+            foreach (int id in result) queue.Remove(id);
+            return result;
+        }
+    }
+
+    private void RequeueTileEntityQueue(HashSet<int> queue, IEnumerable<int> ids)
+    {
+        lock (TileEntitiesLock)
+            foreach (int id in ids) queue.Add(id);
+    }
+
     /// <summary>
     /// 箱子列表的跨线程保护：仿真线程按命令写入箱内物品，权威校验 / 网络线程读取内容。
     /// </summary>
@@ -655,6 +774,47 @@ public sealed class WorldState
 
     public object ChestUpdatesLock { get; } = new();
     private readonly HashSet<(int ChestIndex, int Slot)> _pendingChestUpdates = new();
+    private readonly HashSet<(int PlayerId, long SessionId, int Slot)> _pendingInventoryUpdates = new();
+    private readonly Dictionary<(int PlayerId, long SessionId), HashSet<long>> _appliedInventoryChestOperations = new();
+
+    public void MarkInventoryChanged(int playerId, long sessionId, int slot)
+    {
+        lock (ChestUpdatesLock)
+            _pendingInventoryUpdates.Add((playerId, sessionId, slot));
+    }
+
+    public List<(int PlayerId, long SessionId, int Slot)> DrainInventoryUpdates(int max)
+    {
+        if (max <= 0) return new List<(int PlayerId, long SessionId, int Slot)>();
+        lock (ChestUpdatesLock)
+        {
+            var result = new List<(int PlayerId, long SessionId, int Slot)>(Math.Min(max, _pendingInventoryUpdates.Count));
+            foreach (var update in _pendingInventoryUpdates)
+            {
+                result.Add(update);
+                if (result.Count >= max) break;
+            }
+            foreach (var update in result) _pendingInventoryUpdates.Remove(update);
+            return result;
+        }
+    }
+
+    public bool HasAppliedInventoryChestOperation(int playerId, long sessionId, long operationId)
+    {
+        lock (ChestUpdatesLock)
+            return _appliedInventoryChestOperations.TryGetValue((playerId, sessionId), out var operations)
+                && operations.Contains(operationId);
+    }
+
+    public void MarkInventoryChestOperationApplied(int playerId, long sessionId, long operationId)
+    {
+        lock (ChestUpdatesLock)
+        {
+            if (!_appliedInventoryChestOperations.TryGetValue((playerId, sessionId), out var operations))
+                _appliedInventoryChestOperations[(playerId, sessionId)] = operations = new HashSet<long>();
+            operations.Add(operationId);
+        }
+    }
 
     public void MarkChestChanged(int chestIndex, int slot)
     {
@@ -689,13 +849,41 @@ public sealed class WorldState
     public Chest? FindChestAt(int x, int y)
     {
         foreach (var chest in Chests)
-            if (chest.X == x && chest.Y == y) return chest;
+            if (!chest.Deleted && chest.X == x && chest.Y == y) return chest;
         return null;
     }
 
-    /// <summary>按索引查找箱子（越界 / 不存在返回 null）。调用方需持 <see cref="ChestsLock"/>。</summary>
+    /// <summary>按索引查找箱子（越界 / 已删除 / 不存在返回 null）。调用方需持 <see cref="ChestsLock"/>。</summary>
     public Chest? FindChestByIndex(int index)
-        => index >= 0 && index < Chests.Count ? Chests[index] : null;
+        => index >= 0 && index < Chests.Count && !Chests[index].Deleted ? Chests[index] : null;
+
+    /// <summary>删除指定位置的空容器，保留列表槽位以维持网络箱子索引稳定。</summary>
+    public bool TryDeleteEmptyChestAt(int x, int y, out int deletedIndex)
+    {
+        lock (ChestsLock)
+        {
+            var chest = FindChestAt(x, y);
+            if (chest is null)
+            {
+                deletedIndex = -1;
+                return true;
+            }
+
+            if (chest.Items.Any(static item => item.Stack > 0))
+            {
+                deletedIndex = -1;
+                return false;
+            }
+
+            chest.Deleted = true;
+            int index = chest.Index;
+            foreach (var playerId in _openChests.Where(pair => pair.Value.ChestIndex == index)
+                         .Select(static pair => pair.Key).ToArray())
+                _openChests.Remove(playerId);
+            deletedIndex = index;
+            return true;
+        }
+    }
 
     /// <summary>NPC 列表的跨线程保护：仿真线程负责增删，世界同步线程负责遍历下发。</summary>
     public object NpcsLock { get; } = new();
@@ -925,6 +1113,7 @@ public sealed class WorldState
     private const int MaxPendingPersistChests = 65_536;
 
     private readonly HashSet<int> _pendingPersistChests = new();
+    private readonly HashSet<int> _pendingDeletedPersistChests = new();
 
     /// <summary>全图扫描模式：待处理集合曾溢出，改用游标遍历全图保证最终一致（内存有界）。</summary>
     private bool _persistFullScan;
@@ -937,7 +1126,9 @@ public sealed class WorldState
         get
         {
             lock (WorldPersistLock)
-                return _persistFullScan || _pendingPersistTiles.Count > 0 || _pendingPersistChests.Count > 0;
+            lock (TileEntitiesLock)
+                return _persistFullScan || _pendingPersistTiles.Count > 0 || _pendingPersistChests.Count > 0 ||
+                       _pendingDeletedPersistChests.Count > 0 || _dirtyTileEntityIds.Count > 0 || _deletedTileEntities.Count > 0;
         }
     }
 
@@ -1024,6 +1215,31 @@ public sealed class WorldState
                 if (result.Count >= max) break;
             }
             foreach (var index in result) _pendingPersistChests.Remove(index);
+            return result;
+        }
+    }
+
+    public void MarkPersistChestDeleted(int chestIndex)
+    {
+        if (chestIndex < 0) return;
+        lock (WorldPersistLock)
+        {
+            _pendingPersistChests.Remove(chestIndex);
+            _pendingDeletedPersistChests.Add(chestIndex);
+        }
+    }
+
+    public List<int> DrainDeletedPersistChests(int max)
+    {
+        lock (WorldPersistLock)
+        {
+            var result = new List<int>(Math.Min(max, _pendingDeletedPersistChests.Count));
+            foreach (var index in _pendingDeletedPersistChests)
+            {
+                result.Add(index);
+                if (result.Count >= max) break;
+            }
+            foreach (var index in result) _pendingDeletedPersistChests.Remove(index);
             return result;
         }
     }
@@ -1368,10 +1584,13 @@ public sealed class PlayerRuntime
     /// <summary>物品栏槽位数量（原版 59：装备区 0-8 / 物品区 / 钱币 / 弹药 / 材料）。</summary>
     public const int InventorySlotCount = 59;
 
-    /// <summary>物品栏（槽位 → 物品 ID；0 = 空）。由包 5 InventorySlot 权威写入（服务端 SSC 唯一真相）。</summary>
+    /// <summary>物品栏（槽位 → 物品 ID；0 = 空）。由服务器受控写入（服务端 SSC 唯一真相）。</summary>
     public readonly int[] Items = new int[InventorySlotCount];
 
-    /// <summary>物品栏槽位 → 物品前缀（包 5 权威写入；近战武器校验按此前缀修正基础伤害）。</summary>
+    /// <summary>物品栏槽位 → 堆叠数量；0 表示空，必须与 <see cref="Items"/> 一致。</summary>
+    public readonly int[] ItemStacks = new int[InventorySlotCount];
+
+    /// <summary>物品栏槽位 → 物品前缀（服务器受控写入；近战武器校验按此前缀修正基础伤害）。</summary>
     public readonly byte[] ItemPrefixes = new byte[InventorySlotCount];
 
     /// <summary>
@@ -1594,6 +1813,7 @@ public struct ChestItem
 public sealed class Chest
 {
     public int Index;
+    public bool Deleted;
     public int X;
     public int Y;
     public string Name = "";

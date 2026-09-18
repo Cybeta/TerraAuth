@@ -208,6 +208,7 @@ public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot,
 
         // 空槽（Stack == 0）允许任意 ItemId（清空语义），统一记为 0；前缀同步清零
         player.Items[Slot] = Stack > 0 ? ItemId : 0;
+        player.ItemStacks[Slot] = Stack > 0 ? Stack : 0;
         player.ItemPrefixes[Slot] = Stack > 0 ? Prefix : (byte)0;
         player.RecalculateDefense();
         return new(true);
@@ -325,7 +326,7 @@ public sealed record PickupItemCommand(long Tick, int? PlayerId, int ItemSlotInd
                     // 聊天框提示（「获取 Wood ×1」）：SSC 下拾取是服务端行为，客户端不会弹原生拾取提示，
                     // 故由服务端经包 82 给该玩家一条提示（世界同步循环统一取走下发）。
                     world.NotifyPlayer(playerId,
-                        $"获取 {ItemNameTable.NameOf(item.ItemId)} ×{item.Stack}");
+                        $"获取 {ItemDisplayNameTable.NameOf(item.ItemId)} ×{item.Stack}");
                     return new(true);
                 }
             }
@@ -431,6 +432,89 @@ public sealed record SyncChestItemCommand(
     }
 }
 
+/// <summary>背包与当前打开箱子间的服务端权威原子物品转移。</summary>
+public sealed record TransferInventoryChestItemCommand(
+    long Tick, int? PlayerId, bool FromChest, int ChestIndex, int InventorySlot, int ChestSlot,
+    int Amount, long OperationId, int ExpectedSourceItemId, byte ExpectedSourcePrefix, int ExpectedSourceStack)
+    : Command(Tick, PlayerId, "transfer_inventory_chest_item")
+{
+    private const int MaxStackSize = 999;
+
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int playerId) return new(false, CommandFailures.MissingPlayer);
+        if (OperationId == 0 || Amount <= 0) return new(false, CommandFailures.NotApplied);
+        long appliedSessionId = 0;
+
+        lock (world.PlayersLock)
+        {
+            if (!world.Players.TryGetValue(playerId, out var player) || !player.Active || player.Dead)
+                return new(false, CommandFailures.PlayerNotActive);
+            if (SessionId != 0 && player.SessionId != SessionId)
+                return new(false, CommandFailures.StaleSession);
+
+            long sessionId = SessionId != 0 ? SessionId : player.SessionId;
+            lock (world.ChestsLock)
+            {
+                if (!world.HasChestSession(playerId, sessionId, ChestIndex))
+                    return new(false, CommandFailures.ChestNotOpen);
+                if (world.HasAppliedInventoryChestOperation(playerId, sessionId, OperationId))
+                    return new(false, "replayed_operation");
+
+                var chest = world.FindChestByIndex(ChestIndex);
+                if (chest is null) return new(false, CommandFailures.ChestNotFound);
+                if (InventorySlot < 0 || InventorySlot >= PlayerRuntime.InventorySlotCount ||
+                    ChestSlot < 0 || ChestSlot >= chest.Items.Length)
+                    return new(false, CommandFailures.InvalidSlot);
+
+                float dx = player.Position.X - chest.X * 16f - 8f;
+                float dy = player.Position.Y - chest.Y * 16f - 8f;
+                if (dx * dx + dy * dy > 160f * 160f) return new(false, CommandFailures.OutOfReach);
+
+                int sourceId = FromChest ? chest.Items[ChestSlot].Type : player.Items[InventorySlot];
+                int sourceStack = FromChest ? chest.Items[ChestSlot].Stack : player.ItemStacks[InventorySlot];
+                byte sourcePrefix = FromChest ? chest.Items[ChestSlot].Prefix : player.ItemPrefixes[InventorySlot];
+                int targetId = FromChest ? player.Items[InventorySlot] : chest.Items[ChestSlot].Type;
+                int targetStack = FromChest ? player.ItemStacks[InventorySlot] : chest.Items[ChestSlot].Stack;
+                byte targetPrefix = FromChest ? player.ItemPrefixes[InventorySlot] : chest.Items[ChestSlot].Prefix;
+
+                if (sourceId != ExpectedSourceItemId || sourcePrefix != ExpectedSourcePrefix || sourceStack != ExpectedSourceStack ||
+                    sourceId == 0 || sourceStack <= 0 || Amount > sourceStack ||
+                    (targetStack == 0 ? targetId != 0 || targetPrefix != 0 : targetId == 0) ||
+                    (targetStack > 0 && (targetId != sourceId || targetPrefix != sourcePrefix)) ||
+                    targetStack + Amount > MaxStackSize)
+                    return new(false, CommandFailures.NoChange);
+
+                int remaining = sourceStack - Amount;
+                int combined = targetStack + Amount;
+                if (FromChest)
+                {
+                    chest.Items[ChestSlot] = remaining == 0 ? new ChestItem() : new ChestItem { Type = sourceId, Stack = (short)remaining, Prefix = sourcePrefix };
+                    player.Items[InventorySlot] = sourceId;
+                    player.ItemStacks[InventorySlot] = combined;
+                    player.ItemPrefixes[InventorySlot] = sourcePrefix;
+                }
+                else
+                {
+                    player.Items[InventorySlot] = remaining == 0 ? 0 : sourceId;
+                    player.ItemStacks[InventorySlot] = remaining;
+                    player.ItemPrefixes[InventorySlot] = remaining == 0 ? (byte)0 : sourcePrefix;
+                    chest.Items[ChestSlot] = new ChestItem { Type = sourceId, Stack = (short)combined, Prefix = sourcePrefix };
+                }
+
+                player.RecalculateDefense();
+                appliedSessionId = sessionId;
+                world.MarkInventoryChestOperationApplied(playerId, sessionId, OperationId);
+            }
+        }
+
+        world.MarkPersistChest(ChestIndex);
+        world.MarkChestChanged(ChestIndex, ChestSlot);
+        world.MarkInventoryChanged(playerId, appliedSessionId, InventorySlot);
+        return new(true);
+    }
+}
+
 /// <summary>
 /// 液体编辑命令：客户端液体上报（包 82 模块 0）权威通过后生成，由仿真写入权威图格并触发流动仿真。
 /// </summary>
@@ -485,11 +569,22 @@ public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, by
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
 return new(false, CommandFailures.NotApplied);
 
+        if (Action == 0 && TileType == 0 && TryBreakDisplayTileEntityObject(world, rng, out var displayBroken))
+            return displayBroken ? new(true) : new(false, CommandFailures.NoChange);
+        if (Action == 0 && TileType == 0 && TryBreakTileEntityObject(world, rng, out var tileEntityBroken))
+            return tileEntityBroken ? new(true) : new(false, CommandFailures.NoChange);
+        if (Action == 0 && TileType == 0 && TryBreakContainerObject(world, rng, out var containerBroken))
+            return containerBroken ? new(true) : new(false, CommandFailures.NoChange);
+        if (Action == 0 && TileType == 0 && TryBreakStatelessMultiTileObject(world, rng, out var objectBroken))
+            return objectBroken ? new(true) : new(false, CommandFailures.NoChange);
+
         // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
         bool changed = false;
         // 挖掉的图格（用于掉落查表；泥土类型就是 0，故用独立标志而非「类型 > 0」）
         bool killedTile = false;
         ushort killedType = 0;
+        short killedFrameX = 0;
+        short killedFrameY = 0;
         world.Sections.EnterWrite(X, Y);
         try
         {
@@ -508,6 +603,8 @@ return new(false, CommandFailures.NotApplied);
                     // 原版此时调 KillTile(x, y, fail: true)：只播击打效果、**不改动世界**（详见 ValidateBreak）。
                     if (TileType != 0) break;
                     killedType = before.Type;
+                    killedFrameX = before.FrameX;
+                    killedFrameY = before.FrameY;
                     killedTile = true;
                     tile.Active = false;
                     tile.Type = 0;
@@ -572,17 +669,509 @@ return new(false, CommandFailures.NotApplied);
         // 放在**区块锁之外**生成，避免与 ItemsLock 形成新的锁序（拾取路径是 PlayersLock → ItemsLock）。
         if (killedTile && TileDropTable.IsTreeTile(killedType))
         {
+            int heldItem = 0;
+            lock (world.PlayersLock)
+            {
+                if (world.Players.TryGetValue(playerId, out var player)
+                    && player.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
+                {
+                    heldItem = player.Items[player.SelectedSlot];
+                }
+            }
+
             // 树：砍掉任意一格即**整棵倒下**（原版一棵树由多格树干组成，逐格产木材），
-            // 故木材数量 = 本次清掉的树干格数（含刚挖掉的这一格）。
+            // 故木材数量 = 本次清掉的树干格数（含刚挖掉的这一格），整棵树只掷一次额外木材。
             int extra = world.FellTreeAt(X, Y, killedType);
-            world.SpawnItemDrop(TileDropTable.Wood, 1 + extra, X, Y, rng);
+            int woodStack = 1 + extra;
+            int axePower = AxePowerTable.AxePowerOf(heldItem);
+            if (rng.NextInt32(35) <= axePower || rng.NextInt32(3) == 0)
+                woodStack++;
+            world.SpawnItemDrop(TileDropTable.Wood, woodStack, X, Y, rng);
         }
-        else if (killedTile && TileDropTable.TryGet(killedType, out int dropItem, out int dropStack))
+        else if (killedTile && TileDropTable.TryGetMatureHerbDrop(killedType, killedFrameX,
+                     out int herbItem, out int seedItem, out bool flowering))
+        {
+            world.SpawnItemDrop(herbItem, 1, X, Y, rng);
+            if (flowering)
+                world.SpawnItemDrop(seedItem, 1 + rng.NextInt32(3), X, Y, rng);
+        }
+        else if (killedTile && TileDropTable.TryGet(killedType, killedFrameX, killedFrameY,
+                     out int dropItem, out int dropStack))
         {
             world.SpawnItemDrop(dropItem, dropStack, X, Y, rng);
         }
 
         return changed ? new(true) : new(false, CommandFailures.NoChange);
+    }
+
+    private readonly record struct DisplayTileEntityObject(int Width, int Height, byte EntityType, int ItemId, bool ReturnsItem);
+
+    private static readonly Dictionary<ushort, DisplayTileEntityObject> DisplayTileEntityObjects = new()
+    {
+        [395] = new(2, 2, 1, 3270, true),
+        [471] = new(3, 3, 4, 2699, true),
+        [520] = new(1, 1, 6, 4326, true),
+        [698] = new(1, 2, 8, 5472, true),
+        [470] = new(2, 3, 3, 498, false),
+        [475] = new(3, 4, 5, 3977, false),
+    };
+
+    private readonly record struct StatelessMultiTileObject(int Width, int Height, int ItemId);
+
+    private static readonly Dictionary<ushort, StatelessMultiTileObject> StatelessMultiTileObjects = new()
+    {
+        [406] = new(3, 3, 3365), [412] = new(3, 3, 3549), [452] = new(3, 3, 3742),
+        [455] = new(3, 3, 3747), [491] = new(3, 3, 4076), [499] = new(3, 3, 4142),
+        [642] = new(3, 3, 5296), [733] = new(3, 3, 5113), [753] = new(3, 3, 6147),
+        [102] = new(3, 4, 355), [463] = new(3, 4, 3813),
+        [106] = new(3, 2, 363), [212] = new(3, 2, 951), [219] = new(3, 2, 997),
+        [220] = new(3, 2, 998), [228] = new(3, 2, 1120), [243] = new(3, 2, 1430),
+        [247] = new(3, 2, 1551), [283] = new(3, 2, 2172), [300] = new(3, 2, 2192),
+        [301] = new(3, 2, 2193), [302] = new(3, 2, 2194), [303] = new(3, 2, 2195),
+        [304] = new(3, 2, 2196), [305] = new(3, 2, 2197), [306] = new(3, 2, 2198),
+        [307] = new(3, 2, 2203), [308] = new(3, 2, 2204), [354] = new(3, 2, 2999),
+        [355] = new(3, 2, 3000), [114] = new(3, 2, 398), [217] = new(3, 2, 995),
+        [218] = new(3, 2, 996), [377] = new(3, 2, 3198), [405] = new(3, 2, 3364),
+        [486] = new(3, 2, 4063), [704] = new(3, 2, 501), [706] = new(3, 2, 4144),
+    };
+
+    private bool TryBreakDisplayTileEntityObject(WorldState world, IRng rng, out bool broken)
+    {
+        broken = false;
+        Tile hit;
+        using (world.Sections.EnterRead(X, Y, X, Y))
+            hit = world.Tiles[X, Y];
+        if (!hit.Active || !DisplayTileEntityObjects.TryGetValue(hit.Type, out var descriptor))
+            return false;
+        if (hit.FrameX < 0 || hit.FrameY < 0)
+            return true;
+
+        int localX = hit.FrameX / 18 % descriptor.Width;
+        int localY = hit.FrameY / 18 % descriptor.Height;
+        int anchorX = X - localX;
+        int anchorY = Y - localY;
+        if (anchorX < 0 || anchorY < 0 || anchorX + descriptor.Width > world.MaxTilesX ||
+            anchorY + descriptor.Height > world.MaxTilesY)
+            return true;
+
+        int styleX = hit.FrameX / (descriptor.Width * 18);
+        int styleY = hit.FrameY / (descriptor.Height * 18);
+        var payloadDrops = new List<TileEntityItem>();
+        bool payloadReturned = false;
+        bool removeEntity = false;
+        int shellItem = 0;
+        TileEntity? entity;
+        lock (world.TileEntitiesLock)
+        {
+            if (!world.TryGetTileEntityAt((short)anchorX, (short)anchorY, out entity) || entity!.Type != descriptor.EntityType)
+                return true;
+
+            using (world.Sections.EnterWrite(anchorX, anchorY, anchorX + descriptor.Width - 1,
+                       anchorY + descriptor.Height - 1))
+            {
+                for (int x = 0; x < descriptor.Width; x++)
+                for (int y = 0; y < descriptor.Height; y++)
+                {
+                    ref var tile = ref world.Tiles[anchorX + x, anchorY + y];
+                    if (!tile.Active || tile.Type != hit.Type || tile.FrameX % 18 != 0 || tile.FrameY % 18 != 0 ||
+                        tile.FrameX / (descriptor.Width * 18) != styleX ||
+                        tile.FrameY / (descriptor.Height * 18) != styleY ||
+                        tile.FrameX / 18 % descriptor.Width != x ||
+                        tile.FrameY / 18 % descriptor.Height != y)
+                        return true;
+                }
+
+                if (!TryTakeDisplayPayload(entity, descriptor.ReturnsItem, payloadDrops))
+                    return true;
+                if (payloadDrops.Count > 0)
+                {
+                    world.MarkTileEntityDirty(entity.Id);
+                    payloadReturned = true;
+                }
+                else
+                {
+                    if (!TryGetDisplayTileEntityObjectDrop(hit.Type, hit.FrameX - localX * 18, out shellItem))
+                        return true;
+
+                    for (int x = 0; x < descriptor.Width; x++)
+                    for (int y = 0; y < descriptor.Height; y++)
+                    {
+                        ref var tile = ref world.Tiles[anchorX + x, anchorY + y];
+                        tile.Active = false;
+                        tile.Type = 0;
+                        tile.Wall = 0;
+                    }
+                    removeEntity = true;
+                }
+            }
+
+            if (removeEntity)
+                world.RemoveTileEntity(entity.Id);
+        }
+
+        foreach (var item in payloadDrops)
+            world.SpawnItemDrop(item.Type, item.Stack, anchorX, anchorY, rng, item.Prefix);
+        if (payloadReturned)
+        {
+            broken = true;
+            return true;
+        }
+
+        for (int x = 0; x < descriptor.Width; x++)
+        for (int y = 0; y < descriptor.Height; y++)
+            world.MarkTileChanged(anchorX + x, anchorY + y);
+        world.SpawnItemDrop(shellItem, 1, anchorX, anchorY, rng);
+        broken = true;
+        return true;
+    }
+
+    private static bool TryTakeDisplayPayload(TileEntity entity, bool returnsItem, List<TileEntityItem> drops)
+    {
+        if (returnsItem)
+        {
+            if (IsValidPayload(entity.Item))
+            {
+                drops.Add(entity.Item);
+                entity.Item = default;
+                return true;
+            }
+            return IsEmptyPayload(entity.Item);
+        }
+
+        TileEntityItem[] first;
+        TileEntityItem[] second;
+        if (entity.IsDisplayDoll)
+        {
+            first = entity.DisplayDollItems;
+            second = entity.DisplayDollDyes;
+            if (!IsValidOrEmpty(entity.DisplayDollMisc))
+                return false;
+        }
+        else if (entity.IsHatRack)
+        {
+            first = entity.HatRackHats;
+            second = entity.HatRackDyes;
+        }
+        else
+        {
+            return false;
+        }
+
+        if (!first.All(IsValidOrEmpty) || !second.All(IsValidOrEmpty))
+            return false;
+
+        TakePayloads(first, drops);
+        TakePayloads(second, drops);
+        if (entity.IsDisplayDoll && IsValidPayload(entity.DisplayDollMisc))
+        {
+            drops.Add(entity.DisplayDollMisc);
+            entity.DisplayDollMisc = default;
+        }
+        return true;
+    }
+
+    private static void TakePayloads(TileEntityItem[] items, List<TileEntityItem> drops)
+    {
+        for (int i = 0; i < items.Length; i++)
+        {
+            if (IsValidPayload(items[i]))
+                drops.Add(items[i]);
+            items[i] = default;
+        }
+    }
+
+    private static readonly Dictionary<ushort, TileEntityObject> TileEntityObjects = new()
+    {
+        [423] = new(1, 1, 2),
+        [378] = new(2, 3, 0),
+        [597] = new(3, 4, 7),
+        [723] = new(1, 1, 9),
+        [724] = new(1, 1, 10),
+    };
+
+    private readonly record struct TileEntityObject(int Width, int Height, byte EntityType);
+
+    private bool TryBreakTileEntityObject(WorldState world, IRng rng, out bool broken)
+    {
+        broken = false;
+        Tile hit;
+        using (world.Sections.EnterRead(X, Y, X, Y))
+            hit = world.Tiles[X, Y];
+        if (!hit.Active || !TileEntityObjects.TryGetValue(hit.Type, out var descriptor))
+            return false;
+        if (hit.FrameX < 0 || hit.FrameY < 0 || hit.FrameX % 18 != 0 || hit.FrameY % 18 != 0)
+            return true;
+
+        int localX = hit.FrameX / 18 % descriptor.Width;
+        int localY = hit.FrameY / 18 % descriptor.Height;
+        int anchorX = X - localX;
+        int anchorY = Y - localY;
+        if (anchorX < 0 || anchorY < 0 || anchorX + descriptor.Width > world.MaxTilesX ||
+            anchorY + descriptor.Height > world.MaxTilesY)
+            return true;
+
+        int styleX = hit.FrameX / (descriptor.Width * 18);
+        int styleY = hit.FrameY / (descriptor.Height * 18);
+        int shellItem = 0;
+        int payloadItem = 0;
+        lock (world.TileEntitiesLock)
+        {
+            if (!world.TryGetTileEntityAt((short)anchorX, (short)anchorY, out var entity) ||
+                entity!.Type != descriptor.EntityType)
+                return true;
+
+            using (world.Sections.EnterWrite(anchorX, anchorY, anchorX + descriptor.Width - 1,
+                       anchorY + descriptor.Height - 1))
+            {
+                for (int x = 0; x < descriptor.Width; x++)
+                for (int y = 0; y < descriptor.Height; y++)
+                {
+                    ref var tile = ref world.Tiles[anchorX + x, anchorY + y];
+                    if (!tile.Active || tile.Type != hit.Type || tile.FrameX % 18 != 0 || tile.FrameY % 18 != 0 ||
+                        tile.FrameX / (descriptor.Width * 18) != styleX ||
+                        tile.FrameY / (descriptor.Height * 18) != styleY ||
+                        tile.FrameX / 18 % descriptor.Width != x ||
+                        tile.FrameY / 18 % descriptor.Height != y)
+                        return true;
+                }
+
+                if (hit.Type is 723 or 724)
+                {
+                    // Vanilla anchor data persists only an item type, so a present type returns one plain item.
+                    payloadItem = entity.Item.Type;
+                }
+                else if (!TryGetTileEntityObjectShellDrop(hit, out shellItem))
+                {
+                    return true;
+                }
+
+                for (int x = 0; x < descriptor.Width; x++)
+                for (int y = 0; y < descriptor.Height; y++)
+                {
+                    ref var tile = ref world.Tiles[anchorX + x, anchorY + y];
+                    tile.Active = false;
+                    tile.Type = 0;
+                    tile.Wall = 0;
+                }
+            }
+
+            world.RemoveTileEntity(entity.Id);
+        }
+
+        for (int x = 0; x < descriptor.Width; x++)
+        for (int y = 0; y < descriptor.Height; y++)
+            world.MarkTileChanged(anchorX + x, anchorY + y);
+        if (payloadItem > 0)
+            world.SpawnItemDrop(payloadItem, 1, anchorX, anchorY, rng);
+        if (shellItem > 0)
+            world.SpawnItemDrop(shellItem, 1, anchorX, anchorY, rng);
+        broken = true;
+        return true;
+    }
+
+    private static bool TryGetTileEntityObjectShellDrop(Tile hit, out int itemId)
+    {
+        switch (hit.Type)
+        {
+            case 423:
+                itemId = GetLogicSensorDrop(hit.FrameY / 18);
+                return itemId > 0;
+            case 378:
+                itemId = 3202;
+                return true;
+            case 597:
+                itemId = GetTeleportationPylonDrop(hit.FrameX / 54);
+                return true;
+            default:
+                itemId = 0;
+                return false;
+        }
+    }
+
+    private static int GetLogicSensorDrop(int style) => style switch
+    {
+        0 => 3613,
+        1 => 3614,
+        2 => 3615,
+        3 => 3726,
+        4 => 3727,
+        5 => 3728,
+        6 => 3729,
+        _ => 0,
+    };
+
+    private static int GetTeleportationPylonDrop(int style) => style switch
+    {
+        1 => 4875,
+        2 => 4916,
+        3 => 4917,
+        4 => 4918,
+        5 => 4919,
+        6 => 4920,
+        7 => 4921,
+        8 => 4951,
+        9 => 5652,
+        10 => 5653,
+        _ => 4876,
+    };
+
+    private static bool IsValidPayload(TileEntityItem item) => item.Type > 0 && item.Stack > 0;
+    private static bool IsEmptyPayload(TileEntityItem item) => item.Type == 0 && item.Stack == 0;
+    private static bool IsValidOrEmpty(TileEntityItem item) => IsValidPayload(item) || IsEmptyPayload(item);
+
+    private static bool TryGetDisplayTileEntityObjectDrop(ushort tileType, int anchorFrameX, out int itemId)
+    {
+        switch (tileType)
+        {
+            case 395: itemId = 3270; return true;
+            case 471: itemId = 2699; return true;
+            case 520: itemId = 4326; return true;
+            case 698: itemId = 5472; return true;
+            case 470: itemId = anchorFrameX / 72 == 1 ? 1989 : 498; return true;
+            case 475: itemId = 3977; return true;
+            default: itemId = 0; return false;
+        }
+    }
+
+    private bool TryBreakStatelessMultiTileObject(WorldState world, IRng rng, out bool broken)
+    {
+        broken = false;
+        Tile hit;
+        using (world.Sections.EnterRead(X, Y, X, Y))
+            hit = world.Tiles[X, Y];
+        if (!hit.Active || !StatelessMultiTileObjects.TryGetValue(hit.Type, out var descriptor))
+            return false;
+
+        int localX = hit.FrameX / 18 % descriptor.Width;
+        int localY = hit.FrameY / 18 % descriptor.Height;
+        int anchorX = X - localX;
+        int anchorY = Y - localY;
+        if (anchorX < 0 || anchorY < 0 || anchorX + descriptor.Width > world.MaxTilesX ||
+            anchorY + descriptor.Height > world.MaxTilesY)
+            return true;
+
+        int styleX = hit.FrameX / (descriptor.Width * 18);
+        int styleY = hit.FrameY / (descriptor.Height * 18);
+        using (world.Sections.EnterWrite(anchorX, anchorY, anchorX + descriptor.Width - 1,
+                   anchorY + descriptor.Height - 1))
+        {
+            for (int x = 0; x < descriptor.Width; x++)
+            for (int y = 0; y < descriptor.Height; y++)
+            {
+                ref var tile = ref world.Tiles[anchorX + x, anchorY + y];
+                if (!tile.Active || tile.Type != hit.Type ||
+                    tile.FrameX / (descriptor.Width * 18) != styleX ||
+                    tile.FrameY / (descriptor.Height * 18) != styleY ||
+                    tile.FrameX / 18 % descriptor.Width != x ||
+                    tile.FrameY / 18 % descriptor.Height != y)
+                    return true;
+            }
+
+            for (int x = 0; x < descriptor.Width; x++)
+            for (int y = 0; y < descriptor.Height; y++)
+            {
+                ref var tile = ref world.Tiles[anchorX + x, anchorY + y];
+                tile.Active = false;
+                tile.Type = 0;
+                tile.Wall = 0;
+            }
+        }
+
+        broken = true;
+        for (int x = 0; x < descriptor.Width; x++)
+        for (int y = 0; y < descriptor.Height; y++)
+            world.MarkTileChanged(anchorX + x, anchorY + y);
+        world.SpawnItemDrop(descriptor.ItemId, 1, anchorX, anchorY, rng);
+        return true;
+    }
+
+    private bool TryBreakContainerObject(WorldState world, IRng rng, out bool broken)
+    {
+        broken = false;
+        Tile hit;
+        using (world.Sections.EnterRead(X, Y, X, Y))
+            hit = world.Tiles[X, Y];
+        if (!hit.Active || (hit.Type != 21 && hit.Type != 467 && hit.Type != 88))
+            return false;
+
+        int width = hit.Type == 88 ? 3 : 2;
+        int anchorX = X - (hit.FrameX / 18 % width);
+        int anchorY = Y - hit.FrameY / 18;
+        if (anchorX < 0 || anchorY < 0 || anchorX + width > world.MaxTilesX || anchorY + 2 > world.MaxTilesY)
+            return true;
+
+        ushort type = hit.Type;
+        short frameX = hit.FrameX;
+        int deletedChestIndex;
+        using (world.Sections.EnterWrite(anchorX, anchorY, anchorX + width - 1, anchorY + 1))
+        {
+            for (int localX = 0; localX < width; localX++)
+            for (int localY = 0; localY < 2; localY++)
+            {
+                ref var tile = ref world.Tiles[anchorX + localX, anchorY + localY];
+                if (!tile.Active || tile.Type != type || tile.FrameX / 18 % width != localX || tile.FrameY / 18 != localY)
+                    return true;
+            }
+
+            if (!world.TryDeleteEmptyChestAt(anchorX, anchorY, out deletedChestIndex))
+                return true;
+
+            for (int localX = 0; localX < width; localX++)
+            for (int localY = 0; localY < 2; localY++)
+            {
+                ref var tile = ref world.Tiles[anchorX + localX, anchorY + localY];
+                tile.Active = false;
+                tile.Type = 0;
+                tile.Wall = 0;
+            }
+        }
+
+        if (deletedChestIndex >= 0)
+            world.MarkPersistChestDeleted(deletedChestIndex);
+        broken = true;
+
+        for (int localX = 0; localX < width; localX++)
+        for (int localY = 0; localY < 2; localY++)
+            world.MarkTileChanged(anchorX + localX, anchorY + localY);
+
+        int style = type == 88 ? frameX / 54 : frameX / 36;
+        int itemId = type switch
+        {
+            21 => GetChestDrop(style, false),
+            467 => GetChestDrop(style, true),
+            _ => GetDresserDrop(style),
+        };
+        world.SpawnItemDrop(itemId, 1, anchorX, anchorY, rng);
+        return true;
+    }
+
+    private static int GetChestDrop(int style, bool secondType)
+    {
+        if (secondType)
+        {
+            int[] drops = { 3884, 3885, 3939, 3965, 3988, 4153, 4174, 4195, 4216, 4265, 4267, 4574,
+                4712, 4712, 5156, 5177, 5198, 5556, 5609, 5697, 5720, 5745, 5763, 5784, 5805, 5826,
+                5846, 5865, 5886, 5905, 5939, 5962, 5982, 6005, 6028, 6051, 6074, 6118 };
+            return style >= 0 && style < drops.Length ? drops[style] : drops[0];
+        }
+
+        int[] normalDrops = { 48, 306, 306, 328, 328, 343, 348, 625, 626, 627, 680, 681, 831, 838,
+            914, 952, 1142, 1298, 1528, 1529, 1530, 1531, 1532, 1528, 1529, 1530, 1531, 1532, 2230,
+            2249, 2250, 2526, 2544, 2559, 2574, 2612, 2612, 2613, 2613, 2614, 2614, 2615, 2616, 2617,
+            2618, 2619, 2620, 2748, 2814, 3180, 3125, 3181 };
+        return style >= 0 && style < normalDrops.Length ? normalDrops[style] : normalDrops[0];
+    }
+
+    private static int GetDresserDrop(int style)
+    {
+        if (style is >= 1 and <= 3) return 646 + style;
+        if (style is >= 5 and <= 15) return 2386 + style - 5;
+        int[] drops = { 334, 0, 0, 0, 918, 2386, 2387, 2388, 2389, 2390, 2391, 2392, 2393, 2394, 2395,
+            2396, 2529, 2545, 2562, 2577, 2637, 2638, 2639, 2640, 2816, 3132, 3134, 3133, 3911, 3912,
+            3913, 3914, 3934, 3968, 4148, 4169, 4190, 4211, 4301, 4569, 5151, 5172, 5193, 5551, 5604,
+            5692, 5715, 5741, 5766, 5787, 5808, 5829, 5848, 5868, 5888, 5908, 5942, 5965, 5985, 6008,
+            6031, 6054, 6077, 6099, 6121 };
+        return style >= 0 && style < drops.Length && drops[style] != 0 ? drops[style] : 334;
     }
 }
 
@@ -934,24 +1523,81 @@ public sealed record SpawnProjectileCommand(
 
         lock (world.ProjectilesLock)
         {
-            // 同一 Key 视为同一弹幕的更新（原版 projectile 索引由归属者选定）
-            var existing = world.Projectiles.FirstOrDefault(p => p.Key == Key);
+            // 客户端 projectile 索引仅在归属者范围内唯一；不同玩家可同时使用同一 Key。
+            var existing = world.Projectiles.FirstOrDefault(p => p.Owner == playerId && p.Key == Key);
             if (existing is not null)
             {
-                // 服务端已永久销毁（如「移除召唤武器即销毁」）：忽略后续更新，拒绝复活。
-                if (existing.Destroyed)
-                    return new(true);
-
-                existing.Position = Position;
-                existing.Velocity = Velocity;
-                existing.Active = true;
-                existing.RemovalNotified = false;
+                // 已有弹幕由服务端仿真推进；包 27 更新不采信客户端的位置、速度或生命周期状态。
                 return new(true);
             }
+
+            // 碰撞盒按原版逐类型尺寸（Sizes），未登记类型沿用 16×16 近似。
+            var size = ProjectileCapabilityTable.Sizes.TryGetValue(Type, out var s)
+                ? s : (Width: 16f, Height: 16f);
+
+            if (!float.IsFinite(Position.X) || !float.IsFinite(Position.Y) ||
+                !float.IsFinite(Velocity.X) || !float.IsFinite(Velocity.Y))
+                return new(false, CommandFailures.ProjectileSpawnInvalid);
+
+            float worldWidth = world.MaxTilesX * 16f;
+            float worldHeight = world.MaxTilesY * 16f;
+            if (Position.X < 0f || Position.Y < 0f || Position.X + size.Width > worldWidth ||
+                Position.Y + size.Height > worldHeight)
+                return new(false, CommandFailures.ProjectileSpawnOutOfWorld);
+
+            if (Velocity.X * Velocity.X + Velocity.Y * Velocity.Y > 512f * 512f)
+                return new(false, CommandFailures.ProjectileSpeedExceeded);
 
             // 弹幕伤害的服务端权威推导结果（默认沿用客户端上报；近战 / 魔法等可精确推导的通道则覆盖为
             // 服务端推导值，使阶段 C 命中匹配以服务端权威值而非客户端上报值为基准）。
             int derivedDamage = Damage;
+
+            // 对已收录的武器，包 27 的弹幕类型必须能由服务端权威手持物品和背包弹药推出。
+            // 未收录武器或弹药保持兼容性放行；它们无法被安全地映射到固定弹幕类型。
+            if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
+            {
+                int heldItem = player.ItemStacks[player.SelectedSlot] > 0 ? player.Items[player.SelectedSlot] : 0;
+                if (WeaponProjectileTypeOf.Direct.TryGetValue(heldItem, out int directType))
+                {
+                    if (Type != directType)
+                        return new(false, CommandFailures.ProjectileTypeNotAllowed);
+                }
+                else if (WeaponAmmoTypeOf.Of.TryGetValue(heldItem, out int ammoType))
+                {
+                    bool allowsType = false;
+                    for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+                    {
+                        int ammoItem = player.Items[slot];
+                        if (player.ItemStacks[slot] <= 0 || !AmmoTypeOf.Of.TryGetValue(ammoItem, out int actualAmmoType) || actualAmmoType != ammoType)
+                            continue;
+
+                        if (!WeaponProjectileTypeOf.Ammo.TryGetValue(ammoItem, out int ammoProjectileType))
+                            continue;
+
+                        if (Type == ammoProjectileType)
+                        {
+                            allowsType = true;
+                            break;
+                        }
+                    }
+
+                    if (!allowsType)
+                        return new(false, CommandFailures.ProjectileTypeNotAllowed);
+                }
+            }
+
+            if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
+            {
+                int heldItem = player.ItemStacks[player.SelectedSlot] > 0 ? player.Items[player.SelectedSlot] : 0;
+                if (WeaponProjectileTypeOf.Direct.ContainsKey(heldItem) || WeaponAmmoTypeOf.Of.ContainsKey(heldItem))
+                {
+                    // 普通手持发射的起点应接近玩家中心偏移，避免远程凭空生成。
+                    float dx = Position.X + size.Width / 2f - (player.Position.X + 10f);
+                    float dy = Position.Y + size.Height / 2f - (player.Position.Y + 21f);
+                    if (dx * dx + dy * dy > 160f * 160f)
+                        return new(false, CommandFailures.ProjectileSpawnTooFar);
+                }
+            }
 
             // 阶段 H：召唤 / 哨兵弹幕 spawn 伤害权威校验——堵住「虚报弹幕伤害 → 命中上界随之上抬」漏洞。
             // 原版仆从伤害 = **召唤时**武器伤害（GetWeaponDamage 含前缀 / Buff / 饰品 / 套装），创建时一次确定，
@@ -1029,9 +1675,6 @@ public sealed record SpawnProjectileCommand(
                 }
             }
 
-            // 碰撞盒按原版逐类型尺寸（Sizes），未登记类型沿用 16×16 近似。
-            var size = ProjectileCapabilityTable.Sizes.TryGetValue(Type, out var s)
-                ? s : (Width: 16f, Height: 16f);
             world.Projectiles.Add(new ProjectileEntity
             {
                 Key = Key,
@@ -1058,22 +1701,19 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
     {
         lock (world.ProjectilesLock)
         {
-            foreach (var p in world.Projectiles)
-            {
-                if (p.Key != Key || !p.Active) continue;
+            if (PlayerId is not int owner)
+                return new(false, CommandFailures.MissingPlayer);
 
-                // 服务端权威：只有归属者能销毁自己的弹幕（防伪造他人弹幕消失）
-                if (PlayerId is int owner && p.Owner != owner) return new(false, CommandFailures.NotOwner);
+            var projectile = world.Projectiles.FirstOrDefault(p => p.Owner == owner && p.Key == Key && p.Active);
+            if (projectile is null)
+                return new(false, CommandFailures.ProjectileNotFound);
 
-                p.Position = Position;
-                p.Active = false;
-                p.DeadTick = world.Tick;   // 用仿真 tick（命令的 Tick 可能落后于当前世界 tick）
-                p.RemovalNotified = true; // 客户端已发起销毁，无需服务端再补发
-                return new(true);
-            }
+            projectile.Position = Position;
+            projectile.Active = false;
+            projectile.DeadTick = world.Tick;   // 用仿真 tick（命令的 Tick 可能落后于当前世界 tick）
+            projectile.RemovalNotified = true; // 客户端已发起销毁，无需服务端再补发
+            return new(true);
         }
-
-        return new(false, CommandFailures.ProjectileNotFound);
     }
 }
 

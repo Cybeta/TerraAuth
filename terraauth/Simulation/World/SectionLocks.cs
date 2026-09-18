@@ -48,6 +48,16 @@ public sealed class SectionLocks
     public void ExitWrite(int tileX, int tileY)
         => _stripes[StripeOf(SectionX(tileX), SectionY(tileY))].ExitWriteLock();
 
+    /// <summary>取写锁，覆盖图格矩形 <c>[x0..x1] × [y0..y1]</c> 涉及的全部条带。</summary>
+    public IDisposable EnterWrite(int x0, int y0, int x1, int y1)
+    {
+        var indices = StripeIndicesFor(x0, y0, x1, y1);
+        for (int i = 0; i < indices.Length; i++)
+            _stripes[indices[i]].EnterWriteLock();
+
+        return new WriteScope(_stripes, indices);
+    }
+
     /// <summary>
     /// 取读锁，覆盖图格矩形 <c>[x0..x1] × [y0..y1]</c> 涉及的全部条带（单格读传 x0==x1、y0==y1）。
     /// 请用 <c>using</c> 包裹读区间；切勿在读锁内做压缩等长耗时工作（见 PacketEncoder 的快照拷贝策略）。
@@ -97,6 +107,26 @@ public sealed class SectionLocks
             _released = true;
             for (int i = _indices.Length - 1; i >= 0; i--)
                 _stripes[_indices[i]].ExitReadLock();
+        }
+    }
+
+    private sealed class WriteScope : IDisposable
+    {
+        private readonly ReaderWriterLockSlim[] _stripes;
+        private readonly int[] _indices;
+        private bool _released;
+
+        public WriteScope(ReaderWriterLockSlim[] stripes, int[] indices)
+            => (_stripes, _indices) = (stripes, indices);
+
+        public void Dispose()
+        {
+            if (_released)
+                return;
+
+            _released = true;
+            for (int i = _indices.Length - 1; i >= 0; i--)
+                _stripes[_indices[i]].ExitWriteLock();
         }
     }
 }

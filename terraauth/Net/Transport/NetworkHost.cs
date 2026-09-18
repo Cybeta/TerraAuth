@@ -913,8 +913,9 @@ public sealed class NetworkHost : IAsyncDisposable
             for (int i = 0; i < PlayerRuntime.InventorySlotCount; i++)
             {
                 var itemId = runtime.Items[i];
+                var stack = runtime.ItemStacks[i];
                 await connection.SendEncodedAsync(PacketId.InventorySlot,
-                    new InventorySlotPacket(i, itemId, itemId == 0 ? 0 : 1)
+                    new InventorySlotPacket(i, itemId, stack)
                     {
                         PlayerId = connection.PlayerId,
                         Prefix = runtime.ItemPrefixes[i],

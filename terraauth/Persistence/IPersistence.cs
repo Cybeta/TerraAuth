@@ -41,8 +41,14 @@ public interface IWorldRepository
     Task SaveChestChangesAsync(IReadOnlyList<WorldChestRecord> chests);
     /// <summary>读取全部箱子内容改动（启动时回放）。</summary>
     Task<IReadOnlyList<WorldChestRecord>> LoadChestChangesAsync();
+    /// <summary>删除已销毁箱子的内容覆盖记录，避免重启时基准世界容器复活。</summary>
+    Task DeleteChestChangesAsync(IReadOnlyList<int> chestIndices);
+    /// <summary>按锚点写入图格实体覆盖或删除墓碑。</summary>
+    Task SaveTileEntityChangesAsync(IReadOnlyList<WorldTileEntityRecord> entities);
+    /// <summary>读取全部图格实体覆盖与删除墓碑，供启动时按锚点回放。</summary>
+    Task<IReadOnlyList<WorldTileEntityRecord>> LoadTileEntityChangesAsync();
     /// <summary>
-    /// 清空全部世界改动（图格 + 箱子）。基准世界换掉（改 <c>WorldSeed</c> / 换 .wld）时必须调用，
+    /// 清空全部世界改动（图格 + 箱子 + 图格实体）。基准世界换掉（改 <c>WorldSeed</c> / 换 .wld）时必须调用，
     /// 否则按旧地图坐标记录的改动会落到新地形上。
     /// </summary>
     Task ClearWorldChangesAsync();
@@ -56,6 +62,12 @@ public record WorldTileRecord(int X, int Y, byte[] Data);
 /// 回放时按索引定位并校验坐标，避免基准世界被替换后错位套用。
 /// </summary>
 public record WorldChestRecord(int Index, int X, int Y, byte[] Data);
+
+/// <summary>
+/// 图格实体覆盖：以锚点为稳定键，保存完整 section-5 单实体文件负载；删除时保留墓碑，
+/// 防止同锚点的基准世界实体在重启回放时复活。
+/// </summary>
+public record WorldTileEntityRecord(int RuntimeId, int FileId, byte Type, short X, short Y, byte[]? Data, bool IsDeleted);
 
 public record PlayerData(Guid Id, string Name, byte[] InventoryBlob, int MaxHp, int MaxMp);
 public record AuditEntry(DateTime Timestamp, Guid PlayerId, string EventType, string Detail, string? IpAddress);

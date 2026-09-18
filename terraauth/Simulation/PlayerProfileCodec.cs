@@ -6,8 +6,8 @@
 // 原版把玩家档案写 .plr，这里按同一语义存进 DB。
 //
 // 布局（小端，版本化，长度随槽位数固定）：
-//   Byte Version=1 | Int32 Hp | Int32 HpMax | Int32 Mp | Int32 MpMax
-//   | N × (Int16 ItemId, Byte Prefix)      // N = PlayerRuntime.InventorySlotCount
+//   Byte Version=2 | Int32 Hp | Int32 HpMax | Int32 Mp | Int32 MpMax
+//   | N × (Int16 ItemId, Int32 Stack, Byte Prefix)      // N = PlayerRuntime.InventorySlotCount
 
 using System;
 using System.IO;
@@ -17,12 +17,13 @@ namespace TerraAuth.Simulation;
 /// <summary>SSC 玩家档案（背包 + 生命 / 法力）的编解码。</summary>
 public static class PlayerProfileCodec
 {
-    private const byte Version = 1;
+    private const byte Version = 2;
+    private const byte LegacyVersion = 1;
 
     /// <summary>编码为存档字节串（槽位数与 <see cref="PlayerRuntime.InventorySlotCount"/> 绑定）。</summary>
     public static byte[] Encode(PlayerRuntime player)
     {
-        using var ms = new MemoryStream(1 + 16 + PlayerRuntime.InventorySlotCount * 3);
+        using var ms = new MemoryStream(1 + 16 + PlayerRuntime.InventorySlotCount * 7);
         using var w = new BinaryWriter(ms);
         w.Write(Version);
         w.Write(player.Hp);
@@ -32,6 +33,7 @@ public static class PlayerProfileCodec
         for (int i = 0; i < PlayerRuntime.InventorySlotCount; i++)
         {
             w.Write((short)player.Items[i]);
+            w.Write(player.ItemStacks[i]);
             w.Write(player.ItemPrefixes[i]);
         }
         w.Flush();
@@ -51,7 +53,8 @@ public static class PlayerProfileCodec
         {
             using var ms = new MemoryStream(blob, writable: false);
             using var r = new BinaryReader(ms);
-            if (r.ReadByte() != Version) return false;
+            byte version = r.ReadByte();
+            if (version != Version && version != LegacyVersion) return false;
 
             int hp = r.ReadInt32();
             int hpMax = r.ReadInt32();
@@ -60,8 +63,12 @@ public static class PlayerProfileCodec
 
             for (int i = 0; i < PlayerRuntime.InventorySlotCount; i++)
             {
-                player.Items[i] = r.ReadInt16();
-                player.ItemPrefixes[i] = r.ReadByte();
+                int itemId = r.ReadInt16();
+                int stack = version == Version ? r.ReadInt32() : (itemId == 0 ? 0 : 1);
+                byte prefix = r.ReadByte();
+                player.Items[i] = stack > 0 ? itemId : 0;
+                player.ItemStacks[i] = stack > 0 ? stack : 0;
+                player.ItemPrefixes[i] = stack > 0 ? prefix : (byte)0;
             }
 
             player.HpMax = Math.Max(1, hpMax);

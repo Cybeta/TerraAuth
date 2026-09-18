@@ -2,6 +2,7 @@
 
 using System;
 using System.Buffers;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using TerraAuth.Net.Transport;
@@ -13,6 +14,36 @@ namespace TerraAuth.Tests;
 
 public class SimulationTests
 {
+    [Fact]
+    public void TileEntities_Index_Delete_And_Queues_Remain_Consistent()
+    {
+        var world = new WorldState();
+        var first = world.InsertTileEntity(new TileEntity { Type = 7, X = 10, Y = 20 });
+        var replacement = world.InsertTileEntity(new TileEntity { Type = 1, X = 10, Y = 20 });
+        var other = world.InsertTileEntity(new TileEntity { Type = 2, X = 11, Y = 20 });
+
+        Assert.Equal(0, first.Id);
+        Assert.Equal(1, replacement.Id);
+        Assert.Equal(2, other.Id);
+        Assert.False(world.TryGetTileEntity(first.Id, out _));
+        Assert.True(world.TryGetTileEntityAt(10, 20, out var atAnchor));
+        Assert.Same(replacement, atAnchor);
+        Assert.Equal(new[] { 1, 2 }, world.DrainDirtyTileEntities(10));
+        Assert.Equal(new[] { 0 }, world.DrainDeletedTileEntities(10).Select(static entity => entity.RuntimeId));
+
+        world.MarkTileEntityDirty(replacement.Id);
+        Assert.True(world.RemoveTileEntityAt(10, 20));
+        Assert.False(world.TryGetTileEntity(replacement.Id, out _));
+        Assert.False(world.TryGetTileEntityAt(10, 20, out _));
+        Assert.Equal(new[] { 1 }, world.DrainDeletedTileEntities(10).Select(static entity => entity.RuntimeId));
+
+        world.RequeueDirtyTileEntities(new[] { other.Id });
+        Assert.Equal(new[] { other.Id }, world.DrainDirtyTileEntities(10));
+        var deletion = new WorldState.TileEntityDeletion(replacement.Id, replacement.FileId, replacement.Type, replacement.X, replacement.Y);
+        world.RequeueDeletedTileEntities(new[] { deletion });
+        Assert.Equal(new[] { replacement.Id }, world.DrainDeletedTileEntities(10).Select(static entity => entity.RuntimeId));
+    }
+
     /// <summary>
     /// 区块分区锁：写锁持有期间，同区块的读锁必须被阻塞（图格写入与包 10 编码 / 权威校验互斥）。
     /// 注意：ReaderWriterLockSlim 写锁具线程亲和性，故由后台线程持锁并在同一线程释放。
@@ -165,7 +196,7 @@ public class SimulationTests
     {
         // 阶段 H：召唤弹幕 spawn 时校验权威伤害——手持已收录召唤武器则弹幕 Damage 须 ≤ 武器上界，
         // 空手 / 非召唤武器拒绝，未收录武器（mod）放行，非召唤弹幕不受影响。
-        var world = new WorldState();
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
         lock (world.PlayersLock)
             world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
         var player = world.Players[1];
@@ -213,7 +244,7 @@ public class SimulationTests
     {
         // 阶段 H2：非召唤 / 非哨兵弹幕创建时，按「手持已收录武器」权威推导伤害——
         // 假报超高伤害应拒绝（堵住用高 Damage 弹幕抬阶段 C 命中上界）；合理上报则被服务端覆盖为权威值。
-        var world = new WorldState();
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
         lock (world.PlayersLock)
             world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
         var player = world.Players[1];
@@ -246,6 +277,156 @@ public class SimulationTests
         player.Items[3] = 0;
         Assert.True(new SpawnProjectileCommand(3, 1, 3, 9, new Vector2(0, 0), new Vector2(0, 0), 30)
             .Apply(world, rng).Applied);
+    }
+
+    [Fact]
+    public void ProjectileSpawn_RequiresAuthoritativeWeaponAndAmmoType()
+    {
+        var world = new WorldState();
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+        var player = world.Players[1];
+        var rng = new XoshiroRng(1);
+        var origin = new Vector2(0, 0);
+
+        // 泰拉刃固定发射 985；客户端篡改成 2 必须被拒绝。
+        player.Items[3] = 757;
+        player.ItemStacks[3] = 1;
+        Assert.Equal("projectile_type_not_allowed",
+            new SpawnProjectileCommand(1, 1, 1, 2, origin, origin, 85).Apply(world, rng).Reason);
+        Assert.True(new SpawnProjectileCommand(2, 1, 2, 985, origin, origin, 85).Apply(world, rng).Applied);
+
+        // 木弓仅可使用服务端背包中的木箭（类型 1），不能伪造为火箭类型。
+        player.Items[3] = 39;
+        player.ItemStacks[3] = 1;
+        player.Items[4] = 40;
+        player.ItemStacks[4] = 20;
+        Assert.Equal("projectile_type_not_allowed",
+            new SpawnProjectileCommand(3, 1, 3, 134, origin, origin, 4).Apply(world, rng).Reason);
+        Assert.True(new SpawnProjectileCommand(4, 1, 4, 1, origin, origin, 4).Apply(world, rng).Applied);
+
+        // 已知弹药但无服务端弹幕映射时，不能回退为接受任意客户端类型。
+        player.Items[4] = 771;
+        player.ItemStacks[4] = 1;
+        Assert.Equal("projectile_type_not_allowed",
+            new SpawnProjectileCommand(5, 1, 5, 134, origin, origin, 4).Apply(world, rng).Reason);
+
+        // 已收录远程武器没有可用同类弹药也不能凭空生成弹幕。
+        player.ItemStacks[4] = 0;
+        player.Items[4] = 0;
+        Assert.Equal("projectile_type_not_allowed",
+            new SpawnProjectileCommand(5, 1, 5, 1, origin, origin, 4).Apply(world, rng).Reason);
+    }
+
+    [Fact]
+    public void ProjectileSpawn_Validates_Initial_Position_And_Velocity()
+    {
+        var world = new WorldState { MaxTilesX = 1000, MaxTilesY = 1000 };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Position = new Vector2(160, 160),
+                AimPosition = new Vector2(160, 160),
+                SelectedSlot = 3,
+            };
+        }
+        var player = world.Players[1];
+        player.Items[3] = 757;
+        player.ItemStacks[3] = 1;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new SpawnProjectileCommand(1, 1, 1, 985, new Vector2(170, 170), new Vector2(20, 0), 85)
+            .Apply(world, rng).Applied);
+        Assert.Equal("projectile_spawn_too_far",
+            new SpawnProjectileCommand(2, 1, 2, 985, new Vector2(500, 500), new Vector2(20, 0), 85)
+                .Apply(world, rng).Reason);
+        Assert.Equal("projectile_speed_exceeded",
+            new SpawnProjectileCommand(3, 1, 3, 985, new Vector2(170, 170), new Vector2(513, 0), 85)
+                .Apply(world, rng).Reason);
+        Assert.Equal("projectile_spawn_out_of_world",
+            new SpawnProjectileCommand(4, 1, 4, 985, new Vector2(-1, 0), new Vector2(20, 0), 85)
+                .Apply(world, rng).Reason);
+        Assert.Equal("invalid_projectile_spawn",
+            new SpawnProjectileCommand(5, 1, 5, 985, new Vector2(float.NaN, 170), new Vector2(20, 0), 85)
+                .Apply(world, rng).Reason);
+
+        lock (world.ProjectilesLock)
+        {
+            Assert.Single(world.Projectiles);
+            Assert.DoesNotContain(world.Projectiles, p => p.Key is 2 or 3 or 4 or 5);
+        }
+    }
+
+    [Fact]
+    public void Existing_Projectile_Update_Preserves_Server_Authoritative_State()
+    {
+        var world = new WorldState();
+        var projectile = new ProjectileEntity
+        {
+            Key = 7,
+            Owner = 1,
+            Type = 1,
+            Position = new Vector2(10, 20),
+            Velocity = new Vector2(1, 2),
+            Active = true,
+        };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(projectile);
+
+        var result = new SpawnProjectileCommand(1, 1, 7, 1,
+            new Vector2(1000, 2000), new Vector2(100, 200), 10).Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(new Vector2(10, 20), projectile.Position);
+        Assert.Equal(new Vector2(1, 2), projectile.Velocity);
+        Assert.True(projectile.Active);
+    }
+
+    [Fact]
+    public void ProjectileKeys_Are_Isolated_By_Owner()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
+            world.Players[2] = new PlayerRuntime { Id = 2, Active = true };
+        }
+
+        var rng = new XoshiroRng(1);
+        var firstPosition = new Vector2(10, 20);
+        var secondPosition = new Vector2(30, 40);
+
+        Assert.True(new SpawnProjectileCommand(1, 1, 7, 1, firstPosition, new Vector2(1, 0), 10)
+            .Apply(world, rng).Applied);
+        Assert.True(new SpawnProjectileCommand(2, 2, 7, 1, secondPosition, new Vector2(0, 1), 10)
+            .Apply(world, rng).Applied);
+
+        lock (world.ProjectilesLock)
+        {
+            Assert.Equal(2, world.Projectiles.Count);
+            Assert.Equal(firstPosition, world.Projectiles.Single(p => p.Owner == 1 && p.Key == 7).Position);
+            Assert.Equal(secondPosition, world.Projectiles.Single(p => p.Owner == 2 && p.Key == 7).Position);
+        }
+
+        var updatedPosition = new Vector2(50, 60);
+        Assert.True(new SpawnProjectileCommand(3, 2, 7, 1, updatedPosition, new Vector2(0, 2), 10)
+            .Apply(world, rng).Applied);
+        Assert.True(new KillProjectileCommand(4, 2, 7, updatedPosition).Apply(world, rng).Applied);
+
+        lock (world.ProjectilesLock)
+        {
+            var first = world.Projectiles.Single(p => p.Owner == 1 && p.Key == 7);
+            var second = world.Projectiles.Single(p => p.Owner == 2 && p.Key == 7);
+            Assert.True(first.Active);
+            Assert.Equal(firstPosition, first.Position);
+            Assert.False(second.Active);
+            Assert.Equal(updatedPosition, second.Position);
+        }
     }
 
     [Fact]
@@ -372,6 +553,89 @@ public class SimulationTests
         Assert.Equal("chest_not_open", result.Reason);
         Assert.Equal(0, world.Chests[0].Items[2].Stack);
         Assert.Empty(world.DrainChestUpdates(10));
+    }
+
+    [Fact]
+    public void TransferInventoryChest_ChestToInventory_PartialTransfer_ConservesItems()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        chest.Items[2] = new ChestItem { Type = 50, Stack = 10, Prefix = 3 };
+
+        var result = new TransferInventoryChestItemCommand(1, 1, true, 0, 4, 2, 4, 100, 50, 3, 10)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(6, chest.Items[2].Stack);
+        Assert.Equal(50, player.Items[4]);
+        Assert.Equal(4, player.ItemStacks[4]);
+        Assert.Equal(3, player.ItemPrefixes[4]);
+        Assert.Contains((0, 2), world.DrainChestUpdates(10));
+        Assert.Contains((1, 22L, 4), world.DrainInventoryUpdates(10));
+    }
+
+    [Fact]
+    public void TransferInventoryChest_InventoryToChest_MergesAndConservesItems()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[4] = 50;
+        player.ItemStacks[4] = 7;
+        player.ItemPrefixes[4] = 3;
+        chest.Items[2] = new ChestItem { Type = 50, Stack = 4, Prefix = 3 };
+
+        var result = new TransferInventoryChestItemCommand(1, 1, false, 0, 4, 2, 3, 101, 50, 3, 7)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(4, player.ItemStacks[4]);
+        Assert.Equal(7, chest.Items[2].Stack);
+        Assert.Equal(11, player.ItemStacks[4] + chest.Items[2].Stack);
+    }
+
+    [Fact]
+    public void TransferInventoryChest_ClosedSession_IsRejectedWithoutChanges()
+    {
+        var (world, player, chest) = CreateTransferWorld(openSession: false);
+        chest.Items[2] = new ChestItem { Type = 50, Stack = 10, Prefix = 3 };
+
+        var result = new TransferInventoryChestItemCommand(1, 1, true, 0, 4, 2, 4, 102, 50, 3, 10)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal(CommandFailures.ChestNotOpen, result.Reason);
+        Assert.Equal(10, chest.Items[2].Stack);
+        Assert.Equal(0, player.ItemStacks[4]);
+    }
+
+    [Fact]
+    public void TransferInventoryChest_ReplayedOperation_IsRejectedWithoutChanges()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        chest.Items[2] = new ChestItem { Type = 50, Stack = 10, Prefix = 3 };
+        var command = new TransferInventoryChestItemCommand(1, 1, true, 0, 4, 2, 4, 103, 50, 3, 10)
+        { SessionId = 22 };
+
+        Assert.True(command.Apply(world, new XoshiroRng(1)).Applied);
+        var replay = command.Apply(world, new XoshiroRng(1));
+
+        Assert.False(replay.Applied);
+        Assert.Equal("replayed_operation", replay.Reason);
+        Assert.Equal(6, chest.Items[2].Stack);
+        Assert.Equal(4, player.ItemStacks[4]);
+    }
+
+    [Fact]
+    public void TransferInventoryChest_StaleSession_IsRejectedWithoutChanges()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        chest.Items[2] = new ChestItem { Type = 50, Stack = 10, Prefix = 3 };
+
+        var result = new TransferInventoryChestItemCommand(1, 1, true, 0, 4, 2, 4, 104, 50, 3, 10)
+        { SessionId = 11 }.Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal(CommandFailures.StaleSession, result.Reason);
+        Assert.Equal(10, chest.Items[2].Stack);
+        Assert.Equal(0, player.ItemStacks[4]);
     }
 
     [Fact]
@@ -559,7 +823,7 @@ public class SimulationTests
         Assert.False(Assert.Single(world.Items).Active);
     }
 
-    /// <summary>拾取成功 → 排队一条聊天提示（「获取 Wood ×N」，名称取原版标识名）。</summary>
+    /// <summary>拾取成功 → 排队一条聊天提示（「获取 木材 ×N」，名称取中文显示名）。</summary>
     [Fact]
     public void PickupItem_Queues_Chat_Notice()
     {
@@ -580,8 +844,28 @@ public class SimulationTests
         Assert.True(result.Applied);
         var notice = Assert.Single(world.DrainPlayerNotices(8));
         Assert.Equal(1, notice.PlayerId);
-        Assert.Equal("获取 Wood ×3", notice.Text);
+        Assert.Equal("获取 木材 ×3", notice.Text);
         Assert.Empty(world.DrainPlayerNotices(8));   // 取走即清空
+    }
+
+    [Fact]
+    public void PickupItem_Uses_ItemDisplayName_Fallback()
+    {
+        var world = new WorldState { InventoryLedger = new AcceptingInventoryLedger() };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+        lock (world.ItemsLock)
+            world.Items.Add(new WorldItemEntity
+            {
+                Slot = 0,
+                ItemId = 99999,
+                Stack = 1,
+                Position = new Vector2(8, 8),
+            });
+
+        Assert.True(new PickupItemCommand(1, 1, 0).Apply(world, new XoshiroRng(1)).Applied);
+
+        Assert.Equal("获取 Item#99999 ×1", Assert.Single(world.DrainPlayerNotices(8)).Text);
     }
 
     [Fact]
@@ -664,6 +948,17 @@ public class SimulationTests
 
     // ---------- helpers ----------
 
+    private static (WorldState World, PlayerRuntime Player, Chest Chest) CreateTransferWorld(bool openSession = true)
+    {
+        var world = new WorldState();
+        var player = new PlayerRuntime { Id = 1, SessionId = 22, Active = true, Position = new Vector2(8, 8) };
+        var chest = new Chest { Index = 0, X = 0, Y = 0, Items = new ChestItem[40] };
+        lock (world.PlayersLock) world.Players[1] = player;
+        lock (world.ChestsLock) world.Chests.Add(chest);
+        if (openSession) world.OpenChestSession(1, 22, 0);
+        return (world, player, chest);
+    }
+
     private static (WorldState World, GameLoop Loop, WorldSimulator Sim, CommandQueue Commands) CreateSim()
     {
         var world = new WorldState();
@@ -692,6 +987,15 @@ public class SimulationTests
         public bool TryAddItem(int playerId, int itemId, int stack) => true;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => true;
     }
+}
+
+sealed class FixedRng(params int[] values) : IRng
+{
+    private readonly Queue<int> _values = new(values);
+
+    public uint NextUInt32() => (uint)NextInt32(int.MaxValue);
+    public int NextInt32(int maxExclusive) => _values.Count > 0 ? _values.Dequeue() : 0;
+    public double NextDouble() => 0;
 }
 
 /// <summary>
@@ -2727,6 +3031,504 @@ public class WorldGeneratorTests
         Assert.Empty(hitOnly.Items);
     }
 
+    [Fact]
+    public void TileBreakCommand_BreaksChestObjectOnce_FromAnyPart()
+    {
+        var world = NewContainerWorld(21, style: 0, width: 2, out int anchorX, out int anchorY);
+        var chest = new Chest { Index = 0, X = anchorX, Y = anchorY, Items = Array.Empty<ChestItem>() };
+        world.Chests.Add(chest);
+        world.OpenChestSession(1, 0);
+
+        var result = new TileBreakCommand(1, 1, anchorX + 1, anchorY + 1, 0, 0).Apply(world, new XoshiroRng(7));
+
+        Assert.True(result.Applied);
+        for (int x = anchorX; x < anchorX + 2; x++)
+        for (int y = anchorY; y < anchorY + 2; y++)
+            Assert.False(world.Tiles[x, y].Active);
+        lock (world.ItemsLock)
+        {
+            var drop = Assert.Single(world.Items);
+            Assert.Equal(48, drop.ItemId);
+            Assert.Equal(1, drop.Stack);
+        }
+        Assert.Null(world.FindChestAt(anchorX, anchorY));
+        Assert.Null(world.FindChestByIndex(0));
+        Assert.False(world.HasChestSession(1, 0));
+        Assert.Equal(new[] { 0 }, world.DrainDeletedPersistChests(10));
+        Assert.Equal(4, world.DrainTileUpdates(10).Count);
+    }
+
+    [Fact]
+    public void TileBreakCommand_UsesSecondChestAndDresserStyleDrops()
+    {
+        var secondChest = NewContainerWorld(467, style: 2, width: 2, out int chestX, out int chestY);
+        new TileBreakCommand(1, 1, chestX, chestY, 0, 0).Apply(secondChest, new XoshiroRng(7));
+        lock (secondChest.ItemsLock)
+            Assert.Equal(3939, Assert.Single(secondChest.Items).ItemId);
+
+        var dresser = NewContainerWorld(88, style: 4, width: 3, out int dresserX, out int dresserY);
+        new TileBreakCommand(1, 1, dresserX + 2, dresserY + 1, 0, 0).Apply(dresser, new XoshiroRng(7));
+        for (int x = dresserX; x < dresserX + 3; x++)
+        for (int y = dresserY; y < dresserY + 2; y++)
+            Assert.False(dresser.Tiles[x, y].Active);
+        lock (dresser.ItemsLock)
+            Assert.Equal(918, Assert.Single(dresser.Items).ItemId);
+    }
+
+    [Fact]
+    public void TileBreakCommand_BreaksContainerWithoutWorldChestRecord()
+    {
+        var world = NewContainerWorld(21, style: 0, width: 2, out int anchorX, out int anchorY);
+
+        var result = new TileBreakCommand(1, 1, anchorX, anchorY, 0, 0).Apply(world, new XoshiroRng(7));
+
+        Assert.True(result.Applied);
+        for (int x = anchorX; x < anchorX + 2; x++)
+        for (int y = anchorY; y < anchorY + 2; y++)
+            Assert.False(world.Tiles[x, y].Active);
+        lock (world.ItemsLock)
+            Assert.Equal(48, Assert.Single(world.Items).ItemId);
+        Assert.Empty(world.DrainDeletedPersistChests(10));
+    }
+
+    [Fact]
+    public void TileBreakCommand_RejectsNonEmptyOrIncompleteContainerObject()
+    {
+        var nonEmpty = NewContainerWorld(21, style: 0, width: 2, out int anchorX, out int anchorY);
+        nonEmpty.Chests.Add(new Chest
+        {
+            Index = 0,
+            X = anchorX,
+            Y = anchorY,
+            Items = new[] { new ChestItem { Type = 1, Stack = 1 } },
+        });
+        nonEmpty.OpenChestSession(1, 0);
+
+        var rejected = new TileBreakCommand(1, 1, anchorX, anchorY, 0, 0).Apply(nonEmpty, new XoshiroRng(7));
+
+        Assert.False(rejected.Applied);
+        Assert.All(Enumerable.Range(anchorX, 2), x =>
+            Assert.All(Enumerable.Range(anchorY, 2), y => Assert.True(nonEmpty.Tiles[x, y].Active)));
+        Assert.Empty(nonEmpty.Items);
+        Assert.NotNull(nonEmpty.FindChestByIndex(0));
+        Assert.True(nonEmpty.HasChestSession(1, 0));
+        Assert.Empty(nonEmpty.DrainDeletedPersistChests(10));
+
+        var incomplete = NewContainerWorld(88, style: 0, width: 3, out int dresserX, out int dresserY);
+        incomplete.Tiles[dresserX + 2, dresserY + 1].Active = false;
+        var incompleteResult = new TileBreakCommand(1, 1, dresserX, dresserY, 0, 0).Apply(incomplete, new XoshiroRng(7));
+        Assert.False(incompleteResult.Applied);
+        Assert.True(incomplete.Tiles[dresserX, dresserY].Active);
+        Assert.Empty(incomplete.Items);
+    }
+
+    private static WorldState NewContainerWorld(int type, int style, int width, out int anchorX, out int anchorY)
+    {
+        var world = new WorldState { MaxTilesX = 10, MaxTilesY = 10, Tiles = new TileMap(10, 10) };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+
+        anchorX = 3;
+        anchorY = 3;
+        int styleFrameWidth = width * 18;
+        for (int localX = 0; localX < width; localX++)
+        for (int localY = 0; localY < 2; localY++)
+        {
+            world.Tiles[anchorX + localX, anchorY + localY] = new Tile
+            {
+                Active = true,
+                Type = (ushort)type,
+                FrameX = (short)(style * styleFrameWidth + localX * 18),
+                FrameY = (short)(localY * 18),
+            };
+        }
+        return world;
+    }
+
+    [Theory]
+    [InlineData(406, 3, 3, 3365)]
+    [InlineData(102, 3, 4, 355)]
+    [InlineData(106, 3, 2, 363)]
+    public void TileBreakCommand_BreaksStatelessMultiTileObjectOnce_FromAnyPart(
+        int type, int width, int height, int expectedItem)
+    {
+        var world = NewStatelessMultiTileWorld(type, width, height, styleX: 2, styleY: 1,
+            out int anchorX, out int anchorY);
+
+        var result = new TileBreakCommand(1, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.True(result.Applied);
+        for (int x = anchorX; x < anchorX + width; x++)
+        for (int y = anchorY; y < anchorY + height; y++)
+            Assert.False(world.Tiles[x, y].Active);
+        lock (world.ItemsLock)
+        {
+            var drop = Assert.Single(world.Items);
+            Assert.Equal(expectedItem, drop.ItemId);
+            Assert.Equal(1, drop.Stack);
+        }
+        Assert.Equal(width * height, world.DrainTileUpdates(100).Count);
+    }
+
+    [Theory]
+    [InlineData(406, 3, 3)]
+    [InlineData(102, 3, 4)]
+    [InlineData(106, 3, 2)]
+    public void TileBreakCommand_RejectsIncompleteStatelessMultiTileObject(int type, int width, int height)
+    {
+        var world = NewStatelessMultiTileWorld(type, width, height, styleX: 0, styleY: 0,
+            out int anchorX, out int anchorY);
+        world.Tiles[anchorX + width - 1, anchorY + height - 1].Active = false;
+
+        var result = new TileBreakCommand(1, 1, anchorX + 1, anchorY, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.False(result.Applied);
+        Assert.True(world.Tiles[anchorX + 1, anchorY].Active);
+        Assert.Empty(world.Items);
+    }
+
+    private static WorldState NewStatelessMultiTileWorld(int type, int width, int height, int styleX, int styleY,
+        out int anchorX, out int anchorY)
+    {
+        var world = new WorldState { MaxTilesX = 12, MaxTilesY = 12, Tiles = new TileMap(12, 12) };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+
+        anchorX = 3;
+        anchorY = 3;
+        for (int x = 0; x < width; x++)
+        for (int y = 0; y < height; y++)
+        {
+            world.Tiles[anchorX + x, anchorY + y] = new Tile
+            {
+                Active = true,
+                Type = (ushort)type,
+                FrameX = (short)(styleX * width * 18 + x * 18),
+                FrameY = (short)(styleY * height * 18 + y * 18),
+            };
+        }
+        return world;
+    }
+
+    [Theory]
+    [InlineData(395, 2, 2, 1, 3270)]
+    [InlineData(471, 3, 3, 4, 2699)]
+    [InlineData(520, 1, 1, 6, 4326)]
+    [InlineData(698, 1, 2, 8, 5472)]
+    public void TileBreakCommand_DisplayItemEntity_ReturnsPayloadThenBreaksShell(
+        int tileType, int width, int height, byte entityType, int shellItem)
+    {
+        var world = NewDisplayTileEntityWorld(tileType, width, height, entityType, out int anchorX, out int anchorY,
+            out var entity);
+        entity.Item = new TileEntityItem { Type = 123, Prefix = 17, Stack = 4 };
+        world.DrainDirtyTileEntities(10);
+
+        var first = new TileBreakCommand(1, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.True(first.Applied);
+        Assert.All(Enumerable.Range(anchorX, width), x =>
+            Assert.All(Enumerable.Range(anchorY, height), y => Assert.True(world.Tiles[x, y].Active)));
+        Assert.True(entity.Item.IsAir);
+        Assert.Equal(new[] { entity.Id }, world.DrainDirtyTileEntities(10));
+        lock (world.ItemsLock)
+        {
+            var payload = Assert.Single(world.Items);
+            Assert.Equal(123, payload.ItemId);
+            Assert.Equal(4, payload.Stack);
+            Assert.Equal(17, payload.Prefix);
+        }
+
+        var second = new TileBreakCommand(2, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.True(second.Applied);
+        Assert.All(Enumerable.Range(anchorX, width), x =>
+            Assert.All(Enumerable.Range(anchorY, height), y => Assert.False(world.Tiles[x, y].Active)));
+        lock (world.ItemsLock)
+        {
+            Assert.Equal(2, world.Items.Count);
+            Assert.Contains(world.Items, item => item.ItemId == shellItem && item.Stack == 1);
+        }
+        Assert.False(world.TryGetTileEntity(entity.Id, out _));
+        Assert.Equal(new[] { entity.Id }, world.DrainDeletedTileEntities(10).Select(static deletion => deletion.RuntimeId));
+        Assert.Equal(width * height, world.DrainTileUpdates(100).Count);
+    }
+
+    [Theory]
+    [InlineData(470, 2, 3, 3, 498)]
+    [InlineData(475, 3, 4, 5, 3977)]
+    public void TileBreakCommand_DisplayDollAndHatRack_ReturnAllPayloadThenBreakWhenEmpty(
+        int tileType, int width, int height, byte entityType, int shellItem)
+    {
+        var world = NewDisplayTileEntityWorld(tileType, width, height, entityType, out int anchorX, out int anchorY,
+            out var entity);
+        if (tileType == 470)
+        {
+            entity.DisplayDollItems[0] = new TileEntityItem { Type = 121, Prefix = 3, Stack = 2 };
+            entity.DisplayDollDyes[8] = new TileEntityItem { Type = 122, Prefix = 4, Stack = 3 };
+            entity.DisplayDollMisc = new TileEntityItem { Type = 123, Prefix = 5, Stack = 4 };
+        }
+        else
+        {
+            entity.HatRackHats[0] = new TileEntityItem { Type = 121, Prefix = 3, Stack = 2 };
+            entity.HatRackHats[1] = new TileEntityItem { Type = 122, Prefix = 4, Stack = 3 };
+            entity.HatRackDyes[0] = new TileEntityItem { Type = 123, Prefix = 5, Stack = 4 };
+        }
+        world.DrainDirtyTileEntities(10);
+
+        var first = new TileBreakCommand(1, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.True(first.Applied);
+        Assert.All(Enumerable.Range(anchorX, width), x =>
+            Assert.All(Enumerable.Range(anchorY, height), y => Assert.True(world.Tiles[x, y].Active)));
+        Assert.True(world.TryGetTileEntity(entity.Id, out _));
+        Assert.Equal(new[] { entity.Id }, world.DrainDirtyTileEntities(10));
+        lock (world.ItemsLock)
+        {
+            Assert.Equal(3, world.Items.Count);
+            Assert.Contains(world.Items, item => item.ItemId == 121 && item.Stack == 2 && item.Prefix == 3);
+            Assert.Contains(world.Items, item => item.ItemId == 122 && item.Stack == 3 && item.Prefix == 4);
+            Assert.Contains(world.Items, item => item.ItemId == 123 && item.Stack == 4 && item.Prefix == 5);
+        }
+
+        var broken = new TileBreakCommand(2, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.True(broken.Applied);
+        Assert.All(Enumerable.Range(anchorX, width), x =>
+            Assert.All(Enumerable.Range(anchorY, height), y => Assert.False(world.Tiles[x, y].Active)));
+        lock (world.ItemsLock)
+            Assert.Contains(world.Items, item => item.ItemId == shellItem && item.Stack == 1);
+        Assert.Equal(new[] { entity.Id }, world.DrainDeletedTileEntities(10).Select(static deletion => deletion.RuntimeId));
+    }
+
+    [Theory]
+    [InlineData(395, 2, 2)]
+    [InlineData(471, 3, 3)]
+    [InlineData(520, 1, 1)]
+    [InlineData(698, 1, 2)]
+    [InlineData(470, 2, 3)]
+    [InlineData(475, 3, 4)]
+    public void TileBreakCommand_DisplayTileEntityWithoutRecord_IsRejected(int tileType, int width, int height)
+    {
+        var world = NewDisplayTileEntityWorld(tileType, width, height, entityType: 0, out int anchorX, out int anchorY,
+            out _);
+
+        var result = new TileBreakCommand(1, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.False(result.Applied);
+        Assert.All(Enumerable.Range(anchorX, width), x =>
+            Assert.All(Enumerable.Range(anchorY, height), y => Assert.True(world.Tiles[x, y].Active)));
+        Assert.Empty(world.Items);
+    }
+
+    [Theory]
+    [InlineData(395, 2, 2, 1)]
+    [InlineData(471, 3, 3, 4)]
+    [InlineData(520, 1, 1, 6)]
+    [InlineData(698, 1, 2, 8)]
+    [InlineData(470, 2, 3, 3)]
+    [InlineData(475, 3, 4, 5)]
+    public void TileBreakCommand_DisplayTileEntityWithWrongTypeOrIncompleteFrame_IsRejected(
+        int tileType, int width, int height, byte entityType)
+    {
+        var wrongTypeWorld = NewDisplayTileEntityWorld(tileType, width, height, entityType, out int anchorX,
+            out int anchorY, out var wrongTypeEntity);
+        wrongTypeEntity.Type = 0;
+        var wrongType = new TileBreakCommand(1, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(wrongTypeWorld, new XoshiroRng(7));
+        Assert.False(wrongType.Applied);
+        Assert.True(wrongTypeWorld.Tiles[anchorX + width - 1, anchorY + height - 1].Active);
+        Assert.Empty(wrongTypeWorld.Items);
+
+        var incompleteWorld = NewDisplayTileEntityWorld(tileType, width, height, entityType, out anchorX,
+            out anchorY, out _);
+        incompleteWorld.Tiles[anchorX + width - 1, anchorY + height - 1].FrameX++;
+        var incomplete = new TileBreakCommand(1, 1, anchorX, anchorY, 0, 0)
+            .Apply(incompleteWorld, new XoshiroRng(7));
+        Assert.False(incomplete.Applied);
+        Assert.True(incompleteWorld.Tiles[anchorX, anchorY].Active);
+        Assert.Empty(incompleteWorld.Items);
+    }
+
+    [Fact]
+    public void TileBreakCommand_DisplayDoll_UsesVanillaFemaleStyleShellDrop()
+    {
+        var world = NewDisplayTileEntityWorld(470, 2, 3, 3, out int anchorX, out int anchorY, out _);
+        for (int x = 0; x < 2; x++)
+        for (int y = 0; y < 3; y++)
+            world.Tiles[anchorX + x, anchorY + y].FrameX += 72;
+
+        var result = new TileBreakCommand(1, 1, anchorX + 1, anchorY + 2, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.True(result.Applied);
+        lock (world.ItemsLock)
+            Assert.Equal(1989, Assert.Single(world.Items).ItemId);
+    }
+
+    private static WorldState NewDisplayTileEntityWorld(int tileType, int width, int height, byte entityType,
+        out int anchorX, out int anchorY, out TileEntity entity)
+    {
+        var world = new WorldState { MaxTilesX = 12, MaxTilesY = 12, Tiles = new TileMap(12, 12) };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+
+        anchorX = 3;
+        anchorY = 3;
+        for (int x = 0; x < width; x++)
+        for (int y = 0; y < height; y++)
+        {
+            world.Tiles[anchorX + x, anchorY + y] = new Tile
+            {
+                Active = true,
+                Type = (ushort)tileType,
+                FrameX = (short)(x * 18),
+                FrameY = (short)(y * 18),
+            };
+        }
+
+        entity = new TileEntity { Type = entityType, X = (short)anchorX, Y = (short)anchorY };
+        if (entityType != 0) world.InsertTileEntity(entity);
+        return world;
+    }
+
+    [Theory]
+    [InlineData(423, 1, 1, 2, 0, 0, 0, 0, 3613)]
+    [InlineData(423, 1, 1, 2, 0, 0, 0, 6, 3729)]
+    [InlineData(378, 2, 3, 0, 1, 2, 0, 0, 3202)]
+    [InlineData(597, 3, 4, 7, 2, 3, 0, 0, 4876)]
+    [InlineData(597, 3, 4, 7, 2, 3, 10, 0, 5653)]
+    public void TileBreakCommand_RuntimeTileEntityShell_BreaksValidatedFootprint(
+        int tileType, int width, int height, byte entityType, int hitX, int hitY, int styleX, int styleY,
+        int expectedItem)
+    {
+        var world = NewRuntimeTileEntityWorld(tileType, width, height, entityType, styleX, styleY,
+            out int anchorX, out int anchorY, out var entity);
+
+        var result = new TileBreakCommand(1, 1, anchorX + hitX, anchorY + hitY, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.True(result.Applied);
+        Assert.All(Enumerable.Range(anchorX, width), x =>
+            Assert.All(Enumerable.Range(anchorY, height), y => Assert.False(world.Tiles[x, y].Active)));
+        lock (world.ItemsLock)
+        {
+            var drop = Assert.Single(world.Items);
+            Assert.Equal(expectedItem, drop.ItemId);
+            Assert.Equal(1, drop.Stack);
+        }
+        Assert.False(world.TryGetTileEntity(entity.Id, out _));
+        Assert.Equal(new[] { entity.Id }, world.DrainDeletedTileEntities(10).Select(static deletion => deletion.RuntimeId));
+        Assert.Equal(width * height, world.DrainTileUpdates(100).Count);
+    }
+
+    [Theory]
+    [InlineData(723, 9)]
+    [InlineData(724, 10)]
+    public void TileBreakCommand_LeashedAnchor_ReturnsTypeOnlyPayloadWithoutShell(int tileType, byte entityType)
+    {
+        var world = NewRuntimeTileEntityWorld(tileType, 1, 1, entityType, 0, 0,
+            out int anchorX, out int anchorY, out var entity);
+        entity.Item = new TileEntityItem { Type = 123, Stack = 4, Prefix = 17 };
+
+        var result = new TileBreakCommand(1, 1, anchorX, anchorY, 0, 0).Apply(world, new XoshiroRng(7));
+
+        Assert.True(result.Applied);
+        Assert.False(world.Tiles[anchorX, anchorY].Active);
+        lock (world.ItemsLock)
+        {
+            var drop = Assert.Single(world.Items);
+            Assert.Equal(123, drop.ItemId);
+            Assert.Equal(1, drop.Stack);
+            Assert.Equal(0, drop.Prefix);
+        }
+        Assert.False(world.TryGetTileEntity(entity.Id, out _));
+        Assert.Equal(new[] { entity.Id }, world.DrainDeletedTileEntities(10).Select(static deletion => deletion.RuntimeId));
+        Assert.Single(world.DrainTileUpdates(10));
+    }
+
+    [Theory]
+    [InlineData(423, 1, 1, 2)]
+    [InlineData(378, 2, 3, 0)]
+    [InlineData(597, 3, 4, 7)]
+    [InlineData(723, 1, 1, 9)]
+    [InlineData(724, 1, 1, 10)]
+    public void TileBreakCommand_RuntimeTileEntityWithoutRecord_IsRejected(int tileType, int width, int height,
+        byte entityType)
+    {
+        var world = NewRuntimeTileEntityWorld(tileType, width, height, entityType, 0, 0,
+            out int anchorX, out int anchorY, out var entity);
+        world.RemoveTileEntity(entity.Id);
+
+        var result = new TileBreakCommand(1, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(world, new XoshiroRng(7));
+
+        Assert.False(result.Applied);
+        Assert.All(Enumerable.Range(anchorX, width), x =>
+            Assert.All(Enumerable.Range(anchorY, height), y => Assert.True(world.Tiles[x, y].Active)));
+        Assert.Empty(world.Items);
+    }
+
+    [Theory]
+    [InlineData(423, 1, 1, 2)]
+    [InlineData(378, 2, 3, 0)]
+    [InlineData(597, 3, 4, 7)]
+    [InlineData(723, 1, 1, 9)]
+    [InlineData(724, 1, 1, 10)]
+    public void TileBreakCommand_RuntimeTileEntityWithWrongTypeOrIncompleteFootprint_IsRejected(
+        int tileType, int width, int height, byte entityType)
+    {
+        var wrongTypeWorld = NewRuntimeTileEntityWorld(tileType, width, height, entityType, 0, 0,
+            out int anchorX, out int anchorY, out var wrongTypeEntity);
+        wrongTypeEntity.Type = (byte)(entityType == 0 ? 1 : 0);
+        var wrongType = new TileBreakCommand(1, 1, anchorX + width - 1, anchorY + height - 1, 0, 0)
+            .Apply(wrongTypeWorld, new XoshiroRng(7));
+        Assert.False(wrongType.Applied);
+        Assert.True(wrongTypeWorld.Tiles[anchorX + width - 1, anchorY + height - 1].Active);
+        Assert.Empty(wrongTypeWorld.Items);
+
+        var incompleteWorld = NewRuntimeTileEntityWorld(tileType, width, height, entityType, 0, 0,
+            out anchorX, out anchorY, out _);
+        incompleteWorld.Tiles[anchorX + width - 1, anchorY + height - 1].FrameX++;
+        var incomplete = new TileBreakCommand(1, 1, anchorX, anchorY, 0, 0)
+            .Apply(incompleteWorld, new XoshiroRng(7));
+        Assert.False(incomplete.Applied);
+        Assert.True(incompleteWorld.Tiles[anchorX, anchorY].Active);
+        Assert.Empty(incompleteWorld.Items);
+    }
+
+    private static WorldState NewRuntimeTileEntityWorld(int tileType, int width, int height, byte entityType,
+        int styleX, int styleY, out int anchorX, out int anchorY, out TileEntity entity)
+    {
+        var world = new WorldState { MaxTilesX = 12, MaxTilesY = 12, Tiles = new TileMap(12, 12) };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+
+        anchorX = 3;
+        anchorY = 3;
+        for (int x = 0; x < width; x++)
+        for (int y = 0; y < height; y++)
+        {
+            world.Tiles[anchorX + x, anchorY + y] = new Tile
+            {
+                Active = true,
+                Type = (ushort)tileType,
+                FrameX = (short)((styleX * width + x) * 18),
+                FrameY = (short)((styleY * height + y) * 18),
+            };
+        }
+
+        entity = world.InsertTileEntity(new TileEntity { Type = entityType, X = (short)anchorX, Y = (short)anchorY });
+        world.DrainDirtyTileEntities(10);
+        return world;
+    }
+
     /// <summary>构造成 8×8 世界：玩家在 (1,1)、(3,3) 为指定类型的实心图格。</summary>
     private static WorldState NewTileWorld(int tileType, out int tx, out int ty)
     {
@@ -2757,7 +3559,7 @@ public class WorldGeneratorTests
         world.Tiles[bx - 1, baseY - 2] = new Tile { Active = true, Type = 5 };     // 枝条（4 邻接）
         world.Tiles[bx, baseY + 1] = new Tile { Active = true, Type = 0 };         // 树下泥土：不得被清掉
 
-        new TileBreakCommand(1, 1, bx, baseY, 0, 0).Apply(world, new XoshiroRng(3));
+        new TileBreakCommand(1, 1, bx, baseY, 0, 0).Apply(world, new FixedRng(34, 2));
 
         for (int y = baseY; y > baseY - height; y--)
             Assert.False(world.Tiles[bx, y].Active, $"树干 ({bx},{y}) 未随整棵倒下清除");
@@ -2772,6 +3574,243 @@ public class WorldGeneratorTests
         }
     }
 
+    [Fact]
+    public void TileBreakCommand_Drops_Mature_And_Flowering_Herbs()
+    {
+        var mature = NewTileWorld(83, out int matureX, out int matureY);
+        mature.Tiles[matureX, matureY].FrameX = 18 * 6;
+
+        Assert.True(new TileBreakCommand(1, 1, matureX, matureY, 0, 0).Apply(mature, new FixedRng()).Applied);
+        var matureDrop = Assert.Single(mature.Items);
+        Assert.Equal(2358, matureDrop.ItemId);
+        Assert.Equal(1, matureDrop.Stack);
+
+        var flowering = NewTileWorld(84, out int floweringX, out int floweringY);
+        flowering.Tiles[floweringX, floweringY].FrameX = 18 * 6;
+
+        Assert.True(new TileBreakCommand(1, 1, floweringX, floweringY, 0, 0).Apply(flowering, new FixedRng(0, 0, 2)).Applied);
+        Assert.Collection(flowering.Items.OrderBy(i => i.ItemId),
+            herb => { Assert.Equal(2357, herb.ItemId); Assert.Equal(3, herb.Stack); },
+            seed => { Assert.Equal(2358, seed.ItemId); Assert.Equal(1, seed.Stack); });
+    }
+
+    [Theory]
+    [InlineData(102, 0, 0, 355)]
+    [InlineData(106, 0, 0, 363)]
+    [InlineData(212, 0, 0, 951)]
+    [InlineData(219, 0, 0, 997)]
+    [InlineData(220, 0, 0, 998)]
+    [InlineData(228, 0, 0, 1120)]
+    [InlineData(243, 0, 0, 1430)]
+    [InlineData(247, 0, 0, 1551)]
+    [InlineData(283, 0, 0, 2172)]
+    [InlineData(300, 0, 0, 2192)]
+    [InlineData(303, 0, 0, 2195)]
+    [InlineData(306, 0, 0, 2198)]
+    [InlineData(307, 0, 0, 2203)]
+    [InlineData(308, 0, 0, 2204)]
+    [InlineData(354, 0, 0, 2999)]
+    [InlineData(355, 0, 0, 3000)]
+    [InlineData(487, 0, 0, 4064)]
+    [InlineData(487, 72, 0, 4064)]
+    [InlineData(487, 504, 0, 4064)]
+    [InlineData(493, 0, 0, 4083)]
+    [InlineData(493, 90, 0, 4088)]
+    [InlineData(4, 0, 0, 8)]
+    [InlineData(4, 0, 176, 523)]
+    [InlineData(4, 0, 484, 5293)]
+    [InlineData(4, 0, 506, 5353)]
+    [InlineData(3, 144, 0, 5)]
+    [InlineData(24, 144, 0, 60)]
+    [InlineData(110, 144, 0, 5)]
+    [InlineData(201, 270, 0, 2887)]
+    [InlineData(14, 0, 0, 32)]
+    [InlineData(14, 54, 0, 638)]
+    [InlineData(14, 1836, 0, 3154)]
+    [InlineData(14, 1890, 0, 32)]
+    [InlineData(469, 0, 0, 3920)]
+    [InlineData(469, 486, 0, 5165)]
+    [InlineData(469, 1674, 0, 6128)]
+    [InlineData(469, 1728, 0, 3920)]
+    [InlineData(441, 0, 0, 3665)]
+    [InlineData(441, 252, 0, 3668)]
+    [InlineData(441, 1836, 0, 3704)]
+    [InlineData(441, 1872, 0, 3665)]
+    [InlineData(468, 0, 0, 3886)]
+    [InlineData(468, 180, 0, 4164)]
+    [InlineData(468, 1332, 0, 6131)]
+    [InlineData(468, 1368, 0, 3886)]
+    [InlineData(15, 0, 0, 34)]
+    [InlineData(15, 0, 720, 1703)]
+    [InlineData(15, 0, 2680, 6116)]
+    [InlineData(15, 0, 2720, 34)]
+    [InlineData(18, 0, 0, 36)]
+    [InlineData(18, 648, 0, 2229)]
+    [InlineData(18, 2304, 0, 6130)]
+    [InlineData(18, 2340, 0, 36)]
+    [InlineData(34, 0, 0, 106)]
+    [InlineData(34, 108, 0, 3894)]
+    [InlineData(34, 108, 1782, 6117)]
+    [InlineData(34, 108, 1836, 106)]
+    [InlineData(42, 0, 0, 136)]
+    [InlineData(42, 0, 1188, 2820)]
+    [InlineData(42, 0, 2520, 6123)]
+    [InlineData(42, 0, 2556, 136)]
+    [InlineData(79, 0, 0, 224)]
+    [InlineData(79, 0, 972, 2811)]
+    [InlineData(79, 0, 2304, 6112)]
+    [InlineData(79, 0, 2340, 224)]
+    [InlineData(87, 0, 0, 333)]
+    [InlineData(87, 2106, 0, 4579)]
+    [InlineData(87, 3456, 0, 6124)]
+    [InlineData(87, 3510, 0, 333)]
+    [InlineData(89, 0, 0, 335)]
+    [InlineData(89, 2268, 0, 4582)]
+    [InlineData(89, 3672, 0, 6127)]
+    [InlineData(89, 3726, 0, 335)]
+    [InlineData(90, 0, 0, 336)]
+    [InlineData(90, 0, 1404, 4566)]
+    [InlineData(90, 0, 2304, 6111)]
+    [InlineData(90, 0, 2340, 336)]
+    [InlineData(93, 0, 0, 342)]
+    [InlineData(93, 0, 2106, 4577)]
+    [InlineData(93, 0, 3456, 6122)]
+    [InlineData(93, 0, 3510, 342)]
+    [InlineData(100, 0, 0, 349)]
+    [InlineData(100, 0, 1404, 4570)]
+    [InlineData(100, 0, 2304, 6114)]
+    [InlineData(100, 0, 2340, 349)]
+    [InlineData(101, 0, 0, 354)]
+    [InlineData(101, 2160, 0, 4568)]
+    [InlineData(101, 3456, 0, 6113)]
+    [InlineData(101, 3510, 0, 354)]
+    [InlineData(104, 0, 0, 359)]
+    [InlineData(104, 1440, 0, 4575)]
+    [InlineData(104, 2340, 0, 6119)]
+    [InlineData(104, 2376, 0, 359)]
+    [InlineData(139, 0, 0, 562)]
+    [InlineData(139, 0, 1656, 4237)]
+    [InlineData(139, 0, 3600, 6146)]
+    [InlineData(139, 0, 3636, 576)]
+    [InlineData(172, 0, 0, 2827)]
+    [InlineData(172, 0, 1520, 4581)]
+    [InlineData(172, 0, 2470, 6126)]
+    [InlineData(172, 0, 2508, 2827)]
+    [InlineData(497, 0, 0, 4096)]
+    [InlineData(497, 0, 1240, 4127)]
+    [InlineData(497, 0, 1280, 4141)]
+    [InlineData(497, 0, 1560, 4731)]
+    [InlineData(497, 0, 2560, 6129)]
+    [InlineData(497, 0, 2600, 4096)]
+    [InlineData(33, 0, 0, 105)]
+    [InlineData(33, 0, 22, 1405)]
+    [InlineData(33, 0, 88, 2045)]
+    [InlineData(33, 0, 286, 2054)]
+    [InlineData(33, 0, 308, 2153)]
+    [InlineData(33, 0, 352, 2155)]
+    [InlineData(33, 0, 374, 2236)]
+    [InlineData(33, 0, 1386, 6115)]
+    [InlineData(33, 0, 1408, 105)]
+    [InlineData(19, 0, 0, 94)]
+    [InlineData(19, 0, 18, 631)]
+    [InlineData(19, 0, 540, 3903)]
+    [InlineData(19, 0, 630, 3908)]
+    [InlineData(19, 0, 648, 3945)]
+    [InlineData(19, 0, 1242, 6125)]
+    [InlineData(19, 0, 1260, 94)]
+    [InlineData(13, 0, 0, 31)]
+    [InlineData(13, 18, 0, 28)]
+    [InlineData(13, 144, 0, 2258)]
+    [InlineData(13, 162, 0, 31)]
+    [InlineData(227, 0, 0, 1107)]
+    [InlineData(227, 238, 0, 1114)]
+    [InlineData(227, 272, 0, 3385)]
+    [InlineData(227, 374, 0, 3388)]
+    [InlineData(227, 408, 0, 1119)]
+    [InlineData(178, 0, 0, 181)]
+    [InlineData(178, 108, 0, 999)]
+    [InlineData(703, 0, 0, 195)]
+    [InlineData(703, 108, 0, 208)]
+    [InlineData(703, 126, 0, 208)]
+    [InlineData(703, 144, 0, 331)]
+    [InlineData(703, 162, 0, 223)]
+    [InlineData(703, 180, 0, 195)]
+    [InlineData(135, 0, 108, 1151)]
+    [InlineData(137, 0, 90, 5135)]
+    [InlineData(144, 72, 0, 4485)]
+    [InlineData(239, 0, 0, 20)]
+    [InlineData(239, 126, 0, 706)]
+    [InlineData(239, 396, 0, 3467)]
+    [InlineData(324, 0, 88, 4071)]
+    [InlineData(380, 0, 36, 3217)]
+    [InlineData(419, 36, 0, 3663)]
+    [InlineData(420, 0, 90, 3608)]
+    [InlineData(423, 0, 108, 3729)]
+    [InlineData(428, 0, 54, 3626)]
+    [InlineData(650, 504, 0, 9)]
+    [InlineData(650, 1350, 0, 276)]
+    [InlineData(50, 0, 0, 149)]
+    [InlineData(50, 90, 0, 165)]
+    [InlineData(707, 90, 0, 165)]
+    [InlineData(129, 0, 0, 502)]
+    [InlineData(129, 324, 0, 4988)]
+    [InlineData(149, 0, 0, 596)]
+    [InlineData(149, 18, 0, 597)]
+    [InlineData(149, 36, 0, 598)]
+    [InlineData(149, 54, 0, 596)]
+    public void TileDropTable_Uses_Frames_For_StyleSpecific_Drops(
+        int tileType, short frameX, short frameY, int expectedItem)
+    {
+        Assert.True(TileDropTable.TryGet(tileType, frameX, frameY, out int itemId, out int stack));
+        Assert.Equal(expectedItem, itemId);
+        Assert.Equal(1, stack);
+    }
+
+    [Fact]
+    public void TileDropTable_Rejects_Unknown_Bathtub_Frame()
+    {
+        Assert.False(TileDropTable.TryGet(149, 108, 0, out _, out _));
+    }
+
+    [Theory]
+    [InlineData(3, 126, 0)]
+    [InlineData(24, 162, 0)]
+    [InlineData(110, 126, 0)]
+    [InlineData(201, 252, 0)]
+    [InlineData(178, 126, 0)]
+    [InlineData(135, 0, 126)]
+    [InlineData(137, 0, 108)]
+    [InlineData(144, 90, 0)]
+    [InlineData(239, 414, 0)]
+    [InlineData(324, 0, 110)]
+    [InlineData(419, 54, 0)]
+    [InlineData(650, 1476, 0)]
+    [InlineData(468, 144, 0)]
+    [InlineData(493, 108, 0)]
+    public void TileDropTable_Rejects_Unknown_Style_Frame(int tileType, short frameX, short frameY)
+    {
+        Assert.False(TileDropTable.TryGet(tileType, frameX, frameY, out _, out _));
+    }
+
+    [Fact]
+    public void TileBreakCommand_Tree_AxePower_Adds_One_Wood_Per_Tree()
+    {
+        var world = NewTileWorld(5, out int tx, out int ty);
+        lock (world.PlayersLock)
+        {
+            var player = world.Players[1];
+            player.SelectedSlot = 0;
+            player.Items[0] = 10;
+        }
+
+        Assert.True(new TileBreakCommand(1, 1, tx, ty, 0, 0).Apply(world, new FixedRng(9)).Applied);
+        var wood = Assert.Single(world.Items);
+        Assert.Equal(9, wood.ItemId);
+        Assert.Equal(2, wood.Stack);
+        Assert.Equal(9, AxePowerTable.AxePowerOf(10));
+        Assert.Equal(0, AxePowerTable.AxePowerOf(99999));
+    }
+
     /// <summary>
     /// SSC 玩家档案编解码往返：背包（含前缀）+ 生命 / 法力逐字段还原；空 / 截断存档按「无档案」处理；
     /// 存档里生命为 0（断线时已死亡）→ 重进按满血复活。
@@ -2781,8 +3820,10 @@ public class WorldGeneratorTests
     {
         var source = new PlayerRuntime { Hp = 73, HpMax = 120, Mp = 45, MpMax = 60 };
         source.Items[3] = 122;        // 熔岩镐
+        source.ItemStacks[3] = 12;
         source.ItemPrefixes[3] = 5;
         source.Items[58] = 3319;      // 眼魔宝袋
+        source.ItemStacks[58] = 1;
 
         var restored = new PlayerRuntime();
         Assert.True(PlayerProfileCodec.TryApply(PlayerProfileCodec.Encode(source), restored));
@@ -2792,8 +3833,10 @@ public class WorldGeneratorTests
         Assert.Equal(45, restored.Mp);
         Assert.Equal(60, restored.MpMax);
         Assert.Equal(122, restored.Items[3]);
+        Assert.Equal(12, restored.ItemStacks[3]);
         Assert.Equal(5, restored.ItemPrefixes[3]);
         Assert.Equal(3319, restored.Items[58]);
+        Assert.Equal(1, restored.ItemStacks[58]);
 
         Assert.False(PlayerProfileCodec.TryApply(null, new PlayerRuntime()));
         Assert.False(PlayerProfileCodec.TryApply(new byte[] { 9, 1, 2 }, new PlayerRuntime())); // 版本不符/截断
@@ -2802,6 +3845,32 @@ public class WorldGeneratorTests
         var revived = new PlayerRuntime();
         Assert.True(PlayerProfileCodec.TryApply(PlayerProfileCodec.Encode(dead), revived));
         Assert.Equal(100, revived.Hp);
+    }
+
+    [Fact]
+    public void PlayerProfileCodec_LegacyVersionOne_RestoresNonEmptyItemsWithOneStack()
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write((byte)1);
+            writer.Write(100);
+            writer.Write(100);
+            writer.Write(20);
+            writer.Write(20);
+            for (int i = 0; i < PlayerRuntime.InventorySlotCount; i++)
+            {
+                writer.Write((short)(i == 3 ? 122 : 0));
+                writer.Write((byte)(i == 3 ? 5 : 0));
+            }
+        }
+
+        var restored = new PlayerRuntime();
+        Assert.True(PlayerProfileCodec.TryApply(stream.ToArray(), restored));
+        Assert.Equal(122, restored.Items[3]);
+        Assert.Equal(1, restored.ItemStacks[3]);
+        Assert.Equal(5, restored.ItemPrefixes[3]);
+        Assert.Equal(0, restored.ItemStacks[4]);
     }
 
     /// <summary>

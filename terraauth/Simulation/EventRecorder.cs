@@ -77,6 +77,16 @@ public static class CommandFailures
     public const string StrikeDamageMismatch = "strike_damage_mismatch";
     /// <summary>阶段 H：召唤弹幕 spawn 上报伤害超出手持召唤武器的权威上界（武器伤害 × 1.15 容差）。</summary>
     public const string ProjectileDamageAboveBound = "projectile_damage_above_bound";
+    /// <summary>包 27 的弹幕类型无法由服务端权威手持武器和弹药推出。</summary>
+    public const string ProjectileTypeNotAllowed = "projectile_type_not_allowed";
+    /// <summary>新建弹幕的位置或速度包含非有限值。</summary>
+    public const string ProjectileSpawnInvalid = "invalid_projectile_spawn";
+    /// <summary>新建弹幕的完整碰撞盒超出世界像素边界。</summary>
+    public const string ProjectileSpawnOutOfWorld = "projectile_spawn_out_of_world";
+    /// <summary>新建弹幕的原始初始速度超过服务端硬上限。</summary>
+    public const string ProjectileSpeedExceeded = "projectile_speed_exceeded";
+    /// <summary>普通手持发射的新建弹幕离服务端玩家位置过远。</summary>
+    public const string ProjectileSpawnTooFar = "projectile_spawn_too_far";
     /// <summary>阶段 H：空手 / 手持非召唤武器却 spawn 召唤弹幕（原版只有召唤武器能召唤）。</summary>
     public const string SummonRequiresSummonWeapon = "summon_requires_summon_weapon";
 }

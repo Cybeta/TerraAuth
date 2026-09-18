@@ -43,7 +43,7 @@ public sealed class AuthorityEnforcers
         _player = new PlayerAuthority(audit, player);
         _movement = new MovementAuthority(_player, audit, movement);
         _combat = new CombatAuthority(_player, audit, combat);
-        _inventory = new InventoryAuthority(audit, inventory);
+        _inventory = new InventoryAuthority(audit, inventory, world);
         _world = new WorldAuthority(_player, audit, worldLimits, world, _inventory);
         _rate = new RateAuthority(rate, audit);
     }

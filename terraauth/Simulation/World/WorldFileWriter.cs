@@ -109,11 +109,9 @@ public static class WorldFileWriter
         positions[4] = (int)ms.Position;
         WriteNpcs(w, state);
 
-        // 段 5..9 必须写出**合法的空编码**（各段起始位置互不相同）：
-        // 本服务端读取器会直接跳到 footer，但原版加载器会逐段读取并校验位置，
-        // 缺少这些段会让原版判定 BadSectionPointer 而拒绝加载。
+        // 段 5..9 必须写出合法编码（各段起始位置互不相同），否则原版会判定 BadSectionPointer。
         positions[5] = (int)ms.Position;
-        w.Write(0);                     // 图格实体：Int32 数量 0
+        WriteTileEntities(w, state);
 
         positions[6] = (int)ms.Position;
         w.Write(0);                     // 加权压力板：Int32 数量 0
@@ -502,8 +500,8 @@ public static class WorldFileWriter
 
     private static void WriteChests(BinaryWriter w, WorldState state)
     {
-        var chests = state.Chests;
-        w.Write((short)chests.Count);
+        var chests = state.Chests.Where(static chest => !chest.Deleted).ToArray();
+        w.Write((short)chests.Length);
 
         foreach (var chest in chests)
         {
@@ -526,6 +524,101 @@ public static class WorldFileWriter
                 w.Write(item.Prefix);
             }
         }
+    }
+
+    // ---------------- 段 5：图格实体 ----------------
+
+    private static void WriteTileEntities(BinaryWriter w, WorldState state)
+    {
+        var entities = state.SnapshotTileEntities();
+        w.Write(entities.Count);
+        foreach (var entity in entities)
+        {
+            if (entity.Type > 10)
+                throw new InvalidDataException($"不支持的图格实体类型：{entity.Type}");
+
+            w.Write(entity.Type);
+            w.Write(entity.FileId);
+            w.Write(entity.X);
+            w.Write(entity.Y);
+            switch (entity.Type)
+            {
+                case 0:
+                    w.Write((short)entity.NpcSlot);
+                    break;
+                case 1:
+                case 4:
+                case 6:
+                case 8:
+                    WriteTileEntityItem(w, entity.Item);
+                    break;
+                case 2:
+                    w.Write(entity.LogicCheck);
+                    w.Write(entity.On);
+                    break;
+                case 3:
+                    WriteDisplayDoll(w, entity);
+                    break;
+                case 5:
+                    WriteHatRack(w, entity);
+                    break;
+                case 7:
+                    break;
+                case 9:
+                case 10:
+                    w.Write(entity.Item.Type);
+                    break;
+            }
+        }
+    }
+
+    private static void WriteTileEntityItem(BinaryWriter w, TileEntityItem item)
+    {
+        w.Write(item.Type);
+        w.Write(item.Prefix);
+        w.Write(item.Stack);
+    }
+
+    private static void WriteDisplayDoll(BinaryWriter w, TileEntity entity)
+    {
+        byte itemBits = 0;
+        byte dyeBits = 0;
+        byte extraBits = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            if (!entity.DisplayDollItems[i].IsAir) itemBits |= (byte)(1 << i);
+            if (!entity.DisplayDollDyes[i].IsAir) dyeBits |= (byte)(1 << i);
+        }
+        if (!entity.DisplayDollItems[8].IsAir) extraBits |= 2;
+        if (!entity.DisplayDollDyes[8].IsAir) extraBits |= 4;
+        if (!entity.DisplayDollMisc.IsAir) extraBits |= 1;
+
+        w.Write(itemBits);
+        w.Write(dyeBits);
+        w.Write(entity.DisplayDollPose);
+        w.Write(extraBits);
+        for (int i = 0; i < 9; i++)
+            if (i < 8 ? (itemBits & (1 << i)) != 0 : (extraBits & 2) != 0)
+                WriteTileEntityItem(w, entity.DisplayDollItems[i]);
+        for (int i = 0; i < 9; i++)
+            if (i < 8 ? (dyeBits & (1 << i)) != 0 : (extraBits & 4) != 0)
+                WriteTileEntityItem(w, entity.DisplayDollDyes[i]);
+        if ((extraBits & 1) != 0) WriteTileEntityItem(w, entity.DisplayDollMisc);
+    }
+
+    private static void WriteHatRack(BinaryWriter w, TileEntity entity)
+    {
+        byte bits = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            if (!entity.HatRackHats[i].IsAir) bits |= (byte)(1 << i);
+            if (!entity.HatRackDyes[i].IsAir) bits |= (byte)(1 << (i + 2));
+        }
+        w.Write(bits);
+        for (int i = 0; i < 2; i++)
+            if ((bits & (1 << i)) != 0) WriteTileEntityItem(w, entity.HatRackHats[i]);
+        for (int i = 0; i < 2; i++)
+            if ((bits & (1 << (i + 2))) != 0) WriteTileEntityItem(w, entity.HatRackDyes[i]);
     }
 
     // ---------------- 段 3：告示牌 ----------------

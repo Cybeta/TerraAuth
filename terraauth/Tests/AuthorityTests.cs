@@ -293,6 +293,34 @@ public class AuthorityTests
         Assert.Equal(new[] { 1, 2, 3 }, order);
     }
 
+    [Fact]
+    public void InventoryAuthority_Uses_PlayerRuntime_ForPickupAndConsumption()
+    {
+        var world = new WorldState();
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
+        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 7, Active = true, Position = new Vector2(8, 8) };
+
+        lock (world.ItemsLock)
+            world.Items.Add(new WorldItemEntity
+            {
+                Slot = 0,
+                ItemId = 9,
+                Stack = 3,
+                Position = new Vector2(8, 8),
+            });
+
+        Assert.True(new PickupItemCommand(1, 1, 0) { SessionId = 7 }.Apply(world, new XoshiroRng(1)).Applied);
+        Assert.Equal(9, world.Players[1].Items[0]);
+        Assert.Equal(3, world.Players[1].ItemStacks[0]);
+        Assert.True(enforcers.Inventory.ConsumeItem(1, 9));
+        Assert.Equal(2, world.Players[1].ItemStacks[0]);
+
+        var updates = world.DrainInventoryUpdates(8);
+        Assert.Contains((1, 7L, 0), updates);
+    }
+
     private sealed class LambdaStage : IPipelineStage
     {
         private readonly int _id;

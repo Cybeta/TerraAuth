@@ -122,6 +122,7 @@ public class WorldFileTests
         var chests = BuildEmptyChests();
         var signs = BuildEmptySigns();
         var npcs = BuildEmptyNpcs();
+        var tileEntities = new byte[sizeof(int)];
         var footer = BuildFooter();
 
         int p0 = headerOffset;
@@ -129,10 +130,11 @@ public class WorldFileTests
         int p2 = p1 + tiles.Length;
         int p3 = p2 + chests.Length;
         int p4 = p3 + signs.Length;
-        int p5 = p4 + npcs.Length;      // 第 5 段（图格实体）起始 = NPC 段结束
-        int p10 = p5;                   // 6..9 段为空，footer 紧随其后
+        int p5 = p4 + npcs.Length;
+        int p6 = p5 + tileEntities.Length;
+        int p10 = p6;
 
-        int[] positions = { p0, p1, p2, p3, p4, p5, p5, p5, p5, p5, p10 };
+        int[] positions = { p0, p1, p2, p3, p4, p5, p6, p6, p6, p6, p10 };
 
         using var ms = new MemoryStream();
         using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
@@ -148,6 +150,7 @@ public class WorldFileTests
             w.Write(chests);
             w.Write(signs);
             w.Write(npcs);
+            w.Write(tileEntities);
             w.Write(footer);
         }
         return ms.ToArray();
@@ -301,6 +304,108 @@ public class WorldFileTests
         Assert.Equal(world.Npcs[0].GivenName, loaded.Npcs[0].GivenName);
         Assert.Equal(world.Npcs[0].Type, loaded.Npcs[0].Type);
         Assert.Equal(world.Npcs[1].Type, loaded.Npcs[1].Type);
+    }
+
+    [Fact]
+    public void Wld_Write_Then_Read_RoundTrips_All_TileEntity_Types()
+    {
+        var world = BuildFeatureWorld();
+        world.InsertTileEntity(new TileEntity { Type = 0, X = 1, Y = 1, NpcSlot = 123 });
+        world.InsertTileEntity(new TileEntity { Type = 1, X = 2, Y = 1, Item = Item(100, 2, 3) });
+        world.InsertTileEntity(new TileEntity { Type = 2, X = 3, Y = 1, LogicCheck = 7, On = true });
+        var doll = new TileEntity { Type = 3, X = 4, Y = 1, DisplayDollPose = 9 };
+        doll.DisplayDollItems[0] = Item(200, 1, 1);
+        doll.DisplayDollItems[8] = Item(201, 2, 2);
+        doll.DisplayDollDyes[3] = Item(202, 3, 1);
+        doll.DisplayDollDyes[8] = Item(203, 4, 1);
+        doll.DisplayDollMisc = Item(204, 5, 1);
+        world.InsertTileEntity(doll);
+        world.InsertTileEntity(new TileEntity { Type = 4, X = 5, Y = 1, Item = Item(300, 1, 1) });
+        var rack = new TileEntity { Type = 5, X = 6, Y = 1 };
+        rack.HatRackHats[0] = Item(400, 1, 1);
+        rack.HatRackHats[1] = Item(401, 2, 1);
+        rack.HatRackDyes[0] = Item(402, 3, 1);
+        rack.HatRackDyes[1] = Item(403, 4, 1);
+        world.InsertTileEntity(rack);
+        world.InsertTileEntity(new TileEntity { Type = 6, X = 7, Y = 1, Item = Item(500, 1, 1) });
+        world.InsertTileEntity(new TileEntity { Type = 7, X = 8, Y = 1 });
+        world.InsertTileEntity(new TileEntity { Type = 8, X = 9, Y = 1, Item = Item(600, 1, 1) });
+        world.InsertTileEntity(new TileEntity { Type = 9, X = 10, Y = 1, Item = new TileEntityItem { Type = 700 } });
+        world.InsertTileEntity(new TileEntity { Type = 10, X = 11, Y = 1, Item = new TileEntityItem { Type = 701 } });
+
+        var loaded = WorldFileReader.Read(new MemoryStream(WorldFileWriter.Serialize(world))).SnapshotTileEntities();
+
+        Assert.Equal(11, loaded.Count);
+        Assert.Equal(Enumerable.Range(0, 11), loaded.Select(static entity => entity.Id));
+        Assert.Equal(123, loaded[0].NpcSlot);
+        AssertTileEntityItem(Item(100, 2, 3), loaded[1].Item);
+        Assert.Equal((byte)7, loaded[2].LogicCheck);
+        Assert.True(loaded[2].On);
+        Assert.Equal((byte)9, loaded[3].DisplayDollPose);
+        AssertTileEntityItem(Item(200, 1, 1), loaded[3].DisplayDollItems[0]);
+        AssertTileEntityItem(Item(201, 2, 2), loaded[3].DisplayDollItems[8]);
+        AssertTileEntityItem(Item(203, 4, 1), loaded[3].DisplayDollDyes[8]);
+        AssertTileEntityItem(Item(204, 5, 1), loaded[3].DisplayDollMisc);
+        AssertTileEntityItem(Item(403, 4, 1), loaded[5].HatRackDyes[1]);
+        Assert.Equal((short)700, loaded[9].Item.Type);
+        Assert.Equal((short)701, loaded[10].Item.Type);
+    }
+
+    [Fact]
+    public void TileEntity_FilePayload_RoundTrips_ComplexEntities()
+    {
+        var doll = new TileEntity { Type = 3, FileId = 41, X = 12, Y = 13, DisplayDollPose = 9 };
+        doll.DisplayDollItems[0] = Item(200, 1, 1);
+        doll.DisplayDollItems[8] = Item(201, 2, 2);
+        doll.DisplayDollDyes[8] = Item(203, 4, 1);
+        doll.DisplayDollMisc = Item(204, 5, 1);
+
+        var rack = new TileEntity { Type = 5, FileId = 42, X = 14, Y = 15 };
+        rack.HatRackHats[0] = Item(400, 1, 1);
+        rack.HatRackDyes[1] = Item(403, 4, 1);
+
+        var loadedDoll = TileEntity.DeserializeFilePayload(doll.SerializeFilePayload());
+        var loadedRack = TileEntity.DeserializeFilePayload(rack.SerializeFilePayload());
+
+        Assert.Equal(doll.FileId, loadedDoll.FileId);
+        Assert.Equal(doll.X, loadedDoll.X);
+        Assert.Equal(doll.Y, loadedDoll.Y);
+        Assert.Equal(doll.DisplayDollPose, loadedDoll.DisplayDollPose);
+        AssertTileEntityItem(doll.DisplayDollItems[8], loadedDoll.DisplayDollItems[8]);
+        AssertTileEntityItem(doll.DisplayDollDyes[8], loadedDoll.DisplayDollDyes[8]);
+        AssertTileEntityItem(doll.DisplayDollMisc, loadedDoll.DisplayDollMisc);
+
+        Assert.Equal(rack.FileId, loadedRack.FileId);
+        AssertTileEntityItem(rack.HatRackHats[0], loadedRack.HatRackHats[0]);
+        AssertTileEntityItem(rack.HatRackDyes[1], loadedRack.HatRackDyes[1]);
+    }
+
+    [Fact]
+    public void Wld_Rejects_Unknown_TileEntity_Type()
+    {
+        var world = BuildFeatureWorld();
+        world.InsertTileEntity(new TileEntity { Type = 7, X = 1, Y = 1 });
+        var bytes = WorldFileWriter.Serialize(world);
+        using (var r = new BinaryReader(new MemoryStream(bytes), Encoding.UTF8, leaveOpen: false))
+        {
+            _ = r.ReadInt32(); _ = r.ReadUInt64(); _ = r.ReadUInt32(); _ = r.ReadUInt64();
+            int count = r.ReadInt16();
+            int[] positions = Enumerable.Range(0, count).Select(_ => r.ReadInt32()).ToArray();
+            bytes[positions[5] + sizeof(int)] = 11;
+        }
+
+        var error = Assert.Throws<InvalidDataException>(() => WorldFileReader.Read(new MemoryStream(bytes)));
+        Assert.Contains("不支持的图格实体类型", error.Message);
+    }
+
+    private static TileEntityItem Item(short type, byte prefix, short stack)
+        => new() { Type = type, Prefix = prefix, Stack = stack };
+
+    private static void AssertTileEntityItem(TileEntityItem expected, TileEntityItem actual)
+    {
+        Assert.Equal(expected.Type, actual.Type);
+        Assert.Equal(expected.Prefix, actual.Prefix);
+        Assert.Equal(expected.Stack, actual.Stack);
     }
 
     [Fact]

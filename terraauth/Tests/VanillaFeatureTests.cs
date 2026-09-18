@@ -431,7 +431,7 @@ public class VanillaFeatureTests
 
         await server.Host.FlushPlayerNoticesAsync();
         var chat = await s.ReadUntilAsync(p => p is NetTextPacket, TimeSpan.FromSeconds(5));
-        Assert.Contains(chat, p => p is NetTextPacket t && t.Text.Contains("DirtBlock"));
+        Assert.Contains(chat, p => p is NetTextPacket t && t.Text.Contains("获取 泥土块 ×1"));
     }
 
     [Fact]
@@ -457,25 +457,19 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task Vanilla_InventoryReport_Then_TilePlace_Succeeds()
+    public async Task AntiCheat_Ssc_Rejects_ClientInventorySnapshot()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
         var world = server.Host.Simulator.State;
-        int sx = world.SpawnTileX, sy = world.SpawnTileY;
-        await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+        var player = world.Players[1];
 
-        // 包 5：上报背包（SSC 启用时服务端持有唯一真相）→ 物品 ID 1（石）x10
-        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 1, 10));
+        // 合法 ID 与堆叠数也不能由客户端包 5 注入；757 是泰拉刃。
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 757, 1));
 
-        int tx = sx + 1, ty = sy - 2; // 地表上方空气格
-        Assert.False(world.Tiles[tx, ty].Active);
-
-        await s.SendAsync(PacketId.TilePlace, new TilePlacePacket(tx, ty, 1));
-
-        Assert.True(await TickUntilAsync(server, () => world.Tiles[tx, ty].Active, TimeSpan.FromSeconds(5)),
-            "放砖未生效（背包未同步或权威拒绝）");
-        Assert.Equal((ushort)1, world.Tiles[tx, ty].Type);
+        Assert.True(await WaitForRejectAsync(server, "inventory_snapshot_forbidden", TimeSpan.FromSeconds(5)),
+            "SSC 未拒绝客户端背包快照");
+        Assert.Equal(0, player.Items[0]);
     }
 
     [Fact]
@@ -1848,7 +1842,7 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task Vanilla_ChestItem_Is_Applied_Authoritatively()
+    public async Task AntiCheat_Ssc_Rejects_ClientChestSnapshot()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
@@ -1859,57 +1853,29 @@ public class VanillaFeatureTests
         await s.SendAsync(PacketId.Chest,
             new ChestPacket(world.SpawnTileX, world.SpawnTileY));
         await s.SendAsync(PacketId.SyncChestItem,
-            new SyncChestItemPacket(index, ItemSlot: 3, Stack: 7, Prefix: 0, ItemType: 5));
+            new SyncChestItemPacket(index, ItemSlot: 3, Stack: 1, Prefix: 0, ItemType: 757));
 
-        Assert.True(await TickUntilAsync(server,
-            () => world.Chests[index].Items[3] is { Stack: 7, Type: 5 },
-            TimeSpan.FromSeconds(5)), "箱内物品未在服务端落盘");
+        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
+            "SSC 未拒绝客户端箱子快照");
+        Assert.Equal(0, world.Chests[index].Items[3].Stack);
     }
 
     [Fact]
-    public async Task Vanilla_ChestItem_Update_Is_Sent_Only_To_Openers()
+    public async Task AntiCheat_Ssc_Rejects_ChestSnapshot_From_An_OpenSession()
     {
         using var server = VanillaServer.Start();
-        await using var a = await server.ConnectAsync("Alice");
-        await a.ReadUntilAsync(p => p is PlayerActivePacket, TimeSpan.FromSeconds(5));
-        await using var b = await server.ConnectAsync("Bee");
-        await b.ReadUntilAsync(p => p is PlayerActivePacket, TimeSpan.FromSeconds(5));
-        await a.ReadUntilAsync(p => p is PlayerActivePacket { PlayerId: 2 }, TimeSpan.FromSeconds(5));
-
+        await using var s = await server.ConnectAsync("Alice");
         var world = server.Host.Simulator.State;
-        await StandAtAsync(server, a, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
-        await StandAtAsync(server, b, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
         int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY);
 
-        await a.SendAsync(PacketId.Chest,
-            new ChestPacket(world.SpawnTileX, world.SpawnTileY));
-        await a.ReadUntilAsync(
-            p => p is PlayerChestIndexPacket { ChestIndex: var chestIndex } && chestIndex == index,
-            TimeSpan.FromSeconds(5));
-        await b.ReadUntilAsync(
-            _ => false,
-            TimeSpan.FromMilliseconds(100));
-
-        await a.SendAsync(PacketId.SyncChestItem,
+        await s.SendAsync(PacketId.Chest, new ChestPacket(world.SpawnTileX, world.SpawnTileY));
+        await s.SendAsync(PacketId.SyncChestItem,
             new SyncChestItemPacket(index, ItemSlot: 3, Stack: 7, Prefix: 0, ItemType: 5));
 
-        Assert.True(await TickUntilAsync(server,
-            () => world.Chests[index].Items[3] is { Stack: 7, Type: 5 },
-            TimeSpan.FromSeconds(5)), "箱子更新未提交到服务端");
-
-        var aUpdate = await a.ReadUntilAsync(
-            p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
-                 && chestIndex == index,
-            TimeSpan.FromSeconds(5));
-        Assert.Contains(aUpdate, p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
-                                      && chestIndex == index);
-
-        var bUpdate = await b.ReadUntilAsync(
-            p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
-                 && chestIndex == index,
-            TimeSpan.FromMilliseconds(300));
-        Assert.DoesNotContain(bUpdate, p => p is SyncChestItemPacket { ChestIndex: var chestIndex, ItemSlot: 3 }
-                                             && chestIndex == index);
+        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
+            "打开箱子后仍接受客户端箱子快照");
+        Assert.Equal(0, world.Chests[index].Items[3].Stack);
     }
 
     [Fact]
@@ -1924,8 +1890,8 @@ public class VanillaFeatureTests
         await s.SendAsync(PacketId.SyncChestItem,
             new SyncChestItemPacket(index, ItemSlot: 200, Stack: 1, Prefix: 0, ItemType: 1));
 
-        Assert.True(await WaitForRejectAsync(server, "invalid_slot", TimeSpan.FromSeconds(5)),
-            "非法箱子槽位未被拒绝");
+        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
+            "SSC 未在检查槽位前拒绝客户端箱子快照");
     }
 
     [Fact]
@@ -1942,8 +1908,8 @@ public class VanillaFeatureTests
         await s.SendAsync(PacketId.SyncChestItem,
             new SyncChestItemPacket(index, ItemSlot: 0, Stack: 1, Prefix: 0, ItemType: 1));
 
-        Assert.True(await WaitForRejectAsync(server, "out_of_reach", TimeSpan.FromSeconds(5)),
-            "远程箱子写入未被拒绝");
+        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
+            "SSC 未在检查距离前拒绝客户端箱子快照");
     }
 
     [Fact]
@@ -2461,38 +2427,20 @@ public class VanillaFeatureTests
         Assert.Equal(1, hurt.PlayerId);
     }
 
-    /// <summary>
-    /// 阶段 D 第二部分：包 5（InventorySlot）经完整管线 → SetInventorySlotCommand →
-    /// <see cref="PlayerRuntime.RecalculateDefense"/> 回填装备防御（SSC 服务端唯一真相）。
-    /// 铜套（79/80/81 = 1/3/2）→ 防御 6；空槽清空 → 降防。
-    /// </summary>
     [Fact]
-    public async Task Vanilla_EquippedArmor_Feeds_Defense_From_InventorySlot_Packets()
+    public async Task AntiCheat_Ssc_Rejects_ClientArmorSnapshot()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
-        var world = server.Host.Simulator.State;
-        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        var player = server.Host.Simulator.State.Players[1];
 
-        var player = world.Players[1];
-        Assert.Equal(0, player.Defense); // 裸装
-
-        // 穿铜套：头盔 89(1) + 链甲 80(2) + 护腿 76(1) = 4，穿齐铜套套装加成 +2 → 防御 6
+        // 客户端不能通过装备槽包 5 获得防御或套装效果。
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 89, 1));
-        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(1, 80, 1));
-        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(2, 76, 1));
 
-        Assert.True(await TickUntilAsync(server, () => player.Defense == 6, TimeSpan.FromSeconds(5)),
-            $"装备防御未经包 5 管线回填，实际 Defense={player.Defense}");
-        Assert.Equal(89, player.Items[0]);
-        Assert.Equal(80, player.Items[1]);
-        Assert.Equal(76, player.Items[2]);
-
-        // 脱头盔（空槽清空语义）→ 防御降为 3（80 的 2 + 76 的 1，铜套三件不齐套装 +2 失效）
-        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 0, 0));
-        Assert.True(await TickUntilAsync(server, () => player.Defense == 3, TimeSpan.FromSeconds(5)),
-            $"空槽清空未降防，实际 Defense={player.Defense}");
+        Assert.True(await WaitForRejectAsync(server, "inventory_snapshot_forbidden", TimeSpan.FromSeconds(5)),
+            "SSC 未拒绝客户端装备槽快照");
         Assert.Equal(0, player.Items[0]);
+        Assert.Equal(0, player.Defense);
     }
 
     /// <summary>
@@ -2781,22 +2729,16 @@ public class VanillaFeatureTests
 
         var configJson = $"{{\"WorldPath\": \"{wldPath.Replace("\\", "\\\\")}\"}}";
 
-        // ---- 第一次运行：经真实包 32 权威链路写入箱子物品 → 落盘 ----
+        // ---- 第一次运行：服务端受控变更箱子内容 → 落盘 ----
         using (var server = VanillaServer.Start(configJson: configJson, dir: dir, deleteOnDispose: false))
         {
-            await using var s = await server.ConnectAsync("Alice");
             var world = server.Host.Simulator.State;
             Assert.True(world.Chests.Count > chestIndex, "追加的箱子未随世界文件载入");
 
-            await StandAtAsync(server, s, cx * 16f + 8f, cy * 16f + 8f);
-            await s.SendAsync(PacketId.Chest, new ChestPacket(cx, cy));
-            await s.SendAsync(PacketId.SyncChestItem,
-                new SyncChestItemPacket(chestIndex, ItemSlot: 5, Stack: 11, Prefix: 0, ItemType: 5));
-
-            Assert.True(await TickUntilAsync(server, () =>
-            {
-                lock (world.ChestsLock) return world.Chests[chestIndex].Items[5].Type == 5;
-            }, TimeSpan.FromSeconds(5)), "包 32 未写入服务端箱子");
+            lock (world.ChestsLock)
+                world.Chests[chestIndex].Items[5] = new ChestItem { Type = 5, Stack = 11, Prefix = 0 };
+            world.MarkPersistChest(chestIndex);
+            world.MarkChestChanged(chestIndex, 5);
 
             // 落盘（生产环境由 1Hz 世界循环触发；此处显式调用并循环到确实入库）
             bool saved = false;
@@ -2822,6 +2764,85 @@ public class VanillaFeatureTests
         }
 
         try { Directory.Delete(dir, recursive: true); } catch { /* 清理失败可忽略 */ }
+    }
+
+    [Fact]
+    public async Task Vanilla_TileEntityOverlays_And_Tombstones_Survive_ServerRestart()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-tepersist-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var wldPath = Path.Combine(dir, "tileentities.wld");
+        var source = WorldGenerator.GenerateSmall(worldName: "TileEntityWorld");
+
+        var baselineDoll = new TileEntity { Type = 3, FileId = 10, X = 100, Y = 100, DisplayDollPose = 1 };
+        baselineDoll.DisplayDollItems[0] = new TileEntityItem { Type = 100, Stack = 1 };
+        source.InsertTileEntity(baselineDoll, markDirty: false);
+        source.InsertTileEntity(new TileEntity
+        {
+            Type = 1, FileId = 11, X = 102, Y = 100,
+            Item = new TileEntityItem { Type = 101, Stack = 2 },
+        }, markDirty: false);
+        source.InsertTileEntity(new TileEntity { Type = 0, FileId = 12, X = 104, Y = 100, NpcSlot = 9 }, markDirty: false);
+        WorldFileWriter.Write(wldPath, source, keepBackup: false);
+        var configJson = $"{{\"WorldPath\": \"{wldPath.Replace("\\", "\\\\")}\"}}";
+
+        using (var server = VanillaServer.Start(configJson: configJson, dir: dir, deleteOnDispose: false))
+        {
+            var world = server.Host.Simulator.State;
+            Assert.True(world.TryGetTileEntityAt(100, 100, out var loadedDoll));
+            Assert.Equal((byte)3, loadedDoll!.Type);
+
+            var rack = new TileEntity { Type = 5, FileId = 20, X = 100, Y = 100 };
+            rack.HatRackHats[0] = new TileEntityItem { Type = 200, Prefix = 2, Stack = 3 };
+            world.InsertTileEntity(rack);
+
+            var replacementDoll = new TileEntity { Type = 3, FileId = 21, X = 102, Y = 100, DisplayDollPose = 8 };
+            replacementDoll.DisplayDollItems[8] = new TileEntityItem { Type = 201, Prefix = 4, Stack = 1 };
+            replacementDoll.DisplayDollMisc = new TileEntityItem { Type = 202, Prefix = 5, Stack = 1 };
+            world.InsertTileEntity(replacementDoll);
+            Assert.True(world.RemoveTileEntityAt(104, 100));
+
+            await server.Host.FlushWorldChangesAsync();
+            var records = await server.Host.WorldRepo!.LoadTileEntityChangesAsync();
+            Assert.Equal(3, records.Count);
+            Assert.Contains(records, static record => record.X == 104 && record.Y == 100 && record.IsDeleted);
+            Assert.Contains(records, static record => record.X == 100 && record.Y == 100 && !record.IsDeleted && record.Type == 5);
+        }
+
+        using (var server = VanillaServer.Start(configJson: configJson, dir: dir))
+        {
+            var world = server.Host.Simulator.State;
+            Assert.True(world.TryGetTileEntityAt(100, 100, out var rack));
+            Assert.Equal((byte)5, rack!.Type);
+            Assert.Equal((short)200, rack.HatRackHats[0].Type);
+            Assert.Equal((short)3, rack.HatRackHats[0].Stack);
+
+            Assert.True(world.TryGetTileEntityAt(102, 100, out var doll));
+            Assert.Equal((byte)3, doll!.Type);
+            Assert.Equal((byte)8, doll.DisplayDollPose);
+            Assert.Equal((short)201, doll.DisplayDollItems[8].Type);
+            Assert.Equal((short)202, doll.DisplayDollMisc.Type);
+            Assert.False(world.TryGetTileEntityAt(104, 100, out _), "已删除的基准图格实体在重启后复活");
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { /* 临时目录清理失败可忽略 */ }
+    }
+
+    [Fact]
+    public async Task Vanilla_TileEntitySerializationFailure_Requeues_Changes()
+    {
+        using var server = VanillaServer.Start();
+        var world = server.Host.Simulator.State;
+        var original = world.InsertTileEntity(new TileEntity { Type = 7, X = 110, Y = 110 });
+        Assert.True(world.RemoveTileEntity(original.Id));
+        world.InsertTileEntity(new TileEntity { Type = 255, X = 112, Y = 110 });
+
+        await server.Host.FlushWorldChangesAsync();
+
+        var deleted = world.DrainDeletedTileEntities(WorldState.PersistBatchSize);
+        var dirty = world.DrainDirtyTileEntities(WorldState.PersistBatchSize);
+        Assert.Contains(deleted, static entry => entry.X == 110 && entry.Y == 110);
+        Assert.Single(dirty);
     }
 
     [Fact]
