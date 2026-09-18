@@ -179,7 +179,7 @@ public class SimulationTests
             world.Players[1] = new PlayerRuntime { Id = 1, SessionId = 22, Active = true };
         lock (world.ProjectilesLock)
         {
-            world.Projectiles.Add(new ProjectileEntity { Key = 1, Owner = 1, Type = 191, Active = true });
+            world.Projectiles.Add(new ProjectileEntity { Key = 1, Owner = 1, Type = 191, IsSummon = true, Active = true });
             world.Projectiles.Add(new ProjectileEntity { Key = 2, Owner = 1, Type = 1, Active = true });
             world.Projectiles.Add(new ProjectileEntity { Key = 3, Owner = 2, Type = 191, Active = true });
         }
@@ -208,6 +208,24 @@ public class SimulationTests
         player.SelectedSlot = 3;
         Assert.True(new SpawnProjectileCommand(1, 1, 7, 191, new Vector2(0, 0), new Vector2(0, 0), 60)
             .Apply(world, rng).Applied);
+        lock (world.ProjectilesLock)
+        {
+            var summon = Assert.Single(world.Projectiles);
+            Assert.True(summon.IsSummon);
+            Assert.Equal(3474, summon.SourceItem);
+            Assert.Equal(3474, summon.SourceWeaponItem);
+            Assert.Equal((byte)0, summon.SourceWeaponPrefix);
+            Assert.Equal(1, summon.SourceTransactionId);
+            Assert.Equal(182, summon.SourceSummonBuffId);
+
+            player.Items[3] = 24;
+            player.ItemPrefixes[3] = 1;
+            Assert.Equal(3474, summon.SourceWeaponItem);
+            Assert.Equal((byte)0, summon.SourceWeaponPrefix);
+            Assert.Equal(1, summon.SourceTransactionId);
+            player.Items[3] = 3474;
+            player.ItemPrefixes[3] = 0;
+        }
 
         // 2) 弹幕伤害 999 超权威上界 69 → 拒绝（堵住虚报弹幕伤害抬高命中上界）
         Assert.Equal("projectile_damage_above_bound",
@@ -237,6 +255,66 @@ public class SimulationTests
         player.Items[3] = 99999;
         Assert.True(new SpawnProjectileCommand(6, 1, 12, 191, new Vector2(0, 0), new Vector2(0, 0), 999)
             .Apply(world, rng).Applied);
+    }
+
+    [Fact]
+    public void Summon_Projectile_Ownership_And_Source_Transaction_Are_Independent()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
+            world.Players[2] = new PlayerRuntime { Id = 2, Active = true };
+            world.Players[1].Items[3] = 3474;
+            world.Players[2].Items[3] = 3474;
+            world.Players[1].SelectedSlot = 3;
+            world.Players[2].SelectedSlot = 3;
+        }
+
+        var rng = new XoshiroRng(1);
+        Assert.True(new SpawnProjectileCommand(1, 1, 7, 191, new Vector2(0f, 0f), new Vector2(0f, 0f), 60)
+            .Apply(world, rng).Applied);
+        Assert.True(new SpawnProjectileCommand(2, 2, 7, 191, new Vector2(0f, 0f), new Vector2(0f, 0f), 60)
+            .Apply(world, rng).Applied);
+
+        lock (world.ProjectilesLock)
+        {
+            Assert.Equal(2, world.Projectiles.Count);
+            Assert.Equal(new[] { 1, 2 }, world.Projectiles.Select(p => p.Owner).OrderBy(id => id));
+            Assert.Equal(new[] { 1L, 2L }, world.Projectiles.Select(p => p.SourceTransactionId).OrderBy(id => id));
+        }
+    }
+
+    [Fact]
+    public void Summon_Entities_Have_Stable_Ids_And_Kinds()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+        player.Items[3] = 3474;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+        Assert.True(new SpawnProjectileCommand(1, 1, 7, 191,
+            new Vector2(0f, 0f), new Vector2(0f, 0f), 60).Apply(world, rng).Applied);
+        Assert.True(new SpawnProjectileCommand(2, 1, 8, 831,
+            new Vector2(0f, 0f), new Vector2(0f, 0f), 60).Apply(world, rng).Applied);
+
+        lock (world.ProjectilesLock)
+        {
+            var minion = Assert.Single(world.Projectiles, p => p.Key == 7);
+            var sentry = Assert.Single(world.Projectiles, p => p.Key == 8);
+            Assert.Equal(SummonKind.Minion, minion.SummonKind);
+            Assert.Equal(SummonKind.Sentry, sentry.SummonKind);
+            Assert.True(minion.SummonEntityId > 0);
+            Assert.True(sentry.SummonEntityId > minion.SummonEntityId);
+
+            long entityId = minion.SummonEntityId;
+            Assert.True(new SpawnProjectileCommand(3, 1, 7, 191,
+                new Vector2(50f, 50f), new Vector2(0f, 0f), 60).Apply(world, rng).Applied);
+            Assert.Equal(2, world.Projectiles.Count);
+            Assert.Equal(entityId, minion.SummonEntityId);
+        }
     }
 
     [Fact]
@@ -319,6 +397,99 @@ public class SimulationTests
     }
 
     [Fact]
+    public void ProjectileSpawn_Consumes_Authoritative_Ammo_Exactly_Once()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+            world.Players[2] = new PlayerRuntime { Id = 2, Active = true, SelectedSlot = 3 };
+        }
+
+        var first = world.Players[1];
+        first.Items[3] = 39;
+        first.ItemStacks[3] = 1;
+        first.Items[4] = 40;
+        first.ItemStacks[4] = 2;
+
+        var second = world.Players[2];
+        second.Items[3] = 39;
+        second.ItemStacks[3] = 1;
+        second.Items[4] = 40;
+        second.ItemStacks[4] = 1;
+
+        var rng = new XoshiroRng(1);
+        var origin = new Vector2(0, 0);
+
+        Assert.True(new SpawnProjectileCommand(1, 1, 1, 1, origin, origin, 4)
+            .Apply(world, rng).Applied);
+        Assert.Equal(1, first.ItemStacks[4]);
+
+        // 同一归属者的重复弹幕 Key 只是同步更新，不得再次扣除弹药。
+        Assert.True(new SpawnProjectileCommand(2, 1, 1, 1, origin, origin, 4)
+            .Apply(world, rng).Applied);
+        Assert.Equal(1, first.ItemStacks[4]);
+
+        // 不同玩家可以使用相同 Key，各自独立消费自己的库存。
+        Assert.True(new SpawnProjectileCommand(3, 2, 1, 1, origin, origin, 4)
+            .Apply(world, rng).Applied);
+        Assert.Equal(0, second.ItemStacks[4]);
+        Assert.Equal(0, second.Items[4]);
+
+        // 无弹药时拒绝，且不会写入新的弹幕或改变库存。
+        var rejected = new SpawnProjectileCommand(4, 2, 2, 1, origin, origin, 4)
+            .Apply(world, rng);
+        Assert.False(rejected.Applied);
+        Assert.Equal("projectile_type_not_allowed", rejected.Reason);
+        Assert.Equal(0, second.ItemStacks[4]);
+    }
+
+    [Fact]
+    public void ProjectileSpawn_Allows_Infinite_Ammo_Without_Decrement()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+
+        var player = world.Players[1];
+        player.Items[3] = 39;
+        player.ItemStacks[3] = 1;
+        player.Items[4] = 3103;
+        player.ItemStacks[4] = 1;
+
+        var result = new SpawnProjectileCommand(1, 1, 1, 1,
+            new Vector2(0, 0), new Vector2(0, 0), 4)
+            .Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(3103, player.Items[4]);
+        Assert.Equal(1, player.ItemStacks[4]);
+    }
+
+    [Fact]
+    public void ProjectileSpawn_Rejects_Mismatched_Ammo_Without_Consuming()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+
+        var player = world.Players[1];
+        player.Items[3] = 39;
+        player.ItemStacks[3] = 1;
+        player.Items[4] = 40;
+        player.ItemStacks[4] = 1;
+
+        var result = new SpawnProjectileCommand(1, 1, 1, 14,
+            new Vector2(0, 0), new Vector2(0, 0), 4)
+            .Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal("projectile_type_not_allowed", result.Reason);
+        Assert.Equal(40, player.Items[4]);
+        Assert.Equal(1, player.ItemStacks[4]);
+    }
+
+    [Fact]
     public void ProjectileSpawn_Validates_Initial_Position_And_Velocity()
     {
         var world = new WorldState { MaxTilesX = 1000, MaxTilesY = 1000 };
@@ -358,6 +529,257 @@ public class SimulationTests
             Assert.Single(world.Projectiles);
             Assert.DoesNotContain(world.Projectiles, p => p.Key is 2 or 3 or 4 or 5);
         }
+    }
+
+    [Fact]
+    public void ProjectileSpawn_UseItem_StateMachine_Gates_New_Mapped_Projectiles()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100, Tick = 10 };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+
+        var player = world.Players[1];
+        player.Items[3] = 757; // TerraBlade -> Direct projectile 985
+        player.ItemStacks[3] = 1;
+        player.Items[4] = 757;
+        player.ItemStacks[4] = 1;
+        var rng = new XoshiroRng(1);
+        var origin = new Vector2(0, 0);
+
+        Assert.True(new MoveCommand(1, 1, player.Position)
+        {
+            SelectedItem = 3,
+            ControlBits = 0,
+        }.Apply(world, rng).Applied);
+        Assert.Equal(CommandFailures.ProjectileUseItemNotHeld,
+            new SpawnProjectileCommand(2, 1, 1, 985, origin, origin, 85).Apply(world, rng).Reason);
+
+        Assert.True(new MoveCommand(3, 1, player.Position)
+        {
+            SelectedItem = 3,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }.Apply(world, rng).Applied);
+        Assert.Equal(3, player.UseItemSelectedSlot);
+        Assert.True(new SpawnProjectileCommand(4, 1, 1, 985, origin, origin, 85).Apply(world, rng).Applied);
+
+        // 同 Key 更新不重新授权，也不刷新新 Key 冷却。
+        Assert.True(new MoveCommand(5, 1, player.Position)
+        {
+            SelectedItem = 3,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }.Apply(world, rng).Applied);
+        Assert.True(new SpawnProjectileCommand(5, 1, 1, 985, origin, origin, 85).Apply(world, rng).Applied);
+        Assert.Equal(CommandFailures.ProjectileUseItemCooldown,
+            new SpawnProjectileCommand(5, 1, 2, 985, origin, origin, 85).Apply(world, rng).Reason);
+
+        Assert.True(new MoveCommand(6, 1, player.Position)
+        {
+            SelectedItem = 4,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }.Apply(world, rng).Applied);
+        Assert.Equal(3, player.UseItemSelectedSlot);
+        Assert.Equal(CommandFailures.ProjectileUseItemNotHeld,
+            new SpawnProjectileCommand(6, 1, 3, 985, origin, origin, 85).Apply(world, rng).Reason);
+
+        Assert.True(new MoveCommand(7, 1, player.Position)
+        {
+            SelectedItem = 3,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }.Apply(world, rng).Applied);
+        world.Tick = 30;
+        Assert.True(new SpawnProjectileCommand(8, 1, 2, 985, origin, origin, 85).Apply(world, rng).Applied);
+
+        Assert.True(new MoveCommand(7, 1, player.Position)
+        {
+            SelectedItem = 3,
+            ControlBits = 0,
+        }.Apply(world, rng).Applied);
+        Assert.Equal(CommandFailures.ProjectileUseItemNotHeld,
+            new SpawnProjectileCommand(7, 1, 3, 985, origin, origin, 85).Apply(world, rng).Reason);
+
+        // 近战与未知武器不进入 UseItem 弹幕状态机，保留旧命令层兼容。
+        player.Items[3] = 24;
+        int meleeDamage = CombatResolver.GetWeaponDamage(player, 24, 0);
+        var meleeResult = new SpawnProjectileCommand(8, 1, 4, 20, origin, origin, meleeDamage).Apply(world, rng);
+        Assert.True(meleeResult.Applied, meleeResult.Reason);
+        player.Items[3] = 99999;
+        var unknownResult = new SpawnProjectileCommand(9, 1, 5, 1, origin, origin, 10).Apply(world, rng);
+        Assert.True(unknownResult.Applied, unknownResult.Reason);
+    }
+
+    [Fact]
+    public void ProjectileSpawn_Uses_Server_Fire_Cooldown_And_Transaction_Idempotency()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100, Tick = 1 };
+        var player = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+        player.Items[3] = 533; // Megashark
+        player.ItemStacks[3] = 1;
+        player.Items[4] = 97;  // Musket Ball
+        player.ItemStacks[4] = 3;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+        var origin = new Vector2(0, 0);
+        Assert.True(new MoveCommand(1, 1, origin)
+        {
+            SelectedItem = 3,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }.Apply(world, rng).Applied);
+
+        Assert.True(new SpawnProjectileCommand(1, 1, 1, 14, origin, origin, 25, 100)
+            .Apply(world, rng).Applied);
+        Assert.Equal(2, player.ItemStacks[4]);
+        Assert.Equal(100, world.Projectiles.Single().FireTransactionId);
+
+        Assert.Equal(CommandFailures.FireTransactionDuplicate,
+            new SpawnProjectileCommand(2, 1, 2, 14, origin, origin, 25, 100)
+                .Apply(world, rng).Reason);
+        Assert.Equal(2, player.ItemStacks[4]);
+        Assert.Single(world.Projectiles);
+
+        world.Tick = 7;
+        Assert.Equal(CommandFailures.ProjectileUseItemCooldown,
+            new SpawnProjectileCommand(7, 1, 2, 14, origin, origin, 25, 101)
+                .Apply(world, rng).Reason);
+
+        world.Tick = 8;
+        Assert.True(new SpawnProjectileCommand(8, 1, 2, 14, origin, origin, 25, 101)
+            .Apply(world, rng).Applied);
+        Assert.Equal(1, player.ItemStacks[4]);
+    }
+
+    [Fact]
+    public void ProjectileSpawn_Mana_Check_Is_Atomic_With_Ammo()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100, Tick = 1 };
+        var player = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3, Mp = 5, MpMax = 20 };
+        player.Items[3] = 127; // Space Gun
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+        var origin = new Vector2(0, 0);
+        Assert.True(new MoveCommand(1, 1, origin)
+        {
+            SelectedItem = 3,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }.Apply(world, rng).Applied);
+
+        Assert.Equal(CommandFailures.ProjectileManaInsufficient,
+            new SpawnProjectileCommand(1, 1, 1, 72, origin, origin, 20, 200)
+                .Apply(world, rng).Reason);
+        Assert.Equal(5, player.Mp);
+        Assert.Empty(world.Projectiles);
+
+        player.Mp = 12;
+        Assert.True(new SpawnProjectileCommand(2, 1, 1, 72, origin, origin, 20, 200)
+            .Apply(world, rng).Applied);
+        Assert.Equal(6, player.Mp);
+        Assert.Single(world.Projectiles);
+        Assert.Contains(1, world.DrainPlayerManaChanged(16));
+        Assert.Empty(world.DrainPlayerManaChanged(16));
+    }
+
+    [Fact]
+    public void ProjectileSpawn_Captures_Weapon_Source_Before_Resource_Commit()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100, Tick = 1 };
+        var player = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+        player.Items[3] = 533; // Megashark
+        player.ItemStacks[3] = 1;
+        player.ItemPrefixes[3] = 81;
+        player.Items[4] = 97; // Musket Ball
+        player.ItemStacks[4] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+        var origin = new Vector2(0, 0);
+        Assert.True(new MoveCommand(1, 1, origin)
+        {
+            SelectedItem = 3,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }.Apply(world, rng).Applied);
+
+        Assert.True(new SpawnProjectileCommand(1, 1, 1, 14, origin, origin, 25, 100)
+            .Apply(world, rng).Applied);
+
+        var projectile = Assert.Single(world.Projectiles);
+        Assert.Equal(533, projectile.SourceWeaponItem);
+        Assert.Equal(81, projectile.SourceWeaponPrefix);
+        Assert.Equal(0, player.Items[4]);
+        Assert.Equal(0, player.ItemStacks[4]);
+    }
+
+    [Fact]
+    public void Fire_Transaction_History_Keeps_Recent_Window()
+    {
+        var player = new PlayerRuntime();
+        for (long transactionId = 1;
+             transactionId <= PlayerRuntime.MaxAppliedFireTransactions + 1;
+             transactionId++)
+        {
+            player.RecordAppliedFireTransaction(transactionId);
+        }
+
+        Assert.Equal(PlayerRuntime.MaxAppliedFireTransactions, player.AppliedFireTransactions.Count);
+        Assert.DoesNotContain(1L, player.AppliedFireTransactions);
+        Assert.Contains(2L, player.AppliedFireTransactions);
+        Assert.Contains(PlayerRuntime.MaxAppliedFireTransactions + 1L,
+            player.AppliedFireTransactions);
+    }
+
+    [Fact]
+    public void Client_Mana_Report_Cannot_Restore_Server_Mana()
+    {
+        var world = new WorldState();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Mp = 6,
+            MpMax = 20,
+            HasReceivedManaSync = true,
+        };
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+        Assert.False(new SetManaCommand(1, 1, 12, 20).Apply(world, rng).Applied);
+        Assert.Equal(6, player.Mp);
+        Assert.False(new SetManaCommand(2, 1, 6, 40).Apply(world, rng).Applied);
+        Assert.Equal(20, player.MpMax);
+        Assert.True(new SetManaCommand(3, 1, 4, 20).Apply(world, rng).Applied);
+        Assert.Equal(4, player.Mp);
+    }
+
+    [Fact]
+    public void SessionResume_Reopens_Mana_Baseline_Window()
+    {
+        var world = new WorldState();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            SessionId = 11,
+            Mp = 6,
+            MpMax = 20,
+            HasReceivedManaSync = true,
+        };
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        world.MarkPlayerOffline(1, 11, "Alice", graceTicks: 60);
+        Assert.True(world.TryResumePlayer(1, 22, "Alice"));
+        Assert.False(player.HasReceivedManaSync);
+
+        var result = new SetManaCommand(1, 1, 12, 40) { SessionId = 22 }
+            .Apply(world, new XoshiroRng(1));
+        Assert.True(result.Applied);
+        Assert.Equal(12, player.Mp);
+        Assert.Equal(40, player.MpMax);
     }
 
     [Fact]
@@ -425,7 +847,8 @@ public class SimulationTests
             Assert.True(first.Active);
             Assert.Equal(firstPosition, first.Position);
             Assert.False(second.Active);
-            Assert.Equal(updatedPosition, second.Position);
+            // 包 27 重试不会覆盖服务端推进的位置；销毁包的位置字段也不是权威状态。
+            Assert.Equal(secondPosition, second.Position);
         }
     }
 
@@ -518,6 +941,23 @@ public class SimulationTests
 
         Assert.Empty(world.DrainChestUpdates(0));
         Assert.Contains((3, 7), world.DrainChestUpdates(10));
+    }
+
+    [Fact]
+    public void PersistChests_CanBeRequeued_AfterFlushFailure()
+    {
+        var world = new WorldState();
+        world.MarkPersistChest(3);
+        world.MarkPersistChest(7);
+
+        var drained = world.DrainPersistChests(10);
+        Assert.Equal(new[] { 3, 7 }, drained.Order());
+        Assert.False(world.HasPendingPersist);
+
+        foreach (int index in drained) world.MarkPersistChest(index);
+
+        Assert.Equal(new[] { 3, 7 }, world.DrainPersistChests(10).Order());
+        Assert.False(world.HasPendingPersist);
     }
 
     [Fact]
@@ -636,6 +1076,261 @@ public class SimulationTests
         Assert.Equal(CommandFailures.StaleSession, result.Reason);
         Assert.Equal(10, chest.Items[2].Stack);
         Assert.Equal(0, player.ItemStacks[4]);
+    }
+
+    [Fact]
+    public void BulkChest_LootAll_IsAtomicAndReplaySafe()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        chest.Items[0] = new ChestItem { Type = 50, Stack = 10, Prefix = 3 };
+        chest.Items[1] = new ChestItem { Type = 51, Stack = 4, Prefix = 0 };
+
+        var command = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.LootAll, 200)
+        { SessionId = 22 };
+
+        Assert.True(command.Apply(world, new XoshiroRng(1)).Applied);
+        Assert.Equal(10, player.ItemStacks[9]);
+        Assert.Equal(50, player.Items[9]);
+        Assert.Equal(4, player.ItemStacks[10]);
+        Assert.Equal(0, chest.Items[0].Stack);
+        Assert.Equal(0, chest.Items[1].Stack);
+
+        var replay = command.Apply(world, new XoshiroRng(1));
+        Assert.False(replay.Applied);
+        Assert.Equal("replayed_operation", replay.Reason);
+    }
+
+    [Fact]
+    public void BulkChest_LootAll_WithFullInventory_PreservesUnmovedItems()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        for (int slot = 10; slot <= 49; slot++)
+        {
+            player.Items[slot] = 1000 + slot;
+            player.ItemStacks[slot] = 999;
+        }
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 995;
+        player.ItemPrefixes[9] = 3;
+        chest.Items[0] = new ChestItem { Type = 50, Stack = 10, Prefix = 3 };
+
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.LootAll, 208)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(999, player.ItemStacks[9]);
+        Assert.Equal(6, chest.Items[0].Stack);
+        Assert.Equal(3, chest.Items[0].Prefix);
+        Assert.Equal(1005, player.ItemStacks[9] + chest.Items[0].Stack);
+    }
+
+    [Fact]
+    public void BulkChest_DepositAll_MergesAndPreservesUnmovedItems()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 7;
+        player.ItemPrefixes[9] = 3;
+        player.Items[10] = 51;
+        player.ItemStacks[10] = 4;
+        chest.Items[2] = new ChestItem { Type = 50, Stack = 4, Prefix = 3 };
+
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.DepositAll, 201)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(11, chest.Items[2].Stack);
+        Assert.Equal(0, player.ItemStacks[9]);
+        Assert.Equal(0, player.ItemStacks[10]);
+        Assert.Equal(51, chest.Items[0].Type);
+        Assert.Equal(4, chest.Items[0].Stack);
+    }
+
+    [Fact]
+    public void BulkChest_QuickStack_OnlyMovesIntoExistingStacks()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 7;
+        player.Items[10] = 51;
+        player.ItemStacks[10] = 4;
+        chest.Items[2] = new ChestItem { Type = 50, Stack = 4 };
+
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.QuickStack, 202)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(11, chest.Items[2].Stack);
+        Assert.Equal(0, player.ItemStacks[9]);
+        Assert.Equal(4, player.ItemStacks[10]);
+        Assert.Equal(51, player.Items[10]);
+    }
+
+    [Theory]
+    [InlineData(ChestBulkOperation.DepositAll)]
+    [InlineData(ChestBulkOperation.QuickStack)]
+    public void BulkChest_DoesNotMergeDifferentPrefixes(ChestBulkOperation operation)
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 7;
+        player.ItemPrefixes[9] = 3;
+        chest.Items[0] = new ChestItem { Type = 50, Stack = 4, Prefix = 4 };
+        if (operation == ChestBulkOperation.QuickStack)
+            chest.Items[1] = new ChestItem { Type = 50, Stack = 1, Prefix = 3 };
+
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, operation, 209)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(4, chest.Items[0].Stack);
+        Assert.Equal(4, chest.Items[0].Prefix);
+        if (operation == ChestBulkOperation.DepositAll)
+        {
+            Assert.Equal(7, chest.Items[1].Stack);
+            Assert.Equal(3, chest.Items[1].Prefix);
+            Assert.Equal(0, player.ItemStacks[9]);
+        }
+        else
+        {
+            Assert.Equal(8, chest.Items[1].Stack);
+            Assert.Equal(3, chest.Items[1].Prefix);
+            Assert.Equal(0, player.ItemStacks[9]);
+        }
+    }
+
+    [Fact]
+    public void BulkChest_DepositAll_RespectsStackLimitAndConservesItems()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 10;
+        player.ItemPrefixes[9] = 3;
+        chest.Items[0] = new ChestItem { Type = 50, Stack = 995, Prefix = 3 };
+        for (int slot = 1; slot < chest.Items.Length; slot++)
+            chest.Items[slot] = new ChestItem { Type = 1000 + slot, Stack = 999 };
+
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.DepositAll, 210)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(999, chest.Items[0].Stack);
+        Assert.Equal(6, player.ItemStacks[9]);
+        Assert.Equal(1005, chest.Items[0].Stack + player.ItemStacks[9]);
+    }
+
+    [Fact]
+    public void BulkChest_NoChange_DoesNotConsumeOperationOrQueueUpdates()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 7;
+        player.ItemPrefixes[9] = 3;
+        chest.Items[0] = new ChestItem { Type = 50, Stack = 4, Prefix = 4 };
+        var command = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.QuickStack, 211)
+        { SessionId = 22 };
+
+        var noChange = command.Apply(world, new XoshiroRng(1));
+
+        Assert.False(noChange.Applied);
+        Assert.Equal(CommandFailures.NoChange, noChange.Reason);
+        Assert.False(world.HasAppliedInventoryChestOperation(1, 22, 211));
+        Assert.Empty(world.DrainPersistChests(10));
+        Assert.Empty(world.DrainChestUpdates(10));
+        Assert.Empty(world.DrainInventoryUpdates(10));
+
+        chest.Items[0].Prefix = 3;
+        Assert.True(command.Apply(world, new XoshiroRng(1)).Applied);
+    }
+
+    [Fact]
+    public void BulkChest_DepositAll_DoesNotMoveEquipmentOrAmmoSlots()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[0] = 50;
+        player.ItemStacks[0] = 1;
+        player.Items[50] = 51;
+        player.ItemStacks[50] = 2;
+        player.Items[9] = 52;
+        player.ItemStacks[9] = 3;
+
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.DepositAll, 204)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(50, player.Items[0]);
+        Assert.Equal(1, player.ItemStacks[0]);
+        Assert.Equal(51, player.Items[50]);
+        Assert.Equal(2, player.ItemStacks[50]);
+        Assert.Equal(0, player.ItemStacks[9]);
+        Assert.Equal(52, chest.Items[0].Type);
+        Assert.Equal(3, chest.Items[0].Stack);
+    }
+
+    [Fact]
+    public async Task BulkChest_ConcurrentPlayers_SerializeWithoutItemLoss()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        lock (world.PlayersLock)
+            world.Players[2] = new PlayerRuntime { Id = 2, Active = true, SessionId = 33, Position = player.Position };
+        world.OpenChestSession(2, 33, 0);
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 10;
+        world.Players[2].Items[9] = 50;
+        world.Players[2].ItemStacks[9] = 10;
+
+        var results = await Task.WhenAll(
+            Task.Run(() => new BulkInventoryChestCommand(1, 1, 0, ChestBulkOperation.DepositAll, 205)
+                { SessionId = 22 }.Apply(world, new XoshiroRng(1))),
+            Task.Run(() => new BulkInventoryChestCommand(1, 2, 0, ChestBulkOperation.DepositAll, 206)
+                { SessionId = 33 }.Apply(world, new XoshiroRng(1))));
+
+        Assert.All(results, result => Assert.True(result.Applied));
+        Assert.Equal(20, chest.Items[0].Stack);
+        Assert.Equal(0, player.ItemStacks[9]);
+        Assert.Equal(0, world.Players[2].ItemStacks[9]);
+    }
+
+    [Fact]
+    public void BulkChest_Disconnect_InvalidatesOldSession()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 5;
+
+        world.MarkPlayerOffline(1, 22, "resume-key", 20);
+
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.DepositAll, 207)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal(CommandFailures.PlayerNotActive, result.Reason);
+        Assert.Equal(0, chest.Items.Sum(item => item.Stack));
+    }
+
+    [Fact]
+    public void BulkChest_ClosedSession_IsRejectedWithoutChanges()
+    {
+        var (world, player, chest) = CreateTransferWorld(openSession: false);
+        player.Items[9] = 50;
+        player.ItemStacks[9] = 7;
+        var result = new BulkInventoryChestCommand(
+            1, 1, 0, ChestBulkOperation.DepositAll, 203)
+        { SessionId = 22 }.Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal(CommandFailures.ChestNotOpen, result.Reason);
+        Assert.Equal(7, player.ItemStacks[9]);
+        Assert.Equal(0, chest.Items.Sum(item => item.Stack));
     }
 
     [Fact]
@@ -1716,7 +2411,7 @@ public class WorldGeneratorTests
                 Key = 7,
                 Owner = 1,
                 Type = 191,
-                Position = new Vector2(320f, 380f),
+                Position = new Vector2(320f, 398f),
                 Velocity = new Vector2(0f, 0f),
                 Damage = 60,
                 Active = true,
@@ -1752,14 +2447,118 @@ public class WorldGeneratorTests
         Assert.True(new MoveCommand(11, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
         Assert.False(new NpcStrikeCommand(12, 1, index, 999, Generation: 3).Apply(world, rng).Applied);
 
-        // 无弹幕 + 空手 + 背包含召唤武器（星尘细胞法杖 3474，60 伤，槽 4）→ 背包兜底上界 69：
-        // 999 拒绝、合法 46 接受（弹幕丢失时防作弊不失效）。
+        // 无弹幕 + 空手 + 背包含召唤武器时，背包物品不能替代服务端召唤实体：命中必须拒绝。
         player.Items[3] = 0;
         player.ItemPrefixes[3] = 0;
         Assert.True(new SetInventorySlotCommand(13, 1, 4, 3474, 1).Apply(world, rng).Applied);
-        Assert.Equal(69, CombatResolver.SummonBackpackBound(player, false));
+        Assert.Null(CombatResolver.SummonDamageBound(world, 1, false));
         Assert.False(new NpcStrikeCommand(14, 1, index, 999, Generation: 3).Apply(world, rng).Applied);
-        Assert.True(new NpcStrikeCommand(15, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
+        Assert.False(new NpcStrikeCommand(15, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
+    }
+
+    [Fact]
+    public void Summon_Attack_Selects_Overlapping_Entity_Deterministically()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime { Id = 1, Active = true, SelectedSlot = 3 };
+        player.Items[3] = 3474;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var npc = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 500,
+            LifeMax = 500,
+            Generation = 1,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(npc);
+        int index = world.Npcs.IndexOf(npc);
+
+        var nearer = new ProjectileEntity
+        {
+            Key = 8, Owner = 1, Type = 191, IsSummon = true,
+            SummonEntityId = 2, SummonKind = SummonKind.Minion,
+            Position = new Vector2(320f, 400f), Damage = 60, Active = true, Penetrate = -1,
+        };
+        var farther = new ProjectileEntity
+        {
+            Key = 7, Owner = 1, Type = 191, IsSummon = true,
+            SummonEntityId = 1, SummonKind = SummonKind.Minion,
+            Position = new Vector2(320f, 398f), Damage = 100, Active = true, Penetrate = -1,
+        };
+        lock (world.ProjectilesLock)
+        {
+            world.Projectiles.Add(farther);
+            world.Projectiles.Add(nearer);
+        }
+
+        Assert.True(new NpcStrikeCommand(10, 1, index, 60, Generation: 1)
+            .Apply(world, new XoshiroRng(1)).Applied);
+        Assert.Equal(20, nearer.SummonNpcHitCooldownUntil[index]);
+        Assert.False(farther.SummonNpcHitCooldownUntil.ContainsKey(index));
+    }
+
+    [Fact]
+    public void Summon_Attack_Uses_Separate_Npc_Hit_Cooldown()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.StrikeProjectileMatch = false;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+            SelectedSlot = 3,
+        };
+        player.Items[3] = 3474;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 500,
+            LifeMax = 500,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        var projectile = new ProjectileEntity
+        {
+            Key = 7,
+            Owner = 1,
+            Type = 191,
+            Position = new Vector2(320f, 398f),
+            Velocity = new Vector2(0f, 0f),
+            Damage = 60,
+            Active = true,
+            IsSummon = true,
+            Penetrate = -1,
+        };
+        projectile.NpcHitCooldownUntil[index] = 0;
+        lock (world.ProjectilesLock) world.Projectiles.Add(projectile);
+
+        var rng = new XoshiroRng(1);
+        Assert.True(new NpcStrikeCommand(10, 1, index, 60, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(20, projectile.SummonNpcHitCooldownUntil[index]);
+        Assert.Equal(0, projectile.NpcHitCooldownUntil[index]);
+        Assert.False(new NpcStrikeCommand(11, 1, index, 60, Generation: 3).Apply(world, rng).Applied);
+        Assert.True(new NpcStrikeCommand(20, 1, index, 60, Generation: 3).Apply(world, rng).Applied);
     }
 
     /// <summary>
@@ -1806,7 +2605,7 @@ public class WorldGeneratorTests
                 Key = 7,
                 Owner = 1,
                 Type = 191,
-                Position = new Vector2(320f, 380f),
+                Position = new Vector2(320f, 398f),
                 Velocity = new Vector2(0f, 0f),
                 Damage = 60,
                 Active = true,
@@ -1815,7 +2614,6 @@ public class WorldGeneratorTests
         // 背包槽 4 先放星尘细胞法杖（3474，60 伤）再移出背包 → 背包兜底消失、弹幕基准仍在。
         Assert.True(new SetInventorySlotCommand(1, 1, 4, 3474, 1).Apply(world, rng).Applied);
         Assert.True(new SetInventorySlotCommand(2, 1, 4, 0, 0).Apply(world, rng).Applied);
-        Assert.Null(CombatResolver.SummonBackpackBound(player, false));
         Assert.Equal(69, CombatResolver.SummonDamageBound(world, 1, false));
 
         // 空手（两通道：背包 null + 弹幕 69）→ 999 拒绝、46 接受。
@@ -1951,6 +2749,39 @@ public class WorldGeneratorTests
     /// 原版仆从由召唤 Buff 驱动存活（客户端 AI 每帧检查、Buff 消失则仆从自杀），
     /// 只销毁服务端弹幕不够——客户端 Buff 未移除时仆从不消失、仍发射弹幕造成伤害。
     /// </summary>
+    [Fact]
+    public void Removed_Summon_Buff_Clears_Only_Its_Minions()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Buffs.Add(182);
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var minion = new ProjectileEntity
+        {
+            Key = 1, Owner = 1, Type = 191, IsSummon = true,
+            SummonEntityId = 1, SummonKind = SummonKind.Minion,
+            SourceSummonBuffId = 182, Active = true,
+        };
+        var sentry = new ProjectileEntity
+        {
+            Key = 2, Owner = 1, Type = 831, IsSummon = true,
+            SummonEntityId = 2, SummonKind = SummonKind.Sentry,
+            Active = true,
+        };
+        lock (world.ProjectilesLock)
+        {
+            world.Projectiles.Add(minion);
+            world.Projectiles.Add(sentry);
+        }
+
+        Assert.True(new SetBuffsCommand(1, 1, Array.Empty<int>())
+            .Apply(world, new XoshiroRng(1)).Applied);
+        Assert.False(minion.Active);
+        Assert.True(minion.Destroyed);
+        Assert.True(sentry.Active);
+    }
+
     [Fact]
     public void KillSummonedProjectiles_Removes_Summon_Buff_And_Marks_Buffs_Changed()
     {
@@ -2213,7 +3044,7 @@ public class WorldGeneratorTests
         // 端到端：手持木弓（槽 3）+ 木箭（槽 50），上报 12 超界被拒、11 被收 → 89
         Assert.True(new SetInventorySlotCommand(8, 1, 3, 39, 1).Apply(world, rng).Applied);
         Assert.True(new SetInventorySlotCommand(9, 1, 50, 40, 1).Apply(world, rng).Applied);
-        Assert.True(new MoveCommand(10, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(10, 1, player.Position) { SelectedItem = 3, ControlBits = PlayerRuntime.ControlUseItem }.Apply(world, rng).Applied);
         Assert.Equal(3, player.SelectedSlot);
 
         var slime = new WorldNpc
@@ -2230,10 +3061,106 @@ public class WorldGeneratorTests
         lock (world.NpcsLock) world.Npcs.Add(slime);
         int index = world.Npcs.IndexOf(slime);
 
-        Assert.False(new NpcStrikeCommand(11, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
+        // 已收录远程武器的包 28 必须由服务端登记且与目标碰撞的弹幕背书。
+        Assert.True(new SpawnProjectileCommand(11, 1, 1, 1, new Vector2(slime.X, slime.Y), new Vector2(0, 0), 9)
+            .Apply(world, rng).Applied);
+        Assert.False(new NpcStrikeCommand(12, 1, index, 12, Generation: 3).Apply(world, rng).Applied);
         Assert.Equal(100, slime.Life);
-        Assert.True(new NpcStrikeCommand(12, 1, index, 11, Generation: 3).Apply(world, rng).Applied);
+        Assert.True(new NpcStrikeCommand(13, 1, index, 11, Generation: 3).Apply(world, rng).Applied);
         Assert.Equal(89, slime.Life);
+    }
+
+    [Fact]
+    public void RangedStrike_Requires_Own_Active_Colliding_Projectile()
+    {
+        static (WorldState World, PlayerRuntime Player, WorldNpc Npc, int Index) CreateScenario()
+        {
+            var world = WorldGenerator.GenerateSmall();
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Position = new Vector2(320f, 460f),
+                AimPosition = new Vector2(320f, 460f),
+                SelectedSlot = 3,
+            };
+            player.Items[3] = 39;
+            player.ItemStacks[3] = 1;
+            player.Items[4] = 40;
+            player.ItemStacks[4] = 20;
+            var npc = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                Active = true,
+                Life = 100,
+                LifeMax = 100,
+                Generation = 3,
+                X = 320f,
+                Y = 400f,
+            };
+            lock (world.PlayersLock) world.Players[1] = player;
+            int index;
+            lock (world.NpcsLock)
+            {
+                world.Npcs.Add(npc);
+                index = world.Npcs.IndexOf(npc);
+            }
+            return (world, player, npc, index);
+        }
+
+        var rng = new XoshiroRng(1);
+
+        // 包 27 被类型校验拒绝后，不能再直接用包 28 扣血。
+        var rejectedSpawn = CreateScenario();
+        Assert.Equal(CommandFailures.ProjectileTypeNotAllowed,
+            new SpawnProjectileCommand(1, 1, 1, 2, new Vector2(320f, 400f), new Vector2(0, 0), 9)
+                .Apply(rejectedSpawn.World, rng).Reason);
+        var noProjectile = new NpcStrikeCommand(2, 1, rejectedSpawn.Index, 9, Generation: 3)
+            .Apply(rejectedSpawn.World, rng);
+        Assert.Equal(CommandFailures.ProjectileRequired, noProjectile.Reason);
+        Assert.Equal(100, rejectedSpawn.Npc.Life);
+
+        // 服务端登记的自有弹幕与 NPC AABB 接触时，合理伤害允许结算。
+        var colliding = CreateScenario();
+        Assert.True(new SpawnProjectileCommand(3, 1, 1, 1, new Vector2(320f, 400f), new Vector2(0, 0), 9)
+            .Apply(colliding.World, rng).Applied);
+        Assert.True(new NpcStrikeCommand(4, 1, colliding.Index, 9, Generation: 3)
+            .Apply(colliding.World, rng).Applied);
+        Assert.Equal(91, colliding.Npc.Life);
+
+        // 自有存活弹幕远离 NPC，不能作为包 28 的背书。
+        var distant = CreateScenario();
+        lock (distant.World.ProjectilesLock)
+            distant.World.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 1, Owner = 1, Type = 1, Position = new Vector2(1000f, 1000f), Damage = 9, Active = true,
+            });
+        var notColliding = new NpcStrikeCommand(5, 1, distant.Index, 9, Generation: 3).Apply(distant.World, rng);
+        Assert.Equal(CommandFailures.ProjectileNotColliding, notColliding.Reason);
+        Assert.Equal(100, distant.Npc.Life);
+
+        // 其他玩家的碰撞弹幕不能为当前玩家背书。
+        var otherOwner = CreateScenario();
+        lock (otherOwner.World.ProjectilesLock)
+            otherOwner.World.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 1, Owner = 2, Type = 1, Position = new Vector2(320f, 400f), Damage = 9, Active = true,
+            });
+        var foreignProjectile = new NpcStrikeCommand(6, 1, otherOwner.Index, 9, Generation: 3).Apply(otherOwner.World, rng);
+        Assert.Equal(CommandFailures.ProjectileRequired, foreignProjectile.Reason);
+        Assert.Equal(100, otherOwner.Npc.Life);
+
+        // 已销毁的自有弹幕不再能为包 28 背书。
+        var destroyed = CreateScenario();
+        lock (destroyed.World.ProjectilesLock)
+            destroyed.World.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 1, Owner = 1, Type = 1, Position = new Vector2(320f, 400f), Damage = 9, Active = false,
+            });
+        var destroyedProjectile = new NpcStrikeCommand(7, 1, destroyed.Index, 9, Generation: 3).Apply(destroyed.World, rng);
+        Assert.Equal(CommandFailures.ProjectileRequired, destroyedProjectile.Reason);
+        Assert.Equal(100, destroyed.Npc.Life);
     }
 
     /// <summary>
@@ -3572,6 +4499,36 @@ public class WorldGeneratorTests
             Assert.Equal(9, wood.ItemId);                     // 木材
             Assert.Equal(height + 1, wood.Stack);             // 6 格树干 + 1 格枝
         }
+    }
+
+    [Fact]
+    public void TileBreakCommand_Marks_All_Stateless_MultiTile_Cells_For_Persistence()
+    {
+        var world = new WorldState { MaxTilesX = 16, MaxTilesY = 16, Tiles = new TileMap(16, 16) };
+        lock (world.PlayersLock)
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(8, 8) };
+
+        const int anchorX = 4;
+        const int anchorY = 4;
+        for (var x = 0; x < 3; x++)
+        for (var y = 0; y < 3; y++)
+            world.Tiles[anchorX + x, anchorY + y] = new Tile
+            {
+                Active = true,
+                Type = 406,
+                FrameX = (short)(x * 18),
+                FrameY = (short)(y * 18),
+            };
+
+        var result = new TileBreakCommand(1, 1, anchorX, anchorY, 0, 0).Apply(world, new FixedRng());
+
+        Assert.True(result.Applied);
+        var persisted = world.DrainPersistTiles(WorldState.PersistBatchSize);
+        Assert.Equal(9, persisted.Count);
+        Assert.All(persisted, coordinate =>
+            Assert.InRange(coordinate.X, anchorX, anchorX + 2));
+        Assert.All(persisted, coordinate =>
+            Assert.InRange(coordinate.Y, anchorY, anchorY + 2));
     }
 
     [Fact]

@@ -100,7 +100,7 @@ internal sealed class PlayerAuthority : IPlayerAuthority
             return AuthorityResult.Reject("invalid_health");
         }
 
-        var state = _stats.GetOrAdd(playerId, _ => new PlayerStats(_limits.MaxHp, _limits.MaxMana));
+        var state = _stats.GetOrAdd(playerId, _ => new PlayerStats(_limits.MaxHp));
         lock (state.Gate)
         {
             // 上限由服务端持有：客户端不得抬高，超出即纠正为服务端值
@@ -131,8 +131,8 @@ internal sealed class PlayerAuthority : IPlayerAuthority
     }
 
     /// <summary>
-    /// 玩家法力（包 42）：与血量同口径——上限由服务端持有，客户端不得抬高；
-    /// 当前法力不得高于上限。原版不向他人转发法力，故此处只维护服务端权威值。
+    /// 玩家法力（包 42）：此层只做协议边界校验。会话内最终法力由仿真层
+    /// <see cref="PlayerRuntime"/> 持有，避免 Authority 与 WorldState 维护两份可偏离的状态。
     /// </summary>
     private AuthorityResult ValidateMana(PlayerManaPacket mana, int playerId)
     {
@@ -143,31 +143,26 @@ internal sealed class PlayerAuthority : IPlayerAuthority
             return AuthorityResult.Reject("invalid_mana");
         }
 
-        var state = _stats.GetOrAdd(playerId, _ => new PlayerStats(_limits.MaxHp, _limits.MaxMana));
-        lock (state.Gate)
+        var limits = _limits;
+        if (mana.MaxMana > limits.MaxMana)
         {
-            if (mana.MaxMana > state.MaxMana)
-            {
-                _audit.Log(AuditEvent.Now(playerId, "authority", "mana_corrected", "max_mana_exceeded",
-                    new { ClientMaxMana = mana.MaxMana, ServerMaxMana = state.MaxMana }));
-                return AuthorityResult.Correct(
-                    new PlayerManaPacket(playerId, Math.Min(mana.Mana, state.MaxMana), state.MaxMana),
-                    "max_mana_exceeded");
-            }
-
-            if (mana.Mana > mana.MaxMana)
-            {
-                _audit.Log(AuditEvent.Now(playerId, "authority", "mana_corrected", "mana_exceeded",
-                    new { ClientMana = mana.Mana, MaxMana = mana.MaxMana }));
-                return AuthorityResult.Correct(
-                    new PlayerManaPacket(playerId, mana.MaxMana, mana.MaxMana),
-                    "mana_exceeded");
-            }
-
-            state.Mana = mana.Mana;
-            state.MaxMana = mana.MaxMana;
-            return AuthorityResult.Accept(mana);
+            _audit.Log(AuditEvent.Now(playerId, "authority", "mana_corrected", "max_mana_exceeded",
+                new { ClientMaxMana = mana.MaxMana, ServerMaxMana = limits.MaxMana }));
+            return AuthorityResult.Correct(
+                new PlayerManaPacket(playerId, Math.Min(mana.Mana, limits.MaxMana), limits.MaxMana),
+                "max_mana_exceeded");
         }
+
+        if (mana.Mana > mana.MaxMana)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "authority", "mana_corrected", "mana_exceeded",
+                new { ClientMana = mana.Mana, mana.MaxMana }));
+            return AuthorityResult.Correct(
+                new PlayerManaPacket(playerId, mana.MaxMana, mana.MaxMana),
+                "mana_exceeded");
+        }
+
+        return AuthorityResult.Accept(mana);
     }
 
     /// <summary>
@@ -239,7 +234,7 @@ internal sealed class PlayerAuthority : IPlayerAuthority
     }
 
     public int GetMaxHp(int playerId) => _stats.TryGetValue(playerId, out var s) ? s.MaxHp : _limits.MaxHp;
-    public int GetMaxMana(int playerId) => _stats.TryGetValue(playerId, out var s) ? s.MaxMana : _limits.MaxMana;
+    public int GetMaxMana(int playerId) => _limits.MaxMana;
 
     private sealed class PlayerStats
     {
@@ -247,15 +242,11 @@ internal sealed class PlayerAuthority : IPlayerAuthority
         public readonly Lock Gate = new();
         public int Hp;
         public int MaxHp;
-        public int Mana;
-        public int MaxMana;
 
-        public PlayerStats(int maxHp, int maxMana)
+        public PlayerStats(int maxHp)
         {
             Hp = maxHp;
             MaxHp = maxHp;
-            Mana = maxMana;
-            MaxMana = maxMana;
         }
     }
 }

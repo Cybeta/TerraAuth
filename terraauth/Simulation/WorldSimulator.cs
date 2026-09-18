@@ -389,7 +389,7 @@ public partial class WorldSimulator : IWorldViewProvider
                 // 完全由客户端包 27 权威上报，服务端直线积分反而会漂移；且默认 300 tick
                 // 超时会在合法召唤物命中前销毁弹幕、丢失伤害基准。故**不积分、不超时**，
                 // 生命周期由客户端包 29（销毁）驱动，掉线兜底见下方统一回收。
-                if (SummonProjectileTable.Of.Contains(p.Type))
+                if (p.IsSummon || SummonProjectileTable.Of.Contains(p.Type))
                     continue;
 
                 // 原版字段驱动的行为（图格碰撞 / 重力 / extraUpdates / 生存期钳制）：

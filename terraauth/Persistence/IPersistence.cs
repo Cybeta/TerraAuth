@@ -33,6 +33,8 @@ public interface IAuditRepository
 /// </summary>
 public interface IWorldRepository
 {
+    string WorldId { get; }
+
     /// <summary>批量写入图格改动（同坐标覆盖写）。</summary>
     Task SaveTileChangesAsync(IReadOnlyList<WorldTileRecord> tiles);
     /// <summary>读取全部图格改动（启动时回放）。</summary>
@@ -55,19 +57,19 @@ public interface IWorldRepository
 }
 
 /// <summary>单格图格改动：坐标 + 定长序列化图格（见 <c>Tile.Serialize</c>）。</summary>
-public record WorldTileRecord(int X, int Y, byte[] Data);
+public record WorldTileRecord(int X, int Y, byte[] Data, string WorldId = "default");
 
 /// <summary>
 /// 单个箱子的内容改动：索引 + 坐标 + 物品格序列化字节（见 <c>Chest.SerializeItems</c>）。
 /// 回放时按索引定位并校验坐标，避免基准世界被替换后错位套用。
 /// </summary>
-public record WorldChestRecord(int Index, int X, int Y, byte[] Data);
+public record WorldChestRecord(int Index, int X, int Y, byte[] Data, string WorldId = "default");
 
 /// <summary>
 /// 图格实体覆盖：以锚点为稳定键，保存完整 section-5 单实体文件负载；删除时保留墓碑，
 /// 防止同锚点的基准世界实体在重启回放时复活。
 /// </summary>
-public record WorldTileEntityRecord(int RuntimeId, int FileId, byte Type, short X, short Y, byte[]? Data, bool IsDeleted);
+public record WorldTileEntityRecord(int RuntimeId, int FileId, byte Type, short X, short Y, byte[]? Data, bool IsDeleted, string WorldId = "default");
 
 public record PlayerData(Guid Id, string Name, byte[] InventoryBlob, int MaxHp, int MaxMp);
 public record AuditEntry(DateTime Timestamp, Guid PlayerId, string EventType, string Detail, string? IpAddress);

@@ -129,7 +129,8 @@ public static class WorldGenerator
         => Generate(WorldSize.Small, worldName, seed);
 
     /// <summary>按尺寸档生成确定性世界。</summary>
-    public static WorldState Generate(WorldSize size, string worldName = "TerraAuth", int seed = 20260909)
+    public static WorldState Generate(WorldSize size, string worldName = "TerraAuth", int seed = 20260909,
+        bool? crimson = null)
     {
         var (maxTilesX, maxTilesY) = Dimensions(size);
         var rng = new XoshiroRng((ulong)seed);
@@ -279,7 +280,7 @@ public static class WorldGenerator
         PlaceOreVeins(world, rng, worldSurface, rockLayer, hellStart);
 
         // ---- 5b. 生物群系（腐化/猩红、雪原、沙漠、丛林、发光蘑菇、地牢）----
-        PlaceBiomes(world, rng, seed, groundY, rockLayer, hellStart, spawnX, oceanWidth);
+        PlaceBiomes(world, rng, seed, groundY, rockLayer, hellStart, spawnX, oceanWidth, crimson);
 
         // ---- 5c. 地表树木（原版 WorldGen.GrowTree 的树干部分）----
         PlaceTrees(world, rng, spawnX);
@@ -821,10 +822,10 @@ public static class WorldGenerator
     /// 神圣与陨石**不在**生成阶段（分别是困难模式转换与砸暗影珠坠落），见 <see cref="ApplyHardmode"/>。
     /// </summary>
     private static void PlaceBiomes(WorldState world, XoshiroRng rng, int seed, int[] groundY,
-        int rockLayer, int hellStart, int spawnX, int oceanWidth)
+        int rockLayer, int hellStart, int spawnX, int oceanWidth, bool? forceCrimson = null)
     {
         int width = world.MaxTilesX;
-        bool crimson = rng.NextInt32(2) == 0;
+        bool crimson = forceCrimson ?? rng.NextInt32(2) == 0;
 
         // 锚点全部落在海滩内侧、且与出生点拉开距离；各条带横向互不重叠（斜向带按坡度留余量）
         int dungeonX = BiomeAnchor(width, 12, spawnX, +1);

@@ -51,6 +51,14 @@ public sealed class ConfigurationService : IConfigurationService
         _watcher.EnableRaisingEvents = true;
     }
 
+    public static void Write(string path, ServerConfig config)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var directory = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+        File.WriteAllText(fullPath, JsonSerializer.Serialize(config, JsonOptions));
+    }
+
     public void Reload()
     {
         if (_path is null || !File.Exists(_path)) return;

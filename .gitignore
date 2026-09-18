@@ -17,6 +17,7 @@ terraauth/Tests/TestResults/
 # ---- 运行时数据 ----
 terraauth/*.db
 terraauth/*.log
+p0-validation/
 *.log
 
 # ---- 编辑器/系统 ----
@@ -26,6 +27,6 @@ Thumbs.db
 *.tmp
 
 # ---- 本地素材 / 第三方产物：一律放仓库外，禁止入库 ----
-decompiled/
-decompiled-*.zip
+third-party-artifacts/
+third-party-artifacts-*.zip
 *.bundle

@@ -1,6 +1,6 @@
 # TerraAuth — 原版功能覆盖与验证矩阵
 
-> 记录「原版客户端会用到的功能」在服务端的实现与验证状态，供"测试原版所有功能"时对照。
+> 记录原版客户端会用到的功能在服务端的实现与验证状态，供测试和发布核对。
 > 自动化验证见 [`Tests/VanillaFeatureTests.cs`](Tests/VanillaFeatureTests.cs)：**真实权威管线（GameHost.Bootstrap）+ 真实 TCP**，
 > 与 `IntegrationTests`（多为桩管线）互补。
 > 最后更新：2026-09-16（基础原版客户端真机验证已完成；小动物逐类 aiStyle 与地表树木已落地；完整游玩回归仍待完成）
@@ -27,8 +27,8 @@
 | 背包同步 | 5 | 槽位 / 堆叠 / 物品校验；SSC 下服务端持有唯一真相；**断线时按玩家名把背包 / 生命 / 法力落盘，新会话进服时回读**（`PlayerProfileCodec`，否则重进即清空） | `Vanilla_InventorySlot_InvalidSlot_IsRejected` / `Vanilla_SscInventory_Survives_Reconnect` / `PlayerProfileCodec_RoundTrips_Inventory_And_Vitals` |
 | 物品丢弃 | 21 | 物品 ID / 堆叠校验；并中继给他人 | `Vanilla_ItemDrop_UnknownItem_IsRejected` / `..._Is_Relayed_To_OtherPlayers` |
 | 开箱 | 31 | 坐标越界校验 | `Vanilla_Chest_OutOfBounds_IsRejected` |
-| 攻击 NPC | 28 | 单次伤害上限 + 窗口内 DPS 上限 | `Vanilla_NpcStrike_Above_SingleDamage_Limit_IsRejected` / `..._Within_Limit_IsAccepted` |
-| 抛射物 | 27 | 字段 / 速率校验；并中继给他人 | `Vanilla_Projectile_Is_Not_Rejected` / `..._Is_Relayed_To_OtherPlayers` |
+| 攻击 NPC | 28 | 单次伤害上限 + 窗口内 DPS 上限；已收录远程及固定弹幕魔法还须关联同归属、存活且与目标 AABB 接触的服务端弹幕 | `Vanilla_NpcStrike_Above_SingleDamage_Limit_Is_Rejected` / `..._Within_Limit_IsAccepted` / `RangedStrike_Requires_Own_Active_Colliding_Projectile` |
+| 抛射物 | 27 | 字段 / 速率与武器、弹药、出生位置校验；通过后登记服务端实体并向其他玩家同步 | `Vanilla_Projectile_Is_Not_Rejected` / `..._Is_Relayed_To_OtherPlayers` |
 | 生命 / 法力上报 | 16 | 上限校验；超限则下发**纠正包 16** | `Vanilla_Health_Above_ServerMax_Gets_Correction` |
 | 传送 | 65 | 实体索引 / 落点越界 / 频率校验 | `Vanilla_Teleport_OutOfBounds_IsRejected` |
 | 弃用包健壮性 | 25 | 未知 / 弃用包透传，连接不受影响 | `Vanilla_DeprecatedChatPacket_DoesNot_Disconnect` |
@@ -46,7 +46,7 @@
 | **增益（服务端持有）** | 50 | 条目数 ≤ 44（原版增益槽位）且 ID ∈ [1,400] 校验通过后，由服务端持有增益列表（唯一真相） | `Vanilla_Buffs_Are_Held_Server_Side` / `Vanilla_Invalid_Buff_Id_Is_Rejected` |
 | **弹幕生成校验** | 27 | 弹幕类型须在 [1,1135]；伤害超单次上限即判为作弊拒绝（与包 28 共用阈值）；通过后由服务端登记实体 | `Vanilla_Projectile_Damage_Above_Limit_Is_Rejected` / `Vanilla_Projectile_Invalid_Type_Is_Rejected` |
 | **掉落物拾取** | 22 | 槽位对账（真实存活实体）+ 拾取半径校验 + 服务端背包入库（SSC）→ 移除世界实体并下发包 21（stack=0），并给拾取者一条中文聊天提示（包 82，`ItemDisplayNameTable`；未知项回退调试名或 `Item#ID`） | `Vanilla_ItemPickup_Removes_WorldItem` / `Vanilla_ItemPickup_OutOfReach_Is_Rejected` / `PickupItem_Queues_Chat_Notice` / `PickupItem_Uses_ItemDisplayName_Fallback` |
-| **弹幕命中判定** | 27 | 服务端按弹幕 / 敌怪距离判定命中并扣血，不再采信客户端声明 | `Vanilla_Projectile_Hit_Damages_Enemy` |
+| **弹幕命中判定** | 28（命中上报） | 包 28 仅触发结算；已收录远程及固定弹幕魔法必须有同归属、存活且与目标 AABB 接触的服务端登记弹幕，才会按服务端状态校验并扣血 | `Vanilla_PlayerStrike_Damage_Must_Match_Owned_Projectile` / `RangedStrike_Requires_Own_Active_Colliding_Projectile` |
 | 请求传送（回城类） | 73 | 类型 / 频率校验（与 65 共窗口） | `Vanilla_TeleportRequest_Is_Accepted` / `Vanilla_TeleportRequest_RateExceeded_Is_Rejected` |
 | **箱子内容（服务端持有 + 持久化）** | 31 / 32 / 34 | 开箱校验（存在 / 距离）→ 服务端逐槽下发权威内容（包 34 + 包 32×N）；包 32 校验箱子 / 槽位 / 堆叠 / 物品 / 距离后写入服务端箱子，并**登记增量落盘**（重启后回放，按索引 + 坐标校验） | `Vanilla_ChestOpen_Sends_Authoritative_Contents` / `Vanilla_ChestItem_Is_Applied_Authoritatively` / `..._Invalid_Slot_...` / `..._OutOfReach_...` / `Vanilla_ChestContent_Survives_ServerRestart` |
 | **液体（NetLiquid）** | 82 模块 0 | 客户端上报液体编辑（坐标 / 类型 / 距离校验）→ `LiquidEditCommand` 权威落盘 → 简化流动仿真（下落优先、受阻后侧向均衡）+ 混合反应（异种液体累计 ≥ 24 单位 → 黑曜石 / 蜂蜜块 / 松脆蜂蜜块 / 微光块）→ 按快照频率批量下发 | `Vanilla_Liquid_Edit_Is_Applied_And_Flows_Down` / `..._Changes_Are_Broadcast_To_Client` / `..._OutOfReach_...` / `..._Invalid_Type_...` / `Vanilla_LiquidMerge_Water_Plus_Lava_Creates_Obsidian` |
@@ -80,7 +80,15 @@
 
 ---
 
-## 三、已知隐患
+## 三、P3-2 至 P3-6 交付边界
+
+- P3-2/P3-3：已完成服务端弹幕归属、创建校验、位置与速度限制、弹药扣减、命中碰撞、重复命中窗口、伤害上界、暴击上界和资源状态跟踪。
+- P3-4：已完成召唤弹幕归属、服务端命中凭据、断线/配置清理、Buff 清理、销毁后不可复活和切换武器后创建时伤害保持。
+- P3-5：已完成图格、箱子、图格实体增量回放、失败重排、树木及多图格对象既有回归，以及停机异常路径的最终刷盘和导出保护。
+- P3-6：已完成服务端世界选择/新建/导入流程、发布流水线测试与双后端构建门禁、运行数据排除检查和敏感内容扫描。
+- 明确边界：当前没有可靠的逐武器 useTime/useAnimation、法力消耗、逐弹幕穿透和特殊弹药数据表，因此这些行为继续采用兼容性策略，不能视为完整逐武器复现。
+
+## 四、已知隐患
 
 1. **`MaxSingleDamage` 与协议量纲冲突**：`NpcStrike.Damage` 线格式为 **Int16**（±32767），而默认上限为 30000，
    两者几乎贴边；若把上限配置为 >32767，该上限**永远不会触发**。已加启动期校验：`MaxSingleDamage > 32767` 直接拒绝启动并提示量纲约束。
@@ -109,8 +117,7 @@
     （原版还允许覆盖可被黑曜石破坏的图格），且无液体压力模型。
 11. **区块超帧上限已有兜底**：编码后超过 `UInt16`（65535）时按较长轴二分拆分再发（`NetworkHost.SendTileSectionAsync`），
     避免高熵区块直接抛异常中断登录；原版是同通道的降级压缩路径，此处用拆分替代。
-12. **弹幕伤害为「上界校验」而非原版推导**：包 27 的伤害仍由客户端声明，服务端只保证不超过配置的单次伤害上限
-    （与包 28 共用阈值）；原版伤害由武器 / 装备推导，此处未建模武器表。法力 / 增益已改为服务端跟踪与持有，
+12. **弹幕伤害仍为「上界校验」而非完整原版推导**：已收录远程及固定弹幕魔法的包 28 命中还必须关联同归属、存活且与目标 AABB 接触的服务端登记弹幕；但包 27 的基础伤害仍需后续由完整武器使用状态、装备与效果推导。法力 / 增益已改为服务端跟踪与持有，
     但**增益的效果**仍由客户端计算（服务端只维护列表），属简化模型。
 13. **实体位置语义与物理常数已按原版对齐**：`position` = **碰撞盒左上角**，脚底 = `position.Y + height`；
     玩家 20×42（原版 `Player.cs`），NPC 逐类型尺寸（见 `Simulation/NpcAI/NpcSizes.cs`，按原版 `NPC.SetDefaults` 核对：
@@ -119,7 +126,7 @@
     （`NPC.UpdateNPC_UpdateGravity`）。**这些必须与客户端一致** —— 客户端收到包 23 后即按自己的尺寸 / 常数
     解释该坐标并自行推进 / 碰撞（`netOffset` 只用于渲染平滑），不一致会表现为「贴图陷地 / 悬空 + 持续抖动」
     以及「看着没碰到却扣血」。遗留：少数 NPC 类型在原版会覆盖 `gravity` / `maxFallSpeed`，当前统一用默认值；
-    弹幕命中判定统一按 16×16 近似；NPC 水平方向未做完整 AABB 阻挡（靠同步收敛）。
+    弹幕命中判定使用登记弹幕的实际宽高与 NPC 逐类型尺寸 AABB（含 2px 同步容差）；NPC 水平方向未做完整 AABB 阻挡（靠同步收敛）。
 
 ---
 

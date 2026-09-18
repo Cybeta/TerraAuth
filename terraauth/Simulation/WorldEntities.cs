@@ -78,6 +78,43 @@ public sealed class ProjectileEntity
     public Vector2 Velocity;
     public int Damage;
 
+    /// <summary>创建该弹幕时使用的服务端物品；未知来源为 0。</summary>
+    public int SourceItem;
+
+    /// <summary>创建该弹幕时锁定的来源武器物品；实体创建后不随玩家换武器变化。</summary>
+    public int SourceWeaponItem;
+
+    /// <summary>创建该弹幕时锁定的来源武器前缀。</summary>
+    public byte SourceWeaponPrefix;
+
+    /// <summary>服务端为本次弹幕创建分配的来源事务标识；不是网络协议事务号。</summary>
+    public long SourceTransactionId;
+    public long FireTransactionId;
+
+    /// <summary>服务端创建 tick，用于诊断和生命周期判断。</summary>
+    public long SpawnTick;
+
+    /// <summary>是否为召唤物实体。</summary>
+    public bool IsSummon;
+
+    /// <summary>服务端分配的稳定召唤实体标识；普通弹幕为 0。</summary>
+    public long SummonEntityId;
+
+    /// <summary>召唤实体分类；普通弹幕为 <see cref="SummonKind.None"/>。</summary>
+    public SummonKind SummonKind;
+
+    /// <summary>创建 Minion 的召唤 Buff；Sentry 和未知来源为 0。</summary>
+    public int SourceSummonBuffId;
+
+    /// <summary>剩余 NPC 穿透次数；-1 表示不因命中消耗。</summary>
+    public int Penetrate = 1;
+
+    /// <summary>普通弹幕对同一 NPC 的下一次可命中 tick。</summary>
+    public Dictionary<int, long> NpcHitCooldownUntil { get; } = new();
+
+    /// <summary>召唤弹幕对同一 NPC 的下一次可命中 tick。</summary>
+    public Dictionary<int, long> SummonNpcHitCooldownUntil { get; } = new();
+
     /// <summary>碰撞盒尺寸（按原版 Projectile.SetDefaults 逐类型 width/height；未登记类型取 16 近似）。</summary>
     public float Width = 16f;
     public float Height = 16f;

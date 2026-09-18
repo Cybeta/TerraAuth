@@ -987,6 +987,44 @@ public class EndToEndTests
     }
 
     [Fact]
+    public async Task Persistence_WorldScopes_IsolateTilesChestsAndTileEntities_AcrossReopen()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-world-scope-{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var worldA = new SqlitePersistence(dbPath, worldId: "world-a"))
+            {
+                await worldA.SaveTileChangesAsync(new[] { new WorldTileRecord(10, 20, new byte[] { 1 }) });
+                await worldA.SaveChestChangesAsync(new[] { new WorldChestRecord(3, 40, 50, new byte[] { 2 }) });
+                await worldA.SaveTileEntityChangesAsync(new[] { new WorldTileEntityRecord(4, 9, 3, 60, 70, new byte[] { 3 }, false) });
+            }
+
+            using (var worldB = new SqlitePersistence(dbPath, worldId: "world-b"))
+            {
+                Assert.Empty(await worldB.LoadTileChangesAsync());
+                Assert.Empty(await worldB.LoadChestChangesAsync());
+                Assert.Empty(await worldB.LoadTileEntityChangesAsync());
+                await worldB.SaveTileChangesAsync(new[] { new WorldTileRecord(10, 20, new byte[] { 4 }) });
+            }
+
+            using (var worldA = new SqlitePersistence(dbPath, worldId: "world-a"))
+            {
+                Assert.Equal(new byte[] { 1 }, Assert.Single(await worldA.LoadTileChangesAsync()).Data);
+                Assert.Equal(new byte[] { 2 }, Assert.Single(await worldA.LoadChestChangesAsync()).Data);
+                Assert.Equal(new byte[] { 3 }, Assert.Single(await worldA.LoadTileEntityChangesAsync()).Data);
+                await worldA.ClearWorldChangesAsync();
+            }
+
+            using (var worldB = new SqlitePersistence(dbPath, worldId: "world-b"))
+                Assert.Equal(new byte[] { 4 }, Assert.Single(await worldB.LoadTileChangesAsync()).Data);
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
+    [Fact]
     public async Task Persistence_TileEntityOverlay_UpsertsByAnchor_And_SurvivesReopen()
     {
         var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-te-{Guid.NewGuid():N}.db");

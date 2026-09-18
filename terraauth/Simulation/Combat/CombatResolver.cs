@@ -182,38 +182,8 @@ public static class CombatResolver
             foreach (var p in world.Projectiles)
             {
                 if (!p.Active || p.Owner != playerId || p.Damage <= 0) continue;
-                if (!SummonProjectileTable.Of.Contains(p.Type)) continue;
+                if (!p.IsSummon && !SummonProjectileTable.Of.Contains(p.Type)) continue;
                 if (p.Damage > best) best = p.Damage;
-            }
-        }
-
-        if (best <= 0) return null;
-        return (int)Math.Ceiling(best * 1.15f) * (crit ? 2 : 1);
-    }
-
-    /// <summary>
-    /// 阶段 G：召唤 / 哨兵命中的**背包兜底上界**——玩家物品栏中最高基础伤害的召唤武器权威伤害
-    /// （<c>GetWeaponDamage</c>，含前缀 / Buff / 饰品 / 套装修饰）。
-    /// 服务端未跟踪到召唤弹幕时（弹幕类型未收录 / 包 27 丢失 / 掉线重连）用作兜底基准，防作弊不失效。
-    /// <para>
-    /// 注意不能**单独**作为召唤上界：原版仆从伤害 = **召唤时**的武器伤害，召唤后把武器移出背包
-    /// 会导致背包上界低于仆从实际伤害 → 误拒合法命中；故与 <see cref="SummonDamageBound"/>（弹幕）
-    /// 由调用方取最大合并——弹幕在时不受背包变动影响，弹幕丢失时由背包兜底。
-    /// </para>
-    /// 返回 null（背包无召唤武器）→ 调用方失败放行。
-    /// </summary>
-    public static int? SummonBackpackBound(PlayerRuntime player, bool crit)
-    {
-        int best = 0;
-        for (int i = 0; i < player.Items.Length; i++)
-        {
-            int item = player.Items[i];
-            if (item <= 0) continue;
-            if (ItemDamageTable.Of.TryGetValue(item, out var stats) && stats.Class == WeaponClass.Summon)
-            {
-                byte prefix = i < player.ItemPrefixes.Length ? player.ItemPrefixes[i] : (byte)0;
-                int wd = GetWeaponDamage(player, item, prefix);
-                if (wd > best) best = wd;
             }
         }
 

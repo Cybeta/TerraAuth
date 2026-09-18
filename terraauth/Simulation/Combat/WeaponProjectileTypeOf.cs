@@ -24,12 +24,14 @@ public static class WeaponProjectileTypeOf
         [51] = 5,     // JestersArrow
         [265] = 41,   // HellfireArrow
         [516] = 91,   // HolyArrow
+        [3103] = 1,    // EndlessQuiver (uses the selected arrow projectile family)
         [545] = 103,  // CursedArrow
         [988] = 172,  // FrostburnArrow
         [1235] = 225, // ChlorophyteArrow
         [1334] = 278, // IchorArrow
         [1341] = 282, // VenomArrow
         [97] = 14,    // MusketBall
+        [3104] = 14,   // EndlessMusketPouch (uses the bullet projectile family)
         [234] = 75,   // MeteorShot
         [278] = 15,   // SilverBullet
         [515] = 27,   // CrystalBullet

@@ -56,6 +56,22 @@ public sealed class WorldState
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
 
+    private long _nextProjectileSourceTransactionId;
+    private long _nextSummonEntityId;
+
+    internal long AllocateProjectileSourceTransactionId()
+    {
+        lock (ProjectilesLock)
+            return ++_nextProjectileSourceTransactionId;
+    }
+
+    /// <summary>为新建召唤实体分配单调递增的服务端内部标识。</summary>
+    internal long AllocateSummonEntityId()
+    {
+        lock (ProjectilesLock)
+            return ++_nextSummonEntityId;
+    }
+
     /// <summary>玩家运行时状态（服务端权威唯一真相）。</summary>
     public Dictionary<int, PlayerRuntime> Players { get; } = new();
 
@@ -85,7 +101,8 @@ public sealed class WorldState
             for (int i = 0; i < Projectiles.Count; i++)
             {
                 var p = Projectiles[i];
-                if (p.Active && p.Owner == playerId && SummonProjectileTable.Of.Contains(p.Type))
+                if (p.Active && p.Owner == playerId &&
+                    (p.IsSummon || SummonProjectileTable.Of.Contains(p.Type)))
                 {
                     p.Active = false;
                     p.Destroyed = true;   // 永久销毁：拒绝被后续包 27 更新复活
@@ -119,6 +136,27 @@ public sealed class WorldState
                 MarkPlayerBuffsChanged(playerId);
                 if (DiagnosticLog.Enabled)
                     Console.WriteLine($"[DIAG] KillSummonedProjectiles pid={playerId} removed_buffs={removed}");
+            }
+        }
+    }
+
+    /// <summary>销毁指定玩家由某个召唤 Buff 维持的 Minion；Sentry 不受 Buff 变化影响。</summary>
+    public void KillSummonedProjectilesForBuff(int playerId, int buffId)
+    {
+        lock (ProjectilesLock)
+        {
+            foreach (var projectile in Projectiles)
+            {
+                if (!projectile.Active || projectile.Owner != playerId ||
+                    projectile.SummonKind != SummonKind.Minion ||
+                    projectile.SourceSummonBuffId != buffId)
+                {
+                    continue;
+                }
+
+                projectile.Active = false;
+                projectile.Destroyed = true;
+                projectile.DeadTick = Tick;
             }
         }
     }
@@ -178,6 +216,7 @@ public sealed class WorldState
                 runtime.SessionId = expectedSessionId;
             runtime.Id = newPlayerId;
             runtime.Active = true;
+            runtime.HasReceivedManaSync = false;
             runtime.AimPosition = runtime.Position;
             runtime.Resumed = true;
             runtime.RespawnNotified = false;   // 世界同步据此下发包 12（携恢复后的坐标）
@@ -988,6 +1027,35 @@ public sealed class WorldState
         }
     }
 
+    // ---- 法力变更推送（服务端扣除法力后生成原版包 42）----
+
+    public object PlayerManaLock { get; } = new();
+    private readonly HashSet<int> _pendingPlayerMana = new();
+
+    /// <summary>标记玩家法力已由服务端权威修改，向本人回写包 42。</summary>
+    public void MarkPlayerManaChanged(int playerId)
+    {
+        lock (PlayerManaLock) _pendingPlayerMana.Add(playerId);
+    }
+
+    public List<int> DrainPlayerManaChanged(int max)
+    {
+        if (max <= 0)
+            return new List<int>();
+
+        lock (PlayerManaLock)
+        {
+            var result = new List<int>(Math.Min(max, _pendingPlayerMana.Count));
+            foreach (var playerId in _pendingPlayerMana)
+            {
+                result.Add(playerId);
+                if (result.Count >= max) break;
+            }
+            foreach (var playerId in result) _pendingPlayerMana.Remove(playerId);
+            return result;
+        }
+    }
+
     // ---- 增益列表变更推送（仿真移除增益后生成原版包 50）----
 
     public object PlayerBuffsLock { get; } = new();
@@ -1559,6 +1627,9 @@ public sealed class PlayerRuntime
     public int Mp = 20;
     public int MpMax = 20;
 
+    /// <summary>是否已接受本次会话的首个合法法力同步；之后客户端只能报告减少。</summary>
+    public bool HasReceivedManaSync;
+
     /// <summary>服务端持有的增益 / 减益列表（包 50 权威；上限与原版增益槽位数一致，44）。</summary>
     public readonly List<int> Buffs = new();
 
@@ -1662,6 +1733,36 @@ public sealed class PlayerRuntime
     /// </summary>
     public byte ControlBits;
 
+    /// <summary>是否已收到过包 13；旧的直接命令测试路径在此之前保持兼容。</summary>
+    public bool HasReceivedPlayerControls;
+
+    /// <summary>当前按住 UseItem 时包 13 关联的手持槽位；松开后清除。</summary>
+    public int UseItemSelectedSlot = -1;
+
+    /// <summary>上次获准创建受 UseItem 状态机约束弹幕的服务端 tick。</summary>
+    public long LastUseItemProjectileSpawnTick = long.MinValue;
+
+    /// <summary>服务器分配的下一次开火事务序号，绑定当前 UseItem 周期。</summary>
+    public long NextFireTransactionId = 1;
+
+    /// <summary>已提交的开火事务；用于网络重试幂等，键为服务端事务号。</summary>
+    public readonly HashSet<long> AppliedFireTransactions = new();
+
+    private readonly Queue<long> _appliedFireTransactionOrder = new();
+
+    /// <summary>每位玩家保留的最近开火事务数，避免重试去重状态无限增长。</summary>
+    public const int MaxAppliedFireTransactions = 256;
+
+    public void RecordAppliedFireTransaction(long transactionId)
+    {
+        if (!AppliedFireTransactions.Add(transactionId))
+            return;
+
+        _appliedFireTransactionOrder.Enqueue(transactionId);
+        while (_appliedFireTransactionOrder.Count > MaxAppliedFireTransactions)
+            AppliedFireTransactions.Remove(_appliedFireTransactionOrder.Dequeue());
+    }
+
     /// <summary>上一 tick 是否按住跳跃键。原版用 <c>releaseJump</c> 要求「松开后再按」才算一次起跳。</summary>
     public bool JumpHeld;
 
@@ -1684,11 +1785,13 @@ public sealed class PlayerRuntime
     public const byte ControlLeft = 0x04;
     public const byte ControlRight = 0x08;
     public const byte ControlJump = 0x10;
+    public const byte ControlUseItem = 0x20;
 
     public bool PressingLeft => (ControlBits & ControlLeft) != 0;
     public bool PressingRight => (ControlBits & ControlRight) != 0;
     public bool PressingJump => (ControlBits & ControlJump) != 0;
     public bool PressingDown => (ControlBits & ControlDown) != 0;
+    public bool PressingUseItem => (ControlBits & ControlUseItem) != 0;
 }
 
 /// <summary>

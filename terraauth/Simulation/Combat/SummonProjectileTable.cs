@@ -18,6 +18,13 @@ namespace TerraAuth.Simulation;
 /// 原版 1.4.5.8 全部召唤物 / 哨兵弹幕类型（<c>minion = true</c> / <c>sentry = true</c>）。
 /// 用于识别「该玩家拥有的召唤弹幕」并据此计算包 28 的合法伤害上界。
 /// </summary>
+public enum SummonKind
+{
+    None = 0,
+    Minion = 1,
+    Sentry = 2,
+}
+
 public static class SummonProjectileTable
 {
     /// <summary>召唤 / 哨兵弹幕类型集合（可安全包含全部 minion/sentry 弹幕）。</summary>
@@ -84,7 +91,25 @@ public static class SummonProjectileTable
         [6164] = 394,  // Forbidden Minion                     (Item.cs:47567)
     };
 
+    private static readonly HashSet<int> SentryTypes = new()
+    {
+        667, 676, 687,
+        831, 833, 834, 835,
+        946, 951, 966, 970,
+    };
+
     private static readonly HashSet<int> SummonBuffSet = new(SummonWeaponBuff.Values);
+
+    /// <summary>返回服务端用于生命周期和命中归因的召唤类别。</summary>
+    public static SummonKind KindOf(int projectileType)
+    {
+        if (!Of.Contains(projectileType))
+            return SummonKind.None;
+
+        return SentryTypes.Contains(projectileType)
+            ? SummonKind.Sentry
+            : SummonKind.Minion;
+    }
 
     /// <summary>判断 Buff 是否为召唤 Buff（供 <see cref="WorldState.KillSummonedProjectiles"/> 移除）。</summary>
     public static bool IsSummonBuff(int buffId) => SummonBuffSet.Contains(buffId);

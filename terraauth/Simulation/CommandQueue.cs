@@ -115,9 +115,15 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
         player.AimPosition = Position;
         if (ReportedVelocity is { } reported)
             player.Velocity = reported;
+        bool wasPressingUseItem = player.PressingUseItem;
         player.ControlBits = ControlBits;
         if (SelectedItem < PlayerRuntime.InventorySlotCount)
             player.SelectedSlot = SelectedItem;
+        player.HasReceivedPlayerControls = true;
+        if (!player.PressingUseItem)
+            player.UseItemSelectedSlot = -1;
+        else if (!wasPressingUseItem || player.UseItemSelectedSlot < 0)
+            player.UseItemSelectedSlot = player.SelectedSlot;
         player.Active = true;
         world.MarkPlayerChanged(id);
         return new(true);
@@ -512,6 +518,156 @@ public sealed record TransferInventoryChestItemCommand(
         world.MarkChestChanged(ChestIndex, ChestSlot);
         world.MarkInventoryChanged(playerId, appliedSessionId, InventorySlot);
         return new(true);
+    }
+}
+
+public enum ChestBulkOperation
+{
+    LootAll,
+    DepositAll,
+    QuickStack,
+}
+
+/// <summary>箱子批量物品操作：服务端规划后一次性提交，客户端不能提交最终快照。</summary>
+public sealed record BulkInventoryChestCommand(
+    long Tick, int? PlayerId, int ChestIndex, ChestBulkOperation Operation, long OperationId)
+    : Command(Tick, PlayerId, "bulk_inventory_chest")
+{
+    private const int MaxStackSize = 999;
+    private const int InventoryStart = 9;
+    private const int InventoryEnd = 49;
+
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int playerId) return new(false, CommandFailures.MissingPlayer);
+        if (OperationId == 0) return new(false, CommandFailures.NotApplied);
+        long appliedSessionId;
+        var changedInventory = new HashSet<int>();
+        var changedChest = new HashSet<int>();
+
+        lock (world.PlayersLock)
+        {
+            if (!world.Players.TryGetValue(playerId, out var player) || !player.Active || player.Dead)
+                return new(false, CommandFailures.PlayerNotActive);
+            if (SessionId != 0 && player.SessionId != SessionId)
+                return new(false, CommandFailures.StaleSession);
+
+            appliedSessionId = SessionId != 0 ? SessionId : player.SessionId;
+            lock (world.ChestsLock)
+            {
+                if (!world.HasChestSession(playerId, appliedSessionId, ChestIndex))
+                    return new(false, CommandFailures.ChestNotOpen);
+                if (world.HasAppliedInventoryChestOperation(playerId, appliedSessionId, OperationId))
+                    return new(false, "replayed_operation");
+
+                var chest = world.FindChestByIndex(ChestIndex);
+                if (chest is null) return new(false, CommandFailures.ChestNotFound);
+
+                float dx = player.Position.X - chest.X * 16f - 8f;
+                float dy = player.Position.Y - chest.Y * 16f - 8f;
+                if (dx * dx + dy * dy > 160f * 160f)
+                    return new(false, CommandFailures.OutOfReach);
+
+                var inventory = new ChestItem[PlayerRuntime.InventorySlotCount];
+                for (int slot = 0; slot < inventory.Length; slot++)
+                    inventory[slot] = new ChestItem
+                    {
+                        Type = player.Items[slot],
+                        Stack = (short)Math.Clamp(player.ItemStacks[slot], 0, MaxStackSize),
+                        Prefix = player.ItemPrefixes[slot],
+                    };
+                var chestItems = (ChestItem[])chest.Items.Clone();
+
+                if (Operation is ChestBulkOperation.LootAll)
+                {
+                    for (int chestSlot = 0; chestSlot < chestItems.Length; chestSlot++)
+                        MoveStack(chestItems, chestSlot, inventory, changedChest, changedInventory, false,
+                            InventoryStart, InventoryEnd);
+                }
+                else
+                {
+                    bool existingOnly = Operation == ChestBulkOperation.QuickStack;
+                    for (int inventorySlot = InventoryStart; inventorySlot <= InventoryEnd; inventorySlot++)
+                        MoveStack(inventory, inventorySlot, chestItems, changedInventory, changedChest, existingOnly,
+                            0, chestItems.Length - 1);
+                }
+
+                if (changedInventory.Count == 0 && changedChest.Count == 0)
+                    return new(false, CommandFailures.NoChange);
+
+                for (int slot = 0; slot < inventory.Length; slot++)
+                {
+                    player.Items[slot] = inventory[slot].Type;
+                    player.ItemStacks[slot] = inventory[slot].Stack;
+                    player.ItemPrefixes[slot] = inventory[slot].Prefix;
+                }
+                chest.Items = chestItems;
+                player.RecalculateDefense();
+                world.MarkInventoryChestOperationApplied(playerId, appliedSessionId, OperationId);
+            }
+        }
+
+        world.MarkPersistChest(ChestIndex);
+        foreach (int slot in changedChest)
+            world.MarkChestChanged(ChestIndex, slot);
+        foreach (int slot in changedInventory)
+            world.MarkInventoryChanged(playerId, appliedSessionId, slot);
+        return new(true);
+    }
+
+    private static void MoveStack(
+        ChestItem[] source, int sourceSlot, ChestItem[] target,
+        HashSet<int> changedSource, HashSet<int> changedTarget, bool existingOnly,
+        int targetStart, int targetEnd)
+    {
+        var item = source[sourceSlot];
+        if (item.Type == 0 || item.Stack <= 0) return;
+
+        int remaining = item.Stack;
+        for (int targetSlot = targetStart; targetSlot <= targetEnd && targetSlot < target.Length && remaining > 0; targetSlot++)
+        {
+            var destination = target[targetSlot];
+            if (destination.Type != item.Type || destination.Prefix != item.Prefix ||
+                destination.Stack >= MaxStackSize)
+                continue;
+
+            int amount = Math.Min(remaining, MaxStackSize - destination.Stack);
+            target[targetSlot] = new ChestItem
+            {
+                Type = item.Type,
+                Stack = (short)(destination.Stack + amount),
+                Prefix = item.Prefix,
+            };
+            remaining -= amount;
+            changedTarget.Add(targetSlot);
+        }
+
+        if (!existingOnly && remaining > 0)
+        {
+            for (int targetSlot = targetStart; targetSlot <= targetEnd && targetSlot < target.Length && remaining > 0; targetSlot++)
+            {
+                if (target[targetSlot].Type != 0 || target[targetSlot].Stack != 0 || target[targetSlot].Prefix != 0)
+                    continue;
+
+                int amount = Math.Min(remaining, MaxStackSize);
+                target[targetSlot] = new ChestItem
+                {
+                    Type = item.Type,
+                    Stack = (short)amount,
+                    Prefix = item.Prefix,
+                };
+                remaining -= amount;
+                changedTarget.Add(targetSlot);
+            }
+        }
+
+        if (remaining != item.Stack)
+        {
+            source[sourceSlot] = remaining == 0
+                ? new ChestItem()
+                : new ChestItem { Type = item.Type, Stack = (short)remaining, Prefix = item.Prefix };
+            changedSource.Add(sourceSlot);
+        }
     }
 }
 
@@ -1326,22 +1482,34 @@ public sealed record NpcStrikeCommand(
                 return new(false, CommandFailures.NotApplied);
             }
 
-            // 阶段 C「弹幕伤害匹配」：玩家攻击 NPC 的数值必须落在其**最近存活弹幕**的权威伤害区间内。
-            // 原版客户端 Projectile.Damage()：Damage × DamageVar(±15%) × (crit ? 2 : 1)（均发生在防御减伤**之前**，
-            // 包 28 上报的是减防御前数值；NPC 防御减伤在服务端结算时应用，见下方 applied）。
-            // 上界 = ceil(p.Damage × 1.15) × (crit ? 2 : 1)。
-            // 近战挥砍无弹幕（找不到匹配）→ 交棒阶段 E 武器校验。
+            // 已收录远程武器，以及有固定弹幕映射的已收录魔法武器，必须以服务端登记且实际
+            // 接触目标的自有弹幕为依据。其余武器保留既有近战 / 召唤兼容路径。
+            bool projectileRequired = RequiresProjectileForStrike(player!);
+            bool summonWeaponHeld = IsSummonWeaponHeld(player!);
+            bool summonAttackExpected = summonWeaponHeld ||
+                IsSelectedSlotEmpty(player!) &&
+                (HasOwnedSummonProjectile(world, playerId) || HasSummonWeaponInInventory(player!));
             bool projectileMatched = false;
-            if (world.StrikeProjectileMatch)
+            bool summonProjectileMatched = false;
+            if (world.StrikeProjectileMatch || projectileRequired)
             {
-                var proj = FindPlayerProjectileNearNpc(world, playerId, npc);
+                var proj = FindPlayerProjectileNearNpc(world, playerId, npc, out bool hasOwnedProjectile);
                 if (proj is null)
                 {
+                    if (projectileRequired)
+                        return new(false, hasOwnedProjectile
+                            ? CommandFailures.ProjectileNotColliding
+                            : CommandFailures.ProjectileRequired);
+
                     if (DiagnosticLog.Enabled)
-                        Console.WriteLine($"[Strike] slot={NpcIndex} 未找到归属玩家 #{playerId} 的存活弹幕（近战挥砍？），交棒武器校验 dmg={Damage}");
+                        Console.WriteLine($"[Strike] slot={NpcIndex} 未找到归属玩家 #{playerId} 的存活碰撞弹幕，交棒武器校验 dmg={Damage}");
                 }
                 else
                 {
+                    if (proj.NpcHitCooldownUntil.TryGetValue(NpcIndex, out long cooldownUntil) &&
+                        Tick < cooldownUntil)
+                        return new(false, CommandFailures.ProjectileHitCooldown);
+
                     int bound = (int)Math.Ceiling(proj.Damage * 1.15f) * (Crit ? 2 : 1);
                     if (Damage > bound)
                     {
@@ -1350,10 +1518,49 @@ public sealed record NpcStrikeCommand(
                         return new(false, CommandFailures.StrikeDamageMismatch);
                     }
                     projectileMatched = true;
+                    proj.NpcHitCooldownUntil[NpcIndex] = Tick + 10;
+                    if (proj.Penetrate > 0)
+                    {
+                        proj.Penetrate--;
+                        if (proj.Penetrate == 0)
+                        {
+                            proj.Active = false;
+                            proj.DeadTick = Tick;
+                        }
+                    }
                 }
             }
 
-            // 阶段 E「近战武器伤害校验」/ 阶段 F「远程武器校验」/ 阶段 G「召唤弹幕校验」：
+            if (summonAttackExpected)
+            {
+                var summonProjectile = FindPlayerProjectileNearNpc(
+                    world, playerId, npc, out _, summonOnly: true);
+                if (summonProjectile is null)
+                    return new(false, CommandFailures.ProjectileRequired);
+
+                if (summonProjectile.SummonNpcHitCooldownUntil.TryGetValue(
+                        NpcIndex, out long summonCooldownUntil) &&
+                    Tick < summonCooldownUntil)
+                    return new(false, CommandFailures.ProjectileHitCooldown);
+
+                int summonBound = (int)Math.Ceiling(summonProjectile.Damage * 1.15f)
+                    * (Crit ? 2 : 1);
+                if (Damage > summonBound)
+                    return new(false, CommandFailures.StrikeDamageMismatch);
+                summonProjectileMatched = true;
+                summonProjectile.SummonNpcHitCooldownUntil[NpcIndex] = Tick + 10;
+                if (summonProjectile.Penetrate > 0)
+                {
+                    summonProjectile.Penetrate--;
+                    if (summonProjectile.Penetrate == 0)
+                    {
+                        summonProjectile.Active = false;
+                        summonProjectile.DeadTick = Tick;
+                    }
+                }
+            }
+
+            // 阶段 E「近战武器伤害校验」/ 阶段 F「远程武器校验」/ 阶段 G「召唤弹幕校验」:
             // 无弹幕匹配的命中按**多通道取最大上界**校验——任一合法来源（手持武器或召唤物）
             // 的权威伤害都构成合法上界，上报值超过**所有**通道的上界才拒绝。
             //   · 近战 / 魔法：武器伤害即弹幕伤害（无弹药合并），直接按武器上界校验；
@@ -1362,7 +1569,7 @@ public sealed record NpcStrikeCommand(
             //   · 召唤：仆从伤害 ≠ 手持武器（召唤后切换武器仍沿用创建时伤害），不进手持通道，
             //     改按玩家拥有的存活召唤弹幕最高伤害上界校验（SummonProjectileTable）。
             // 未收录武器 / 空手 / 无召唤弹幕 → 无通道上界，失败放行，绝不误拒未知物品。
-            if (!projectileMatched && world.StrikeWeaponCheck)
+            if (!projectileMatched && !summonProjectileMatched && world.StrikeWeaponCheck)
             {
                 int? upperBound = null;
 
@@ -1388,14 +1595,10 @@ public sealed record NpcStrikeCommand(
                     }
                 }
 
-                // 通道 2：召唤 / 哨兵上界（阶段 G）。无论手持武器，只要该玩家拥有存活召唤弹幕，
-                // 其最高伤害即构成合法上界——召唤物命中不会因「手持弱武器」被误拒。
-                // 弹幕基准 + 背包兜底取最大：弹幕未被跟踪时（类型未收录 / 包 27 丢失 / 掉线重连）
-                // 由背包最高召唤武器伤害兜底，防作弊不失效；弹幕在时不受「召唤后武器移出背包」影响。
+                // 通道 2：召唤 / 哨兵上界（阶段 G）。只使用服务端仍存活的召唤弹幕，
+                // 不以当前背包内容替代召唤物实体作为命中凭据。
                 if (CombatResolver.SummonDamageBound(world, playerId, Crit) is int sb)
                     upperBound = Math.Max(upperBound ?? 0, sb);
-                if (CombatResolver.SummonBackpackBound(player, Crit) is int pb)
-                    upperBound = Math.Max(upperBound ?? 0, pb);
 
                 if (upperBound is int ub && Damage > ub)
                 {
@@ -1431,28 +1634,114 @@ public sealed record NpcStrikeCommand(
         return new(true);
     }
 
-    /// <summary>
-    /// 查找归属该玩家、距离 NPC 最近的一枚存活弹幕（阶段 C 伤害匹配的数值来源）。
-    /// 原版客户端只结算「自己发射」的弹幕（<c>Projectile.Damage</c> 断言 owner == myPlayer），
-    /// 故匹配基准必须是 <c>Owner == playerId</c>；未找到（近战挥砍 / 弹幕已销毁）返回 null。
-    /// </summary>
-    private static ProjectileEntity? FindPlayerProjectileNearNpc(WorldState world, int playerId, WorldNpc npc)
+    private static bool RequiresProjectileForStrike(PlayerRuntime player)
     {
+        if (player.SelectedSlot < 0 || player.SelectedSlot >= PlayerRuntime.InventorySlotCount)
+            return false;
+
+        int heldItem = player.Items[player.SelectedSlot];
+        return ItemDamageTable.Of.TryGetValue(heldItem, out var stats)
+            && (stats.Class == WeaponClass.Ranged
+                || stats.Class == WeaponClass.Magic && WeaponProjectileTypeOf.Direct.ContainsKey(heldItem));
+    }
+
+    private static bool IsSummonWeaponHeld(PlayerRuntime player)
+    {
+        if (player.SelectedSlot < 0 || player.SelectedSlot >= PlayerRuntime.InventorySlotCount)
+            return false;
+
+        int heldItem = player.Items[player.SelectedSlot];
+        return ItemDamageTable.Of.TryGetValue(heldItem, out var stats)
+            && stats.Class == WeaponClass.Summon;
+    }
+
+    private static bool IsSelectedSlotEmpty(PlayerRuntime player)
+    {
+        return player.SelectedSlot < 0 || player.SelectedSlot >= PlayerRuntime.InventorySlotCount ||
+            player.ItemStacks[player.SelectedSlot] <= 0 || player.Items[player.SelectedSlot] <= 0;
+    }
+
+    private static bool HasOwnedSummonProjectile(WorldState world, int playerId)
+    {
+        lock (world.ProjectilesLock)
+            return world.Projectiles.Any(p => p.Active && p.Owner == playerId && p.Damage > 0 &&
+                IsSummonProjectile(p));
+    }
+
+    private static bool HasSummonWeaponInInventory(PlayerRuntime player)
+    {
+        for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+        {
+            if (player.ItemStacks[slot] > 0 &&
+                ItemDamageTable.Of.TryGetValue(player.Items[slot], out var stats) &&
+                stats.Class == WeaponClass.Summon)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 查找归属该玩家、存活且与目标 NPC 碰撞盒实际接触的弹幕。客户端同步与服务端积分之间
+    /// 允许 2 像素余量；普通弹幕按最高伤害保留兼容行为，召唤候选按距 NPC 中心最近、再按稳定实体 ID
+    /// 和弹幕 Key 排序，保证重叠召唤物的命中归因不受列表顺序或伤害配置影响。
+    /// </summary>
+    private static bool IsSummonProjectile(ProjectileEntity projectile)
+        => projectile.IsSummon || SummonProjectileTable.Of.Contains(projectile.Type);
+
+    private static ProjectileEntity? FindPlayerProjectileNearNpc(
+        WorldState world, int playerId, WorldNpc npc, out bool hasOwnedProjectile,
+        bool summonOnly = false)
+    {
+        const float syncTolerance = 2f;
+        var (npcWidth, npcHeight) = NpcSizes.Of(npc.Type);
+        float npcLeft = npc.X - syncTolerance;
+        float npcTop = npc.Y - syncTolerance;
+        float npcRight = npc.X + npcWidth + syncTolerance;
+        float npcBottom = npc.Y + npcHeight + syncTolerance;
         ProjectileEntity? best = null;
-        float bestDistSq = float.MaxValue;
+        hasOwnedProjectile = false;
 
         lock (world.ProjectilesLock)
         {
             foreach (var p in world.Projectiles)
             {
-                if (!p.Active || p.Owner != playerId || p.Damage <= 0) continue;
+                if (!p.Active || p.Owner != playerId || p.Damage <= 0 ||
+                    summonOnly && !IsSummonProjectile(p))
+                    continue;
 
-                float dx = p.Position.X - npc.X;
-                float dy = p.Position.Y - npc.Y;
-                float distSq = dx * dx + dy * dy;
-                if (distSq < bestDistSq)
+                hasOwnedProjectile = true;
+                if (p.Position.X + p.Width < npcLeft || p.Position.X > npcRight ||
+                    p.Position.Y + p.Height < npcTop || p.Position.Y > npcBottom)
+                    continue;
+
+                if (best is null)
                 {
-                    bestDistSq = distSq;
+                    best = p;
+                    continue;
+                }
+
+                if (!summonOnly)
+                {
+                    if (p.Damage > best.Damage)
+                        best = p;
+                    continue;
+                }
+
+                float npcCenterX = npc.X + npcWidth / 2f;
+                float npcCenterY = npc.Y + npcHeight / 2f;
+                float px = p.Position.X + p.Width / 2f - npcCenterX;
+                float py = p.Position.Y + p.Height / 2f - npcCenterY;
+                float bestX = best.Position.X + best.Width / 2f - npcCenterX;
+                float bestY = best.Position.Y + best.Height / 2f - npcCenterY;
+                float distanceSquared = px * px + py * py;
+                float bestDistanceSquared = bestX * bestX + bestY * bestY;
+                long entityId = p.SummonEntityId > 0 ? p.SummonEntityId : long.MaxValue;
+                long bestEntityId = best.SummonEntityId > 0 ? best.SummonEntityId : long.MaxValue;
+                if (distanceSquared < bestDistanceSquared ||
+                    distanceSquared == bestDistanceSquared &&
+                    (entityId < bestEntityId || entityId == bestEntityId && p.Key < best.Key))
+                {
                     best = p;
                 }
             }
@@ -1511,9 +1800,14 @@ public sealed record SpawnItemCommand(
 
 /// <summary>弹幕生成 / 更新命令：包 27 权威通过后生成，服务端登记并推进其生命周期。</summary>
 public sealed record SpawnProjectileCommand(
-    long Tick, int? PlayerId, int Key, int Type, Vector2 Position, Vector2 Velocity, int Damage)
+    long Tick, int? PlayerId, int Key, int Type, Vector2 Position, Vector2 Velocity, int Damage,
+    long FireTransactionId = 0)
     : Command(Tick, PlayerId, "spawn_projectile")
 {
+    /// <summary>服务端兼容未知武器的默认开火间隔。</summary>
+    private const long MinimumUseItemProjectileIntervalTicks =
+        WeaponUseBehaviorTable.CompatibilityUseTime;
+
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId)
@@ -1529,6 +1823,31 @@ public sealed record SpawnProjectileCommand(
             {
                 // 已有弹幕由服务端仿真推进；包 27 更新不采信客户端的位置、速度或生命周期状态。
                 return new(true);
+            }
+
+            // 已收到过包 13 的玩家必须以当前 UseItem 按住状态及其关联槽位创建已映射普通武器弹幕。
+            // 未收到包 13 时保留直接构造 WorldState/Command 的既有测试与服务端路径兼容性。
+            bool requiresUseItem = RequiresUseItemState(player!);
+            bool hasRegisteredUseBehavior = player!.SelectedSlot >= 0 &&
+                player.SelectedSlot < PlayerRuntime.InventorySlotCount &&
+                WeaponUseBehaviorTable.Of.ContainsKey(player.Items[player.SelectedSlot]);
+            bool controlledFire = (requiresUseItem || hasRegisteredUseBehavior) &&
+                player.HasReceivedPlayerControls;
+            int firingSlot = player.SelectedSlot;
+            WeaponUseBehavior useBehavior = WeaponUseBehaviorTable.For(0);
+            if (controlledFire)
+            {
+                if (!player.PressingUseItem || player.UseItemSelectedSlot != player.SelectedSlot)
+                    return new(false, CommandFailures.ProjectileUseItemNotHeld);
+
+                firingSlot = player.UseItemSelectedSlot;
+                int firingItem = player.Items[firingSlot];
+                useBehavior = WeaponUseBehaviorTable.For(firingItem);
+                if (FireTransactionId > 0 && player.AppliedFireTransactions.Contains(FireTransactionId))
+                    return new(true, CommandFailures.FireTransactionDuplicate);
+                if (player.LastUseItemProjectileSpawnTick != long.MinValue &&
+                    world.Tick - player.LastUseItemProjectileSpawnTick < useBehavior.UseTime)
+                    return new(false, CommandFailures.ProjectileUseItemCooldown);
             }
 
             // 碰撞盒按原版逐类型尺寸（Sizes），未登记类型沿用 16×16 近似。
@@ -1652,44 +1971,130 @@ public sealed record SpawnProjectileCommand(
                 //     仅作校验（更宽容，不覆盖，避免写低值误拒）；
                 //   · 手持未知 / 空手 / Buff 弹幕：无推导来源 → 放行（绝不误拒未知物品）。
                 if (player!.SelectedSlot >= 0 && player.SelectedSlot < PlayerRuntime.InventorySlotCount)
+            {
+                int heldItem = player.Items[player.SelectedSlot];
+                byte heldPrefix = player.ItemPrefixes[player.SelectedSlot];
+                if (heldItem > 0 && ItemDamageTable.Of.TryGetValue(heldItem, out var heldStats)
+                    && heldStats.Class is WeaponClass.Melee or WeaponClass.Magic or WeaponClass.Ranged)
                 {
-                    int heldItem = player.Items[player.SelectedSlot];
-                    byte heldPrefix = player.ItemPrefixes[player.SelectedSlot];
-                    if (heldItem > 0 && ItemDamageTable.Of.TryGetValue(heldItem, out var heldStats)
-                        && heldStats.Class is WeaponClass.Melee or WeaponClass.Magic or WeaponClass.Ranged)
+                    if (heldStats.Class is WeaponClass.Melee or WeaponClass.Magic)
                     {
-                        if (heldStats.Class is WeaponClass.Melee or WeaponClass.Magic)
-                        {
-                            int wd = CombatResolver.GetWeaponDamage(player, heldItem, heldPrefix);
-                            if (Damage > (int)Math.Ceiling(wd * 1.15f))
-                                return new(false, CommandFailures.ProjectileDamageAboveBound);
-                            derivedDamage = wd;   // 精确推导 → 服务端权威覆盖
-                        }
-                        else if (CombatResolver.RangedDamageBound(player, heldItem, false, heldPrefix) is int rb
-                                 && Damage > (int)Math.Ceiling(rb * 1.15f))
-                        {
+                        int wd = CombatResolver.GetWeaponDamage(player, heldItem, heldPrefix);
+                        if (Damage > (int)Math.Ceiling(wd * 1.15f))
                             return new(false, CommandFailures.ProjectileDamageAboveBound);
-                        }
-                        // 远程仅校验（上界已含弹药合并），不覆盖 storeDamage。
+                        derivedDamage = wd;   // 精确推导 → 服务端权威覆盖
                     }
+                    else if (CombatResolver.RangedDamageBound(player, heldItem, false, heldPrefix) is int rb
+                             && Damage > (int)Math.Ceiling(rb * 1.15f))
+                    {
+                        return new(false, CommandFailures.ProjectileDamageAboveBound);
+                    }
+                    // 远程仅校验（上界已含弹药合并），不覆盖 storeDamage。
                 }
+            }
+            }
+
+            int sourceWeaponItem = firingSlot >= 0 && firingSlot < PlayerRuntime.InventorySlotCount
+                ? player.Items[firingSlot] : 0;
+            byte sourceWeaponPrefix = firingSlot >= 0 && firingSlot < PlayerRuntime.InventorySlotCount
+                ? player.ItemPrefixes[firingSlot] : (byte)0;
+            SummonKind summonKind = SummonProjectileTable.KindOf(Type);
+
+            // 全部校验完成后才预检资源。任一资源不足时不修改另一项，保证开火要么整体提交、要么完全不变。
+            int manaCost = controlledFire ? useBehavior.ManaCost : 0;
+            if (player.Mp < manaCost)
+                return new(false, CommandFailures.ProjectileManaInsufficient);
+
+            int ammoSlot = -1;
+            bool infiniteAmmo = false;
+            if (firingSlot >= 0 && firingSlot < PlayerRuntime.InventorySlotCount &&
+                WeaponAmmoTypeOf.Of.TryGetValue(player.Items[firingSlot], out int requiredAmmoType))
+            {
+                for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+                {
+                    int ammoItem = player.Items[slot];
+                    if (player.ItemStacks[slot] <= 0 || !AmmoTypeOf.Of.TryGetValue(ammoItem, out int actualAmmoType) ||
+                        actualAmmoType != requiredAmmoType || !WeaponProjectileTypeOf.Ammo.TryGetValue(ammoItem, out int ammoProjectileType) ||
+                        ammoProjectileType != Type)
+                        continue;
+
+                    if (ammoItem is 3103 or 3104)
+                    {
+                        infiniteAmmo = true;
+                        break;
+                    }
+
+                    ammoSlot = slot;
+                    break;
+                }
+
+                if (!infiniteAmmo && ammoSlot < 0)
+                    return new(false, CommandFailures.ProjectileTypeNotAllowed);
+            }
+
+            long committedFireTransactionId = FireTransactionId > 0
+                ? FireTransactionId
+                : player.NextFireTransactionId++;
+            player.Mp -= manaCost;
+            if (manaCost > 0)
+                world.MarkPlayerManaChanged(playerId);
+
+            if (!infiniteAmmo && ammoSlot >= 0)
+            {
+                player.ItemStacks[ammoSlot]--;
+                if (player.ItemStacks[ammoSlot] == 0)
+                {
+                    player.Items[ammoSlot] = 0;
+                    player.ItemPrefixes[ammoSlot] = 0;
+                }
+                world.MarkInventoryChanged(playerId, player.SessionId, ammoSlot);
             }
 
             world.Projectiles.Add(new ProjectileEntity
             {
                 Key = Key,
-                Owner = PlayerId ?? -1,
+                Owner = playerId,
                 Type = Type,
                 Position = Position,
                 Velocity = Velocity,
                 Damage = derivedDamage,
+                SourceItem = sourceWeaponItem,
+                SourceWeaponItem = sourceWeaponItem,
+                SourceWeaponPrefix = sourceWeaponPrefix,
+                SourceTransactionId = summonKind != SummonKind.None
+                    ? world.AllocateProjectileSourceTransactionId() : 0,
+                FireTransactionId = committedFireTransactionId,
+                SpawnTick = world.Tick,
+                IsSummon = summonKind != SummonKind.None,
+                SummonEntityId = summonKind != SummonKind.None
+                    ? world.AllocateSummonEntityId() : 0,
+                SummonKind = summonKind,
+                SourceSummonBuffId = summonKind == SummonKind.Minion &&
+                    SummonProjectileTable.SummonWeaponBuff.TryGetValue(sourceWeaponItem, out int summonBuffId)
+                        ? summonBuffId : 0,
+                Penetrate = -1,
                 Width = size.Width,
                 Height = size.Height,
-                NewNotified = false,   // 由世界同步循环推送给其他玩家（包 27）
+                NewNotified = false,
             });
+            if (controlledFire)
+            {
+                player.LastUseItemProjectileSpawnTick = world.Tick;
+                player.RecordAppliedFireTransaction(committedFireTransactionId);
+            }
         }
 
         return new(true);
+    }
+
+    private static bool RequiresUseItemState(PlayerRuntime player)
+    {
+        if (player.SelectedSlot < 0 || player.SelectedSlot >= PlayerRuntime.InventorySlotCount)
+            return false;
+
+        int heldItem = player.ItemStacks[player.SelectedSlot] > 0 ? player.Items[player.SelectedSlot] : 0;
+        return WeaponProjectileTypeOf.Direct.ContainsKey(heldItem)
+            || WeaponAmmoTypeOf.Of.ContainsKey(heldItem);
     }
 }
 
@@ -1708,7 +2113,6 @@ public sealed record KillProjectileCommand(long Tick, int? PlayerId, int Key, Ve
             if (projectile is null)
                 return new(false, CommandFailures.ProjectileNotFound);
 
-            projectile.Position = Position;
             projectile.Active = false;
             projectile.DeadTick = world.Tick;   // 用仿真 tick（命令的 Tick 可能落后于当前世界 tick）
             projectile.RemovalNotified = true; // 客户端已发起销毁，无需服务端再补发
@@ -1729,8 +2133,15 @@ public sealed record SetManaCommand(long Tick, int? PlayerId, int Mana, int MaxM
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
 
-        player!.MpMax = MaxMana;
-        player.Mp = Math.Clamp(Mana, 0, MaxMana);
+        if (player!.HasReceivedManaSync && (MaxMana > player.MpMax || Mana > player.Mp))
+        {
+            world.MarkPlayerManaChanged(id);
+            return new(false, CommandFailures.NotApplied);
+        }
+
+        player.MpMax = MaxMana;
+        player.Mp = Math.Clamp(Mana, 0, player.MpMax);
+        player.HasReceivedManaSync = true;
         return new(true);
     }
 }
@@ -1769,8 +2180,14 @@ public sealed record SetBuffsCommand(long Tick, int? PlayerId, IReadOnlyList<int
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
 
-        player!.Buffs.Clear();
+        var removedSummonBuffs = player!.Buffs
+            .Where(SummonProjectileTable.IsSummonBuff)
+            .Except(Buffs)
+            .ToArray();
+        player.Buffs.Clear();
         player.Buffs.AddRange(Buffs);
+        foreach (int buffId in removedSummonBuffs)
+            world.KillSummonedProjectilesForBuff(id, buffId);
         player.RecalculateDefense(); // Buff 防御（铁皮/吃饱…）实时并入 statDefense，驱动 117 上界
         world.MarkPlayerChanged(id);
         return new(true);

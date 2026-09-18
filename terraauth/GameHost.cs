@@ -6,6 +6,8 @@ using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading.Channels;
+using System.Security.Cryptography;
+using System.Text;
 using TerraAuth.Config;
 using TerraAuth.Persistence;
 using TerraAuth.Monitoring;
@@ -136,7 +138,8 @@ public sealed class GameHost : IDisposable
         DiagnosticLog.Enabled = config.Current.VerboseDiagnostics;
 
         // 2. 持久化（SQLite；无 NuGet 时走内嵌 LiteDb）
-        var db = new SqlitePersistence(dbPath);
+        var worldId = CreateWorldId(config.Current.WorldPath, config.Current.WorldSize, config.Current.WorldSeed);
+        var db = new SqlitePersistence(dbPath, worldId: worldId);
 
         // 3. 监控（Prometheus 风格 + /metrics HTTP 端点）；由 ServerConfig.MetricsEnabled 控制开关
         var metrics = new PrometheusMetrics();
@@ -154,9 +157,10 @@ public sealed class GameHost : IDisposable
         if (config.Current.ResetWorldChangesOnStart)
         {
             db.ClearWorldChangesAsync().GetAwaiter().GetResult();
-            Console.WriteLine(
-                "[World] 已按 ResetWorldChangesOnStart 清空持久化的世界改动（图格 + 箱子）——" +
-                "请把 server.json 的该项改回 false，否则每次重启都会丢弃玩家改动");
+            var resetConfig = config.Current with { ResetWorldChangesOnStart = false };
+            ConfigurationService.Write(configPath, resetConfig);
+            config.Reload();
+            Console.WriteLine("[World] 已清空旧世界改动，本次启动后自动恢复增量持久化");
         }
 
         var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize, config.Current.WorldSeed);
@@ -330,6 +334,8 @@ public sealed class GameHost : IDisposable
                 await FlushTileUpdatesAsync(ct).ConfigureAwait(false);
                 // 客户端状态变更仅在仿真 Apply 成功后，按服务端最终状态生成包 13
                 await FlushPlayerUpdatesAsync(ct).ConfigureAwait(false);
+                // 服务端开火扣除法力后，向本人回写最终法力（包 42）。
+                await FlushPlayerManaAsync(ct).ConfigureAwait(false);
                 // 服务端权威修改的增益列表（如移除召唤 Buff）→ 包 50 回写本人
                 await FlushPlayerBuffsAsync(ct).ConfigureAwait(false);
                 // 服务端权威修改的 NPC 增益列表 → 包 54 向全体玩家回写
@@ -403,28 +409,54 @@ public sealed class GameHost : IDisposable
             }
         }, ct);
 
-        await Task.WhenAll(simTask, netTask, snapTask, npcSyncTask, worldSyncTask).ConfigureAwait(false);
-
-        // 停机：把待落盘的世界改动冲刷干净（单批上限决定每轮吞吐，故循环到排空；
-        // 极端情况下（曾降级为全图扫描）最多多跑一遍全图，轮数有上限，不会挂死）
         try
         {
-            var world = Simulator.State;
-            int maxRounds = world.MaxTilesX * world.MaxTilesY / WorldState.PersistBatchSize + 4;
-            int rounds = 0;
-            while (world.HasPendingPersist && rounds++ < maxRounds)
-                await FlushWorldChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            await Task.WhenAll(simTask, netTask, snapTask, npcSyncTask, worldSyncTask).ConfigureAwait(false);
         }
-        catch (Exception ex) { Console.WriteLine($"[World] 停机落盘失败：{ex.Message}"); }
+        finally
+        {
+            // 无论任务异常、取消还是正常停机，都尝试排空最后一批世界改动。
+            try
+            {
+                var world = Simulator.State;
+                int maxRounds = world.MaxTilesX * world.MaxTilesY / WorldState.PersistBatchSize + 4;
+                int rounds = 0;
+                while (world.HasPendingPersist && rounds++ < maxRounds)
+                    await FlushWorldChangesAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[World] 停机落盘失败：{ex.Message}");
+            }
 
-        // 停机导出：此时增量已全部落盘，导出的 .wld 反映最终状态（可被再次作为基准世界加载）
-        TryExportWorld(force: true);
+            // 排空后导出最终状态；导出失败不覆盖前面的生命周期异常。
+            try
+            {
+                TryExportWorld(force: true);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[World] 停机导出失败：{ex.Message}");
+            }
+        }
     }
 
     /// <summary>
     /// 载入基准世界：配置了 <see cref="ServerConfig.WorldPath"/> 且文件存在 → 解析该 `.wld`；
     /// 否则按 <see cref="ServerConfig.WorldSize"/> + <see cref="ServerConfig.WorldSeed"/> 程序化生成（小 / 中 / 大三档）。
     /// </summary>
+    private static string CreateWorldId(string worldPath, WorldSize size, int seed)
+    {
+        if (string.IsNullOrWhiteSpace(worldPath))
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"generated:{size}:{seed}")));
+
+        string fullPath = Path.GetFullPath(worldPath);
+        if (File.Exists(fullPath))
+            return Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(fullPath)));
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"missing:{fullPath.ToUpperInvariant()}")));
+    }
+
     private static WorldState LoadBaseWorld(string worldPath, WorldSize size, int seed)
     {
         if (!string.IsNullOrWhiteSpace(worldPath) && File.Exists(worldPath))
@@ -783,6 +815,33 @@ public sealed class GameHost : IDisposable
             await Network.BroadcastWhereAsync(PacketId.PlayerPosition,
                 new PlayerControlsPacket((byte)playerId, player.Position, player.Velocity),
                 pid => pid != playerId, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>单批法力变更通知上限。</summary>
+    private const int MaxPlayerManaPerFlush = 256;
+
+    /// <summary>向本人回写服务端提交后的法力最终值（包 42）。</summary>
+    public async Task FlushPlayerManaAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var playerIds = world.DrainPlayerManaChanged(MaxPlayerManaPerFlush);
+        foreach (var playerId in playerIds)
+        {
+            PlayerRuntime? player;
+            lock (world.PlayersLock)
+                world.Players.TryGetValue(playerId, out player);
+            if (player is null || !player.Active) continue;
+
+            try
+            {
+                await Network.SendToPlayerAsync(playerId, PacketId.PlayerMana,
+                    new PlayerManaPacket(playerId, player.Mp, player.MpMax), ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsTransientSendFailure(ex))
+            {
+                // 连接已断开时丢弃；重连初始化会重新下发完整玩家状态。
+            }
         }
     }
 
@@ -1635,9 +1694,7 @@ public sealed class GameHost : IDisposable
     // ---- 首次启动生成默认配置（含全部阈值，运维可直接改）----
     private static string CreateDefaultConfig(string path)
     {
-        var json = System.Text.Json.JsonSerializer.Serialize(
-            new ServerConfig(), ConfigurationService.JsonOptions);
-        File.WriteAllText(path, json);
+        ConfigurationService.Write(path, new ServerConfig());
         return path;
     }
 
@@ -1731,6 +1788,41 @@ public sealed class GameHost : IDisposable
                 new InventorySlotPacket(Slot: (short)slot, ItemId: itemId, Stack: 1) { PlayerId = pid });
             Console.WriteLine($"[Give] 已向 #{pid} 下发包5 slot={slot} type={itemId}");
             return CommandResult.Ok($"已给 #{pid} 槽 {slot} 放置物品 {itemId}");
+        });
+
+        commands.Register("chest", "服务端箱子批量操作：chest <loot|deposit|quickstack> <chestIndex> <operationId>", (playerId, args) =>
+        {
+            if (playerId <= 0)
+                return CommandResult.Fail("该命令只能由在线玩家执行");
+            if (args.Length != 3 || !int.TryParse(args[1], out var chestIndex) ||
+                !long.TryParse(args[2], out var operationId) || operationId <= 0)
+                return CommandResult.Fail("用法：/chest <loot|deposit|quickstack> <chestIndex> <operationId>");
+
+            ChestBulkOperation operation = args[0].ToLowerInvariant() switch
+            {
+                "loot" => ChestBulkOperation.LootAll,
+                "deposit" => ChestBulkOperation.DepositAll,
+                "quickstack" => ChestBulkOperation.QuickStack,
+                _ => (ChestBulkOperation)(-1),
+            };
+            if ((int)operation < 0)
+                return CommandResult.Fail("操作必须是 loot、deposit 或 quickstack");
+
+            long sessionId;
+            lock (world.PlayersLock)
+            {
+                if (!world.Players.TryGetValue(playerId, out var player) || !player.Active)
+                    return CommandResult.Fail("玩家不在线");
+                sessionId = player.SessionId;
+            }
+
+            var result = new BulkInventoryChestCommand(
+                world.Tick, playerId, chestIndex, operation, operationId)
+            { SessionId = sessionId }.Apply(world, new XoshiroRng((ulong)world.Tick + (ulong)playerId));
+
+            return result.Applied
+                ? CommandResult.Ok("箱子批量操作已完成")
+                : CommandResult.Fail($"箱子批量操作未执行：{result.Reason}");
         });
 
         // 召唤 NPC / Boss（真机调试用）：npcId 为原版 NPC 类型 ID，生命 / 伤害 / 防御取 NpcStatsTable

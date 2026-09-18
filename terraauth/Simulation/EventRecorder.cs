@@ -75,6 +75,10 @@ public static class CommandFailures
     public const string HurtDamageAboveLimit = "hurt_damage_above_limit";
     /// <summary>包 28 上报伤害超出归属弹幕的权威伤害区间（阶段 C 弹幕伤害匹配）。</summary>
     public const string StrikeDamageMismatch = "strike_damage_mismatch";
+    /// <summary>已收录远程或固定弹幕魔法武器命中时，未登记归属玩家的存活伤害弹幕。</summary>
+    public const string ProjectileRequired = "projectile_required";
+    /// <summary>已登记归属玩家的存活伤害弹幕未与 NPC 碰撞盒接触。</summary>
+    public const string ProjectileNotColliding = "projectile_not_colliding";
     /// <summary>阶段 H：召唤弹幕 spawn 上报伤害超出手持召唤武器的权威上界（武器伤害 × 1.15 容差）。</summary>
     public const string ProjectileDamageAboveBound = "projectile_damage_above_bound";
     /// <summary>包 27 的弹幕类型无法由服务端权威手持武器和弹药推出。</summary>
@@ -87,6 +91,16 @@ public static class CommandFailures
     public const string ProjectileSpeedExceeded = "projectile_speed_exceeded";
     /// <summary>普通手持发射的新建弹幕离服务端玩家位置过远。</summary>
     public const string ProjectileSpawnTooFar = "projectile_spawn_too_far";
+    /// <summary>已建立包 13 控制状态的玩家未按住 UseItem 或切换了关联手持槽位。</summary>
+    public const string ProjectileUseItemNotHeld = "projectile_use_item_not_held";
+    /// <summary>已映射普通武器的新建弹幕未满足服务端最小 UseItem 发射间隔。</summary>
+    public const string ProjectileUseItemCooldown = "projectile_use_item_cooldown";
+    /// <summary>开火所需法力不足。</summary>
+    public const string ProjectileManaInsufficient = "projectile_mana_insufficient";
+    /// <summary>同一开火事务已提交，重复提交不会再次扣除资源。</summary>
+    public const string FireTransactionDuplicate = "fire_transaction_duplicate";
+    /// <summary>同一服务端弹幕在 NPC 免疫窗口内重复命中。</summary>
+    public const string ProjectileHitCooldown = "projectile_hit_cooldown";
     /// <summary>阶段 H：空手 / 手持非召唤武器却 spawn 召唤弹幕（原版只有召唤武器能召唤）。</summary>
     public const string SummonRequiresSummonWeapon = "summon_requires_summon_weapon";
 }

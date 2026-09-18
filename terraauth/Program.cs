@@ -51,6 +51,9 @@ internal static class Program
         Console.WriteLine($"[TerraAuth] 配置={options.ConfigPath} 数据库={options.DbPath}");
         Console.WriteLine($"[TerraAuth] 监听端口={options.Port} 指标端口={options.MetricsPort}");
 
+        if (!Console.IsInputRedirected)
+            WorldManagementConsole.Run(options.ConfigPath, Console.In, Console.Out);
+
         GameHost host;
         try
         {

@@ -354,9 +354,7 @@ public class VanillaFeatureTests
 
         int tx = sx, ty = sy + 3; // 地表下 3 格：实心，且在 160px 挖掘半径内
         Assert.True(world.Tiles[tx, ty].Active);
-        var type = world.Tiles[tx, ty].Type;
-
-        await s.SendAsync(PacketId.TileBreak, new TileBreakPacket(tx, ty, 0) { TileType = type });
+        await s.SendAsync(PacketId.TileBreak, new TileBreakPacket(tx, ty, 0));
 
         Assert.True(await TickUntilAsync(server, () => !world.Tiles[tx, ty].Active, TimeSpan.FromSeconds(5)),
             "挖砖权威通过后图格未变空");
@@ -1741,10 +1739,24 @@ public class VanillaFeatureTests
         await TickUntilAsync(server, () => slime.Life != 88, TimeSpan.FromMilliseconds(700));
         Assert.Equal(88, slime.Life);
 
+        // 拒绝断言期间敌怪 AI 仍会推进；重新对齐已登记的静止弹幕，确保本次命中满足服务端 AABB 规则。
+        lock (world.ProjectilesLock)
+        {
+            var projectile = Assert.Single(world.Projectiles, p => p.Key == 7 && p.Active);
+            projectile.Position = new Vector2(slime.X, slime.Y);
+        }
+
         // 暴击区间内（24 ≤ ceil(10×1.15)×2 = 24）→ 接受：88 - 24×2 = 40
         await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 24) { Generation = 5, Crit = true });
         Assert.True(await TickUntilAsync(server, () => slime.Life == 40, TimeSpan.FromSeconds(5)),
             $"暴击区间内上报未结算，实际 Life={slime.Life}");
+
+        // 命中后等待时敌怪继续移动；再次对齐才能验证「有碰撞弹幕时」的暴击超上界拒绝。
+        lock (world.ProjectilesLock)
+        {
+            var projectile = Assert.Single(world.Projectiles, p => p.Key == 7 && p.Active);
+            projectile.Position = new Vector2(slime.X, slime.Y);
+        }
 
         // 暴击超上界（25 > 24）→ 拒绝，生命不变
         await s.SendAsync(PacketId.NpcStrike, new NpcStrikePacket(index, 25) { Generation = 5, Crit = true });
@@ -2505,6 +2517,59 @@ public class VanillaFeatureTests
     }
 
     [Fact]
+    public async Task Vanilla_Server_Mana_Change_Is_Synced_Back_To_Owner()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+        var world = server.Host.Simulator.State;
+
+        var player = world.Players[1];
+        player.Mp = 6;
+        player.MpMax = 20;
+        world.MarkPlayerManaChanged(1);
+
+        await server.Host.FlushPlayerManaAsync();
+        var ownerPackets = await a.ReadUntilAsync(p => p is PlayerManaPacket,
+            TimeSpan.FromMilliseconds(500));
+        var mana = Assert.Single(ownerPackets.OfType<PlayerManaPacket>());
+        Assert.Equal(1, mana.PlayerId);
+        Assert.Equal(6, mana.Mana);
+        Assert.Equal(20, mana.MaxMana);
+
+        var otherPackets = await b.ReadUntilAsync(p => p is PlayerManaPacket,
+            TimeSpan.FromMilliseconds(300));
+        Assert.DoesNotContain(otherPackets, p => p is PlayerManaPacket);
+    }
+
+    [Fact]
+    public async Task Vanilla_Client_Mana_Restore_Is_Rejected_And_Synced_Back()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        var player = world.Players[1];
+        player.Mp = 6;
+        player.MpMax = 20;
+        player.HasReceivedManaSync = true;
+
+        await s.SendAsync(PacketId.PlayerMana, new PlayerManaPacket(0, 20, 20));
+        Assert.True(await TickUntilAsync(server,
+            () => world.DrainPlayerManaChanged(1).Count == 1,
+            TimeSpan.FromSeconds(5)), "伪造法力未触发服务端纠正");
+        world.MarkPlayerManaChanged(1);
+        await server.Host.FlushPlayerManaAsync();
+
+        var got = await s.ReadUntilAsync(p => p is PlayerManaPacket, TimeSpan.FromSeconds(5));
+        var corrected = Assert.Single(got.OfType<PlayerManaPacket>());
+        Assert.Equal(6, corrected.Mana);
+        Assert.Equal(20, corrected.MaxMana);
+        Assert.Equal(6, player.Mp);
+    }
+
+    [Fact]
     public async Task Vanilla_Mana_Above_Server_Max_Gets_Correction()
     {
         using var server = VanillaServer.Start();
@@ -2674,6 +2739,51 @@ public class VanillaFeatureTests
         try { Directory.Delete(dir, recursive: true); } catch { /* 清理失败可忽略 */ }
     }
 
+    [Fact]
+    public async Task Vanilla_TreeFelling_Survives_ServerRestart()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"terraauth-tree-persist-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        var treeTiles = new List<(int X, int Y)>();
+
+        // ---- 第一次运行：真实包 17 砍掉一棵含枝条的树，并显式冲刷世界改动 ----
+        using (var server = VanillaServer.Start(dir: dir, deleteOnDispose: false))
+        {
+            await using var s = await server.ConnectAsync("Alice");
+            var world = server.Host.Simulator.State;
+            int x = world.SpawnTileX;
+            int baseY = world.SpawnTileY + 3;
+            await StandAtAsync(server, s, x * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+            for (int y = baseY; y > baseY - 6; y--)
+            {
+                world.Tiles[x, y] = new Tile { Active = true, Type = 5 };
+                treeTiles.Add((x, y));
+            }
+            world.Tiles[x - 1, baseY - 2] = new Tile { Active = true, Type = 5 };
+            treeTiles.Add((x - 1, baseY - 2));
+
+            await s.SendAsync(PacketId.TileBreak, new TileBreakPacket(x, baseY, 0));
+            Assert.True(await TickUntilAsync(server,
+                () => treeTiles.All(tile => !world.Tiles[tile.X, tile.Y].Active),
+                TimeSpan.FromSeconds(5)), "包 17 未使整棵树倒下");
+
+            await server.Host.FlushWorldChangesAsync();
+            var records = await server.Host.WorldRepo!.LoadTileChangesAsync();
+            Assert.All(treeTiles, tile => Assert.Contains(records, record => record.X == tile.X && record.Y == tile.Y));
+        }
+
+        // ---- 第二次运行：复用同一目录，树干和枝条的每个原始位置都必须保持为空 ----
+        using (var server = VanillaServer.Start(dir: dir))
+        {
+            var world = server.Host.Simulator.State;
+            Assert.All(treeTiles, tile => Assert.False(world.Tiles[tile.X, tile.Y].Active,
+                $"重启后树木图格 ({tile.X}, {tile.Y}) 被恢复"));
+        }
+
+        try { Directory.Delete(dir, recursive: true); } catch { /* 清理失败可忽略 */ }
+    }
+
     // ========================================================================
     // 二十·补三、世界文件（.wld）：作为基准世界加载 + 导出
     // ========================================================================
@@ -2735,10 +2845,29 @@ public class VanillaFeatureTests
             var world = server.Host.Simulator.State;
             Assert.True(world.Chests.Count > chestIndex, "追加的箱子未随世界文件载入");
 
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                SessionId = 22,
+                Active = true,
+                Position = new Vector2(cx * 16f + 8f, cy * 16f + 8f),
+            };
+            player.Items[9] = 5;
+            player.ItemStacks[9] = 11;
+            lock (world.PlayersLock) world.Players[player.Id] = player;
+            world.OpenChestSession(player.Id, player.SessionId, chestIndex);
+
+            var result = new BulkInventoryChestCommand(
+                1, player.Id, chestIndex, ChestBulkOperation.DepositAll, 1)
+            { SessionId = player.SessionId }.Apply(world, new XoshiroRng(1));
+
+            Assert.True(result.Applied);
+            Assert.Equal(0, player.ItemStacks[9]);
             lock (world.ChestsLock)
-                world.Chests[chestIndex].Items[5] = new ChestItem { Type = 5, Stack = 11, Prefix = 0 };
-            world.MarkPersistChest(chestIndex);
-            world.MarkChestChanged(chestIndex, 5);
+            {
+                Assert.Equal(5, world.Chests[chestIndex].Items[0].Type);
+                Assert.Equal(11, world.Chests[chestIndex].Items[0].Stack);
+            }
 
             // 落盘（生产环境由 1Hz 世界循环触发；此处显式调用并循环到确实入库）
             bool saved = false;
@@ -2758,8 +2887,8 @@ public class VanillaFeatureTests
             lock (world.ChestsLock)
             {
                 Assert.True(world.Chests.Count > chestIndex, "重启后追加的箱子丢失");
-                Assert.Equal(5, world.Chests[chestIndex].Items[5].Type);
-                Assert.Equal(11, world.Chests[chestIndex].Items[5].Stack);
+                Assert.Equal(5, world.Chests[chestIndex].Items[0].Type);
+                Assert.Equal(11, world.Chests[chestIndex].Items[0].Stack);
             }
         }
 
