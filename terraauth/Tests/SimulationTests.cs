@@ -3614,6 +3614,87 @@ public class WorldGeneratorTests
         Assert.False(new NpcStrikeCommand(15, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
     }
 
+    /// <summary>
+    /// W-2 第二步 <c>ServerDamage</c> 的**前置守卫**（对应已回退尝试的 P0-1）：
+    /// 玩家**带着存活召唤物**、手持普通武器命中时，绝不能被"场上有 owned summon"挟持去走召唤校验路径
+    /// （旧实现只要场上有自有召唤弹幕就要求包 28 必须由召唤弹幕背书，导致普通近战 / 远程命中被拒）。
+    /// 关键点：本用例让**召唤上界远低于武器上界**——若哪天把召唤通道改回"强制"，合法武器命中会被拒而失败。
+    /// </summary>
+    [Fact]
+    public void Summon_P0_1_Guard_NormalWeapon_Hit_Not_Hijacked_By_Owned_Summons()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.StrikeWeaponCheck = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 手持炽焰巨剑（121，40 伤害近战）→ 武器上界 46；召唤物很弱（191，5 伤害 → 上界 6）。
+        Assert.True(new SetInventorySlotCommand(1, 1, 3, 121, 1).Apply(world, rng).Applied);
+        Assert.True(new MoveCommand(2, 1, player.Position) { SelectedItem = 3, ControlBits = 0 }.Apply(world, rng).Applied);
+        Assert.Equal(46, CombatResolver.WeaponDamageBound(player, 121, false));
+
+        var npc = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 500,
+            LifeMax = 500,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(npc);
+        int index = world.Npcs.IndexOf(npc);
+
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 7,
+                Owner = 1,
+                Type = 191,
+                IsSummon = true,
+                Position = new Vector2(320f, 398f),
+                Damage = 5,
+                Active = true,
+            });
+
+        Assert.Equal(6, CombatResolver.SummonDamageBound(world, 1, false));
+
+        // 核心断言：合法近战 40（≤ 武器上界 46，但**远超**召唤上界 6）→ 必须 Applied。
+        var legal = new NpcStrikeCommand(3, 1, index, 40, Generation: 3).Apply(world, rng);
+        Assert.True(legal.Applied, $"带仆从时手持武器的合法命中被拒：{legal.Reason}");
+        Assert.Equal(460, npc.Life);
+
+        // 贴边 46 仍在武器上界内 → Applied；47 超上界 → 拒绝（防上界被意外放大成"全放行"）。
+        Assert.True(new NpcStrikeCommand(4, 1, index, 46, Generation: 3).Apply(world, rng).Applied);
+        Assert.Equal(CommandFailures.StrikeDamageMismatch,
+            new NpcStrikeCommand(5, 1, index, 47, Generation: 3).Apply(world, rng).Reason);
+
+        // 暴击：武器通道 92、召唤通道 12 → 合法暴击 80 仍凭**武器**通道放行（不被召唤通道压住）。
+        Assert.True(new NpcStrikeCommand(6, 1, index, 80, Generation: 3, Crit: true).Apply(world, rng).Applied);
+
+        // 对照（预期语义，非缺陷）：**空手** + 场上有自有召唤弹幕时，包 28 视作召唤物命中，
+        // 须由召唤弹幕背书 → 40 超召唤上界 6，按召唤口径拒绝。这正是"手持武器"与"空手"的分界。
+        player.Items[3] = 0;
+        player.ItemStacks[3] = 0;
+        player.ItemPrefixes[3] = 0;
+        Assert.Equal(CommandFailures.StrikeDamageMismatch,
+            new NpcStrikeCommand(7, 1, index, 40, Generation: 3).Apply(world, rng).Reason);
+    }
+
     [Fact]
     public void Summon_Attack_Selects_Overlapping_Entity_Deterministically()
     {
@@ -4106,6 +4187,246 @@ public class WorldGeneratorTests
             new Vector2(320f, 460f), new Vector2(0f, -2f), 0);
         Assert.True(dropDefault.Apply(worldDefault, rng).Applied);
         Assert.True(worldDefault.Projectiles[0].Active, "默认配置保持原版行为：丢弃召唤武器不销毁");
+    }
+
+    /// <summary>
+    /// 召唤本体数据表（backlog W-2 第一步，数据侧）：62 条 = 46 个物品直生本体 + 16 个本体变体。
+    /// 判定本体的唯一权威是原版 <c>Projectile.SetDefaults</c> 赋 <c>minion = true</c> / <c>sentry = true</c>；
+    /// 物品归属取自 <c>Item.shoot</c>（真正的数据源在 <c>Item.cs</c>，其 case 缩进不统一、
+    /// 且 DD2 哨兵是 12 个物品共享 fallthrough case + 内层 switch 逐 id 精化——按 `case N:` 数会数错）。
+    /// 哨兵寿命 36000（10 分钟），另有 3 个短命本体（831 / 864 / 970，timeLeft = 60）。
+    /// </summary>
+    [Fact]
+    public void SummonEntityTable_Matches_Vanilla_SetDefaults()
+    {
+        Assert.Equal(62, SummonEntityTable.Of.Count);
+        Assert.Equal(44, SummonEntityTable.Of.Values.Count(e => e.Kind == SummonKind.Minion));
+        Assert.Equal(18, SummonEntityTable.Of.Values.Count(e => e.Kind == SummonKind.Sentry));
+
+        // 46 条由物品直生；16 条是本体变体（由别的本体 / 增益生成，ItemId = null）
+        var byItem = SummonEntityTable.Of.Where(kv => kv.Value.ItemId is not null).ToList();
+        Assert.Equal(46, byItem.Count);
+        Assert.Equal(46, byItem.Select(kv => kv.Value.ItemId!.Value).Distinct().Count());
+        Assert.Equal(16, SummonEntityTable.Of.Values.Count(e => e.ItemId is null));
+        // 哨兵全部由物品直生（没有"哨兵变体"）
+        Assert.All(SummonEntityTable.Of.Where(kv => kv.Value.Kind == SummonKind.Sentry),
+            kv => Assert.NotNull(kv.Value.ItemId));
+
+        var pygmy = SummonEntityTable.Of[191];                       // PygmyStaff → Pygmy
+        Assert.Equal(1157, pygmy.ItemId);
+        Assert.Equal(SummonKind.Minion, pygmy.Kind);
+        Assert.Equal(26, pygmy.AiStyle);
+        Assert.Equal(0, pygmy.TimeLeft);
+
+        var hydra = SummonEntityTable.Of[308];                       // FrostHydra → 哨兵，80×74，10 分钟
+        Assert.Equal(1572, hydra.ItemId);
+        Assert.Equal(SummonKind.Sentry, hydra.Kind);
+        Assert.Equal(36000, hydra.TimeLeft);
+        Assert.Equal((80, 74), (hydra.Width, hydra.Height));
+        Assert.True(hydra.TileCollide, "308 未设 tileCollide → 原版默认 true（旧表记 false 是错的）");
+
+        // 上一版漏掉的 19 条物品本体：8 条非 DD2（Hornet / FlyingImp / SpiderHiver / Retanimini /
+        // VenomSpider / OneEyedPirate / Tempest / UFOMinion）+ 11 个 DD2 哨兵
+        Assert.Equal(new[] { 373, 375, 377, 387, 390, 393, 407, 423 },
+            SummonEntityTable.Of.Where(kv => kv.Value.ItemId is 2364 or 2365 or 2366 or 2535 or 2551 or 2584 or 2621 or 2749)
+                .Select(kv => kv.Key).OrderBy(x => x));
+        Assert.Equal(new[] { 663, 665, 667, 677, 678, 679, 688, 689, 690, 691, 692, 693 },
+            SummonEntityTable.Of.Where(kv => new[] { 3818, 3819, 3820, 3824, 3825, 3826, 3829, 3830, 3831, 3832, 3833, 3834 }
+                    .Contains(kv.Value.ItemId ?? 0))
+                .Select(kv => kv.Key).OrderBy(x => x));
+        // DD2 12 个物品 ↔ 12 个哨兵本体一一对应（旧表把 3834 的 shoot 记成 663，真值 693）
+        Assert.Equal(3834, SummonEntityTable.Of[693].ItemId);
+        Assert.Equal(3818, SummonEntityTable.Of[663].ItemId);
+        Assert.Equal((130, 28, 60), (SummonEntityTable.Of[667].AiStyle, SummonEntityTable.Of[667].Width, SummonEntityTable.Of[667].Height));
+
+        // 短命本体（timeLeft = 60）：831 StormTigerGem / 864 Smolstar / 970 AbigailCounter
+        // （旧表把 759 BabyBird 也记成 60 —— 原版是 `timeLeft *= 5`，真值不是 60）
+        Assert.Equal(new[] { 831, 864, 970 },
+            SummonEntityTable.Of.Where(kv => kv.Value.TimeLeft == 60).Select(kv => kv.Key).OrderBy(x => x));
+        Assert.Equal(0, SummonEntityTable.Of[759].TimeLeft);
+        Assert.Equal(18, SummonEntityTable.Of.Values.Count(e => e.TimeLeft == 36000));
+
+        // 命中节奏（原版 Projectile.Damage → Damage_PVE_Inner L12731-12754 / L14676-14684）
+        Assert.Equal(27, SummonEntityTable.Of.Values.Count(e => e.Immunity == SummonHitImmunity.Default));
+        Assert.Equal(26, SummonEntityTable.Of.Values.Count(e => e.Immunity == SummonHitImmunity.LocalPerTarget));
+        Assert.Equal(9, SummonEntityTable.Of.Values.Count(e => e.Immunity == SummonHitImmunity.IdStaticShared));
+        Assert.Equal(new[] { 266, 387, 388, 390, 391, 392, 407, 758, 951 },                     // 同类型共享免疫
+            SummonEntityTable.Of.Where(kv => kv.Value.Immunity == SummonHitImmunity.IdStaticShared)
+                .Select(kv => kv.Key).OrderBy(x => x));
+        // 冷却一律取原版抽取值（服务端不得另造冷却）：-1 = 同一弹幕对同一目标终身只能命中一次
+        Assert.Equal(new[] { 755, 946 },
+            SummonEntityTable.Of.Where(kv => kv.Value.HitCooldownTicks == -1).Select(kv => kv.Key).OrderBy(x => x));
+        var allowedCooldowns = new[] { -1, 3, 5, 7, 9, 10, 12, 15, 16, 18, 20, 30 };
+        Assert.All(SummonEntityTable.Of.Values, e =>
+            Assert.True(allowedCooldowns.Contains(e.HitCooldownTicks),
+                $"冷却 {e.HitCooldownTicks} 不在原版抽取集合内"));
+        // 穿墙本体（tileCollide = false）共 32 个
+        Assert.Equal(32, SummonEntityTable.Of.Values.Count(e => !e.TileCollide));
+
+        // 与旧表的关系：旧表漏收 17 个本体（按「宽于实际」的既有口径，漏收只会失败放行，安全），
+        // 另把 389 MiniRetinaLaser / 614 一类派生弹幕与 676 / 687 等混收——属第二步要拆开的部分。
+        Assert.Equal(new[] { 390, 391, 392, 393, 394, 395, 663, 665, 677, 678, 679, 688, 689, 690, 691, 692, 693 },
+            SummonEntityTable.Of.Keys.Where(t => !SummonProjectileTable.Of.Contains(t)).OrderBy(x => x));
+    }
+
+    /// <summary>
+    /// 召唤派生弹幕表（backlog W-2 第一步，数据侧）：62 个本体全部读完原版 AI ——
+    /// 32 个有派生（34 条关系、25 个派生类型），30 个确认无派生。两表互补，不存在"未解析"。
+    /// 派生必须来自**本体所走的那条 AI 分支内、type 条件对本本体成立**的 NewProjectile
+    /// （原版把几十个 type 塞进同一个巨型 AI，发射类型常由入口处局部变量按 type 赋值，不能按字面量就近推断）。
+    /// </summary>
+    [Fact]
+    public void SummonShotTable_Matches_Vanilla_Ai()
+    {
+        static int[] Shots(int body) =>
+            SummonShotTable.Of[body].Select(s => s.ProjectileType).OrderBy(x => x).ToArray();
+
+        // 32 有派生 + 30 无派生 = 62 本体（与 SummonEntityTable 完全互补）
+        Assert.Equal(32, SummonShotTable.Of.Count);
+        Assert.Equal(30, SummonShotTable.NoDerivedShots.Count);
+        Assert.Equal(34, SummonShotTable.Of.Values.Sum(v => v.Count));
+        Assert.Equal(SummonEntityTable.Of.Keys.OrderBy(x => x),
+            SummonShotTable.Of.Keys.Concat(SummonShotTable.NoDerivedShots).OrderBy(x => x));
+        Assert.Empty(SummonShotTable.Of.Keys.Intersect(SummonShotTable.NoDerivedShots));
+
+        // 派生弹幕一律不是本体（本体 62 条已定稿；若某天重叠说明分类被破坏）
+        var derived = SummonShotTable.Of.Values.SelectMany(v => v).Select(s => s.ProjectileType).ToHashSet();
+        Assert.Equal(25, derived.Count);
+        Assert.Empty(derived.Intersect(SummonEntityTable.Of.Keys));
+        // 每个派生都带 ProjectileID 名称（防"裸数字"入库）
+        Assert.All(SummonShotTable.Of.Values.SelectMany(v => v), s => Assert.False(string.IsNullOrWhiteSpace(s.Name)));
+
+        // Pygmy 191-194 → 195（AI_026 的发射点默认 195，仅 Foxsparks flag8 改写为 1097）；
+        // 同走 AI_026 的蜘蛛 390/391/392 不发射
+        foreach (var pygmy in new[] { 191, 192, 193, 194 })
+            Assert.Equal(new[] { 195 }, Shots(pygmy));
+        foreach (var spider in new[] { 390, 391, 392 })
+            Assert.DoesNotContain(spider, SummonShotTable.Of.Keys);
+
+        // AI_062 共享块里 num48 只在 373/375/407/423/613 被赋值；963 保持 0 → 无有效派生
+        Assert.Equal(new[] { 374 }, Shots(373));
+        Assert.Equal(new[] { 376 }, Shots(375));
+        Assert.Equal(new[] { 408 }, Shots(407));
+        Assert.Equal(new[] { 433 }, Shots(423));
+        Assert.Equal(new[] { 614 }, Shots(613));
+        Assert.Contains(963, SummonShotTable.NoDerivedShots);
+
+        // aiStyle 66 内联块：389 被 `if (type == 387)` 限定 → 388 / 533 不发射
+        Assert.Equal(new[] { 389 }, Shots(387));
+        Assert.Contains(388, SummonShotTable.NoDerivedShots);
+        Assert.Contains(533, SummonShotTable.NoDerivedShots);
+
+        // AI_067 唯一发射点被 `type == 1022` 包裹（海盗 / 蛙 / Flinx 不发射）；
+        // 老虎 833/834/835 走专用 AI_067_TigerSpecialAttack → 818
+        foreach (var pirateOrFrog in new[] { 393, 394, 395, 758, 951, 1093, 1112, 1118 })
+            Assert.Contains(pirateOrFrog, SummonShotTable.NoDerivedShots);
+        foreach (var tier in new[] { 833, 834, 835 })
+            Assert.Equal(new[] { 818 }, Shots(tier));
+        Assert.Equal(new[] { 1044 }, Shots(1022));
+        Assert.Equal(new[] { 1120 }, Shots(1119));
+
+        // DD2 三档由入口默认值 + switch(type) 覆写决定（不得按 ID 相邻推断）
+        Assert.Equal(new[] { 664 }, Shots(663));
+        Assert.Equal(new[] { 666 }, Shots(665));
+        Assert.Equal(new[] { 668 }, Shots(667));
+        foreach (var ballista in new[] { 677, 678, 679 }) Assert.Equal(new[] { 680 }, Shots(ballista));
+        Assert.Equal(new[] { 694 }, Shots(691));
+        Assert.Equal(new[] { 695 }, Shots(692));
+        Assert.Equal(new[] { 696 }, Shots(693));
+        // LightningAura 只有范围接触判定，不发射
+        foreach (var aura in new[] { 688, 689, 690 }) Assert.Contains(aura, SummonShotTable.NoDerivedShots);
+
+        // 哨兵派生（AI_053 按 type 覆写 num15；炮台/水晶按攻击计数阈值）
+        Assert.Equal(new[] { 309 }, Shots(308));
+        Assert.Equal(new[] { 378 }, Shots(377));
+        Assert.Equal(new[] { 967 }, Shots(966));
+        Assert.Equal(new[] { 642 }, Shots(641));
+        Assert.Equal(new[] { 644 }, Shots(643));
+        Assert.Equal(new[] { 1026 }, Shots(1025));
+
+        // 星尘龙 625-628 的 AI 只做节段重连（节段由物品 3531 召唤时生成）→ 本体不发射
+        foreach (var dragon in new[] { 625, 626, 627, 628 }) Assert.Contains(dragon, SummonShotTable.NoDerivedShots);
+
+        // Foxsparks 1094/1113：普通攻击 → 1097，引导武器 → 1106（同表两条关系）
+        foreach (var fox in new[] { 1094, 1113 }) Assert.Equal(new[] { 1097, 1106 }, Shots(fox));
+
+        // 媒介（831 → 833/834/835、970 → 963）本身不发射
+        Assert.Contains(831, SummonShotTable.NoDerivedShots);
+        Assert.Contains(970, SummonShotTable.NoDerivedShots);
+    }
+
+    /// <summary>
+    /// 召唤行为参数表（backlog W-2 第一步，数据侧）：给 32 个**会发射**的本体记录索敌射程与攻击间隔。
+    /// 三条口径必须守住：①射程度量不统一（欧氏 / 曼哈顿 / owner 矩形）；②间隔多为「阈值 + 随机累加」，
+    /// 表里记均值；③依赖玩家护甲套装的哨兵记无套装默认值。
+    /// </summary>
+    [Fact]
+    public void SummonBehaviorTable_Matches_Vanilla_Ai()
+    {
+        // 与派生弹幕表的键集合逐一对应（不发射的本体没有"攻击间隔"）
+        Assert.Equal(32, SummonBehaviorTable.Of.Count);
+        Assert.Equal(SummonShotTable.Of.Keys.OrderBy(x => x), SummonBehaviorTable.Of.Keys.OrderBy(x => x));
+
+        Assert.All(SummonBehaviorTable.Of.Values, b =>
+        {
+            Assert.True(b.TargetingRange > 0f, "射程必须为正");
+            Assert.True(b.AttackIntervalTicks > 0, "攻击间隔必须为正");
+            Assert.True(b.FirstShotDelayTicks >= 0, "首射前摇不得为负");
+        });
+        // 首射前摇 120 只属于 AI_053 系的三个哨兵（ai[0] 初始化为 120）
+        Assert.Equal(new[] { 308, 377, 966 },
+            SummonBehaviorTable.Of.Where(kv => kv.Value.FirstShotDelayTicks == 120)
+                .Select(kv => kv.Key).OrderBy(x => x));
+
+        // AI_026：射程 800（+40×minionPos），冷却 num135
+        foreach (var pygmy in new[] { 191, 192, 193, 194 })
+            Assert.Equal((800f, 30), (SummonBehaviorTable.Of[pygmy].TargetingRange, SummonBehaviorTable.Of[pygmy].AttackIntervalTicks));
+        Assert.Equal((800f, 42), (SummonBehaviorTable.Of[1094].TargetingRange, SummonBehaviorTable.Of[1094].AttackIntervalTicks));
+        Assert.Equal((1160f, 30), (SummonBehaviorTable.Of[1113].TargetingRange, SummonBehaviorTable.Of[1113].AttackIntervalTicks));
+
+        // AI_062：索敌半径被入口处 num12 = 2000 无条件覆写（400/300 是死赋值）
+        foreach (var minion in new[] { 373, 375, 407, 423, 613 })
+            Assert.Equal(2000f, SummonBehaviorTable.Of[minion].TargetingRange);
+        Assert.Equal(45, SummonBehaviorTable.Of[373].AttackIntervalTicks);   // 阈值 90、每帧 +1~3 → ≈45
+        Assert.Equal(30, SummonBehaviorTable.Of[407].AttackIntervalTicks);   // 阈值 50 → ≈30
+        Assert.Equal(27, SummonBehaviorTable.Of[423].AttackIntervalTicks);   // 阈值 45 → ≈27（且开火需 ≤400）
+        Assert.Equal(36, SummonBehaviorTable.Of[613].AttackIntervalTicks);   // 阈值 60 → ≈36（且开火需 ≤500）
+
+        // aiStyle 66 内联块：387 索敌 2000、冷却阈值 90
+        Assert.Equal((2000f, 45), (SummonBehaviorTable.Of[387].TargetingRange, SummonBehaviorTable.Of[387].AttackIntervalTicks));
+
+        // 哨兵：AI_053 系是**曼哈顿** 1000、间隔 60/90、首射前摇 120；AI_123 是**欧氏** 1000
+        Assert.Equal(SummonRangeMetric.Manhattan, SummonBehaviorTable.Of[308].RangeMetric);
+        Assert.Equal(SummonRangeMetric.Manhattan, SummonBehaviorTable.Of[1025].RangeMetric);
+        Assert.Equal(SummonRangeMetric.Euclidean, SummonBehaviorTable.Of[641].RangeMetric);
+        Assert.Equal(60, SummonBehaviorTable.Of[308].AttackIntervalTicks);
+        Assert.Equal(90, SummonBehaviorTable.Of[966].AttackIntervalTicks);
+        Assert.Equal(30, SummonBehaviorTable.Of[641].AttackIntervalTicks);
+        Assert.Equal(25, SummonBehaviorTable.Of[643].AttackIntervalTicks);
+        Assert.Equal(1240f, SummonBehaviorTable.Of[1025].TargetingRange);    // 1000 + 15×16
+
+        // DD2 三档：射程同 900，间隔按档递减；弩车三档共用同一套数值（冷却由玩家装备决定）
+        Assert.Equal(new[] { 104, 102, 92 },
+            new[] { 663, 665, 667 }.Select(t => SummonBehaviorTable.Of[t].AttackIntervalTicks));
+        Assert.All(new[] { 663, 665, 667 },
+            t => Assert.Equal((900f, SummonRangeMetric.Euclidean), (SummonBehaviorTable.Of[t].TargetingRange, SummonBehaviorTable.Of[t].RangeMetric)));
+        foreach (var ballista in new[] { 677, 678, 679 })
+            Assert.Equal((900f, 185), (SummonBehaviorTable.Of[ballista].TargetingRange, SummonBehaviorTable.Of[ballista].AttackIntervalTicks));
+
+        // 爆裂陷阱是**矩形相交**（144×144），不是距离；冷却 = 无套装 90
+        foreach (var trap in new[] { 691, 692, 693 })
+            Assert.Equal((144f, SummonRangeMetric.OwnerRect, 90),
+                (SummonBehaviorTable.Of[trap].TargetingRange, SummonBehaviorTable.Of[trap].RangeMetric, SummonBehaviorTable.Of[trap].AttackIntervalTicks));
+
+        // 老虎：owner 中心 1600×800 矩形，冷却按档 360 / 300 / 240
+        Assert.Equal(new[] { 360, 300, 240 },
+            new[] { 833, 834, 835 }.Select(t => SummonBehaviorTable.Of[t].AttackIntervalTicks));
+        Assert.All(new[] { 833, 834, 835 },
+            t => Assert.Equal((1600f, SummonRangeMetric.OwnerRect), (SummonBehaviorTable.Of[t].TargetingRange, SummonBehaviorTable.Of[t].RangeMetric)));
+
+        // 蘑菇小子（800 + 60 内爆炸）与禁咒仆从（800 + CanHitLine）
+        Assert.Equal((800f, 135), (SummonBehaviorTable.Of[1022].TargetingRange, SummonBehaviorTable.Of[1022].AttackIntervalTicks));
+        Assert.Equal((800f, 110), (SummonBehaviorTable.Of[1119].TargetingRange, SummonBehaviorTable.Of[1119].AttackIntervalTicks));
     }
 
     /// <summary>

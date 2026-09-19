@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-19（第四十四轮：难度缩放收口 —— 困难模式补强 + 多人人数缩放 + 包 23 双段；818/818 通过）
+> 最后更新：2026-09-19（W-2 第一步数据表**收口** + 第二步前置 **P0-1 守卫**落库；现状核查确认无活跃 P0-1；822/822 通过）
 
 ---
 
@@ -38,6 +38,182 @@
 
 **遗留**：写出文件已通过**逐格 round-trip** + **严格分段走查** + **原版服务端实测加载**（第二十轮）；
 **双向 `.wld` 格式互操作性均已确认**（导出 → 原版；原版 → TerraAuth）；原版客户端已完成连接、进图及 `/give` 掉落物拾取验证，完整游玩回归仍待验证。
+
+---
+
+### W-2 服务端权威召唤（Minion / Sentry）—— 独立立项（2026-09-19）
+
+**目标**：把召唤物的**位置、存活、索敌与伤害**从"owner 客户端自报"逐步收到服务端，
+使召唤流派也具备服务端权威（对应交接说明 §8 第 3 项 / 差距盘点 G2）。
+
+**现状（v4.3.1）**：召唤本体与本体发射的弹幕都在同一张 `Simulation/Combat/SummonProjectileTable.cs` 的
+`Of` 集合里；服务端只做**归属登记 + 伤害上界校验**（包 28 走 `CombatResolver.SummonDamageBound`），
+位置与存活完全由客户端包 27 / 29 驱动，不做积分也不超时。这套设计**当前没有已知缺陷**，
+仅"权威性不足"。
+
+**已回退的第一次尝试（重要：不要重复踩）**：2026-09-19 曾有一版实现（服务端跑本体 AI、拒客户端包 28/29/27 覆盖、
+包 27 反向广播），评审未通过、已 `git stash` 存档：
+
+```
+git stash list          # stash@{0}: wip: server-authoritative summon/sentry (UNFINISHED - review failed ...)
+git stash show -p stash@{0} --stat
+```
+
+两个 P0（**必须先想清楚怎么避免**）：
+1. **带仆从的玩家所有近战 / 远程命中被否决** —— 在武器校验**之前**用"场上有自有召唤弹幕"直接拒绝包 28。
+   正确做法：召唤只意味着"召唤伤害不能作为放行依据"，不能连带否决同一玩家手持武器的命中。
+   **守卫用例（未来实现的第一步就写它）**：`带仆从时手持武器合法命中仍生效`（铂金短剑 13 伤 + 场上有仆从 → 必须 Applied）。
+2. **召唤物发射的弹幕被当成"本体"** —— `Of` 混装本体与派生弹幕（308 ImpFireball、317 HornetStinger、623 ThornBall、
+   831-835 / 963-970 哨兵弹幕 …），若对它们"跳过积分 + 不超时 + 拒包 29 + 服务端接管跟随与攻击"，
+   会变成**永久跟随的炮台**，且包 27 会把客户端本应消失的弹幕复活。
+
+**第一步交付（只做数据，不动行为）**：三张表（建议由 `decompiled-tmp/` 的生成脚本抽取，与 `RecipeTable` /
+`ItemDamageTable` 同路，文件头写来源方法 + 条目数 + 未知项）：
+
+| 表 | 内容 | 来源 | 用途 |
+|---|---|---|---|
+| `SummonEntityTable` | 召唤**本体**弹幕类型（+ 其召唤武器 / 哨兵物品） | `Item.SetDefaults` 的 `shoot` + `WeaponClass.Summon`；哨兵 `sentry` | 界定"服务端接管生命周期与 AI"的范围 |
+| `SummonShotTable` | 本体 AI 发射的**派生弹幕**类型 | 各本体 AI 里的 `Projectile.NewProjectile` | 这些**永不进**本体集合，按普通弹幕走 |
+| `SummonBehaviorTable` | 逐本体的索敌射程 / 攻击节奏 / 飞行或贴地 / 是否射击 | 本体 AI + `SetDefaults`；**抽不到就留空标注未知，绝不猜** | 贴原版行为；未知项退回保守策略 |
+
+**第一步进度（2026-09-19，只做数据、不改行为）**
+
+| 表 | 状态 | 落点 |
+|---|---|---|
+| 本体表（**62 条** = 46 物品直生 + 16 本体变体；含 aiStyle / 尺寸 / timeLeft / tileCollide / 免疫三档 / 冷却 / 类别） | ✅ 已落库（2026-09-19 **重抽修正**，见下） | `Simulation/Combat/SummonEntityTable.cs`（只读数据）+ 测试 `SummonEntityTable_Matches_Vanilla_SetDefaults` |
+| 抽取脚本（仓库外） | ✅ | **现行**：`extract-summon-bodies3.ps1`（Projectile.SetDefaults → 本体类型，支持 `type == a \|\| b` / `type >= a && type <= b` / `case N:` 三形态 + 缩进无关归属）、`extract-summon-bodies-full.ps1`（逐本体 aiStyle / 尺寸 / timeLeft / tileCollide / 免疫 / 冷却 / minionSlots）、`extract-summon-items2.ps1`（Item.cs → 物品，缩进无关 + **内层同 id 精化**）、`diag-summon-items.ps1`（完整性诊断：43 处 `summon/sentry = true` 逐处归属，0 处未归属）<br>**已废弃（结论错）**：`extract-summons.ps1`（只匹配 2 缩进 `case`）、`extract-summon-table.ps1`、`extract-summon-params.ps1` |
+| 派生弹幕表（**62 个本体全部读完 AI，已定稿**：32 个有派生 / 34 条关系 / 25 个派生类型；30 个确认无派生） | ✅ 已落库（2026-09-19） | `Simulation/Combat/SummonShotTable.cs`（只读数据）+ 测试 `SummonShotTable_Matches_Vanilla_Ai` |
+| — 其中「无派生」= `SummonShotTable.NoDerivedShots`（显式列出，避免"表里没有≠不发射"的静默漏判） | ✅ | **纯接触伤害（21）**：266 BabySlime、317 Raven、388 Spazmamini、390/391/392 蜘蛛、393/394/395 海盗、533 DeadlySphere、623 StardustGuardian、625-628 StardustDragon、755 BatOfLight、758 VampireFrog、759 BabyBird、864 Smolstar、946 EmpressBlade、951 FlinxMinion、963 AbigailMinion、1093 Cattiva、1112 TrustyCattiva、1118 ClayPotMinion；**媒介 / 召唤生成（2）**：831 StormTigerGem（→ `Player.UpdateStormTigerStatus` 生成 833/834/835）、970 AbigailCounter（→ `Player.UpdateAbigailStatus` 生成 963）；**哨兵无发射（3）**：688/689/690 DD2LightningAura |
+| — 已定稿的派生关系（34 条） | ✅ | 191/192/193/194→195；373→374、375→376、407→408、423→433、613→614（`AI_062` 的 `num48` 按 type 赋值）；387→389（aiStyle 66 内联块，被 `type == 387` 限定）；833/834/835→818（专用 `AI_067_TigerSpecialAttack`，冷却 360/300/240）；1022→1044；1094/1113→{1097, 1106}；1119→1120；308→309、377→378、966→967（`AI_053` 覆写 `num15`）；641→642、643→644；663→664 / 665→666 / 667→668（`AI_130` 入口 `num2 = 664` + switch 覆写）；677/678/679→680（`AI_134` 共用字面量）；691→694 / 692→695 / 693→696（`AI_138` 入口 `num = 694` + switch 覆写）；1025→1026 |
+| 逐本体行为参数（射程 / 节奏 / 是否射击） | ✅ 已落库（2026-09-19；**32 个会发射本体的射程 + 间隔**） | `Simulation/Combat/SummonBehaviorTable.cs`（只读数据）+ 测试 `SummonBehaviorTable_Matches_Vanilla_Ai`；表中的射程 / 间隔口径与推导见下 |
+
+**第一步完成**：三张数据表全部落库（本体 62 / 派生弹幕 62 全覆盖 / 会发射本体的射程 + 间隔 32）。下一步可以进入第二步 `ServerDamage`。
+
+**射程 / 间隔的三个口径陷阱（写 `ServerAi` 前必须遵守）**：
+
+1. **射程度量不统一**，原版各 AI 各写一套，服务端不得混用或当作同一语义：
+   - `Vector2.Distance` 欧氏 —— `AI_123`（641/643）、`AI_130`（663-667）、`AI_134`（677-679）；
+   - `|dx| + |dy|` 曼哈顿 —— `AI_053_HandleSentryNPCTargeting`（308/377/966/1025，默认 `maxDistance = 1000f`）；
+   - **矩形相交** —— `691/692/693` 是 144×144（中心在本体上方 48），`833/834/835` 是 owner 中心 1600×800；
+   - 另有 `Collision.CanHit`（`AI_026`）与 `Collision.CanHitLine`（`AI_062` / aiStyle 66 / `AI_206` / DD2）两种视线口径。
+2. **间隔多是「阈值 + 随机累加」而非固定帧数**：原版每帧把 `ai[1]` 加一个随机量、超过阈值归零
+   （373 每帧 +1~3 / 阈值 90 → 均值 ≈45；375 +1 与 1/3 概率再 +1 → ≈68；407 阈值 50 → ≈30；
+   423 阈值 45 → ≈27；613 阈值 60 → ≈36；387 阈值 90 → ≈45）。表里记**均值**；
+   服务端若要严格贴原版，必须复刻同样的随机累加，**不要**用定值近似。
+3. **部分间隔取决于玩家护甲套装**（表中记无套装默认值）：
+   `677/678/679` 用 `GetBallistraShotDelay` ← 无套装 **160**、侍从 T3 → 100、弩车恐慌 → 60、两者兼具 → 30；
+   `691/692/693` 用 `GetExplosiveTrapCooldown` ← 无套装 **90**、女猎手 T2 → 60、T3 → 30。两者都要求服务端能读到套装备注。
+
+**逐条要点（非显然项）**：
+
+- `AI_053` 的 `num14`（6 / 9 / 12.5）是**弹丸速度**不是冷却（经 `num19 = num14 / 距离` 归一化证明）；冷却由 `num13` 写 `ai[0]`（60，966 为 90），首射前摇 120。
+- `AI_134` 的 `num2` 初值 12 在下一行被 `num2 = num6` 覆写成 **5**，开火点是 `ai[1] == 5` 而不是 12。
+- `AI_130` 的 `num6` 是**爆发动画帧数**（`num6 × num7` = 状态持续帧数），不是"每次几发"；每个爆发周期**只发 1 发**。
+- `AI_062` 入口 `float num12 = 400f` 后紧接着 `num12 = 2000f` 无条件覆写（423/613 的 300 是**死赋值**）。
+- `1025` 射程 1240 = `1000 + num3(15) × 16`，且**复用** `AI_053` 的曼哈顿索敌。
+- `AI_026` 的射程随仆从位变化（`800 + 40 × minionPos`，`minionPos = player.numMinions`）；1113 额外 +360。
+- `423` 开火另需目标 ≤ **400**、`613` 另需 ≤ **500**（索敌半径 2000 只在"锁定"层面有效）。
+- `1022` 的节奏由 `ai[2]` 驱动：蓄力 15 起跳 → 空中窗口 30 → 命中后 `-120` 逐帧恢复到 0，故两次爆炸最小间隔 ≈135。
+
+**这一步就纠正了现存数据的六处错**（务必按新表口径修正第二步）：
+
+1. **本体数从 27 → 62**：旧抽取只扫 2 缩进 `case`，**整整漏了 19 个物品本体**——
+   8 条非 DD2（Hornet 373 ← HornetStaff 2364、FlyingImp 375 ← ImpStaff 2365、SpiderHiver 377 ← QueenSpiderStaff 2366、
+   Retanimini 387 ← OpticStaff 2535、VenomSpider 390 ← SpiderStaff 2551、OneEyedPirate 393 ← PirateStaff 2584、
+   Tempest 407 ← TempestStaff 2621、UFOMinion 423 ← XenoStaff 2749）+ 11 个 DD2 哨兵
+   （663/665/667 FlameBurst、677/678/679 Ballistra、688/689/690 LightningAura、691/692/693 ExplosiveTrap）。
+   这意味着"移除召唤武器即销毁"（`SummonWeaponBuff`）此前对 8 个法杖**不生效**（已补 7 条 buff 映射：125/126/133/134/135/139/140）。
+2. **DD2 哨兵不是"一个物品"**：3818-3834 共 **12 个物品**共享一段 fallthrough `case` + 内层 `switch (type)` 逐 id 精化 shoot；
+   旧脚本 last-wins 把「`case 3831: shoot = 690`」记到了 3834 头上（真值 `shoot = 693`），于是"旧表 663 属 3834"整条是错的。
+3. **「本体变体」不是「派生弹幕」**：192/193/194 Pygmy2/3/4、388 Spazmamini、391/392 JumperSpider/DangerousSpider、
+   394/395 SoulscourgePirate/PirateCaptain、623 StardustGuardian、626/627/628 StardustDragon2/3/4、
+   833/834/835 StormTigerTier1/2/3、963 AbigailMinion 都是**本体**（多态 / 分档 / 多节 / 套装加成），
+   不能按派生弹幕销毁；它们的 `ItemId = null`（不由物品直接生成）。
+4. **970 AbigailCounter 是「媒介」**：5114 AbigailsFlower 的 `Item.shoot` 是 970，真实本体是它生成的 963 AbigailMinion。
+5. **哨兵 / 仆从的旧标注多处是错的**：旧 `SentryTypes` 把 831/946/951/970 当哨兵（真身是仆从 StormTigerGem /
+   EmpressBlade / FlinxMinion / AbigailCounter），又把真哨兵 663/665/667 当仆从；旧表注释「373/375/377 = 海盗法杖」
+   也是错的（Hornet / FlyingImp / SpiderHiver）。**名称必须查 `ProjectileID.cs` / `ItemID.cs`，不要凭印象写。**
+6. **本体寿命不一律为 0**：18 个哨兵 = 36000（10 分钟）；831/864/970 = **60 tick 短命本体**；
+   759 是 `timeLeft *= 5`（旧表记成 60，错）。另：默认 `tileCollide = true`（复位块 L800），
+   308/966/1025 未设该字段 → true（旧表记 false，错）。
+
+**抽取陷阱（写脚本时注意，本轮全部踩过一遍）**：
+- `Item.cs` 有多个 switch，`case N:` **缩进深度不统一**（2 缩进 / 4 缩进各一处），且同一 id 会重复出现——
+  必须①缩进无关匹配，②**降入内层同 id 的 `case`** 再读字段（否则 fallthrough 组会串味），
+  ③保留带 `summon` 标志的那条。首轮就因此静默丢了 FrostHydra 1572，本轮又漏了上面 19 条。
+- `Projectile.SetDefaults` 用 `else if (type == N)`（**小写 type**）且含 `type == a || type == b` /
+  `type >= a && type <= b` 组合条件——按 `case` 或按单值条件都会漏；`case N:` 只出现在**内层精化 switch** 里。
+- **完整性诊断要先做**：`Item.cs` 里 `summon = true` / `sentry = true` 共 43 处，逐处打印归属，
+  未归属必须为 0（唯一一处未归属在 `DefaultToWhip` 辅助方法里，属鞭子，不是召唤武器）。
+- `NewProjectile` 有多种重载（Projectile Type 分别在第 3 / 4 / 5 个参数位置，需按签名判断）。
+- **必须用名称做交叉校验**：光看"共享 AI 里的字面量"会把其它本体的弹幕算到自己头上（`AI_067` 的 1044 属于
+  1022 Mushroom Boi，却会挂到 758/951/1093/1112/1118）。校验规则：候选弹幕的 `ProjectileID` 名称须与本体名称
+  互相包含（忽略非字母数字）——这条规则一次性拦掉了 5 个假阳性，且不依赖任何人工猜测。
+- **派生弹幕的类型常在 AI 入口处按 `type` 赋给局部变量**（`int num48 = 0; if (type == 373) num48 = 374;`、
+  `int num2 = 664; case 665: num2 = 666;`），在生成点附近找字面量必然误判——必须回溯该局部变量的赋值链。
+- **同一个巨型 AI 被几十个 type 共用**（`AI_026` 含 Pygmy/蜘蛛/Foxsparks/宠物；`AI_062` 含 Hornet/Imp/Tempest/UFO/
+  StardustCell/Abigail；`AI_067` 含海盗/蛙/Flinx/蘑菇小子/老虎）：入口的 `flagN = type == …` 系列是唯一可信的分派依据，
+  必须逐个确认，不能按"AI 里有生成点"就判所有共用者都发射。
+- **共享块里的无效调用不是派生**：`AI_062` 对 963 AbigailMinion 会走到 `NewProjectile(..., num48=0, ...)`
+  （type 0 = None），这是"类型变量未赋值"的结果，**不是** Abby 的攻击派生——这类必须判为"无派生"。
+- `aiStyle` 常量块**不一定**被抽成 `AI_<n>` 方法：54 / 66 是内联块，130/134/137/138 是 `AI_130/134/137/138_*`
+  专用方法但变体走的是**别的**方法（833-835 的射击在 `AI_067_TigerSpecialAttack`，不在 `AI_164`）。
+  按方法名找不到生成点 ≠ 没有生成点。
+
+---
+
+**权威边界三档（第二~四步，每档独立可验证、可回退）**：
+
+1. **`ServerDamage`**：位置仍收客户端包 27；服务端维护本体集合与生命周期，
+   **命中改由服务端判定并结算**（本体不直接扣血，派生弹幕走既有弹幕物理管线）。
+2. **`ServerAi`**：本体跟随 / 驻守 / 索敌 / 节奏 / 暴击在服务端，包 27 只用于创建登记；
+   服务端反向广播位置。**必须预留 owner 特权回退**（主人视角抖动的兜底：owner 保持本地表现、
+   服务端只掌存活与伤害），并真机验证。
+3. **`ServerShots`**：本体的攻击由服务端 `NewProjectile` 生成派生弹幕（用 `SummonShotTable`），
+   退掉"本体直扣血"的简化。
+
+配置建议：`ServerConfig.SummonAuthorityMode { ClientDriven(默认), ServerDamage, ServerAi, ServerShots }`，
+默认 `ClientDriven` = 现状、零风险；逐档开、逐档验。
+
+**包处置矩阵（写死并逐格测）**：
+
+| 客户端包 | 本体 | 派生弹幕 |
+|---|---|---|
+| 27 创建 | 接受（登记 + 归属 / buff / 伤害上界校验） | 接受，走普通弹幕路径 |
+| 27 更新 | `ServerDamage` 接受位置；`ServerAi` 起拒绝（owner 特权除外） | 接受 |
+| 28 命中 | **拒绝**（服务端自己算） | 走现有普通弹幕通道校验 |
+| 29 销毁 | 拒绝（服务端为唯一销毁方） | **接受**（客户端 + 服务端超时双通道） |
+
+**数值口径（一律取原版）**：本体存活 = owner 在线 ∧ 对应召唤 buff 在身 ∧（哨兵）`timeLeft = 36000`；
+越界 / 超远归位用原版 `Center = player.Center`（`Projectile.cs` L18393-18402）；
+命中免疫按 `Simulation/Combat/SummonEntityTable.cs` 的**三档 + 冷却**（默认每玩家 10 tick / `LocalPerTarget` 3-30 /
+`IdStaticShared` 10-16 / `-1` = 终身一次 / 星尘龙 626-628 共用头节 625 的免疫数组），
+**不要**再自造冷却或统一按 10 tick；伤害照玩家装备算暴击；射程与攻击节奏取 `SummonBehaviorTable`。
+
+**工程注意**：先在锁外快照（PlayersLock → NpcsLock），再只持 `ProjectilesLock` 改实体，
+最后单独持 `NpcsLock` 结算伤害（同 `RefreshProjectileTargets` 模式）；本体位移同步要聚合/节流，
+不要"每 tick 每本体一个包"。
+
+**第二步开工前的现状核查（2026-09-19，已按代码逐条核对）**：
+
+- **当前不存在活跃的 P0-1**：`NpcStrikeCommand.Apply`（`Simulation/CommandQueue.cs` L1638-1777）已是
+  「**多通道取最大上界**」——`projectileMatched` / `summonProjectileMatched` 之外，无弹幕命中按
+  `Math.Max(手持武器上界, 召唤上界)` 校验，**任一通道放行即放行**；`summonAttackExpected`
+  （L1640-1642）带**空手前置条件**（`IsSelectedSlotEmpty`），故"带仆从 + 手持普通武器"不会走召唤强制路径。
+- **P0-1 守卫测试已落库**（第二步的前置动作已完成）：
+  `Summon_P0_1_Guard_NormalWeapon_Hit_Not_Hijacked_By_Owned_Summons`（`Tests/SimulationTests.cs`）。
+  用例刻意让**召唤上界远低于武器上界**（召唤 Damage 5 → 上界 6；手持 FieryGreatsword 121 → 上界 46），
+  断言合法近战 40 / 贴边 46 / 合法暴击 80 全部 `Applied`、47 被拒（防上界被放大成"全放行"），
+  并给出**空手 + 有召唤弹幕**时按召唤口径拒绝的对照——若日后把召唤通道改回"强制"，该用例立即变红。
+- **第二步剩余工作**（尚未开始）：
+  1. `ServerConfig.SummonAuthorityMode`（默认 `ClientDriven`）与 `WorldState` 侧开关（当前**不存在**该配置）；
+  2. 本体集合的**服务端生命周期**（存活 = owner 在线 ∧ 召唤 buff 在身 ∧ 哨兵 `timeLeft`）；
+  3. 命中免疫改按 `SummonEntityTable` 的**三档 + 冷却**（现为硬编码 `Tick + 10`，且 `LocalPerTarget` /
+     `IdStaticShared` / `-1`（终身一次）/ 星尘龙 626-628 共用头节数组都还没建模）；
+  4. `SummonProjectileTable.Of` / `SentryTypes` 按 `SummonEntityTable` 改正（本体与派生弹幕拆开）。
+- **注意**：现命中冷却写成 `SummonNpcHitCooldownUntil[NpcIndex] = Tick + 10`（`CommandQueue.cs` L1719），
+  与数据表的口径不符（表里是默认 10 / `LocalPerTarget` 3-30 / `IdStaticShared` 10-16 / `-1`），
+  属第二步要替换项，**不要**在新代码里继续复用这个硬编码。
 
 ---
 

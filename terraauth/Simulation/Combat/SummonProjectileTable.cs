@@ -1,7 +1,8 @@
 // TerraAuth — 召唤 / 哨兵弹幕类型表（阶段 G）
 // 服务端权威地识别「召唤物 / 哨兵炮台」发射的弹幕，用于两处：
-//   1) 生命周期：召唤物由召唤 AI 驱动（跟随 / 驻守），位置与朝向完全由客户端包 27 权威上报，
-//      服务端不做直线积分，也不按默认 300 tick 超时销毁（否则合法召唤物命中会失去弹幕基准）。
+//   1) 生命周期：召唤物由召唤 AI 驱动（跟随 / 驻守），位置与朝向目前仍由客户端包 27 上报，
+//      服务端不做直线积分，也不按默认 300 tick 超时销毁（否则合法召唤物命中会失去弹幕基准），
+//      存活由客户端包 29 + 召唤 Buff / 召唤武器清理驱动。
 //   2) 伤害校验：召唤物命中（包 28）的上界 = ceil(最高召唤弹幕伤害 × 1.15) × (crit ? 2 : 1)，
 //      （原版 Projectile.Damage 的 DamageVar ±15% × 暴击倍率；弹幕伤害由客户端包 27 创建时上报，
 //       已含 minionDamage 修饰，攻击时不再变化）。见 CombatResolver.SummonDamageBound。
@@ -9,6 +10,17 @@
 //         （ID 以 ProjectileID.cs 为准，与 ItemDamageTable 同源）。
 // 说明：表允许「宽于实际」——误收录只抬高合法上界（不误拒），漏收录则找不到基准（失败放行），
 //       两个方向都保证绝不误拒合法命中。
+//
+// **已知口径问题（待 backlog W-2 第二步修正，本文件暂不改行为）**：本表把「本体」与「本体发射的派生弹幕」
+// 混在一起，且 `SentryTypes` 有多处误标。经原版源码逐条核对（见 Simulation/Combat/SummonEntityTable.cs）：
+//   · 真本体共 **62 条**（46 条由物品 `Item.shoot` 直生 + 16 条本体变体），其中本表**漏了 19 条**：
+//     Hornet 373 / FlyingImp 375 / SpiderHiver 377 / Retanimini 387 / VenomSpider 390（+变体 391/392）、
+//     OneEyedPirate 393（+394/395）/ Tempest 407 / UFOMinion 423、以及 11 个 DD2 哨兵
+//     （663/665/667 FlameBurst、677/678/679 Ballistra、688/689/690 LightningAura、691/692/693 ExplosiveTrap）；
+//   · `SentryTypes` 误标：831 / 946 / 951 / 970 是**仆从**（StormTigerGem / EmpressBlade / FlinxMinion / AbigailCounter），
+//     真正的哨兵是 308 / 377 / 641 / 643 / 663-693（DD2 四系三档）/ 966 / 1025；
+//   · 192-194 / 626-628 / 833-835 / 963 / 623 / 388 是**本体变体**（仍是本体，不是派生弹幕）。
+// 逐条对照表见 `Simulation/Combat/SummonEntityTable.cs` 文件头。
 
 using System.Collections.Generic;
 
@@ -71,6 +83,13 @@ public static class SummonProjectileTable
         [1157] = 49,   // Pygmy Staff → Pygmies                (Item.cs:14284)
         [1309] = 64,   // Slime Staff → BabySlime              (Item.cs:16240)
         [1802] = 83,   // Raven Staff → Ravens                 (Item.cs:20046)
+        [2364] = 125,  // Hornet Staff → Hornet                (Item.cs:23862)
+        [2365] = 126,  // Imp Staff → FlyingImp                (Item.cs:23881)
+        [2535] = 134,  // Optic Staff → Retanimini/Spazmamini  (Item.cs:24694)
+        [2551] = 133,  // Spider Staff → VenomSpider           (Item.cs:24960)
+        [2584] = 135,  // Pirate Staff → OneEyedPirate         (Item.cs:25393)
+        [2621] = 139,  // Tempest Staff → Tempest              (Item.cs:25623)
+        [2749] = 140,  // Xeno Staff → UFOMinion               (Item.cs:26320)
         [3249] = 161,  // Deadly Sphere Staff → DeadlySphere  (Item.cs:29965)
         [3474] = 182,  // Stardust Cell Staff → StardustMinion(Item.cs:31197)
         [3531] = 188,  // Stardust Dragon Staff → Dragon      (Item.cs:31766)
