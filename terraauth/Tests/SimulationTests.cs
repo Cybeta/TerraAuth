@@ -984,12 +984,14 @@ public class SimulationTests
     /// <summary>
     /// SSC 背包守恒事务：原版合成（3 铜矿 → 1 铜锭）改变背包总量，但净增量可由原版配方解释
     /// → 必须提交（此前判据只看「总量不变」，把合成当成凭空造物整窗回滚，表现为合成后物品被吃掉）。
+    /// 铜锭需要熔炉（图格 17）→ 用例先在玩家可达区域内放一块熔炉。
     /// </summary>
     [Fact]
     public void InventoryTransaction_Commits_Recipe_Explained_Craft()
     {
-        var world = new WorldState { Tick = 100 };
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(32, 32) };
         var player = new PlayerRuntime { Id = 1, Active = true };
+        PlaceCraftingStation(world, player, tileType: 17);
         player.Items[50] = 12;   // 铜矿
         player.ItemStacks[50] = 3;
         lock (world.PlayersLock)
@@ -1005,6 +1007,94 @@ public class SimulationTests
         Assert.Equal(0, player.Items[50]);
         Assert.Equal(20, player.Items[51]);
         Assert.Equal(1, player.ItemStacks[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：材料齐备但**不在合成站旁** → 配方前置条件不满足 → 回滚
+    /// （否则客户端只要凑齐材料就能在任意位置合成高阶物品）。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_RollsBack_Craft_Without_Station()
+    {
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(32, 32) };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[50] = 12;
+        player.ItemStacks[50] = 3;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 20, 1).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(12, player.Items[50]);
+        Assert.Equal(0, player.Items[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：合成站**超出可达区域**（原版 Simple 判定为 X ±5 / Y ±3 图格）同样不满足前置条件。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_RollsBack_Craft_Station_Out_Of_Reach()
+    {
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(32, 32) };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        var (sx, sy) = PlaceCraftingStation(world, player, tileType: 17);
+        world.Tiles[sx + 6, sy] = new Tile { Active = true, Type = 17 };   // 熔炉挪到可达区域外
+        world.Tiles[sx, sy] = Tile.Empty;
+        player.Items[50] = 12;
+        player.ItemStacks[50] = 3;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 20, 1).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(12, player.Items[50]);
+    }
+
+    /// <summary>
+    /// 合成环境快照（原版 <c>AdjTiles()</c>）：可达区域内的合成站（含 <c>TileCountsAs</c> 等价图格）
+    /// 与相邻液体被正确采集，区域外的不算。
+    /// </summary>
+    [Fact]
+    public void CraftingEnvironmentSampler_Tracks_Station_And_Liquids()
+    {
+        var world = new WorldState { Tiles = new TileMap(32, 32) };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        var environment = player.CraftingEnvironment;
+
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.False(environment.Satisfies(17, CraftEnvironment.None));   // 空旷：熔炉不可用
+        Assert.True(environment.Satisfies(-1, CraftEnvironment.None));    // 手工合成始终可用
+
+        var (sx, sy) = PlaceCraftingStation(world, player, tileType: 17);
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.True(environment.Satisfies(17, CraftEnvironment.None));
+
+        // 等价图格：355（炼金台）算作 13（瓶子）——原版 Recipe.TileCountsAs
+        world.Tiles[sx, sy] = new Tile { Active = true, Type = 355 };
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.True(environment.Satisfies(13, CraftEnvironment.None));
+
+        // 水源：算作水源的图格（172 水槽）与满水液体格都满足 needWater
+        world.Tiles[sx, sy] = Tile.Empty;
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.False(environment.Satisfies(-1, CraftEnvironment.Water));
+
+        world.Tiles[sx, sy] = new Tile { Active = true, Type = 172 };
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.True(environment.Satisfies(-1, CraftEnvironment.Water));
+
+        world.Tiles[sx, sy] = new Tile { Active = false, Liquid = 255, LiquidType = 1 };   // 满格岩浆
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.False(environment.Water);
+        Assert.True(environment.Satisfies(-1, CraftEnvironment.Lava));
     }
 
     /// <summary>
@@ -1031,13 +1121,14 @@ public class SimulationTests
     }
 
     /// <summary>
-    /// SSC 背包守恒事务：材料不足的「合成」（只有 2 铜矿却报出 1 铜锭）无法被配方解释 → 回滚。
+    /// SSC 背包守恒事务：站位齐备但**材料不足**的「合成」（只有 2 铜矿却报出 1 铜锭）无法被配方解释 → 回滚。
     /// </summary>
     [Fact]
     public void InventoryTransaction_RollsBack_Craft_Short_Of_Materials()
     {
-        var world = new WorldState { Tick = 100 };
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(32, 32) };
         var player = new PlayerRuntime { Id = 1, Active = true };
+        PlaceCraftingStation(world, player, tileType: 17);
         player.Items[50] = 12;
         player.ItemStacks[50] = 2;
         lock (world.PlayersLock)
@@ -1174,6 +1265,7 @@ public class SimulationTests
     public void ChestTransaction_Commits_Craft_From_Chest()
     {
         var (world, player, chest) = CreateTransferWorld();
+        PlaceCraftingStation(world, player, tileType: 17);   // 铜锭需要熔炉
         chest.Items[0] = new ChestItem { Type = 12, Stack = 3 };
         world.Tick = 100;
         var rng = new XoshiroRng(1);
@@ -2284,13 +2376,27 @@ public class SimulationTests
 
     private static (WorldState World, PlayerRuntime Player, Chest Chest) CreateTransferWorld(bool openSession = true)
     {
-        var world = new WorldState();
+        var world = new WorldState { Tiles = new TileMap(16, 16) };
         var player = new PlayerRuntime { Id = 1, SessionId = 22, Active = true, Position = new Vector2(8, 8) };
         var chest = new Chest { Index = 0, X = 0, Y = 0, Items = new ChestItem[40] };
         lock (world.PlayersLock) world.Players[1] = player;
         lock (world.ChestsLock) world.Chests.Add(chest);
         if (openSession) world.OpenChestSession(1, 22, 0);
         return (world, player, chest);
+    }
+
+    /// <summary>
+    /// 在玩家可达区域内放一块合成站图格（默认熔炉 17），供「合成守恒」用例满足站位前置条件。
+    /// 返回放置点，便于用例做「够不着」的对照。
+    /// </summary>
+    private static (int X, int Y) PlaceCraftingStation(WorldState world, PlayerRuntime player, int tileType = 17)
+    {
+        int x = (int)(player.Position.X / 16f) + 1;
+        int y = (int)(player.Position.Y / 16f) + 1;
+        if (world.Tiles.Width <= x || world.Tiles.Height <= y)
+            world.Tiles = new TileMap(Math.Max(16, x + 2), Math.Max(16, y + 2));
+        world.Tiles[x, y] = new Tile { Active = true, Type = (ushort)tileType };
+        return (x, y);
     }
 
     private static (WorldState World, GameLoop Loop, WorldSimulator Sim, CommandQueue Commands) CreateSim()

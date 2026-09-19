@@ -249,6 +249,18 @@ public class VanillaFeatureTests
         return player.PendingChestChanges.Count == 0 && player.PendingChestInventoryChanges.Count == 0;
     }
 
+    /// <summary>
+    /// 在玩家可达区域内放一块合成站图格（默认熔炉 17），供「合成守恒」用例满足站位前置条件。
+    /// </summary>
+    private static void PlaceCraftingStation(VanillaServer server, PlayerRuntime player, int tileType = 17)
+    {
+        var tiles = server.Host.Simulator.State.Tiles;
+        int x = (int)(player.Position.X / 16f) + 1;
+        int y = (int)(player.Position.Y / 16f) + 1;
+        if (x < 0 || y < 0 || x >= tiles.Width || y >= tiles.Height) return;
+        tiles[x, y] = new Tile { Active = true, Type = (ushort)tileType };
+    }
+
     /// <summary>等待权威层出现指定拒绝原因（Prometheus 计数器）。</summary>
     private static async Task<bool> WaitForRejectAsync(VanillaServer server, string reason, TimeSpan timeout)
     {
@@ -561,6 +573,7 @@ public class VanillaFeatureTests
     /// <summary>
     /// SSC 背包守恒事务：原版合成（3 铜矿 → 1 铜锭）在真机链路上（TCP → 管线 → 事务窗口）必须被提交 ——
     /// 这是「SSC 守恒」此前的唯一硬缺口：材料减少 + 产物增加被逐项判成不守恒，合成结果被整窗回滚。
+    /// 铜锭需要熔炉（图格 17）→ 用例先在玩家可达区域内放一块熔炉（原版合成站前置条件）。
     /// </summary>
     [Fact]
     public async Task Vanilla_InventoryCraft_Is_Accepted_And_Conserved()
@@ -570,6 +583,7 @@ public class VanillaFeatureTests
         var world = server.Host.Simulator.State;
         var player = world.Players[1];
         await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        PlaceCraftingStation(server, player, tileType: 17);
 
         // 服务端权威背包：槽 50 有 3 个铜矿（物品 12）
         player.Items[50] = 12;
@@ -586,6 +600,32 @@ public class VanillaFeatureTests
         Assert.Equal(0, player.Items[50]);
         Assert.Equal(20, player.Items[51]);
         Assert.Equal(1, player.ItemStacks[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：材料齐备但**不在合成站旁** → 前置条件不满足 → 回滚（客户端被纠正）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_InventoryCraft_Without_Station_Rolls_Back()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        player.Items[50] = 12;
+        player.ItemStacks[50] = 3;
+
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 0, 0));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(51, 20, 1));
+
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+
+        Assert.Equal(12, player.Items[50]);
+        Assert.Equal(3, player.ItemStacks[50]);
+        Assert.Equal(0, player.Items[51]);
     }
 
     /// <summary>
@@ -611,7 +651,7 @@ public class VanillaFeatureTests
         Assert.Equal(0, player.Items[50]);
     }
 
-    /// <summary>SSC 背包守恒事务：材料不足的「合成」无法被配方解释 → 仍须回滚。</summary>
+    /// <summary>SSC 背包守恒事务：站位齐备但材料不足的「合成」无法被配方解释 → 仍须回滚。</summary>
     [Fact]
     public async Task Vanilla_InventoryCraft_Short_Of_Materials_Rolls_Back()
     {
@@ -620,6 +660,7 @@ public class VanillaFeatureTests
         var world = server.Host.Simulator.State;
         var player = world.Players[1];
         await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        PlaceCraftingStation(server, player, tileType: 17);
 
         player.Items[50] = 12;
         player.ItemStacks[50] = 2;   // 只有 2 个铜矿，却要报出 1 个铜锭

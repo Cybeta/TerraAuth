@@ -1269,7 +1269,8 @@ public sealed class WorldState
         }
 
         return CraftingConservation.IsConserved(
-            authoritative, proposed, allowConsumption: true, BuildRemovalLimit(player.InventoryTransactionBaseline));
+            authoritative, proposed, allowConsumption: true,
+            BuildRemovalLimit(player.InventoryTransactionBaseline), player.CraftingEnvironment);
     }
 
     /// <summary>
@@ -1513,7 +1514,8 @@ public sealed class WorldState
             AddTotals(proposed, itemId, stack, prefix);
         }
 
-        return CraftingConservation.IsConserved(baseline, proposed, allowConsumption: false);
+        return CraftingConservation.IsConserved(
+            baseline, proposed, allowConsumption: false, removalLimit: null, player.CraftingEnvironment);
     }
 
     // ---- 对话 NPC 变更推送（仿真接受包 40 后生成原版包 40，中继给其他玩家）----
@@ -2197,6 +2199,13 @@ public sealed class PlayerRuntime
     /// 不在基准内，故客户端「清空该槽」的暂存意图会超出上限而被判不守恒（保留与外部变更冲突回滚的语义）。
     /// </summary>
     public readonly Dictionary<(int ItemId, byte Prefix), int> InventoryTransactionBaseline = new();
+
+    /// <summary>
+    /// 合成环境快照（可达区域图格 + 相邻液体），由 <see cref="CraftingEnvironmentSampler.Refresh"/> 在
+    /// 事务暂存时重取；提交时据此校验配方的合成站 / 液体前置条件。
+    /// 默认（未采集）为空快照 = 任何需要合成站的配方都不可用 —— **失败方向是安全侧**（回滚）。
+    /// </summary>
+    public readonly CraftingEnvironment CraftingEnvironment = new();
 
     // ---- SSC 箱子守恒事务（包 32 的窗口聚合）----
 

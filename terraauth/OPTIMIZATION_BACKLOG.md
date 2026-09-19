@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-19（第三十九轮：合成 / 消耗配方表补齐 —— SSC 守恒最后一个硬缺口；795/795 通过）
+> 最后更新：2026-09-19（第四十轮：合成站 / 环境校验 —— 关掉「任意位置合成」作弊面；799/799 通过）
 
 ---
 
@@ -113,6 +113,48 @@
 
 ## 附：本轮回溯
 
+### 第四十轮（2026-09-19）：合成站 / 环境校验 —— 关掉「任意位置合成」作弊面
+
+**一、根因**
+
+- 上一轮把「材料 → 产物」的净增量交给配方表解释，但**没有校验配方的前置条件**：原版合成要求玩家
+  站在合成站附近（工作台 / 砧 / 熔炉 / 锯木机…），部分配方还要紧邻水 / 蜂蜜 / 岩浆。
+  缺这一步 → 客户端只要凑齐材料，就能**在任意位置**合成高阶物品（配方表里的 `requiredTile` 当时被生成器丢弃）。
+
+**二、配方表扩充（`gen-recipes.ps1` → `RecipeTable.cs`）**
+
+- 每条配方新增两列：**`RequiredTile`**（原版 `requiredTile` / `SetCraftingStation`；-1 = 手工合成）
+  与 **`CraftEnvironment`**（原版 `needWater` / `needHoney` / `needLava`）。本轮由 `SetCraftingStation` 纳入
+  的 331 条 + `requiredTile` 的 1820 条全部落表；家具模板按 `overrideStation` 复刻站位
+  （含原版特例：模板里的工作台**只在 overrideStation ≥ 0 时**设站位）。
+- 同时抽取两张小表：**`TileCountsAs`**（原版 `Recipe.SetupTileInheritance` 的 9 条「算作」关系，
+  如 `355 → 13`：炼金台算作瓶子）与 **`WaterForCraftingTiles`**（原版 `TileID.Sets.CountsAsWaterForCrafting` = 水槽 172 / 207）。
+- **未收录**（服务端不可确定性复现，文件头如实标注出现次数）：`needSnowBiome`（1）/
+  `needGraveyardBiome`（131）/ `needMechdusa`（1）/ `needTorchGodsFavor`（2）—— 依赖客户端分辨率的场景度量或玩家解锁状态。
+
+**三、环境快照与校验（新增 `Simulation/Crafting/CraftingEnvironment.cs`）**
+
+- `CraftingEnvironment`：可达区域图格集合（含等价图格展开）+ 水 / 蜂蜜 / 岩浆标志；
+  `Satisfies(requiredTile, environment)` 即原版 `Recipe.PlayerMeetsEnvironmentConditions`。
+- `CraftingEnvironmentSampler.Refresh`：镜像原版 `Player.AdjTiles()` —— 区域取
+  `TileReachCheckSettings.Simple`（X ±5 / Y ±3 图格，原版 `DefaultTileRangeX=5` / `DefaultTileRangeY=3`），
+  以玩家碰撞盒（20×42）为基准并夹取到世界边界；液体按 `tile.liquid > 200` + `LiquidType` 判定；
+  等价图格按 `TileCountsAs` 取传递闭包。**默认空快照 = 需要站位的配方一律不可用（失败方向是安全侧）**。
+- **锁序**：快照必须在取 `PlayersLock` **之前**采集（内部要取区块读锁；全局锁序 SectionLocks → PlayersLock → ChestsLock），
+  故挂在 `StageInventorySlotCommand` / `StageChestItemCommand`（包 5 / 包 32 暂存）时刷新，
+  提交阶段只用快照、不再碰图格 —— 与「暂存时刻的合成意图」语义一致。
+- `CraftingConservation.IsConserved` 新增可选 `CraftingEnvironment` 参数：候选配方不满足前置条件直接跳过
+  （等价原版「该配方当前不可用」），不会把「配方存在但不该可用」误当成合法合成。
+
+**四、已知边界**
+
+- 站位 / 液体已按原版判定；雪原 / 墓地 / 特殊种子 / 火把神恩仍未校验（上述 4 类标志的配方仅受材料与站位约束）。
+- 家具模板里不设站位的工作台配方（`overrideStation < 0`）与手工合成配方（`-1`）本就不需要站位。
+
+**测试**：**799 / 799 通过**（新增 4 例：材料齐备但无站位 → 回滚、站位超出可达区域 → 回滚、
+环境快照采集（站位 / 等价图格 / 水槽 / 满格岩浆）、真机链路无站位合成回滚；并修正既有合成用例
+——铜锭需要熔炉，用例补放熔炉图格）。
+
 ### 第三十九轮（2026-09-19）：合成 / 消耗配方表 —— SSC 守恒最后一个硬缺口
 
 **一、根因**
@@ -148,7 +190,7 @@
 
 **四、已知边界（均落在安全侧：宁回滚不放过）**
 
-- 只校验「材料 → 产物」守恒，**不校验合成站 / 环境条件**（工作台、砧、水 / 岩浆等）。
+- ~~只校验「材料 → 产物」守恒，**不校验合成站 / 环境条件**~~ → **第四十轮已补上**（站位 + 水 / 蜂蜜 / 岩浆）。
 - 同一窗口内的**多级合成**（先合成中间物、再立刻用它合成成品，中间物净变化为 0）不被解释；窗口仅 15 tick。
 
 **测试**：**795 / 795 通过**（新增 16 例：背包合成提交 / 纯消耗放行 / 材料不足回滚 / 带前缀造物回滚、

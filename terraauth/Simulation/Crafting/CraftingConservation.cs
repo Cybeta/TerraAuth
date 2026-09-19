@@ -52,13 +52,36 @@ public readonly struct CraftRequirement
     public readonly int Stack;
 }
 
-/// <summary>单条原版配方：产物 + 产物堆叠 + 材料需求。</summary>
+/// <summary>配方要求的液体环境（原版 <c>needWater</c> / <c>needHoney</c> / <c>needLava</c>）。</summary>
+[System.Flags]
+public enum CraftEnvironment
+{
+    None = 0,
+
+    /// <summary>需要紧邻水源（液体 &gt; 200 的水格，或算作水源的图格，如水槽）。</summary>
+    Water = 1,
+
+    /// <summary>需要紧邻蜂蜜（液体 &gt; 200 且 LiquidType == 2）。</summary>
+    Honey = 2,
+
+    /// <summary>需要紧邻岩浆（液体 &gt; 200 且 LiquidType == 1）。</summary>
+    Lava = 4,
+}
+
+/// <summary>单条原版配方：产物 + 产物堆叠 + 合成站 + 液体环境 + 材料需求。</summary>
 public readonly struct CraftRecipe
 {
-    public CraftRecipe(int productItemId, int productStack, CraftRequirement[] requirements)
+    public CraftRecipe(
+        int productItemId,
+        int productStack,
+        int requiredTile,
+        CraftEnvironment environment,
+        CraftRequirement[] requirements)
     {
         ProductItemId = productItemId;
         ProductStack = productStack;
+        RequiredTile = requiredTile;
+        Environment = environment;
         Requirements = requirements;
     }
 
@@ -66,6 +89,12 @@ public readonly struct CraftRecipe
 
     /// <summary>单次合成的产物堆叠数（净增量必须是它的整数倍）。</summary>
     public readonly int ProductStack;
+
+    /// <summary>合成站图格 ID（原版 <c>requiredTile</c>）；-1 = 手工合成（无站位要求）。</summary>
+    public readonly int RequiredTile;
+
+    /// <summary>液体环境要求（原版 <c>needWater</c> / <c>needHoney</c> / <c>needLava</c>）。</summary>
+    public readonly CraftEnvironment Environment;
 
     public readonly CraftRequirement[] Requirements;
 }
@@ -122,11 +151,16 @@ public static class CraftingConservation
     /// 窗口期内服务端外部塞入（/give、拾取、开袋）的物品不在其中，客户端「清空该槽」的暂存意图
     /// 会因超出上限被判不守恒（保留「与外部变更冲突 → 回滚」的既有语义）。null = 不限制。
     /// </param>
+    /// <param name="environment">
+    /// 玩家当前合成环境快照（可达区域图格 + 相邻液体）。传入后，配方的**合成站与液体前置条件**
+    /// 一并校验（等价原版 <c>Recipe.PlayerMeetsEnvironmentConditions</c>）；null = 不校验（仅纯函数用例）。
+    /// </param>
     public static bool IsConserved(
         Dictionary<(int ItemId, byte Prefix), int> authoritative,
         Dictionary<(int ItemId, byte Prefix), int> proposed,
         bool allowConsumption,
-        IReadOnlyDictionary<int, int>? removalLimit = null)
+        IReadOnlyDictionary<int, int>? removalLimit = null,
+        CraftingEnvironment? environment = null)
     {
         if (SameTotals(authoritative, proposed)) return true;   // 快路径：逐 (物品, 前缀) 完全一致
 
@@ -162,7 +196,7 @@ public static class CraftingConservation
         if (added.Count == 0) return allowConsumption;   // 纯减少：背包 = 消耗，箱子 = 不放行
 
         int budget = MaxSearchNodes;
-        return TryExplain(available, added, requireEmptyRemovals: !allowConsumption, ref budget);
+        return TryExplain(available, added, requireEmptyRemovals: !allowConsumption, environment, ref budget);
     }
 
     private static bool SameTotals(
@@ -192,12 +226,15 @@ public static class CraftingConservation
 
     /// <summary>
     /// 递归把 <paramref name="added"/> 里的净增加逐项解释成配方产物（材料从 <paramref name="available"/> 扣减，
-    /// 失败回溯）。每次取一个待解释产物，遍历其候选配方，要求净增量能被单次产出堆叠整除。
+    /// 失败回溯）。每次取一个待解释产物，遍历其候选配方，要求净增量能被单次产出堆叠整除；
+    /// 传了 <paramref name="environment"/> 时，候选配方还须满足合成站 / 液体前置条件
+    /// （不满足的配方直接跳过，等价原版「该配方当前不可用」）。
     /// </summary>
     private static bool TryExplain(
         Dictionary<int, int> available,
         Dictionary<int, int> added,
         bool requireEmptyRemovals,
+        CraftingEnvironment? environment,
         ref int budget)
     {
         int chosen = 0;
@@ -221,6 +258,8 @@ public static class CraftingConservation
         int need = added[chosen];
         foreach (var recipe in recipes)
         {
+            if (environment is not null && !environment.Satisfies(recipe.RequiredTile, recipe.Environment)) continue;
+
             int outStack = recipe.ProductStack > 0 ? recipe.ProductStack : 1;
             if (need % outStack != 0) continue;
 
@@ -228,7 +267,7 @@ public static class CraftingConservation
             if (!TryDeduct(available, recipe.Requirements, need / outStack, out var deductions)) continue;
 
             added[chosen] = 0;
-            if (TryExplain(available, added, requireEmptyRemovals, ref budget)) return true;
+            if (TryExplain(available, added, requireEmptyRemovals, environment, ref budget)) return true;
             added[chosen] = need;
             Rollback(available, deductions);
         }

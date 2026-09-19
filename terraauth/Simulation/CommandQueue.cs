@@ -55,6 +55,20 @@ public abstract record Command(
         return true;
     }
 
+    /// <summary>
+    /// 重取玩家合成环境快照（可达区域图格 + 相邻液体）。
+    /// **必须在取 <see cref="WorldState.PlayersLock"/> 之前调用**：内部要取区块读锁，
+    /// 而全局锁序是 SectionLocks → PlayersLock → ChestsLock / ItemsLock …
+    /// 玩家不存在时静默跳过（后续命令自身会失败）。
+    /// </summary>
+    protected static void RefreshCraftingEnvironment(WorldState world, int playerId)
+    {
+        PlayerRuntime? player;
+        lock (world.PlayersLock)
+            world.Players.TryGetValue(playerId, out player);
+        if (player is not null) CraftingEnvironmentSampler.Refresh(world, player);
+    }
+
     /// <summary>应用命令到世界状态。这是唯一允许变更 WorldState 的地方。</summary>
     public abstract CommandApplyResult Apply(WorldState world, IRng rng);
 }
@@ -511,6 +525,9 @@ public sealed record StageChestItemCommand(
     {
         if (PlayerId is not int playerId)
             return new(false, CommandFailures.MissingPlayer);
+
+        // 合成环境快照：先于 PlayersLock（锁序 SectionLocks → PlayersLock → ChestsLock）。
+        RefreshCraftingEnvironment(world, playerId);
 
         lock (world.PlayersLock)
         {
@@ -2370,6 +2387,10 @@ public sealed record StageInventorySlotCommand(long Tick, int? PlayerId, int Slo
 
         if (!TryGetPlayer(world, id, out var player, out var failure))
             return failure;
+
+        // 合成环境快照（可达区域图格 + 相邻液体）：等价原版暂存时刻的 AdjTiles()。
+        // 必须先于 PlayersLock（锁序 SectionLocks → PlayersLock → ChestsLock），提交时据此校验配方前置条件。
+        CraftingEnvironmentSampler.Refresh(world, player);
 
         // 开箱期间的包 5 属于「背包 ↔ 箱子」转移的一半：必须与同一窗口的包 32 合并结算。
         // 若按背包事务单独校验，存入箱子会让背包总量减少而被判不守恒回滚（取出则相反）。
