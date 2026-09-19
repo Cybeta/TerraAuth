@@ -4625,14 +4625,24 @@ public class WorldGeneratorTests
         Assert.True(new NpcStrikeCommand(10, 1, near.Index, 30, Generation: 3)
             .Apply(near.World, new XoshiroRng(2)).Applied);
 
-        // 未自算位置的族（387 Fly）不受几何判定影响 → 远处目标仍照旧（失败放行）
+        // 飞行族（387）现在同样被接管 → 远处目标一样拒绝
         var other = CreateScenario(5000f);
         AddBody(other.World, 387);
         var otherSim = new WorldSimulator(other.World, new CommandQueue(), new EventRecorder(), new SnapshotStore());
         otherSim.Tick();
-        Assert.Null(other.World.Projectiles[0].ServerPosition);
-        Assert.True(new NpcStrikeCommand(10, 1, other.Index, 30, Generation: 3)
-            .Apply(other.World, new XoshiroRng(2)).Applied);
+        Assert.NotNull(other.World.Projectiles[0].ServerPosition);
+        Assert.Equal(CommandFailures.ProjectileNotColliding,
+            new NpcStrikeCommand(10, 1, other.Index, 30, Generation: 3)
+                .Apply(other.World, new XoshiroRng(2)).Reason);
+
+        // **派生弹幕**（374）不是本体、没有服务端位置 → 几何判定不适用（失败放行）
+        var shot = CreateScenario(5000f);
+        AddBody(shot.World, 374);
+        var shotSim = new WorldSimulator(shot.World, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        shotSim.Tick();
+        Assert.Null(shot.World.Projectiles[0].ServerPosition);
+        Assert.True(new NpcStrikeCommand(10, 1, shot.Index, 30, Generation: 3)
+            .Apply(shot.World, new XoshiroRng(2)).Applied);
     }
 
     /// <summary>
@@ -4705,6 +4715,59 @@ public class WorldGeneratorTests
 
         npc.X = 400f;
         Assert.True(new NpcStrikeCommand(11, 1, index, 30, Generation: 3).Apply(world, new XoshiroRng(2)).Applied);
+    }
+
+    /// <summary>
+    /// 覆盖完整性不变量：`ServerAi` 档下**全部 62 个本体**都必须拿到服务端自算位置
+    /// （这是「命中几何对该族生效」的前提）；而**派生弹幕**不是本体、不应被接管。
+    /// 新增本体类型时这张表会自动扩大，忘接管的类型会被这条用例抓住。
+    /// </summary>
+    [Fact]
+    public void ServerAi_Covers_All_Body_Types()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.SummonAuthority = SummonAuthorityMode.ServerAi;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1, Active = true, Hp = 100, HpMax = 100,
+            Position = new Vector2(320f, 460f), Direction = 1, DeathNotified = true,
+        };
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        lock (world.ProjectilesLock)
+        {
+            int key = 0;
+            foreach (int type in SummonEntityTable.Of.Keys)
+                world.Projectiles.Add(new ProjectileEntity
+                {
+                    Key = ++key, Owner = 1, Type = type, IsSummon = true, SummonEntityId = key,
+                    SummonKind = SummonProjectileTable.KindOf(type),
+                    Position = new Vector2(320f, 460f), Damage = 10, Penetrate = -1, Active = true,
+                });
+
+            // 派生弹幕（取 SummonShotTable 的第一个）——不应被接管
+            int derived = SummonShotTable.Of.Values.SelectMany(v => v).First().ProjectileType;
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = ++key, Owner = 1, Type = derived, IsSummon = true, SummonEntityId = key,
+                Position = new Vector2(320f, 460f), Damage = 10, Penetrate = -1, Active = true,
+            });
+        }
+
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        sim.Tick();
+
+        lock (world.ProjectilesLock)
+        {
+            foreach (var p in world.Projectiles)
+            {
+                if (SummonEntityTable.Of.ContainsKey(p.Type))
+                    Assert.True(p.ServerPosition is not null, $"本体 {p.Type} 未被服务端接管位置");
+                else
+                    Assert.True(p.ServerPosition is null, $"派生弹幕 {p.Type} 不应被服务端接管位置");
+            }
+        }
     }
 
     /// <summary>

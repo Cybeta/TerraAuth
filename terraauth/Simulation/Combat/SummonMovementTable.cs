@@ -69,6 +69,11 @@ public enum SummonMoveMode
 /// 0 = 本族不用「横向站位」跟随（如 AI_062 的空中编队、哨兵的固定/落体）。
 /// </param>
 /// <param name="StanceStep">每个同类实例额外递增的水平距离（px），配合 <paramref name="StanceBase"/>。</param>
+/// <param name="AnchorOffsetX">
+/// 待命点相对**主人中心**的水平偏移（px）；**按主人朝向取正负**（`× player.direction`）。
+/// 仅对 <see cref="StanceBase"/> 为 0 的飞行 / 悬浮族有意义。
+/// </param>
+/// <param name="AnchorOffsetY">待命点相对主人中心的垂直偏移（px，负 = 上方）。</param>
 public sealed record SummonMovementInfo(
     SummonMoveMode Mode,
     int? RecallDistance = null,
@@ -77,7 +82,9 @@ public sealed record SummonMovementInfo(
     float? SpeedLimit = null,
     float? RecallSpeedLimit = null,
     int StanceBase = 0,
-    int StanceStep = 0);
+    int StanceStep = 0,
+    int AnchorOffsetX = 0,
+    int AnchorOffsetY = 0);
 
 /// <summary>
 /// 62 个本体的移动模式 + 召回 / 归位阈值 + 速度上限（键与 <see cref="SummonEntityTable.Of"/> 相同）。
@@ -131,7 +138,7 @@ public static class SummonMovementTable
     }
 
     /// <summary>星尘龙**头节**类型（节段 626/627/628 的锚点）。</summary>
-    private const int StardustDragonHeadType = 625;
+    internal const int StardustDragonHeadType = 625;
 
     /// <summary>本体弹幕类型 → 移动参数。</summary>
     public static readonly IReadOnlyDictionary<int, SummonMovementInfo> Of =
@@ -158,33 +165,33 @@ public static class SummonMovementTable
             // ==== aiStyle 54（内联块 L38231-38441）Raven ====
             // 飞行；待命点 = 主人中心上方 60（L38331）；拴绳 500，ai[1]!=0 或 friendly 时 1400（L38270-38274）；
             // 自带 >2000 吸附主人（L38338）；速度 8（召回态 12，远距 15）
-            [317] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1400, TeleportDistance: 2000, SpeedLimit: 8f, RecallSpeedLimit: 12f),
+            [317] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1400, TeleportDistance: 2000, SpeedLimit: 8f, RecallSpeedLimit: 12f, AnchorOffsetY: -60),
 
             // ==== aiStyle 62（AI_062）====
             // 飞行；待命点 = 主人中心上方 60（L87227，375/407/963 另有横向偏移）；
             // 拴绳 num21 = 500（963 为 800；有目标 1000；423 为 1200；613 为 1350，L86969-86985）；
             // 自带 >2000 吸附主人（L87271）；速度 6（召回 15；375 为 ×0.75、407 固定 9）
-            [373] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f),
-            [375] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f),
-            [407] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 9f, RecallSpeedLimit: 15f),
-            [423] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1200, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f),
-            [613] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1350, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f),
+            [373] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f, AnchorOffsetY: -60),
+            [375] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f, AnchorOffsetX: -10, AnchorOffsetY: -10),
+            [407] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 9f, RecallSpeedLimit: 15f, AnchorOffsetY: -20),
+            [423] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1200, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f, AnchorOffsetY: -60),
+            [613] = new(SummonMoveMode.Fly, RecallDistance: 500, RecallWithTargetDistance: 1350, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f, AnchorOffsetY: -60),
             // AbigailMinion：无目标档 800、有目标档 1000（L86972/L86976）；速度 ×0.8（L87222）
-            [963] = new(SummonMoveMode.Fly, RecallDistance: 800, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f),
+            [963] = new(SummonMoveMode.Fly, RecallDistance: 800, RecallWithTargetDistance: 1000, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f, AnchorOffsetX: -40, AnchorOffsetY: -20),
 
             // ==== aiStyle 66（内联块 L39361-39942）====
             // 387/388：待命点 = 主人上方 60（L39692）；召回 800（有目标 1200，L39371-39372）；
             //   解除距离 150（L39373 `num726`）；自带 >2000 改 position（L39730）；速度 6（533 为 12）/ 召回 15
-            [387] = new(SummonMoveMode.Fly, RecallDistance: 800, RecallWithTargetDistance: 1200, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f),
-            [388] = new(SummonMoveMode.Fly, RecallDistance: 800, RecallWithTargetDistance: 1200, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f),
+            [387] = new(SummonMoveMode.Fly, RecallDistance: 800, RecallWithTargetDistance: 1200, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f, AnchorOffsetY: -60),
+            [388] = new(SummonMoveMode.Fly, RecallDistance: 800, RecallWithTargetDistance: 1200, TeleportDistance: 2000, SpeedLimit: 6f, RecallSpeedLimit: 15f, AnchorOffsetY: -60),
             // DeadlySphere：召回 900（有目标 1500）、解除 450（L39385-39388）；ai[0] < 9 时参与图格碰撞（L39591）
-            [533] = new(SummonMoveMode.Ground, RecallDistance: 900, RecallWithTargetDistance: 1500, TeleportDistance: 2000, SpeedLimit: 12f, RecallSpeedLimit: 15f),
+            [533] = new(SummonMoveMode.Ground, RecallDistance: 900, RecallWithTargetDistance: 1500, TeleportDistance: 2000, SpeedLimit: 12f, RecallSpeedLimit: 15f, AnchorOffsetY: -60),
 
             // ==== aiStyle 120（AI_120_StardustGuardian）====
             // **全原版唯一使用 MinionRestTargetPoint 的本体**（L58923/L59094）；
             // 待命点 = 主人朝向前方 (5 + player.width/2)px、上方 25px（L58826-58838）；
             // 本 AI 内**没有**超远归位阈值（只有 ai[0]==3 的 Lerp 回位 + 通用世界边界）；无显式速度上限
-            [623] = new(SummonMoveMode.Fly),
+            [623] = new(SummonMoveMode.Fly, AnchorOffsetX: 15, AnchorOffsetY: -25),
 
             // ==== aiStyle 121（AI_121_StardustDragon）====
             // 头节 625：追击判定 700（L56232）、主人到目标最大 1000（L56233）、自带 >2000 吸附（L56235）；
@@ -214,30 +221,30 @@ public static class SummonMovementTable
             // ==== aiStyle 164（AI_164_StormTigerGem）====
             // 位置硬绑定：每帧 `base.Center = AI_164_GetHomeLocation(...)`，**无 speed/惯性/召回**（L61608-61610）；
             // 家点 = 主人 MountedCenter 上方约 61px 的公转环点（半径 8 + 12×排号，L61683-61689）
-            [831] = new(SummonMoveMode.PositionBound),
-            [970] = new(SummonMoveMode.PositionBound),
+            [831] = new(SummonMoveMode.PositionBound, AnchorOffsetY: -61),
+            [970] = new(SummonMoveMode.PositionBound, AnchorOffsetY: -61),
 
             // ==== aiStyle 169（AI_169_Smolstars）====
             // 864 Smolstar：悬浮飞行；待命 = 主人头顶上方 30 + 随 GlobalTimeWrappedHourly 公转的环（L60351-60372）；
             // 速度随距离增长：10 + lerp(200,600,距离)×30（上限 40，L60377-60379）；自带 >=3000 归位（L60380）
-            [864] = new(SummonMoveMode.Fly, TeleportDistance: 3000, SpeedLimit: 40f),
+            [864] = new(SummonMoveMode.Fly, TeleportDistance: 3000, SpeedLimit: 40f, AnchorOffsetY: -50),
 
             // ==== aiStyle 156（AI_156_BatOfLight）====
             // 755/946：悬浮飞行；待命为环绕/偏移点（755 半径 40 环、946 摆动偏移，L69183-69198）；
             // 自带 Vector2.Distance(主人) > 2000 → 复位（L68819）；攻击位移速度 10（L69039）
-            [755] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 10f),
-            [946] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 10f),
+            [755] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 10f),   // 环绕半径 40 环绕主人中心，取中心近似
+            [946] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 10f, AnchorOffsetX: -16, AnchorOffsetY: -15),
 
             // ==== aiStyle 158（AI_158_BabyBird）====
             // 悬浮飞行；待命 = 主人头顶堆叠点（AI_158_GetHomeLocation L65175-65279，每 6 只上移 16）；
             // 速度随距离增长：6 + 距离×0.006（L65116）；自带 >2000 归位（L65105）；**未找到**拴绳阈值
-            [759] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 6f),
+            [759] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 6f, AnchorOffsetY: -40),
 
             // ==== aiStyle 206（AI_206_ForbiddenMinion）====
             // 飞行/悬浮；待命 = 主人头顶偏后 (-direction×16, -25) + 组内椭圆环（L48452/L48463/L48482）；
             // 有目标时与目标保持 200px（L48494）；自带 >2000 吸附主人 MountedCenter（L48453）；
             // 速度上限 16、加速度 2（L48543-48549）
-            [1119] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 16f),
+            [1119] = new(SummonMoveMode.Fly, TeleportDistance: 2000, SpeedLimit: 16f, AnchorOffsetX: -16, AnchorOffsetY: -46),
 
             // ==== 哨兵：均**没有**召回 / 超远归位（越界 = 消亡，见文件头第 1 条）====
             // AI_053：只有**垂直**落体 `velocity.Y += 0.2f`、上限 16（L48198-48206）；未背包时无水平位移

@@ -629,12 +629,14 @@ public partial class WorldSimulator : IWorldViewProvider
     /// 供存活与命中几何判定使用）。表现用的 <see cref="ProjectileEntity.Position"/> 仍由客户端包 27 上报并原样广播，
     /// 因此主人视角无抖动（混合模型）。
     ///
-    /// 覆盖族与复刻范围：
-    ///   · **AI_062**（373 / 375 / 407 / 423 / 613 / 963）：空中待命点（主人中心上方 60，407/375/963 各有偏移）+
-    ///     惯性 `v=(v×20+Δ)/21` + 距离分档速度上限 + 召回提到 15 + 超远传送；
-    ///   · **AI_026**（191-194 / 266 / 390-392 / 1094 / 1113）与 **AI_067**（393-395 / 758 / 833-835 / 951 /
-    ///     1022 / 1093 / 1112 / 1118）：贴地族，按 `StanceBase + StanceStep × 同类序号` 在主人**面朝方向**横向站位，
-    ///     竖直取「主人脚下同一水平线」。
+    /// 覆盖范围：**全部 62 个本体**（`SummonEntityTable` 为准；派生弹幕不在此列，其位置仍由客户端模拟）。
+    /// 三类处理方式：
+    ///   · **贴地族**（`StanceBase > 0`：AI_026 / AI_067）：按 `StanceBase + StanceStep × 同类序号` 在主人
+    ///     **面朝方向**横向站位，竖直取「主人脚下同一水平线」；
+    ///   · **飞行 / 悬浮族**：主人中心 + 逐类型锚点偏移（`AnchorOffsetX × 朝向` / `AnchorOffsetY`），
+    ///     再走惯性 `v=(v×20+Δ)/21` + 速度上限 + 召回 + 超远传送；
+    ///   · **哨兵**：冻结在生成点（原版只有 ≤ 约 30px 的垂直落体/贴顶微调，服务端不读图格故忽略）；
+    ///   · **星尘龙节段 626-628**：第二遍跟随**头节 625** 的服务端位置（节段距头节 ≤ 72px）。
     ///
     /// **近似之处（写判定前必须知情）**：
     ///   ① 贴地族**不做重力与图块碰撞**——真正的贴地需要读图格（`SectionLocks`），而本阶段持有 `ProjectilesLock`，
@@ -668,8 +670,21 @@ public partial class WorldSimulator : IWorldViewProvider
             foreach (var p in _world.Projectiles)
             {
                 if (!p.Active || !p.IsSummon) continue;
-                if (Array.IndexOf(ServerOwnedBodyTypes, p.Type) < 0) continue;
+                // 本体表为准：派生弹幕不是本体，位置仍由客户端模拟（ServerPosition 保持 null → 命中几何不判）
+                if (!SummonEntityTable.Of.ContainsKey(p.Type)) continue;
                 if (!owners.TryGetValue(p.Owner, out var owner)) continue;
+
+                // 哨兵：位置固定在生成点。原版只有**垂直**落体（`velocity.Y += 0.2f` 贴地）或贴顶微调，
+                // 幅度 ≤ 约 30px；服务端不读图格（见类注释①），故按「冻结在生成点」处理。
+                if (SummonEntityTable.InfoOf(p.Type)!.Kind == SummonKind.Sentry)
+                {
+                    p.ServerPosition ??= p.Position;
+                    p.ServerVelocity = new Vector2(0f, 0f);
+                    continue;
+                }
+
+                // 星尘龙节段（626/627/628）：位置由头节 625 决定，放到第二遍处理（头节的位置本遍才算出来）
+                if (p.Type is 626 or 627 or 628) continue;
 
                 var movement = SummonMovementTable.Of[p.Type];
                 var slotKey = (p.Owner, p.Type);
@@ -693,40 +708,15 @@ public partial class WorldSimulator : IWorldViewProvider
                 }
                 else
                 {
-                    // AI_062：空中待命点（默认主人中心上方 60；407 → 下方 20；375 → 前移 10 且上方 10；963 → 前移 40 且下方 20）
-                    targetX = owner.X;
-                    targetY = owner.Y - 60f;
-                    switch (p.Type)
-                    {
-                        case 407:
-                            targetY = owner.Y - 20f;
-                            break;
-                        case 375:
-                            targetX -= 10f * owner.Dir;
-                            targetY = owner.Y - 10f;
-                            break;
-                        case 963:
-                            targetX -= 40f * owner.Dir;
-                            targetY = owner.Y - 20f;
-                            break;
-                    }
-
-                    // 速度上限：基准 6；407 固定 9；963 ×0.8；>200 提到 9；(423|407) 且 >300 提到 12；375 ×0.75
-                    speedCap = 6f;
-                    if (p.Type == 407) speedCap = 9f;
-                    if (p.Type == 963) speedCap *= 0.8f;
+                    // 飞行 / 悬浮族：主人中心 + 逐类型锚点偏移（数据在 SummonMovementTable 的 AnchorOffset*）
+                    targetX = owner.X + movement.AnchorOffsetX * owner.Dir;
+                    targetY = owner.Y + movement.AnchorOffsetY;
+                    speedCap = movement.SpeedLimit ?? 6f;
                 }
 
                 float dx = targetX - px;
                 float dy = targetY - py;
                 float distance = MathF.Sqrt(dx * dx + dy * dy);
-
-                if (movement.StanceBase == 0)
-                {
-                    if (distance > 200f) speedCap = Math.Max(speedCap, 9f);
-                    if ((p.Type is 423 or 407) && distance > 300f) speedCap = Math.Max(speedCap, 12f);
-                    if (p.Type == 375) speedCap = (int)(speedCap * 0.75f);
-                }
 
                 // 召回：水平超阈值，**或**竖直偏离 > 300（原版贴地族的第二个召回触发器）
                 int recall = movement.RecallWithTargetDistance ?? movement.RecallDistance ?? int.MaxValue;
@@ -759,19 +749,30 @@ public partial class WorldSimulator : IWorldViewProvider
                 p.ServerPosition = new Vector2(px, py);
                 p.ServerVelocity = new Vector2(vx, vy);
             }
+
+            // 第二遍：星尘龙节段跟随**头节的服务端位置**（原版为「父节 Center − 单位向量 × 16 × 父节 scale」，
+            // 节段距头节 ≤ 3 × 16 × 1.5 ≈ 72px，故直接用头节位置近似）
+            foreach (var p in _world.Projectiles)
+            {
+                if (!p.Active || p.Type is not (626 or 627 or 628)) continue;
+
+                ProjectileEntity? head = null;
+                foreach (var candidate in _world.Projectiles)
+                {
+                    if (candidate.Active && candidate.Owner == p.Owner &&
+                        candidate.Type == SummonMovementTable.StardustDragonHeadType)
+                    {
+                        head = candidate;
+                        break;
+                    }
+                }
+
+                if (head is null) continue;
+                p.ServerPosition = head.ServerPosition ?? head.Position;
+                p.ServerVelocity = new Vector2(0f, 0f);
+            }
         }
     }
-
-    /// <summary>服务端自算位置的本体（W-2 第三档已接管的族）。</summary>
-    private static readonly int[] ServerOwnedBodyTypes =
-    {
-        // AI_062（空中编队）
-        373, 375, 407, 423, 613, 963,
-        // AI_026（贴地：Pygmy / BabySlime / 蜘蛛 / Foxsparks）
-        191, 192, 193, 194, 266, 390, 391, 392, 1094, 1113,
-        // AI_067（贴地：海盗 / 蛙 / 老虎 / Flinx / 蘑菇小子 / Cattiva / 陶罐 / 禁咒）
-        393, 394, 395, 758, 833, 834, 835, 951, 1022, 1093, 1112, 1118,
-    };
 
     /// <summary>
     /// 已失效掉落物 / 弹幕的回收宽限（tick）：销毁包下发成功（<c>RemovalNotified</c>）即可移除；

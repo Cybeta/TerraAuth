@@ -1897,9 +1897,6 @@ public sealed record NpcStrikeCommand(
     private static bool IsSummonBody(ProjectileEntity projectile)
         => SummonEntityTable.Of.ContainsKey(projectile.Type);
 
-    /// <summary>星尘龙**头节**类型：节段 626/627/628 与它共用命中免疫数组（原版 Projectile.cs L12732-12739）。</summary>
-    private const int StardustDragonHeadType = 625;
-
     /// <summary>
     /// 本体命中是否仍在冷却中。口径取自 <see cref="SummonEntityTable"/> 的**三档**（原版 `Projectile.Damage`）：
     /// <list type="bullet">
@@ -1961,7 +1958,8 @@ public sealed record NpcStrikeCommand(
             {
                 foreach (var p in world.Projectiles)
                 {
-                    if (p.Active && p.Owner == projectile.Owner && p.Type == StardustDragonHeadType)
+                    if (p.Active && p.Owner == projectile.Owner &&
+                        p.Type == SummonMovementTable.StardustDragonHeadType)
                         return p.SummonNpcHitCooldownUntil;
                 }
             }
