@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-19（W-2 第一步数据表收口；**第二步 4 项全部落地**：ServerDamage 档 / 免疫三档 / 哨兵生命周期 / 拆表并修掉派生弹幕伤害丢失；828/828 通过）
+> 最后更新：2026-09-19（W-2 第一步数据表收口；第二步 4 项全部落地；**第三步 ServerAi 第一批（本体移动表）**落库；829/829 通过）
 
 ---
 
@@ -173,6 +173,21 @@ git stash show -p stash@{0} --stat
 2. **`ServerAi`**：本体跟随 / 驻守 / 索敌 / 节奏 / 暴击在服务端，包 27 只用于创建登记；
    服务端反向广播位置。**必须预留 owner 特权回退**（主人视角抖动的兜底：owner 保持本地表现、
    服务端只掌存活与伤害），并真机验证。
+   **第三步第一批已落地（2026-09-19，只做数据）**：`Simulation/Combat/SummonMovementTable.cs` ——
+   62 个本体的**移动模式 / 召回（拴绳）阈值 / 超远归位阈值 / 速度上限**，+ 测试
+   `SummonMovementTable_Matches_Vanilla_Ai`。本轮逐条读 AI 得到**三条会直接改变实现方式的通用事实**：
+   · **出世界边界时两类本体语义不同**（Projectile.cs L18391-18406）：`minion` → `Center = player.Center`（传回主人）；
+     `sentry` → **直接消亡**（`active = false` + 包 29），**不是归位**。所以「哨兵没有超远归位」是原版行为，
+     表里哨兵的 `RecallDistance` / `TeleportDistance` 记 `null`。
+   · **`Main.player[owner].MinionRestTargetPoint` 全原版只有 623 StardustGuardian 用**（AI_120 L58923/L59094）——
+     其余本体的待命点都在各自 AI 内现算，**不存在统一的待命点字段**，服务端不要假设有。
+   · **并非所有哨兵都静止**：只有 `641 MoonlordTurret` / `643 RainbowCrystal` 每帧 `velocity = Vector2.Zero`
+     （`Static` 模式）；其余 16 个哨兵都有 AI 自写的**垂直**速度积分（落体 `velocity.Y += 0.2f` 贴地，
+     或 `1025` 的贴顶调节 `velocity.Y -= 0.1f` 下限 −12）。服务端若"冻结"哨兵会导致「客户端落地、服务端悬空」。
+   **尚未抽取（留给实现某一 aiStyle 时逐条落地，不在此处编造）**：逐类型的待命点公式
+   （AI_026/AI_067 的 `N + minionPos × 步长` 排队、759 的头顶堆叠、755/946 的环绕半径、864 与 831/970 的公转环、
+   1119 的椭圆环）、加速度 / 惯性插值系数（如 `velocity = (velocity×20 + 目标)/21`）。
+   **下一步**：实现服务端位置接管（先做 `Static` / `PositionBound` 两族，风险最低）→ owner 特权回退 → 真机验证。
 3. **`ServerShots`**：本体的攻击由服务端 `NewProjectile` 生成派生弹幕（用 `SummonShotTable`），
    退掉"本体直扣血"的简化。
 

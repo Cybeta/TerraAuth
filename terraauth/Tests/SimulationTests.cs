@@ -4256,6 +4256,57 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// 本体移动表（backlog W-2 第三档 `ServerAi` 的数据侧）：62 个本体的移动模式 / 召回阈值 / 超远归位 / 速度上限。
+    /// 三条通用事实必须被这张表锁住：①出世界边界时 `minion` 传回主人、`sentry` **直接消亡**（故哨兵都没有超远归位）；
+    /// ②`MinionRestTargetPoint` 只有 623 用；③**并非所有哨兵都静止**（只有 641/643 每帧清零 velocity）。
+    /// </summary>
+    [Fact]
+    public void SummonMovementTable_Matches_Vanilla_Ai()
+    {
+        // 与本体表逐一对应
+        Assert.Equal(62, SummonMovementTable.Of.Count);
+        Assert.Equal(SummonEntityTable.Of.Keys.OrderBy(x => x), SummonMovementTable.Of.Keys.OrderBy(x => x));
+
+        // 哨兵：**没有任何**召回 / 超远归位机制（越界即消亡，不是归位）
+        var sentries = SummonEntityTable.Of.Where(kv => kv.Value.Kind == SummonKind.Sentry).Select(kv => kv.Key);
+        Assert.All(sentries, t =>
+        {
+            Assert.Null(SummonMovementTable.Of[t].RecallDistance);
+            Assert.Null(SummonMovementTable.Of[t].RecallWithTargetDistance);
+            Assert.Null(SummonMovementTable.Of[t].TeleportDistance);
+        });
+        Assert.DoesNotContain(SummonMovementTable.Of.Values.Where(v => v.TeleportDistance is not null),
+            v => v.TeleportDistance == 0);
+
+        // 真静止的哨兵只有 641 / 643
+        Assert.Equal(new[] { 641, 643 },
+            SummonMovementTable.Of.Where(kv => kv.Value.Mode == SummonMoveMode.Static).Select(kv => kv.Key).OrderBy(x => x));
+        // 位置硬绑定：831/970（家点）+ 星尘龙节段 626/627/628（绑父节）
+        Assert.Equal(new[] { 626, 627, 628, 831, 970 },
+            SummonMovementTable.Of.Where(kv => kv.Value.Mode == SummonMoveMode.PositionBound)
+                .Select(kv => kv.Key).OrderBy(x => x));
+
+        // 飞行系代表值
+        Assert.Equal(SummonMoveMode.Fly, SummonMovementTable.Of[373].Mode);
+        Assert.Equal((500, 1000), (SummonMovementTable.Of[373].RecallDistance, SummonMovementTable.Of[373].RecallWithTargetDistance));
+        Assert.Equal((800, 1200), (SummonMovementTable.Of[387].RecallDistance, SummonMovementTable.Of[387].RecallWithTargetDistance));
+        Assert.Equal((900, 1500), (SummonMovementTable.Of[533].RecallDistance, SummonMovementTable.Of[533].RecallWithTargetDistance));
+        // 623 是唯一用 MinionRestTargetPoint 的本体 → 本表没有可记的召回/归位阈值
+        Assert.Equal(SummonMoveMode.Fly, SummonMovementTable.Of[623].Mode);
+        Assert.Null(SummonMovementTable.Of[623].RecallDistance);
+        Assert.Null(SummonMovementTable.Of[623].TeleportDistance);
+        // 864 的超远阈值是 3000（全表唯一不是 2000 的）
+        Assert.Equal(3000, SummonMovementTable.Of[864].TeleportDistance);
+        Assert.All(SummonMovementTable.Of.Where(kv => kv.Value.TeleportDistance is not null && kv.Key != 864),
+            kv => Assert.Equal(2000, kv.Value.TeleportDistance));
+
+        // 贴地系（AI_026 / AI_067）与贴顶系
+        Assert.Equal(SummonMoveMode.Ground, SummonMovementTable.Of[191].Mode);
+        Assert.Equal(SummonMoveMode.Ground, SummonMovementTable.Of[1118].Mode);
+        Assert.Equal(SummonMoveMode.Ceiling, SummonMovementTable.Of[1025].Mode);
+    }
+
+    /// <summary>
     /// 阶段 G：召唤弹幕**不因背包武器移除而销毁**（原版仆从不随武器移动消失）——
     /// 武器移出背包后弹幕基准仍生效：999 拒绝、合法 46 接受。
     /// 若此处销毁弹幕，「召唤 → 移除武器 → 报 999」即无任何上界而被放行。
