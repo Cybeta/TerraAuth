@@ -79,6 +79,14 @@ public sealed class WorldState
     public bool ServerSettlesSummonDamage => SummonAuthority >= SummonAuthorityMode.ServerDamage;
 
     /// <summary>
+    /// 服务端是否已接管召唤本体的**位置**（<see cref="SummonAuthorityMode.ServerAi"/> 及以上）。
+    /// 为真时，<see cref="SummonMovementTable"/> 里 `Mode == Static` 的本体（641 / 643）忽略客户端
+    /// 后续包 27 的坐标 / 速度——服务端持有权威坐标（= 首次创建时的落点）。
+    /// 其余移动模式（Fly / Ground / Ceiling / PositionBound）本批**仍由客户端上报**，逐族接管中。
+    /// </summary>
+    public bool ServerOwnsSummonPositions => SummonAuthority >= SummonAuthorityMode.ServerAi;
+
+    /// <summary>
     /// <see cref="SummonHitImmunity.Default"/> 档（27 个本体，如 191 Pygmy / 613 StardustCellMinion）的命中免疫：
     /// 键 <c>(playerId, npcIndex)</c> → 可再次命中的 tick。对应原版 <c>targetNPC.immune[owner] = 10</c>
     /// —— **该玩家**对所有 NPC 各自独立，但同一 NPC 上**该玩家的任意本体**（即使换了本体）都受同一冷却约束。

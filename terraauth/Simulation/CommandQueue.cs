@@ -2131,6 +2131,17 @@ public sealed record SpawnProjectileCommand(
                     if (Velocity.X * Velocity.X + Velocity.Y * Velocity.Y > 512f * 512f)
                         return new(false, CommandFailures.ProjectileSpeedExceeded);
 
+                    // W-2 第三档 ServerAi：位置**固定**的本体（`SummonMovementTable.Mode == Static`，
+                    // 目前是 641 MoonlordTurret / 643 RainbowCrystal —— 原版每帧 `velocity = Vector2.Zero`，
+                    // 无任何位移）其坐标改由服务端持有：忽略客户端后续包 27 的坐标 / 速度，只确认登记。
+                    // 首次创建（下方）仍采信客户端上报的**生成点**——那正是权威落点。
+                    // 边界：本批只拒绝客户端坐标，**尚未反向广播**服务端坐标（留在下一批，与 owner 特权回退一起做）；
+                    // 对 Static 族而言客户端本就不会移动它，故实际不产生可见偏差。
+                    if (world.ServerOwnsSummonPositions &&
+                        SummonMovementTable.Of.TryGetValue(existing.Type, out var movement) &&
+                        movement.Mode == SummonMoveMode.Static)
+                        return new(true);
+
                     existing.Position = Position;
                     existing.Velocity = Velocity;
                 }

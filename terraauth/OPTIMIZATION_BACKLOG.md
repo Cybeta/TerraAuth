@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-19（W-2 第一步数据表收口；第二步 4 项全部落地；**第三步 ServerAi 第一批（本体移动表）**落库；829/829 通过）
+> 最后更新：2026-09-19（W-2 第一步数据表收口；第二步 4 项全部落地；第三步 ServerAi 数据侧 + `Static` 族位置接管；830/830 通过）
 
 ---
 
@@ -187,7 +187,16 @@ git stash show -p stash@{0} --stat
    **尚未抽取（留给实现某一 aiStyle 时逐条落地，不在此处编造）**：逐类型的待命点公式
    （AI_026/AI_067 的 `N + minionPos × 步长` 排队、759 的头顶堆叠、755/946 的环绕半径、864 与 831/970 的公转环、
    1119 的椭圆环）、加速度 / 惯性插值系数（如 `velocity = (velocity×20 + 目标)/21`）。
-   **下一步**：实现服务端位置接管（先做 `Static` / `PositionBound` 两族，风险最低）→ owner 特权回退 → 真机验证。
+   **第三步第二批已落地（2026-09-19）：`Static` 族位置接管** —— 新增 `WorldState.ServerOwnsSummonPositions`
+   （`>= ServerAi`）；`SpawnProjectileCommand` 的包 27 更新路径对 `SummonMovementTable.Mode == Static`
+   的本体（**641 / 643**）**忽略客户端坐标 / 速度**，只确认登记——服务端持有权威坐标（= 首次创建时的落点）。
+   首次创建仍采信客户端上报的生成点（那正是权威落点）。
+   **本批边界（务必知情）**：只拒绝客户端坐标，**尚未反向广播**服务端坐标；对 Static 族而言客户端本就不会
+   移动它，故实际不产生可见偏差。其余移动模式（Fly / Ground / Ceiling / PositionBound）与派生弹幕
+   **仍接受**客户端坐标，逐族接管中。
+   测试：`ServerAi_Static_Body_Position_Is_Server_Owned`（含 ClientDriven 对照、643 同族、
+   387 Fly 与 374 派生弹幕不受影响的负向断言）。
+   **下一步**：`PositionBound` 族（831 / 970 / 626-628，位置由主人 / 父节算出）→ 反向广播 + owner 特权回退 → 真机验证。
 3. **`ServerShots`**：本体的攻击由服务端 `NewProjectile` 生成派生弹幕（用 `SummonShotTable`），
    退掉"本体直扣血"的简化。
 
@@ -201,7 +210,7 @@ server.json 用字符串枚举），组合根注入 `WorldState.SummonAuthority`
 | 客户端包 | 本体 | 派生弹幕 |
 |---|---|---|
 | 27 创建 | 接受（登记 + 归属 / buff / 伤害上界校验） | 接受，走普通弹幕路径 |
-| 27 更新 | `ServerDamage` 接受位置；`ServerAi` 起拒绝（owner 特权除外） | 接受 |
+| 27 更新 | `ClientDriven` / `ServerDamage` 接受位置；`ServerAi` 起按 `SummonMovementTable` **逐族接管**（已接管 `Static`：641 / 643，忽略其坐标） | 接受 |
 | 28 命中 | `ClientDriven` 按上报值结算；`ServerDamage` **只作触发**，数值由服务端裁定 | 走现有普通弹幕通道校验 |
 | 29 销毁 | 拒绝（服务端为唯一销毁方） | **接受**（客户端 + 服务端超时双通道） |
 

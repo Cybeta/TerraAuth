@@ -4307,6 +4307,84 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// W-2 第三档 `ServerAi` 第一刀：**位置固定**的本体（`SummonMovementTable.Mode == Static`，641 / 643）
+    /// 坐标改由服务端持有——客户端后续包 27 的坐标 / 速度被忽略，只确认登记。
+    /// 本批**只**接管 Static 族：其余移动模式与派生弹幕仍接受客户端坐标（逐族接管中）。
+    /// </summary>
+    [Fact]
+    public void ServerAi_Static_Body_Position_Is_Server_Owned()
+    {
+        static (WorldState World, int Index) CreateScenario(int type)
+        {
+            var world = WorldGenerator.GenerateSmall();
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(320f, 460f),
+                DeathNotified = true,
+            };
+            lock (world.PlayersLock) world.Players[1] = player;
+
+            lock (world.ProjectilesLock)
+                world.Projectiles.Add(new ProjectileEntity
+                {
+                    Key = 7,
+                    Owner = 1,
+                    Type = type,
+                    IsSummon = true,
+                    SummonEntityId = 1,
+                    SummonKind = SummonProjectileTable.KindOf(type),
+                    Position = new Vector2(320f, 400f),
+                    Velocity = new Vector2(0f, 0f),
+                    Damage = 100,
+                    Penetrate = -1,
+                    Active = true,
+                });
+
+            return (world, world.Projectiles.Count - 1);
+        }
+
+        static CommandApplyResult Move(WorldState world, int index, float x, float y) =>
+            new SpawnProjectileCommand(10, 1, 7, world.Projectiles[index].Type,
+                new Vector2(x, y), new Vector2(1f, 1f), 100).Apply(world, new XoshiroRng(1));
+
+        // ClientDriven（默认）：Static 本体也照旧接受客户端坐标 —— 锁定现状，证明本档确实改变了什么
+        var client = CreateScenario(641);
+        Assert.False(client.World.ServerOwnsSummonPositions);
+        Assert.True(Move(client.World, client.Index, 500f, 400f).Applied);
+        Assert.Equal(new Vector2(500f, 400f), client.World.Projectiles[client.Index].Position);
+
+        // ServerAi：Static（641）坐标由服务端持有 → 更新被忽略，位置与速度都不变；包 27 仍确认登记
+        var stat = CreateScenario(641);
+        stat.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        Assert.True(stat.World.ServerOwnsSummonPositions);
+        Assert.True(Move(stat.World, stat.Index, 500f, 400f).Applied);
+        Assert.Equal(new Vector2(320f, 400f), stat.World.Projectiles[stat.Index].Position);
+        Assert.Equal(new Vector2(0f, 0f), stat.World.Projectiles[stat.Index].Velocity);
+
+        // 643 RainbowCrystal 同为 Static → 同样被接管
+        var crystal = CreateScenario(643);
+        crystal.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        Assert.True(Move(crystal.World, crystal.Index, 500f, 400f).Applied);
+        Assert.Equal(new Vector2(320f, 400f), crystal.World.Projectiles[crystal.Index].Position);
+
+        // 本批**不**接管其它移动模式：Fly（387）仍接受客户端坐标
+        var fly = CreateScenario(387);
+        fly.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        Assert.True(Move(fly.World, fly.Index, 500f, 400f).Applied);
+        Assert.Equal(new Vector2(500f, 400f), fly.World.Projectiles[fly.Index].Position);
+
+        // 派生弹幕（374）由客户端模拟 → 同样不受影响
+        var shot = CreateScenario(374);
+        shot.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        Assert.True(Move(shot.World, shot.Index, 500f, 400f).Applied);
+        Assert.Equal(new Vector2(500f, 400f), shot.World.Projectiles[shot.Index].Position);
+    }
+
+    /// <summary>
     /// 阶段 G：召唤弹幕**不因背包武器移除而销毁**（原版仆从不随武器移动消失）——
     /// 武器移出背包后弹幕基准仍生效：999 拒绝、合法 46 接受。
     /// 若此处销毁弹幕，「召唤 → 移除武器 → 报 999」即无任何上界而被放行。
