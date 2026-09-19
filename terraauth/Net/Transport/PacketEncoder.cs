@@ -159,6 +159,12 @@ public sealed class PacketEncoder : IPacketEncoder
                     bw.Write((short)mana.MaxMana);
                     break;
 
+                case SyncTalkNpcPacket talk:
+                    // SyncTalkNPC（包 40）：Byte PlayerId + Int16 talkNPC（-1 = 未对话）
+                    bw.Write((byte)talk.PlayerId);
+                    bw.Write((short)talk.TalkNpc);
+                    break;
+
                 case TileBreakPacket tileBreak:
                     // TileManipulation（包 17）：Byte Action + Int16 X + Int16 Y + Int16 TileType + Byte Style
                     bw.Write(tileBreak.Action);
@@ -199,6 +205,14 @@ public sealed class PacketEncoder : IPacketEncoder
                     // RequestChestOpen（包 31）：Int16 X + Int16 Y
                     bw.Write((short)chest.X);
                     bw.Write((short)chest.Y);
+                    break;
+
+                case QuickStackChestsPacket quickStack:
+                    // QuickStackChests（包 85）：Int32 槽位数 + 槽位 × Int16 + Boolean smartStack
+                    bw.Write(quickStack.Slots.Count);
+                    foreach (int slot in quickStack.Slots)
+                        bw.Write((short)slot);
+                    bw.Write(quickStack.SmartStack);
                     break;
 
                 case ItemDropPacket item:

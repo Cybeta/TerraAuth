@@ -241,7 +241,6 @@ public sealed record OpenEyeOfCthulhuTreasureBagCommand(long Tick, int? PlayerId
             return new(false, CommandFailures.InventoryUnavailable);
 
         bool crimson;
-        long playerSessionId;
         lock (world.PlayersLock)
         {
             if (!world.Players.TryGetValue(playerId, out var player) ||
@@ -249,7 +248,6 @@ public sealed record OpenEyeOfCthulhuTreasureBagCommand(long Tick, int? PlayerId
             {
                 return new(false, CommandFailures.PlayerNotActive);
             }
-            playerSessionId = player.SessionId;
             crimson = world.Progress.Crimson;
         }
 
@@ -270,18 +268,14 @@ public sealed record OpenEyeOfCthulhuTreasureBagCommand(long Tick, int? PlayerId
         if (rng.NextInt32(40) == 0) rewards.Add(new InventoryReward(1299, 1));
 
         var result = world.InventoryLedger.TryOpenEyeOfCthulhuTreasureBag(playerId, Slot, rewards);
-        switch (result)
+        // 奖励由服务端原子生成；校验失败（袋已被消费 / 背包满）不产出任何物品。
+        // 客户端随后上报的奖励快照由权威层回正（Correct），无需 pending 屏障。
+        return result switch
         {
-            case InventoryBagOpenResult.Success:
-                world.PromotePendingBagOpen(playerId, playerSessionId);
-                return new(true);
-            case InventoryBagOpenResult.InventoryFull:
-                world.CompletePendingBagOpen(playerId, playerSessionId);
-                return new(false, CommandFailures.InventoryFull);
-            default:
-                world.CompletePendingBagOpen(playerId, playerSessionId);
-                return new(false, CommandFailures.NotApplied);
-        }
+            InventoryBagOpenResult.Success => new(true),
+            InventoryBagOpenResult.InventoryFull => new(false, CommandFailures.InventoryFull),
+            _ => new(false, CommandFailures.NotApplied),
+        };
     }
 }
 
@@ -502,6 +496,60 @@ public sealed record SyncChestItemCommand(
     }
 }
 
+/// <summary>
+/// 箱子物品暂存命令（SSC 箱子守恒事务）：包 32 通过权威校验后不立即写入箱子，
+/// 而是把客户端意图暂存进该玩家的箱子事务窗口；窗口到期后按「玩家背包 ∪ 该箱子」守恒校验
+/// 决定整体提交或回滚（见 <see cref="WorldState.TryCommitChestTransaction"/>）。
+/// 原版拖拽会在一个窗口内发出多个包（源槽清空 + 目标槽填入），逐包写入无法区分
+/// 「合法的箱内整理 / 背包↔箱子移动」与「凭空造物」，故必须窗口聚合后再判。
+/// </summary>
+public sealed record StageChestItemCommand(
+    long Tick, int? PlayerId, int ChestIndex, int Slot, int Stack, byte Prefix, int ItemType)
+    : Command(Tick, PlayerId, "stage_chest_item")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int playerId)
+            return new(false, CommandFailures.MissingPlayer);
+
+        lock (world.PlayersLock)
+        {
+            if (!world.Players.TryGetValue(playerId, out var player))
+                return new(false, CommandFailures.PlayerNotActive);
+            if (SessionId != 0 && player.SessionId != SessionId)
+                return new(false, CommandFailures.StaleSession);
+            if (!player.Active || player.Dead)
+                return new(false, CommandFailures.PlayerNotActive);
+
+            lock (world.ChestsLock)
+            {
+                if (!world.HasChestSession(playerId, SessionId, ChestIndex))
+                    return new(false, CommandFailures.ChestNotOpen);
+
+                var chest = world.FindChestByIndex(ChestIndex);
+                if (chest is null)
+                    return new(false, CommandFailures.ChestNotFound);
+
+                if (Slot < 0 || Slot >= chest.Items.Length)
+                    return new(false, CommandFailures.InvalidSlot);
+
+                var dx = player.Position.X - chest.X * 16f - 8f;
+                var dy = player.Position.Y - chest.Y * 16f - 8f;
+                if (dx * dx + dy * dy > 160f * 160f)
+                    return new(false, CommandFailures.OutOfReach);
+
+                // 会话切换 / 切换到别的箱子 / 上一窗口已结算 → 重开事务并重取守恒基准
+                world.EnsureChestTransaction(player, ChestIndex, world.Tick);
+
+                player.PendingChestChanges[(ChestIndex, Slot)] = (ItemType, Stack, Prefix);
+                world.MarkChestTransactionOpen(playerId);
+            }
+        }
+
+        return new(true);
+    }
+}
+
 /// <summary>背包与当前打开箱子间的服务端权威原子物品转移。</summary>
 public sealed record TransferInventoryChestItemCommand(
     long Tick, int? PlayerId, bool FromChest, int ChestIndex, int InventorySlot, int ChestSlot,
@@ -601,6 +649,12 @@ public sealed record BulkInventoryChestCommand(
     private const int InventoryStart = 9;
     private const int InventoryEnd = 49;
 
+    /// <summary>
+    /// 可选：仅处理这些背包来源槽位（包 85 QuickStackChests 指定的槽位列表）。
+    /// null 或空 → 走全量逻辑（遍历 <see cref="InventoryStart"/>..<see cref="InventoryEnd"/>）。
+    /// </summary>
+    public IReadOnlyList<int>? SourceSlots { get; init; }
+
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
         if (PlayerId is not int playerId) return new(false, CommandFailures.MissingPlayer);
@@ -651,9 +705,22 @@ public sealed record BulkInventoryChestCommand(
                 else
                 {
                     bool existingOnly = Operation == ChestBulkOperation.QuickStack;
-                    for (int inventorySlot = InventoryStart; inventorySlot <= InventoryEnd; inventorySlot++)
-                        MoveStack(inventory, inventorySlot, chestItems, changedInventory, changedChest, existingOnly,
-                            0, chestItems.Length - 1);
+                    if (SourceSlots is { Count: > 0 })
+                    {
+                        // 包 85：仅处理客户端指定的来源槽位（越界槽位忽略）
+                        foreach (int inventorySlot in SourceSlots)
+                        {
+                            if (inventorySlot < 0 || inventorySlot >= inventory.Length) continue;
+                            MoveStack(inventory, inventorySlot, chestItems, changedInventory, changedChest,
+                                existingOnly, 0, chestItems.Length - 1);
+                        }
+                    }
+                    else
+                    {
+                        for (int inventorySlot = InventoryStart; inventorySlot <= InventoryEnd; inventorySlot++)
+                            MoveStack(inventory, inventorySlot, chestItems, changedInventory, changedChest, existingOnly,
+                                0, chestItems.Length - 1);
+                    }
                 }
 
                 if (changedInventory.Count == 0 && changedChest.Count == 0)
@@ -2280,6 +2347,98 @@ public sealed record SetManaCommand(long Tick, int? PlayerId, int Mana, int MaxM
         player.MpMax = MaxMana;
         player.Mp = Math.Clamp(Mana, 0, player.MpMax);
         player.HasReceivedManaSync = true;
+        return new(true);
+    }
+}
+
+/// <summary>
+/// 背包槽位暂存命令（SSC 背包守恒事务）：包 5 与服务端权威值不一致时不再立即回正，
+/// 而是把客户端意图暂存进该玩家的背包事务窗口，窗口到期后由守恒校验决定整体提交或回滚。
+/// 原版客户端拖拽 / 整理 / 拆分 / 合并 / 交换都会在一个窗口内发出多个槽位包，
+/// 逐包校验无法区分「合法的多槽联动」与「凭空造物」，故必须窗口聚合后再判。
+/// </summary>
+public sealed record StageInventorySlotCommand(long Tick, int? PlayerId, int Slot, int ItemId, int Stack, byte Prefix = 0)
+    : Command(Tick, PlayerId, "stage_inventory_slot")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int id)
+            return new(false, CommandFailures.NotApplied);
+
+        if (Slot < 0 || Slot >= PlayerRuntime.InventorySlotCount)
+            return new(false, CommandFailures.NotApplied);
+
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
+
+        // 开箱期间的包 5 属于「背包 ↔ 箱子」转移的一半：必须与同一窗口的包 32 合并结算。
+        // 若按背包事务单独校验，存入箱子会让背包总量减少而被判不守恒回滚（取出则相反）。
+        // 锁序与 StageChestItemCommand / TryCommitChestTransaction 一致：PlayersLock → ChestsLock。
+        lock (world.PlayersLock)
+        {
+            lock (world.ChestsLock)
+            {
+                if (world.TryGetOpenedChestIndex(id, out int chestIndex))
+                {
+                    world.EnsureChestTransaction(player!, chestIndex, world.Tick);
+                    player!.PendingChestInventoryChanges[Slot] = (ItemId, Stack, Prefix);
+                    world.MarkChestTransactionOpen(id);
+                    return new(true);
+                }
+            }
+
+            // 会话切换后不得沿用上一会话的暂存意图（重连复用同一槽位时会串号）
+            if (player!.InventoryTransactionSessionId != player.SessionId)
+            {
+                player.PendingInventoryChanges.Clear();
+                player.InventoryTransactionSessionId = player.SessionId;
+            }
+
+            if (player.PendingInventoryChanges.Count == 0)
+                player.InventoryTransactionStartTick = world.Tick;
+
+            player.PendingInventoryChanges[Slot] = (ItemId, Stack, Prefix);
+        }
+
+        world.MarkInventoryTransactionOpen(id);
+        return new(true);
+    }
+}
+
+/// <summary>
+/// 对话 NPC 命令：包 40 SyncTalkNPC 权威通过后生成。
+/// 服务端持有该表现状态唯一真相：写入玩家当前对话的城镇 NPC 槽位（-1 = 未对话），
+/// 并在真正发生变化时标记中继，由 GameHost 向其他玩家广播包 40。
+/// 索引越界或指向非活跃 / 非城镇 NPC 一律视为「未对话」，避免把无效目标中继给其他客户端。
+/// </summary>
+public sealed record SetTalkNpcCommand(long Tick, int? PlayerId, int TalkNpc)
+    : Command(Tick, PlayerId, "set_talk_npc")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int id)
+            return new(false, CommandFailures.NotApplied);
+
+        if (!TryGetPlayer(world, id, out var player, out var failure))
+            return failure;
+
+        int target = -1;
+        if (TalkNpc >= 0)
+        {
+            lock (world.NpcsLock)
+            {
+                if (TalkNpc < world.Npcs.Count && world.Npcs[TalkNpc].Active
+                    && world.Npcs[TalkNpc].IsTownNpc)
+                    target = TalkNpc;
+            }
+        }
+
+        // 幂等：状态未变不重复广播（客户端会高频重发同一对话目标）
+        if (player!.TalkNpc == target)
+            return new(true);
+
+        player.TalkNpc = target;
+        world.MarkPlayerTalkNpcChanged(id);
         return new(true);
     }
 }

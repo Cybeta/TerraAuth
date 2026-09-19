@@ -1,5 +1,7 @@
 # Phase 6 — 基础设施层（Infrastructure）
 
+> **状态说明**：本文档为**设计说明**；实现已落地于 `Config/`、`Persistence/`、`Monitoring/`、`Security/` 四个目录（现状见 [`PROJECT_STRUCTURE.md`](../PROJECT_STRUCTURE.md)）。
+>
 > 对应架构文档 §4.5。本 Phase 不新增反作弊逻辑，而是把 **配置 / 持久化 / 监控 / 封禁** 四块基础设施补齐，让整个服务端可运维、可观测、可持续对抗。
 
 ## §1. 职责
@@ -39,7 +41,7 @@
 
 ## §4. 封禁策略
 
-`BanManager` 滑动窗口累计违规：达 `MaxViolationsBeforeBan` → 自动封禁（默认 24h）。生产级 `IBanStore` 可选 Redis（多服共享 IP 黑名单）或 SQLite。
+`BanManager` 滑动窗口累计违规：达 `MaxViolationsBeforeBan` → 自动封禁（默认 24h）。`IBanStore` 当前实现为 SQLite（`SqliteBanStore`）；多服共享 IP 黑名单的 Redis 方案**未实现（未来可选）**。
 
 同一阈值也驱动 **连接层即时处置**：`NetworkHost` 按 `ServerConfig`（`MaxViolationsBeforeBan` / `ViolationWindowMinutes`）维护每玩家滑动窗口，达阈值即调用 `ConnectionManager.KickAsync`（先下发包 2 告知原因，再关闭连接释放槽位）。封禁记录 + 踢出双管齐下，避免"只记录不处置"。
 

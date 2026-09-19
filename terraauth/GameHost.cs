@@ -336,12 +336,18 @@ public sealed class GameHost : IDisposable
                 await FlushPlayerUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端开火扣除法力后，向本人回写最终法力（包 42）。
                 await FlushPlayerManaAsync(ct).ConfigureAwait(false);
+                // 服务端持有的对话城镇 NPC（包 40）→ 中继给其他玩家
+                await FlushPlayerTalkNpcAsync(ct).ConfigureAwait(false);
                 // 服务端权威修改的增益列表（如移除召唤 Buff）→ 包 50 回写本人
                 await FlushPlayerBuffsAsync(ct).ConfigureAwait(false);
                 // 服务端权威修改的 NPC 增益列表 → 包 54 向全体玩家回写
                 await FlushNpcBuffsAsync(ct).ConfigureAwait(false);
                 // 服务端受控背包槽位改动仅在仿真提交后回写对应会话。
+                // 先结算到期的背包守恒事务（提交 / 回滚），再回写槽位。
+                await FlushInventoryTransactionsAsync(ct).ConfigureAwait(false);
                 await FlushInventoryUpdatesAsync(ct).ConfigureAwait(false);
+                // 先结算到期的箱子守恒事务（提交 / 回滚），再同步箱子改动
+                await FlushChestTransactionsAsync(ct).ConfigureAwait(false);
                 // 箱子改动只在仿真提交后同步给当前打开该箱子的玩家
                 await FlushChestUpdatesAsync(ct).ConfigureAwait(false);
                 // 服务端判定的玩家受击（接触 / 下落伤害）→ 包 117 + 包 16
@@ -845,6 +851,31 @@ public sealed class GameHost : IDisposable
         }
     }
 
+    /// <summary>单批对话 NPC 变更通知上限。</summary>
+    private const int MaxPlayerTalkNpcPerFlush = 256;
+
+    /// <summary>
+    /// 中继玩家当前对话的城镇 NPC（包 40 SyncTalkNPC）：只发给**其他**玩家
+    /// （原版 <c>SendData(40, -1, whoAmI, talkNPC)</c> 的 ignoreClient = whoAmI 排除本人）。
+    /// 仅在该状态真正变化时由 <c>SetTalkNpcCommand</c> 标记，避免客户端高频重发造成广播风暴。
+    /// </summary>
+    public async Task FlushPlayerTalkNpcAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var playerIds = world.DrainPlayerTalkNpcChanged(MaxPlayerTalkNpcPerFlush);
+        foreach (var playerId in playerIds)
+        {
+            PlayerRuntime? player;
+            lock (world.PlayersLock)
+                world.Players.TryGetValue(playerId, out player);
+            if (player is null || !player.Active) continue;
+
+            await Network.BroadcastWhereAsync(PacketId.SyncTalkNPC,
+                new SyncTalkNpcPacket(playerId, player.TalkNpc),
+                pid => pid != playerId, ct).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>单批增益变更通知上限。</summary>
     private const int MaxPlayerBuffsPerFlush = 64;
 
@@ -1167,6 +1198,29 @@ public sealed class GameHost : IDisposable
 
     private const int MaxInventoryUpdatesPerFlush = 256;
 
+    /// <summary>单批背包事务结算上限。</summary>
+    private const int MaxInventoryTransactionsPerFlush = 256;
+
+    /// <summary>
+    /// 背包事务窗口（tick；60Hz → 250ms）：原版拖拽 / 整理 / 拆分产生的多槽联动包在此窗口内聚合，
+    /// 到期后按守恒校验整体提交或回滚（见 <see cref="WorldState.TryCommitInventoryTransaction"/>）。
+    /// </summary>
+    private const int InventoryTransactionWindowTicks = 15;
+
+    /// <summary>
+    /// 结算到期的 SSC 背包事务：提交 → 服务端接受客户端整理结果；回滚 → 权威槽位回写纠正客户端。
+    /// 必须在下发背包槽位更新（<see cref="FlushInventoryUpdatesAsync"/>）之前调用，
+    /// 使本次结算产生的槽位变更能在同一轮广播出去。
+    /// </summary>
+    public Task FlushInventoryTransactionsAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var playerIds = world.SnapshotInventoryTransactionPlayers(MaxInventoryTransactionsPerFlush);
+        foreach (var playerId in playerIds)
+            world.TryCommitInventoryTransaction(playerId, InventoryTransactionWindowTicks);
+        return Task.CompletedTask;
+    }
+
     public async Task FlushInventoryUpdatesAsync(CancellationToken ct = default)
     {
         var world = Simulator.State;
@@ -1206,6 +1260,29 @@ public sealed class GameHost : IDisposable
     }
 
     private const int MaxChestUpdatesPerFlush = 256;
+
+    /// <summary>单批箱子事务结算上限。</summary>
+    private const int MaxChestTransactionsPerFlush = 256;
+
+    /// <summary>
+    /// 箱子事务窗口（tick；60Hz → 250ms，与背包事务一致）：原版拖拽 / 整理产生的多槽联动包在此窗口内聚合，
+    /// 到期后按「玩家背包 ∪ 该箱子」守恒校验整体提交或回滚（见 <see cref="WorldState.TryCommitChestTransaction"/>）。
+    /// </summary>
+    private const int ChestTransactionWindowTicks = 15;
+
+    /// <summary>
+    /// 结算到期的 SSC 箱子事务：提交 → 服务端接受客户端箱子改动；回滚 → 权威箱子槽回写纠正客户端。
+    /// 必须在下发箱子槽位更新（<see cref="FlushChestUpdatesAsync"/>）之前调用，
+    /// 使本次结算产生的箱子槽位变更（提交或回滚）能在同一轮广播出去。
+    /// </summary>
+    public Task FlushChestTransactionsAsync(CancellationToken ct = default)
+    {
+        var world = Simulator.State;
+        var playerIds = world.SnapshotChestTransactionPlayers(MaxChestTransactionsPerFlush);
+        foreach (var playerId in playerIds)
+            world.TryCommitChestTransaction(playerId, ChestTransactionWindowTicks);
+        return Task.CompletedTask;
+    }
 
     public async Task FlushChestUpdatesAsync(CancellationToken ct = default)
     {

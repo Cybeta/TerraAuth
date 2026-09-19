@@ -149,11 +149,11 @@ PacketId（真实 Terraria 包号）:
 
 > 上表为**代表性**包（非全集）。编解码实际覆盖：包 18 `Time`、20 `TileSquare`、22 `ItemPickup`（SyncItemOwner）、
 > 23 `NpcUpdate`（SyncNPC）、29 `ProjectileDestroy`（KillProjectile）、34 `SyncPlayerChestIndex`、
-> 42 `PlayerMana`、82 `NetModule`（NetLiquid=0 / NetText=1）等亦已结构化 —— 共 **35 个入站包 / 37 类出站包**。
+> 42 `PlayerMana`、82 `NetModule`（NetLiquid=0 / NetText=1）、40 `SyncTalkNPC`、53 `AddNPCBuff` / 54 `NpcBuffSync`、85 `QuickStackChests` 等亦已结构化 —— 共 **40 个入站映射 / 43 类出站包**（按 `PacketDecoder` 映射与 `PacketEncoder` case 统计，不含 `UnknownPacket`）。
 > 完整映射参考 tModLoader `MessageID` / TShock `PacketTypes`。
 
-> **权威白名单已全部可解码**：`ITerrariaProtocol.RequiresAuthority` 列出的 **13 包**
-> （5 / 13 / 17 / 21 / 27 / 28 / 31 / 35 / 42 / 50 / 65 / 73 / 79）均已有 Decoder / Encoder 实现。
+> **权威白名单已全部可解码**：`ITerrariaProtocol.RequiresAuthority` 列出的 **17 包**
+> （5 / 13 / 17 / 21 / 22 / 27 / 28 / 31 / 35 / 40 / 42 / 50 / 65 / 73 / 79 / 85 / 151）均已有 Decoder / Encoder 实现。
 > **未建模包默认拒绝（Vanilla-only）**：未结构化建模的包统一解码为 `UnknownPacket`（保留原始 PacketId + payload），
 > 由权威层默认拒绝，**不再即时中继 / 原样写回**；仅权威校验与状态同步所需的包按需增量结构化。
 > 该拒绝**不计入违规窗口**（正常客户端会发不少未建模包，计入会导致误踢），并按 `PacketId` 统计（`NetworkHost.UnmodeledPacketCounts`
@@ -291,7 +291,7 @@ TShock 依赖既有服务端运行环境提供监听能力。
 5. ✅ `ISnapshotSender` 的 TCP 实现（对接 Snapshots）
 
 ### P1（完善）
-- ✅ 包编解码：权威白名单 **13 包** + 状态同步包已结构化（含传送 `TeleportEntity(65)` / `RequestTeleportationByServer(73)`、治疗 35 / 法力 42 / 增益 50、时间 18 / NPC 23 / 弹幕销毁 29 / 拾取 22 / 箱子索引 34 等，共 **35 个入站包 / 37 类出站包**）；未建模包统一 `UnknownPacket` 且**默认拒绝**（Vanilla-only），不再透传；⚠️ 按需增量结构化
+- ✅ 包编解码：权威白名单 **17 包** + 状态同步包已结构化（含传送 `TeleportEntity(65)` / `RequestTeleportationByServer(73)`、治疗 35 / 法力 42 / 增益 50 / NPC 增益 53·54、对话 NPC 40、箱子写入 32 与快速堆叠 85 / 箱子索引 34、时间 18 / NPC 23 / 弹幕销毁 29 / 拾取 22 等，共 **40 个入站映射 / 43 类出站包**）；未建模包统一 `UnknownPacket` 且**默认拒绝**（Vanilla-only），不再透传；⚠️ 按需增量结构化
 - ✅ 变长整数（`Read/Write7BitEncodedInt`）；⚠️ 特殊类型：`Vector2` / 图格 `Color` 已覆盖，独立 `Rectangle` 读写器待补
 - ✅ 连接认证白名单（`NetworkHost` 按 `PlayerWhitelist` 踢出）；⏳ SteamTicket 未实现
 - ⏳ 性能基准（单服 100 玩家，带宽/CPU 预算）
@@ -310,6 +310,18 @@ TShock 依赖既有服务端运行环境提供监听能力。
 > ⏳ 原版客户端完整游玩回归仍待完成：需继续验证挖掘 / 放置 / 箱子 / 战斗 / NPC / 区块流送 / 重启持久化等组合流程，并依据 `UnmodeledPacketCounts` 补充必要协议覆盖。
 
 > ⚠️ **传输保护边界**：当前 TCP 连接未增加额外传输保护层。如需增强包完整性校验，可在 Framing 层增加 HMAC，但会引入额外延迟。
+
+---
+
+## 12. 实测记录
+
+| 日期 | 场景 | 结果 |
+|---|---|---|
+| 2026-09-09 | 原版 Terraria 客户端（协议 326）连接 `127.0.0.1:7777` | ✅ 握手成功 → 解析玩家名 → `InitialSpawn`/`FinishedConnecting` → 进入世界（出生点 2100,352）→ 正常断开，无异常/畸形包 |
+| 2026-09-09 | 真实 TCP 往返集成测试 `TcpRoundTrip_Packet13_Reaches_SnapshotOverWire` | ✅ `NetworkHost` 监听 → `TcpClient` 握手至 Playing → 发包 13 → `MoveCommand` → 仿真 → 快照包 15 经 TCP 下发，玩家位置与上报匹配 |
+| 2026-09-10 | 双客户端移动广播集成测试 `TcpRoundTrip_Packet13_IsForwarded_ToOtherPlayers` | ✅ 两 `TcpClient` 分别握手至 Playing → A 发包 13（伪造 PlayerId=7）→ B 经 TCP 收到转发的包 13，身份被覆盖为服务端分配的 #1，位置一致 |
+| 2026-09-10 | 对端移动卡顿修复：`MovementAuthority` 速度量纲 | ✅ `MaxSpeed` 为 Terraria 像素/帧量纲（`MaxWalkSpeed=3.6`/`MaxFlightSpeed=8.0`），原按 `maxSpeed * dt(秒)` 误算成像素/秒，每包允许位移仅剩 `TeleportTolerance=4` 像素 → 正常移动被判 `speed_exceeded` 且不转发。改为 `maxSpeed * 60 * dt + tolerance`，`MinDtSeconds` 取 1/60 避免批量处理低估 dt；新增回归测试 `MovementAuthority_Accepts_NormalFrameStep_NotOnly_TinyMove` |
+| 2026-09-10 | 移动权威收紧：Δt 上限放宽但取消静默无条件放行 | ✅ 客户端失焦时位置包间隔可达 4~7s，旧 `MaxDtSeconds=1.0` 使允许位移恒为 484px（首帧 `distance=776` 被误拒）→ 放宽到 10.0s 覆盖稀疏发包。但静默超时**不做无条件放行**（否则 >30s 后可瞬移到任意位置，成为防作弊缺口）：超过 10s 的间隔统一按 10s 计，单包上限 4804px。代价是失焦 >30s 且位移 >4804px 会被误拒，记为后续事项（需服务端权威移动/碰撞校验） |
 
 ---
 

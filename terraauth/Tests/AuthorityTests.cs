@@ -319,7 +319,7 @@ public class AuthorityTests
     }
 
     [Fact]
-    public void InventoryAuthority_PendingBagOpen_SilencesWholeInventoryBeforeApply()
+    public void InventoryAuthority_BagOpen_IsIdempotent_AtAuthority_AndOtherSlotsAreStaged()
     {
         var world = new WorldState();
         var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
@@ -333,17 +333,20 @@ public class AuthorityTests
 
         var inventory = enforcers.Inventory;
         var bag = inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!);
+        // 袋尚未被消费时，重复「清空袋槽」仍转成开袋意图；真正去重发生在命令 Apply 的终审。
         var repeatedBagSlot = inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!);
+        // 其他槽位快照不再被 pending 屏蔽，而是进入背包守恒事务窗口（到期后判守恒）。
         var otherSlot = inventory.Validate(new InventorySlotPacket(4, 56, 1), 1, null!);
 
         Assert.Equal(AuthorityDecision.Accept, bag.Decision);
-        Assert.Equal(AuthorityDecision.RejectSilent, repeatedBagSlot.Decision);
-        Assert.Equal(AuthorityDecision.RejectSilent, otherSlot.Decision);
-        Assert.False(otherSlot.CountsAsViolation);
+        Assert.Equal(AuthorityDecision.Accept, repeatedBagSlot.Decision);
+        Assert.IsType<OpenEyeOfCthulhuTreasureBagPacket>(repeatedBagSlot.Packet);
+        Assert.Equal(AuthorityDecision.Accept, otherSlot.Decision);
+        Assert.IsType<StageInventorySlotPacket>(otherSlot.Packet);
     }
 
     [Fact]
-    public void InventoryAuthority_AppliedBagOpen_SilencesFastClientRewardSnapshots()
+    public void InventoryAuthority_RewardSnapshot_AfterBagOpen_IsStaged_NotViolation()
     {
         var world = new WorldState();
         var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
@@ -358,12 +361,12 @@ public class AuthorityTests
         var inventory = enforcers.Inventory;
         Assert.Equal(AuthorityDecision.Accept,
             inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!).Decision);
-        world.PromotePendingBagOpen(1, world.Players[1].SessionId);
 
+        // 客户端开袋后立即回显的本地奖励快照：进入背包事务窗口，由守恒校验统一结算。
         var rewardSnapshot = inventory.Validate(new InventorySlotPacket(4, 56, 30), 1, null!);
 
-        Assert.Equal(AuthorityDecision.RejectSilent, rewardSnapshot.Decision);
-        Assert.False(rewardSnapshot.CountsAsViolation);
+        Assert.Equal(AuthorityDecision.Accept, rewardSnapshot.Decision);
+        Assert.IsType<StageInventorySlotPacket>(rewardSnapshot.Packet);
     }
 
     [Fact]

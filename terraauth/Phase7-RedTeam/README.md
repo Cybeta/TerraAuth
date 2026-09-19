@@ -4,17 +4,17 @@
 
 ## 零、自动化现状（服务端可自动化部分）
 
-下列清单项已落为可执行测试，其余项（需 CE 改内存或真实客户端交互）仍为手工实验：
+下表仅为**可自动化的子集**，只列出已落为可执行测试的清单项；M 组 / R 组其余项（需 CE 改内存或真实客户端交互）仍为手工实验：
 
 | 清单项 | 自动化测试 | 覆盖点 |
 |--------|-----------|--------|
 | P1 | `AntiCheat_DpsWindow_RejectsBurst` | 单次在 `MaxSingleDamage` 内、窗口累计超 `MaxDps` → `dps_exceeded` |
-| P2 | `Vanilla_Movement_Overspeed_Is_Rejected_And_Corrected`（既有） | 超速 → `speed_exceeded` + 位置纠正 |
+| P2 | `Vanilla_Movement_Overspeed_IsRejected`（既有） | 超速 → `speed_exceeded` + 位置纠正 |
 | P3 | `AntiCheat_IllegalItemStack_IsRejected` / `AntiCheat_ChestItem_WithUnknownItem_Is_Rejected` | 非法堆叠 `invalid_stack`；未知物品 `unknown_item` |
 | P4 | `AntiCheat_UnidentifiedPlayer_IsSilentlyDropped` / `AntiCheat_Replayed_Malicious_Movement_DoesNotAdvance_Authority` | 无身份包丢弃；恶意包重放不推进权威 |
 | P5 / M6 | `AntiCheat_PacketFlood_IsRateLimited_AndEventuallyKicked` | 洪水 → 限流 → 违规累计达阈值踢出（包 2 + 关闭） |
 | M1 | `Vanilla_Health_Above_ServerMax_Gets_Correction`（既有） | 血量超上限被纠正 |
-| M3 | `Vanilla_Place_Without_Item_Is_Rejected`（既有） | 无物品放砖被拒 |
+| M3 | `Vanilla_TilePlace_Without_InventoryItem_Is_Rejected`（既有） | 无物品放砖被拒 |
 | M4 | 同 P2 | 速度上限 |
 | M9 | `Vanilla_ItemPickup_*`（既有） | 拾取按世界真实实体对账 |
 | 健壮性 | `Vanilla_ChaoticSection_Is_Split_Without_Breaking_Login` | 超帧上限区块拆分后登录仍完成 |
@@ -32,7 +32,7 @@
 | M3 | 物品生成 | CE 改物品 ID / 堆叠数 | SSC 不认可，回滚 |
 | M4 | 移动速度 | CE 改速度变量 | 速度校验拒绝，snap back |
 | M5 | 穿墙 | CE 改碰撞相关内存 | 位置校验拒绝 |
-| M6 | 挖掘速率 | CE 加速挖掘循环 | TilePlaceThreshold 拦截 |
+| M6 | 挖掘速率 | CE 加速挖掘循环 | 挖/放砖限流拦截：`ServerConfig.MaxTileBreakPerSecond`（默认 60）/ `MaxTilePlacePerSecond`（默认 40）→ `WorldLimits`，违规码 `tile_break_rate_exceeded` / `tile_place_rate_exceeded` |
 | M7 | 伤害注入 | CE 改武器伤害数值 | 服务端重算，按真实武器算 |
 | M8 | 抛射物 spam | CE 触发大量抛射物 | 服务端限流丢弃 |
 | M9 | 金币复制 | CE 复制堆叠 | 服务端对账拒绝 |

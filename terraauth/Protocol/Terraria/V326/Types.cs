@@ -91,6 +91,17 @@ public sealed record PlayerManaPacket(int PlayerId, int Mana, int MaxMana) : INe
 }
 
 /// <summary>
+/// 对话 NPC 同步包（SyncTalkNPC，包 40，上行 / 下行）。
+/// 布局：Byte PlayerId + Int16 talkNPC（-1 = 未与任何城镇 NPC 对话）。
+/// 原版服务端收到后以发送者 whoAmI 覆盖 PlayerId，调用 <c>Player.SetTalkNPC(talkNPC)</c>，
+/// 再中继给其他玩家；本实现同样由服务端持有该状态并广播给他人（不回发本人）。
+/// </summary>
+public sealed record SyncTalkNpcPacket(int PlayerId, int TalkNpc) : INetworkPacket
+{
+    public PacketId Type => PacketId.SyncTalkNPC;
+}
+
+/// <summary>
 /// NPC 受击包（DamageNPC，包 28，上行，客户端发起）。
 /// 布局：Byte NpcId + Byte Generation + Int16 Damage + Single Knockback + Byte Direction + Byte Crit。
 /// </summary>
@@ -288,6 +299,17 @@ public sealed record ProjectileNewPacket(int ProjectileKey, Vector2 Position, Ve
 public sealed record SyncChestItemPacket(int ChestIndex, int ItemSlot, int Stack, byte Prefix, int ItemType) : INetworkPacket
 {
     public PacketId Type => PacketId.SyncChestItem;
+}
+
+/// <summary>
+/// 快速堆叠到附近箱子（QuickStackChests，包 85，客户端 → 服务端）。
+/// 布局：Int32 槽位数 + 槽位 × Int16 + Boolean smartStack。
+/// 客户端上报「作为来源的背包槽位列表」与 smartStack 标志，由服务端执行 QuickStack
+/// （原版用玩家当前打开的箱子作为目标；payload 长度为 0 表示空列表）。
+/// </summary>
+public sealed record QuickStackChestsPacket(IReadOnlyList<int> Slots, bool SmartStack) : INetworkPacket
+{
+    public PacketId Type => PacketId.QuickStackChests;
 }
 
 /// <summary>

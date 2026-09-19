@@ -4,7 +4,7 @@
 > **目标运行时**：与原版 Terraria 客户端兼容（不修改客户端）
 > **技术栈**：C# / .NET 10 (LTS)
 > **架构定位**：Level 4 深度服务端权威 + 行为分析（Level 5 演进）
-> **文档版本**：v1.0（架构基线，供 arget 工程落地）
+> **文档版本**：v1.0（架构基线，供 target 工程落地）
 
 ---
 
@@ -99,20 +99,22 @@
 ## 2. 模块划分（设计基线 → 实际实现）
 
 > **说明**：下列工程树是 **v1.0 架构基线** 的设计划分（按层拆分为多个类库）。
+> **§2.2 工程树与 §3–§5 伪代码均为早期设计基线**（描述目标形态，非当前实现），现状以 [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md) 为准。
 > 实际落地已**合并为单一工程** `TerraAuth.csproj`（`OutputType=Exe`），分层改由 **命名空间** 承载，目录结构保持不变。
-> 权威的目录树 / 工程配置 / 模块实现状态见 [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md)。
 
 ### 2.1 设计模块 → 实际目录映射
 
-| 设计基线模块 | 实际目录 / 命名空间 | 状态 |
+> 下表「设计基线模块」列为**历史设计名**（如 `TerraAuth.Server` / `TerraAuth.Transport` 等），实际已合并为单一工程 `TerraAuth`，分层由命名空间承载。
+
+| 设计基线模块（设计基线名，实际已合并为单一工程 TerraAuth） | 实际目录 / 命名空间 | 状态 |
 |---|---|---|
 | `TerraAuth.Server` | `Program.cs` / `GameHost.cs`（`TerraAuth`） | 已实现 |
 | `TerraAuth.Transport` | `Net/Transport/`（`TerraAuth.Net.Transport`） | 部分 |
 | `TerraAuth.Protocol` | `Protocol/`（`TerraAuth.Protocol`） | 部分 |
 | `TerraAuth.Authority` | `Authority/`（`TerraAuth.Authority`） | 已实现 |
-| `TerraAuth.Simulation` | `Simulation/`（`TerraAuth.Simulation`） | 部分 |
+| `TerraAuth.Simulation` | `Simulation/`（`TerraAuth.Simulation`） | 已实现 |
 | `TerraAuth.Domain` | `Simulation/World/`（`Tile` / `WorldState` 等） | 部分 |
-| `TerraAuth.Persistence` | `Persistence/` | 部分 |
+| `TerraAuth.Persistence` | `Persistence/` | 已实现 |
 | `TerraAuth.Telemetry` | `Monitoring/` + `Authority/AuditLogger.cs` | 已实现 |
 | `TerraAuth.AntiCheat` | 未落地（见 `Phase7-RedTeam/`） | 未实现 |
 | `TerraAuth.Abstractions` | `Protocol/Types.cs`、`Concurrency/ParallelConfig.cs` 等 | 已实现 |
@@ -416,7 +418,7 @@ while (running)
 - 客户端本地预测移动（原版行为）
 - 服务端每 tick 下发权威位置
 - 客户端收到后与本地预测比对，**小偏差平滑插值，大偏差（被纠正）硬 snap**
-- 这是"手感"与"安全"的平衡点，需在 arget 阶段调参
+- 这是"手感"与"安全"的平衡点，需在 target 阶段调参
 
 ### 6.3 事件溯源（Event Sourcing）
 
@@ -500,7 +502,7 @@ while (running)
 
 ---
 
-## 9. 里程碑（Roadmap for arget）
+## 9. 里程碑（Roadmap for target）
 
 ```
 Phase 0 — 协议兼容骨架 (2 周)
@@ -579,4 +581,4 @@ Phase 5 — 行为分析 L5 (持续, 可与 Phase 3-4 并行)
 
 ---
 
-> **给 arget 的落地提示**：建议从 **Phase 0 + Phase 1** 起步，先跑通"透传模式 + 移动权威"，用 CE 实测能挡住瞬移/超速后再推进 Phase 2。每个 Phase 结束时都必须跑一遍 §8.1 的对抗测试 + 回归测试，确保**阻断率达标且不误杀**。架构是骨架，验收测试才是质量的闸门。
+> **给 target 的落地提示**：建议从 **Phase 0 + Phase 1** 起步，先跑通"透传模式 + 移动权威"，用 CE 实测能挡住瞬移/超速后再推进 Phase 2。每个 Phase 结束时都必须跑一遍 §8.1 的对抗测试 + 回归测试，确保**阻断率达标且不误杀**。架构是骨架，验收测试才是质量的闸门。

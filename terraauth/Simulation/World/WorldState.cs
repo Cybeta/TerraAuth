@@ -794,6 +794,22 @@ public sealed class WorldState
                 && current.ChestIndex == chestIndex;
     }
 
+    /// <summary>取玩家当前打开的箱子索引（未开箱返回 false）。</summary>
+    public bool TryGetOpenedChestIndex(int playerId, out int chestIndex)
+    {
+        lock (ChestsLock)
+        {
+            if (_openChests.TryGetValue(playerId, out var current))
+            {
+                chestIndex = current.ChestIndex;
+                return true;
+            }
+
+            chestIndex = -1;
+            return false;
+        }
+    }
+
     public void CloseChestSession(int playerId)
         => CloseChestSession(playerId, 0);
 
@@ -825,10 +841,8 @@ public sealed class WorldState
     private readonly HashSet<(int ChestIndex, int Slot)> _pendingChestUpdates = new();
     private readonly HashSet<(int PlayerId, long SessionId, int Slot)> _pendingInventoryUpdates = new();
     private readonly Dictionary<(int PlayerId, long SessionId), HashSet<long>> _appliedInventoryChestOperations = new();
-    private readonly Dictionary<(int PlayerId, long SessionId), PendingBagOpen> _pendingBagOpens = new();
     private readonly Dictionary<(int PlayerId, long SessionId, int Slot), PendingInventoryConfirmation> _pendingInventoryConfirmations = new();
 
-    private sealed record PendingBagOpen(int Slot, DateTimeOffset ExpiresAt);
     private sealed record PendingInventoryConfirmation(
         int ItemId,
         int Stack,
@@ -878,66 +892,6 @@ public sealed class WorldState
                    pending.Stack == (stack > 0 ? stack : 0) &&
                    pending.Prefix == (stack > 0 ? prefix : (byte)0);
         }
-    }
-
-    public bool BeginPendingBagOpen(int playerId, long sessionId, int slot)
-    {
-        lock (ChestUpdatesLock)
-        {
-            var key = (playerId, sessionId);
-            if (_pendingBagOpens.TryGetValue(key, out var current) &&
-                current.ExpiresAt > DateTimeOffset.UtcNow)
-                return false;
-
-            _pendingBagOpens[key] = new PendingBagOpen(slot, DateTimeOffset.UtcNow.AddSeconds(2));
-            return true;
-        }
-    }
-
-    public bool IsPendingBagOpen(int playerId, long sessionId, int slot)
-    {
-        lock (ChestUpdatesLock)
-        {
-            if (!_pendingBagOpens.TryGetValue((playerId, sessionId), out var pending))
-                return false;
-            if (pending.ExpiresAt <= DateTimeOffset.UtcNow)
-            {
-                _pendingBagOpens.Remove((playerId, sessionId));
-                return false;
-            }
-            return pending.Slot == -1 || pending.Slot == slot;
-        }
-    }
-
-    public bool HasPendingBagOpen(int playerId, long sessionId)
-    {
-        lock (ChestUpdatesLock)
-        {
-            if (!_pendingBagOpens.TryGetValue((playerId, sessionId), out var pending))
-                return false;
-            if (pending.ExpiresAt <= DateTimeOffset.UtcNow)
-            {
-                _pendingBagOpens.Remove((playerId, sessionId));
-                return false;
-            }
-            return true;
-        }
-    }
-
-    public void PromotePendingBagOpen(int playerId, long sessionId)
-    {
-        lock (ChestUpdatesLock)
-        {
-            var key = (playerId, sessionId);
-            if (_pendingBagOpens.TryGetValue(key, out var pending))
-                _pendingBagOpens[key] = pending with { Slot = -1 };
-        }
-    }
-
-    public void CompletePendingBagOpen(int playerId, long sessionId)
-    {
-        lock (ChestUpdatesLock)
-            _pendingBagOpens.Remove((playerId, sessionId));
     }
 
     public void MarkInventoryChanged(int playerId, long sessionId, int slot)
@@ -1180,8 +1134,408 @@ public sealed class WorldState
         }
     }
 
-    // ---- 增益列表变更推送（仿真移除增益后生成原版包 50）----
+    // ---- SSC 背包守恒事务（包 5 窗口聚合 → 守恒校验 → 提交 / 回滚）----
 
+    public object InventoryTransactionLock { get; } = new();
+    private readonly HashSet<int> _inventoryTransactionPlayers = new();
+
+    /// <summary>标记该玩家存在未结算的背包事务（窗口内聚合，到期后校验守恒）。</summary>
+    public void MarkInventoryTransactionOpen(int playerId)
+    {
+        lock (InventoryTransactionLock) _inventoryTransactionPlayers.Add(playerId);
+    }
+
+    /// <summary>取出一批存在未结算背包事务的玩家（不移除；由 <see cref="TryCommitInventoryTransaction"/> 结算时移除）。</summary>
+    public List<int> SnapshotInventoryTransactionPlayers(int max)
+    {
+        if (max <= 0) return new List<int>();
+        lock (InventoryTransactionLock)
+        {
+            var result = new List<int>(Math.Min(max, _inventoryTransactionPlayers.Count));
+            foreach (var playerId in _inventoryTransactionPlayers)
+            {
+                result.Add(playerId);
+                if (result.Count >= max) break;
+            }
+            return result;
+        }
+    }
+
+    private void CloseInventoryTransaction(int playerId)
+    {
+        lock (InventoryTransactionLock) _inventoryTransactionPlayers.Remove(playerId);
+    }
+
+    /// <summary>
+    /// 结算到期的背包事务（SSC）：窗口内客户端上报的槽位意图按「守恒」整体提交或回滚。
+    /// 守恒 = 对每个 (物品, 前缀)，叠加暂存值后的总数量与当前权威总量完全一致——
+    /// 拖拽 / 整理 / 拆分 / 合并 / 交换都保持总量不变；凭空造物或销毁必然破坏总量。
+    /// 无论提交还是回滚，都会把服务端最终值标记回写这些槽位（提交为幂等确认，回滚为纠正）。
+    /// 未到期 / 无暂存 / 会话已切换 / 玩家离线时返回 <see cref="InventoryTransactionOutcome.None"/>。
+    /// </summary>
+    public InventoryTransactionOutcome TryCommitInventoryTransaction(int playerId, int windowTicks)
+    {
+        PlayerRuntime? player;
+        lock (PlayersLock)
+        {
+            Players.TryGetValue(playerId, out player);
+            if (player is null)
+            {
+                CloseInventoryTransaction(playerId);
+                return InventoryTransactionOutcome.None;
+            }
+
+            if (player.PendingInventoryChanges.Count == 0)
+            {
+                CloseInventoryTransaction(playerId);
+                return InventoryTransactionOutcome.None;
+            }
+
+            // 会话切换 / 离线：暂存意图基于上一会话的背包，直接丢弃而不是结算
+            if (player.InventoryTransactionSessionId != player.SessionId || !player.Active)
+            {
+                player.PendingInventoryChanges.Clear();
+                player.InventoryTransactionStartTick = -1;
+                CloseInventoryTransaction(playerId);
+                return InventoryTransactionOutcome.None;
+            }
+
+            if (Tick - player.InventoryTransactionStartTick < windowTicks)
+                return InventoryTransactionOutcome.None;   // 窗口未到期，继续聚合
+
+            bool conserved = IsInventoryConserved(player);
+            var slots = player.PendingInventoryChanges.Keys.ToArray();
+
+            if (conserved)
+            {
+                foreach (var (slot, staged) in player.PendingInventoryChanges)
+                {
+                    player.Items[slot] = staged.Stack > 0 ? staged.ItemId : 0;
+                    player.ItemStacks[slot] = staged.Stack > 0 ? staged.Stack : 0;
+                    player.ItemPrefixes[slot] = staged.Stack > 0 ? staged.Prefix : (byte)0;
+                }
+                player.RecalculateDefense();
+            }
+
+            player.PendingInventoryChanges.Clear();
+            player.InventoryTransactionStartTick = -1;
+            CloseInventoryTransaction(playerId);
+
+            foreach (int slot in slots)
+                MarkInventoryChanged(playerId, player.SessionId, slot);
+
+            return conserved
+                ? InventoryTransactionOutcome.Committed
+                : InventoryTransactionOutcome.RolledBack;
+        }
+    }
+
+    /// <summary>
+    /// 守恒校验：把暂存意图叠加到权威背包后，每个 (物品, 前缀) 的总数量必须与权威值一致。
+    /// 权威侧含一切外部变更（/give、拾取、开袋、箱子转移），因此与外部变更冲突的暂存意图
+    /// 会因总量对不上而自然回滚，无需额外的版本号或冲突表。
+    /// </summary>
+    private static bool IsInventoryConserved(PlayerRuntime player)
+    {
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int>();
+        var proposed = new Dictionary<(int ItemId, byte Prefix), int>();
+
+        for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+        {
+            int itemId = player.Items[slot];
+            int stack = player.ItemStacks[slot];
+            byte prefix = player.ItemPrefixes[slot];
+            if (itemId != 0 && stack > 0)
+            {
+                var key = (itemId, prefix);
+                authoritative[key] = authoritative.GetValueOrDefault(key) + stack;
+            }
+
+            if (player.PendingInventoryChanges.TryGetValue(slot, out var staged))
+            {
+                itemId = staged.Stack > 0 ? staged.ItemId : 0;
+                stack = staged.Stack > 0 ? staged.Stack : 0;
+                prefix = staged.Stack > 0 ? staged.Prefix : (byte)0;
+            }
+            if (itemId != 0 && stack > 0)
+            {
+                var key = (itemId, prefix);
+                proposed[key] = proposed.GetValueOrDefault(key) + stack;
+            }
+        }
+
+        if (authoritative.Count != proposed.Count) return false;
+        foreach (var (key, total) in authoritative)
+            if (!proposed.TryGetValue(key, out int proposedTotal) || proposedTotal != total)
+                return false;
+
+        return true;
+    }
+
+    // ---- SSC 箱子守恒事务（包 32 窗口聚合 → 守恒校验 → 提交 / 回滚）----
+
+    public object ChestTransactionLock { get; } = new();
+    private readonly HashSet<int> _chestTransactionPlayers = new();
+
+    /// <summary>标记该玩家存在未结算的箱子事务（窗口内聚合，到期后校验守恒）。</summary>
+    public void MarkChestTransactionOpen(int playerId)
+    {
+        lock (ChestTransactionLock) _chestTransactionPlayers.Add(playerId);
+    }
+
+    /// <summary>取出一批存在未结算箱子事务的玩家（不移除；由 <see cref="TryCommitChestTransaction"/> 结算时移除）。</summary>
+    public List<int> SnapshotChestTransactionPlayers(int max)
+    {
+        if (max <= 0) return new List<int>();
+        lock (ChestTransactionLock)
+        {
+            var result = new List<int>(Math.Min(max, _chestTransactionPlayers.Count));
+            foreach (int playerId in _chestTransactionPlayers)
+            {
+                result.Add(playerId);
+                if (result.Count >= max) break;
+            }
+            return result;
+        }
+    }
+
+    private void CloseChestTransaction(int playerId)
+    {
+        lock (ChestTransactionLock) _chestTransactionPlayers.Remove(playerId);
+    }
+
+    /// <summary>
+    /// 为箱子事务建立守恒基准：窗口开始时「玩家权威背包 ∪ 该箱子全部内容」按 (物品, 前缀) 的总堆叠。
+    /// 调用方需持 <see cref="ChestsLock"/>（<see cref="FindChestByIndex"/> 的约定）。
+    /// </summary>
+    public void BeginChestTransaction(PlayerRuntime player, int chestIndex)
+    {
+        player.ChestTransactionBaseline.Clear();
+        for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            AddTotals(player.ChestTransactionBaseline,
+                player.Items[slot], player.ItemStacks[slot], player.ItemPrefixes[slot]);
+
+        var chest = FindChestByIndex(chestIndex);
+        if (chest is null) return;
+        foreach (var item in chest.Items)
+            AddTotals(player.ChestTransactionBaseline, item.Type, item.Stack, item.Prefix);
+    }
+
+    /// <summary>
+    /// 若当前没有以 <paramref name="chestIndex"/> 为目标的箱子事务，则重开窗口并重取守恒基准
+    /// （会话切换 / 切换到别的箱子 / 上一窗口已结算都视为重开）。调用方需持 <see cref="ChestsLock"/>。
+    /// </summary>
+    public void EnsureChestTransaction(PlayerRuntime player, int chestIndex, long tick)
+    {
+        bool newTransaction = (player.PendingChestChanges.Count == 0 && player.PendingChestInventoryChanges.Count == 0)
+            || player.ChestTransactionSessionId != player.SessionId
+            || player.ChestTransactionChestIndex != chestIndex;
+        if (!newTransaction) return;
+
+        player.PendingChestChanges.Clear();
+        player.PendingChestInventoryChanges.Clear();
+        player.ChestTransactionSessionId = player.SessionId;
+        player.ChestTransactionChestIndex = chestIndex;
+        player.ChestTransactionStartTick = tick;
+        BeginChestTransaction(player, chestIndex);
+    }
+
+    private static void AddTotals(
+        Dictionary<(int ItemId, byte Prefix), int> totals, int itemId, int stack, byte prefix)
+    {
+        if (itemId == 0 || stack <= 0) return;
+        var key = (itemId, prefix);
+        totals[key] = totals.GetValueOrDefault(key) + stack;
+    }
+
+    /// <summary>
+    /// 结算到期的箱子事务（SSC）：窗口内客户端上报的箱子槽位意图按「玩家背包 ∪ 该箱子」守恒整体提交或回滚。
+    /// 守恒 = 对每个 (物品, 前缀)，把暂存意图叠加到该箱子上后的总量与窗口开始时的权威总量完全一致——
+    /// 箱内整理 / 交换保持总量不变；凭空造物或销毁必然破坏总量。
+    /// 无论提交还是回滚，都会把箱子最终值标记回写给已打开该箱子的玩家（提交为幂等确认，回滚为纠正）。
+    /// 未到期 / 无暂存 / 会话已切换 / 玩家离线时返回 <see cref="InventoryTransactionOutcome.None"/>。
+    /// </summary>
+    public InventoryTransactionOutcome TryCommitChestTransaction(int playerId, int windowTicks)
+    {
+        PlayerRuntime? player;
+        lock (PlayersLock)
+        {
+            Players.TryGetValue(playerId, out player);
+            if (player is null)
+            {
+                CloseChestTransaction(playerId);
+                return InventoryTransactionOutcome.None;
+            }
+
+            if (player.PendingChestChanges.Count == 0 && player.PendingChestInventoryChanges.Count == 0)
+            {
+                CloseChestTransaction(playerId);
+                return InventoryTransactionOutcome.None;
+            }
+
+            // 会话切换 / 离线：暂存意图基于上一会话，直接丢弃而不是结算
+            if (player.ChestTransactionSessionId != player.SessionId || !player.Active)
+            {
+                player.PendingChestChanges.Clear();
+                player.PendingChestInventoryChanges.Clear();
+                player.ChestTransactionStartTick = -1;
+                player.ChestTransactionChestIndex = -1;
+                player.ChestTransactionBaseline.Clear();
+                CloseChestTransaction(playerId);
+                return InventoryTransactionOutcome.None;
+            }
+
+            if (Tick - player.ChestTransactionStartTick < windowTicks)
+                return InventoryTransactionOutcome.None;   // 窗口未到期，继续聚合
+
+            int chestIndex = player.ChestTransactionChestIndex;
+            var stagedChestSlots = new List<int>();
+            var stagedInventorySlots = player.PendingChestInventoryChanges.Keys.ToArray();
+            bool conserved = false;
+
+            lock (ChestsLock)
+            {
+                var chest = FindChestByIndex(chestIndex);
+                if (chest is not null)
+                {
+                    conserved = IsChestConserved(player, chest, chestIndex);
+                    if (conserved)
+                    {
+                        // 背包侧与箱子侧同属一次转移：一起提交才能保持「玩家背包 ∪ 箱子」总量不变。
+                        foreach (var (slot, staged) in player.PendingChestInventoryChanges)
+                        {
+                            if (slot < 0 || slot >= PlayerRuntime.InventorySlotCount) continue;
+                            player.Items[slot] = staged.Stack > 0 ? staged.ItemId : 0;
+                            player.ItemStacks[slot] = staged.Stack > 0 ? staged.Stack : 0;
+                            player.ItemPrefixes[slot] = staged.Stack > 0 ? staged.Prefix : (byte)0;
+                        }
+                        player.RecalculateDefense();
+
+                        foreach (var ((changedChest, slot), staged) in player.PendingChestChanges)
+                        {
+                            if (changedChest != chestIndex || slot < 0 || slot >= chest.Items.Length)
+                                continue;
+                            chest.Items[slot] = staged.Stack > 0
+                                ? new ChestItem
+                                {
+                                    Type = staged.ItemId,
+                                    Stack = (short)staged.Stack,
+                                    Prefix = staged.Prefix,
+                                }
+                                : new ChestItem();
+                        }
+                    }
+
+                    foreach (var (changedChest, slot) in player.PendingChestChanges.Keys)
+                        if (changedChest == chestIndex)
+                            stagedChestSlots.Add(slot);
+                }
+            }
+
+            player.PendingChestChanges.Clear();
+            player.PendingChestInventoryChanges.Clear();
+            player.ChestTransactionStartTick = -1;
+            player.ChestTransactionChestIndex = -1;
+            player.ChestTransactionBaseline.Clear();
+            CloseChestTransaction(playerId);
+
+            if (chestIndex >= 0)
+            {
+                MarkPersistChest(chestIndex);
+                foreach (int slot in stagedChestSlots)
+                    MarkChestChanged(chestIndex, slot);
+            }
+
+            // 背包侧槽位同样回写本人（提交为幂等确认，回滚为纠正）
+            foreach (int slot in stagedInventorySlots)
+                MarkInventoryChanged(playerId, player.SessionId, slot);
+
+            return conserved
+                ? InventoryTransactionOutcome.Committed
+                : InventoryTransactionOutcome.RolledBack;
+        }
+    }
+
+    /// <summary>
+    /// 箱子守恒校验：把暂存意图叠加到「该箱子 ∪ 玩家背包」后，与窗口开始时的
+    /// (物品, 前缀) 总堆叠逐项一致。背包侧优先取本窗口暂存的意图（背包 ↔ 箱子拖拽的包 5 半边），
+    /// 未暂存的槽位取权威值——因此与外部变更（/give、拾取、其他玩家操作箱子）冲突的意图
+    /// 会因总量对不上而自然回滚。
+    /// </summary>
+    private static bool IsChestConserved(PlayerRuntime player, Chest chest, int chestIndex)
+    {
+        var baseline = player.ChestTransactionBaseline;
+        var proposed = new Dictionary<(int ItemId, byte Prefix), int>();
+
+        for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+        {
+            int itemId = player.Items[slot];
+            int stack = player.ItemStacks[slot];
+            byte prefix = player.ItemPrefixes[slot];
+
+            if (player.PendingChestInventoryChanges.TryGetValue(slot, out var stagedInventory))
+            {
+                itemId = stagedInventory.Stack > 0 ? stagedInventory.ItemId : 0;
+                stack = stagedInventory.Stack > 0 ? stagedInventory.Stack : 0;
+                prefix = stagedInventory.Stack > 0 ? stagedInventory.Prefix : (byte)0;
+            }
+
+            AddTotals(proposed, itemId, stack, prefix);
+        }
+
+        for (int slot = 0; slot < chest.Items.Length; slot++)
+        {
+            int itemId = chest.Items[slot].Type;
+            int stack = chest.Items[slot].Stack;
+            byte prefix = chest.Items[slot].Prefix;
+            if (player.PendingChestChanges.TryGetValue((chestIndex, slot), out var staged))
+            {
+                itemId = staged.Stack > 0 ? staged.ItemId : 0;
+                stack = staged.Stack > 0 ? staged.Stack : 0;
+                prefix = staged.Stack > 0 ? staged.Prefix : (byte)0;
+            }
+
+            AddTotals(proposed, itemId, stack, prefix);
+        }
+
+        if (baseline.Count != proposed.Count) return false;
+        foreach (var (key, total) in baseline)
+            if (!proposed.TryGetValue(key, out int proposedTotal) || proposedTotal != total)
+                return false;
+
+        return true;
+    }
+
+    // ---- 对话 NPC 变更推送（仿真接受包 40 后生成原版包 40，中继给其他玩家）----
+
+    public object PlayerTalkNpcLock { get; } = new();
+    private readonly HashSet<int> _pendingPlayerTalkNpc = new();
+
+    /// <summary>标记玩家对话的城镇 NPC 已由服务端权威更新，向其他玩家中继包 40。</summary>
+    public void MarkPlayerTalkNpcChanged(int playerId)
+    {
+        lock (PlayerTalkNpcLock) _pendingPlayerTalkNpc.Add(playerId);
+    }
+
+    public List<int> DrainPlayerTalkNpcChanged(int max)
+    {
+        if (max <= 0)
+            return new List<int>();
+
+        lock (PlayerTalkNpcLock)
+        {
+            var result = new List<int>(Math.Min(max, _pendingPlayerTalkNpc.Count));
+            foreach (var playerId in _pendingPlayerTalkNpc)
+            {
+                result.Add(playerId);
+                if (result.Count >= max) break;
+            }
+            foreach (var playerId in result) _pendingPlayerTalkNpc.Remove(playerId);
+            return result;
+        }
+    }
+
+    // ---- 增益列表变更推送（仿真移除增益后生成原版包 50）----
     public object PlayerBuffsLock { get; } = new();
     private readonly HashSet<int> _pendingPlayerBuffs = new();
 
@@ -1727,6 +2081,19 @@ public sealed class WorldState
     }
 }
 
+/// <summary>SSC 背包事务的结算结果。</summary>
+public enum InventoryTransactionOutcome
+{
+    /// <summary>无待结算事务（无暂存 / 窗口未到期 / 会话已切换）。</summary>
+    None,
+
+    /// <summary>守恒校验通过：客户端整理结果已提交为服务端权威状态。</summary>
+    Committed,
+
+    /// <summary>守恒校验失败：暂存意图已丢弃，权威槽位已标记回写纠正客户端。</summary>
+    RolledBack,
+}
+
 /// <summary>
 /// 玩家运行时状态（服务端权威唯一真相）：位置 / 速度由仿真推进，生命由战斗阶段结算。
 /// </summary>
@@ -1793,6 +2160,57 @@ public sealed class PlayerRuntime
     /// 阶段 E 近战武器校验据此定位玩家当前武器。
     /// </summary>
     public int SelectedSlot;
+
+    /// <summary>
+    /// 当前对话的城镇 NPC 槽位（原版 <c>Player.talkNPC</c>，包 40 权威更新；-1 = 未对话）。
+    /// 纯表现状态：服务端持有唯一真相并中继给其他玩家，不参与任何数值结算。
+    /// </summary>
+    public int TalkNpc = -1;
+
+    // ---- SSC 背包守恒事务（包 5 的窗口聚合）----
+
+    /// <summary>
+    /// 背包事务窗口内客户端上报的槽位意图：槽位 → (物品, 堆叠, 前缀)。
+    /// 窗口到期前不写入 <see cref="Items"/>；由守恒校验决定整体提交或回滚。
+    /// </summary>
+    public readonly Dictionary<int, (int ItemId, int Stack, byte Prefix)> PendingInventoryChanges = new();
+
+    /// <summary>背包事务窗口起点 tick（-1 = 无进行中的事务）。</summary>
+    public long InventoryTransactionStartTick = -1;
+
+    /// <summary>背包事务所属会话（会话切换后丢弃上一会话的暂存意图；-1 = 尚未建立）。</summary>
+    public long InventoryTransactionSessionId = -1;
+
+    // ---- SSC 箱子守恒事务（包 32 的窗口聚合）----
+
+    /// <summary>
+    /// 箱子事务窗口内客户端上报的槽位意图：(箱子索引, 槽位) → (物品, 堆叠, 前缀)。
+    /// 窗口到期前不写入箱子；由「玩家背包 ∪ 该箱子」守恒校验决定整体提交或回滚。
+    /// </summary>
+    public readonly Dictionary<(int ChestIndex, int Slot), (int ItemId, int Stack, byte Prefix)> PendingChestChanges = new();
+
+    /// <summary>
+    /// 箱子事务窗口内客户端上报的**背包**槽位意图：槽位 → (物品, 堆叠, 前缀)。
+    /// 原版在「背包 ↔ 箱子」之间拖拽时会同时发包 5（背包侧）与包 32（箱子侧）——
+    /// 若两侧各自独立做守恒校验，存入箱子会让背包总量减少、箱子总量增加，两边都会被判不守恒而回滚。
+    /// 因此开箱期间包 5 不进入背包事务，而是与本窗口的包 32 合并，按「玩家背包 ∪ 该箱子」整体守恒结算。
+    /// </summary>
+    public readonly Dictionary<int, (int ItemId, int Stack, byte Prefix)> PendingChestInventoryChanges = new();
+
+    /// <summary>箱子事务窗口起点 tick（-1 = 无进行中的事务）。</summary>
+    public long ChestTransactionStartTick = -1;
+
+    /// <summary>箱子事务所属会话（会话切换后丢弃上一会话的暂存意图；-1 = 尚未建立）。</summary>
+    public long ChestTransactionSessionId = -1;
+
+    /// <summary>箱子事务目标箱子索引（-1 = 未建立；同一窗口内切换到别的箱子会重开事务）。</summary>
+    public int ChestTransactionChestIndex = -1;
+
+    /// <summary>
+    /// 箱子事务守恒基准：窗口开始时「玩家权威背包 ∪ 该箱子全部内容」按 (物品, 前缀) 的总堆叠数。
+    /// 提交前把暂存意图叠加到箱子上后，各 (物品, 前缀) 总量必须与基准完全一致。
+    /// </summary>
+    public readonly Dictionary<(int ItemId, byte Prefix), int> ChestTransactionBaseline = new();
 
     /// <summary>装备区槽位闭区间 [0, 8]：0-2 头盔/胸甲/护腿、3-7 饰品、8 盾牌（原版给防御的装备区）。</summary>
     public const int EquipmentSlotStart = 0;

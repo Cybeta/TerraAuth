@@ -207,6 +207,48 @@ public class VanillaFeatureTests
         return condition();
     }
 
+    /// <summary>
+    /// 结算 SSC 背包守恒事务：先等客户端的包 5 经 TCP + 管线进入事务窗口，再推进仿真使窗口
+    /// （15 tick）到期，最后显式驱动一次结算 —— 测试夹具只跑 <c>Simulator.Tick()</c>，
+    /// 不运行 GameHost 的 flush 循环，故 <c>FlushInventoryTransactionsAsync</c> 须手动调用。
+    /// </summary>
+    private static async Task<bool> SettleInventoryTransactionAsync(
+        VanillaServer server, PlayerRuntime player, TimeSpan timeout)
+    {
+        var world = server.Host.Simulator.State;
+
+        // 包 5 的到达是异步的（TCP 读 → 管线 → 命令队列 → 下一 tick Apply），
+        // 必须等暂存意图真正出现后再读窗口起始 tick，否则会按 -1 提前结算。
+        await TickUntilAsync(server, () => player.PendingInventoryChanges.Count > 0, timeout);
+        if (player.PendingInventoryChanges.Count == 0) return true;   // 无暂存：无需结算
+
+        long startTick = player.InventoryTransactionStartTick;
+        await TickUntilAsync(server, () => world.Tick >= startTick + 16, timeout);
+        await server.Host.FlushInventoryTransactionsAsync();
+        return player.PendingInventoryChanges.Count == 0;
+    }
+
+    /// <summary>
+    /// 结算 SSC 箱子守恒事务：等包 32 / 包 5 进入窗口后推进到窗口到期，再显式驱动一次结算
+    /// （测试夹具不运行 GameHost 的 flush 循环，故须手动调用 FlushChestTransactionsAsync）。
+    /// </summary>
+    private static async Task<bool> SettleChestTransactionAsync(
+        VanillaServer server, PlayerRuntime player, TimeSpan timeout)
+    {
+        var world = server.Host.Simulator.State;
+
+        await TickUntilAsync(server,
+            () => player.PendingChestChanges.Count > 0 || player.PendingChestInventoryChanges.Count > 0,
+            timeout);
+        if (player.PendingChestChanges.Count == 0 && player.PendingChestInventoryChanges.Count == 0)
+            return true;   // 无暂存：无需结算
+
+        long startTick = player.ChestTransactionStartTick;
+        await TickUntilAsync(server, () => world.Tick >= startTick + 16, timeout);
+        await server.Host.FlushChestTransactionsAsync();
+        return player.PendingChestChanges.Count == 0 && player.PendingChestInventoryChanges.Count == 0;
+    }
+
     /// <summary>等待权威层出现指定拒绝原因（Prometheus 计数器）。</summary>
     private static async Task<bool> WaitForRejectAsync(VanillaServer server, string reason, TimeSpan timeout)
     {
@@ -455,19 +497,151 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task AntiCheat_Ssc_Rejects_ClientInventorySnapshot()
+    public async Task AntiCheat_Ssc_Forged_InventorySnapshot_Is_Rolled_Back()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
         var world = server.Host.Simulator.State;
         var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
 
         // 合法 ID 与堆叠数也不能由客户端包 5 注入；757 是泰拉刃。
+        // A2 背包守恒事务：包 5 先进入事务窗口暂存，窗口到期后守恒校验失败 → 回滚。
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 757, 1));
 
-        Assert.True(await WaitForRejectAsync(server, "inventory_snapshot_forbidden", TimeSpan.FromSeconds(5)),
-            "SSC 未拒绝客户端背包快照");
+        Assert.True(await TickUntilAsync(server, () => player.PendingInventoryChanges.ContainsKey(0),
+            TimeSpan.FromSeconds(5)), "客户端包 5 未被暂存进背包事务");
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算（窗口到期后应提交或回滚）");
+
+        // 凭空造物破坏守恒 → 回滚：权威背包与防御均不得被改写
         Assert.Equal(0, player.Items[0]);
+        Assert.Equal(0, player.ItemStacks[0]);
+        Assert.Equal(0, player.Defense);
+    }
+
+    /// <summary>
+    /// A2 背包守恒事务：原版拖拽 / 拆分会在同一窗口内发出多个包 5（如 10 个泥土拆成 6+4）。
+    /// 总量守恒 → 服务端必须**提交**客户端的整理结果（逐包回正会让玩家无法整理背包），
+    /// 并把权威值回写本人确认。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_InventoryDrag_Is_Accepted_And_Conserved()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 服务端权威背包：槽 50 有 10 个泥土（物品 40）
+        player.Items[50] = 40;
+        player.ItemStacks[50] = 10;
+
+        // 客户端拖拽拆分：槽 50 留 6 个、槽 51 放 4 个（总量守恒）
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 40, 6));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(51, 40, 4));
+
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+
+        // 守恒 → 提交：服务端接受整理结果
+        Assert.Equal(40, player.Items[50]);
+        Assert.Equal(6, player.ItemStacks[50]);
+        Assert.Equal(40, player.Items[51]);
+        Assert.Equal(4, player.ItemStacks[51]);
+
+        // 权威值回写本人（包 5）：客户端据此确认最终结果
+        await server.Host.FlushInventoryUpdatesAsync();
+        var written = await s.ReadUntilAsync(p => p is InventorySlotPacket { Slot: 51 }, TimeSpan.FromSeconds(5));
+        Assert.Contains(written, p => p is InventorySlotPacket { Slot: 50, ItemId: 40, Stack: 6 });
+        Assert.Contains(written, p => p is InventorySlotPacket { Slot: 51, ItemId: 40, Stack: 4 });
+    }
+
+    /// <summary>
+    /// B2：开宝藏袋不得给整包建立静默屏障。原版开袋后会继续上报其它槽位（奖励入包 / 后续整理），
+    /// 若这些包被静默丢弃，玩家会看到背包「卡住」；此处验证开袋同时另一槽位的守恒整理仍被提交。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_TreasureBag_DoesNotSilenceOtherSlots()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 服务端权威背包：槽 40 = 眼魔宝袋，槽 50/51 = 待整理的泥土
+        player.Items[40] = 3319;
+        player.ItemStacks[40] = 1;
+        player.Items[50] = 40;
+        player.ItemStacks[50] = 10;
+        player.Items[51] = 40;
+        player.ItemStacks[51] = 4;
+
+        // 客户端清空袋槽（触发权威开袋）+ 同一窗口内整理其它槽位（10/4 → 6/8，守恒）
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(40, 0, 0));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 40, 6));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(51, 40, 8));
+
+        Assert.True(await TickUntilAsync(server, () => player.Items[40] == 0 && player.ItemStacks[40] == 0,
+            TimeSpan.FromSeconds(5)), "宝袋未被权威开袋");
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+
+        // 其它槽位的守恒整理被提交（未被开袋屏障静默丢弃）
+        Assert.Equal(40, player.Items[50]);
+        Assert.Equal(6, player.ItemStacks[50]);
+        Assert.Equal(40, player.Items[51]);
+        Assert.Equal(8, player.ItemStacks[51]);
+
+        // 奖励已由服务端生成（腐化 / 猩红世界的矿物，堆叠 30..90）
+        Assert.Contains(Enumerable.Range(0, PlayerRuntime.InventorySlotCount).Select(i => player.Items[i]),
+            id => id is 56 or 880);
+    }
+
+    /// <summary>
+    /// 正常游玩边界：客户端常规背包操作（整理 / 拆分 / 合并）都属守恒行为，
+    /// 即使连续超出违规阈值次数，也不得累计违规把玩家踢出（A2 的 Accept 分流不含违规计数）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_ClientIsNotKicked_After_NormalInventoryOps()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 服务端权威背包：两个泥土堆叠，反复在两槽之间来回搬运（每次总量守恒）
+        player.Items[50] = 40;
+        player.ItemStacks[50] = 10;
+        player.Items[51] = 40;
+        player.ItemStacks[51] = 0;
+
+        for (int round = 0; round < 15; round++)
+        {
+            bool forward = round % 2 == 0;
+            int left = forward ? 4 : 10;
+            int right = forward ? 6 : 0;
+            await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 40, left));
+            await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(51, right > 0 ? 40 : 0, right));
+            await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5));
+        }
+
+        // 15 轮操作（≥ 违规阈值 10）后玩家仍在线：守恒操作不产生违规累计
+        Assert.True(world.Players.TryGetValue(1, out var runtime) && runtime.Active,
+            "正常背包操作后玩家被踢出");
+        Assert.DoesNotContain("slot_rejected", MetricsText(server));
+
+        // 且连接仍可用：后续合法移动仍被权威应用
+        await Task.Delay(300);
+        var from = world.Players[1].Position;
+        var targetX = from.X + 24f;
+        await s.SendAsync(PacketId.PlayerPosition, new PlayerControlsPacket(1, new Vector2(targetX, from.Y)));
+        Assert.True(await TickUntilAsync(server,
+            () => world.Players.TryGetValue(1, out var p) && MathF.Abs(p.Position.X - targetX) < 2f,
+            TimeSpan.FromSeconds(5)), "正常背包操作后连接不可用");
     }
 
     [Fact]
@@ -1854,40 +2028,98 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task AntiCheat_Ssc_Rejects_ClientChestSnapshot()
+    public async Task AntiCheat_Ssc_Forged_ChestSnapshot_Is_Rolled_Back()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
         var world = server.Host.Simulator.State;
+        var player = world.Players[1];
         await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
         int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY);
 
+        // 打开箱子建立会话后，客户端凭空上报箱子槽位（合法物品 ID 也不行）：
+        // 箱子守恒事务窗口到期时「玩家背包 ∪ 箱子」总量对不上 → 回滚。
         await s.SendAsync(PacketId.Chest,
             new ChestPacket(world.SpawnTileX, world.SpawnTileY));
+        Assert.True(await TickUntilAsync(server, () => world.HasChestSession(1, index),
+            TimeSpan.FromSeconds(5)), "箱子会话未建立");
         await s.SendAsync(PacketId.SyncChestItem,
             new SyncChestItemPacket(index, ItemSlot: 3, Stack: 1, Prefix: 0, ItemType: 757));
 
-        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
-            "SSC 未拒绝客户端箱子快照");
+        Assert.True(await TickUntilAsync(server, () => player.PendingChestChanges.Count > 0,
+            TimeSpan.FromSeconds(5)), "客户端包 32 未被暂存进箱子事务");
+        Assert.True(await SettleChestTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "箱子事务未结算");
+
         Assert.Equal(0, world.Chests[index].Items[3].Stack);
     }
 
     [Fact]
-    public async Task AntiCheat_Ssc_Rejects_ChestSnapshot_From_An_OpenSession()
+    public async Task Vanilla_ChestItem_Rearrange_Is_Conserved_And_Committed()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
         var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY, (5, 10));
+
+        // 箱内整理（槽 0 的 10 个泥土拆成槽 0 留 4 + 槽 1 放 6）：总量守恒 → 必须提交，
+        // 否则玩家无法在箱内整理物品。
+        await s.SendAsync(PacketId.Chest, new ChestPacket(world.SpawnTileX, world.SpawnTileY));
+        Assert.True(await TickUntilAsync(server, () => world.HasChestSession(1, index),
+            TimeSpan.FromSeconds(5)), "箱子会话未建立");
+        await s.SendAsync(PacketId.SyncChestItem,
+            new SyncChestItemPacket(index, ItemSlot: 0, Stack: 4, Prefix: 0, ItemType: 5));
+        await s.SendAsync(PacketId.SyncChestItem,
+            new SyncChestItemPacket(index, ItemSlot: 1, Stack: 6, Prefix: 0, ItemType: 5));
+
+        Assert.True(await SettleChestTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "箱子事务未结算");
+
+        Assert.Equal(4, world.Chests[index].Items[0].Stack);
+        Assert.Equal(6, world.Chests[index].Items[1].Stack);
+    }
+
+    /// <summary>
+    /// C2：背包 → 箱子的单槽转移。原版拖拽会同时发出包 5（背包侧清空）与包 32（箱子侧填入），
+    /// 两者必须归入同一个箱子事务按「玩家背包 ∪ 该箱子」守恒结算 ——
+    /// 若背包侧单独走背包事务，会因背包总量减少而被判不守恒回滚，存入箱子永远不生效。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_ChestDeposit_FromInventory_Is_Accepted_And_Conserved()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
         await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
         int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY);
 
-        await s.SendAsync(PacketId.Chest, new ChestPacket(world.SpawnTileX, world.SpawnTileY));
-        await s.SendAsync(PacketId.SyncChestItem,
-            new SyncChestItemPacket(index, ItemSlot: 3, Stack: 7, Prefix: 0, ItemType: 5));
+        // 服务端权威背包：槽 50 有 10 个泥土
+        player.Items[50] = 40;
+        player.ItemStacks[50] = 10;
 
-        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
-            "打开箱子后仍接受客户端箱子快照");
-        Assert.Equal(0, world.Chests[index].Items[3].Stack);
+        await s.SendAsync(PacketId.Chest, new ChestPacket(world.SpawnTileX, world.SpawnTileY));
+
+        // 必须等 OpenChestCommand 在仿真提交阶段建立会话后再发包 5：
+        // 开箱期间包 5 才归入箱子事务，否则会走背包事务（本用例正是在验证这条分流）。
+        Assert.True(await TickUntilAsync(server, () => world.HasChestSession(1, index),
+            TimeSpan.FromSeconds(5)), "箱子会话未建立");
+
+        // 背包侧清空（包 5）+ 箱子侧填入（包 32）：一次转移的两半
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 0, 0));
+        await s.SendAsync(PacketId.SyncChestItem,
+            new SyncChestItemPacket(index, ItemSlot: 3, Stack: 10, Prefix: 0, ItemType: 40));
+
+        Assert.True(await SettleChestTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "箱子事务未结算");
+
+        Assert.Equal(0, player.Items[50]);
+        Assert.Equal(0, player.ItemStacks[50]);
+        Assert.Equal(40, world.Chests[index].Items[3].Type);
+        Assert.Equal(10, world.Chests[index].Items[3].Stack);
+        Assert.Empty(player.PendingInventoryChanges);   // 背包事务不得介入开箱期间的包 5
     }
 
     [Fact]
@@ -1902,8 +2134,8 @@ public class VanillaFeatureTests
         await s.SendAsync(PacketId.SyncChestItem,
             new SyncChestItemPacket(index, ItemSlot: 200, Stack: 1, Prefix: 0, ItemType: 1));
 
-        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
-            "SSC 未在检查槽位前拒绝客户端箱子快照");
+        Assert.True(await WaitForRejectAsync(server, "invalid_slot", TimeSpan.FromSeconds(5)),
+            "箱子槽位越界未被拒绝");
     }
 
     [Fact]
@@ -1920,8 +2152,39 @@ public class VanillaFeatureTests
         await s.SendAsync(PacketId.SyncChestItem,
             new SyncChestItemPacket(index, ItemSlot: 0, Stack: 1, Prefix: 0, ItemType: 1));
 
-        Assert.True(await WaitForRejectAsync(server, "chest_snapshot_forbidden", TimeSpan.FromSeconds(5)),
-            "SSC 未在检查距离前拒绝客户端箱子快照");
+        Assert.True(await WaitForRejectAsync(server, "out_of_reach", TimeSpan.FromSeconds(5)),
+            "超出交互距离的箱子写入未被拒绝");
+    }
+
+    /// <summary>
+    /// 原版「快速堆叠」按钮（包 85）：客户端上报来源背包槽位 + smartStack，服务端按当前打开的箱子
+    /// 自行规划装箱，不接受客户端提交的最终快照。此处验证 smartStack 只并入已有同类堆叠。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_ChestQuickStack_IsAccepted()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+        int index = AddTestChest(server, world.SpawnTileX, world.SpawnTileY, (5, 5));
+
+        // 背包槽 9 有 7 个泥土（物品 5）：快速堆叠应并入箱子已有堆叠
+        player.Items[9] = 5;
+        player.ItemStacks[9] = 7;
+
+        await s.SendAsync(PacketId.Chest, new ChestPacket(world.SpawnTileX, world.SpawnTileY));
+        Assert.True(await TickUntilAsync(server, () => world.HasChestSession(1, index),
+            TimeSpan.FromSeconds(5)), "箱子会话未建立");
+
+        await s.SendAsync(PacketId.QuickStackChests, new QuickStackChestsPacket(new[] { 9 }, SmartStack: true));
+
+        Assert.True(await TickUntilAsync(server,
+            () => world.Chests[index].Items[0].Stack == 12 && player.Items[9] == 0,
+            TimeSpan.FromSeconds(5)), "快速堆叠未被服务端执行");
+
+        Assert.DoesNotContain("quickstack_rejected", MetricsText(server));
     }
 
     [Fact]
@@ -2440,17 +2703,23 @@ public class VanillaFeatureTests
     }
 
     [Fact]
-    public async Task AntiCheat_Ssc_Rejects_ClientArmorSnapshot()
+    public async Task AntiCheat_Ssc_Forged_ArmorSnapshot_Is_Rolled_Back()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
-        var player = server.Host.Simulator.State.Players[1];
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
 
         // 客户端不能通过装备槽包 5 获得防御或套装效果。
+        // A2 背包守恒事务：窗口内暂存 → 到期守恒校验失败 → 回滚（防御不生效）。
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(0, 89, 1));
 
-        Assert.True(await WaitForRejectAsync(server, "inventory_snapshot_forbidden", TimeSpan.FromSeconds(5)),
-            "SSC 未拒绝客户端装备槽快照");
+        Assert.True(await TickUntilAsync(server, () => player.PendingInventoryChanges.ContainsKey(0),
+            TimeSpan.FromSeconds(5)), "客户端装备槽包 5 未被暂存");
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+
         Assert.Equal(0, player.Items[0]);
         Assert.Equal(0, player.Defense);
     }
@@ -2585,6 +2854,73 @@ public class VanillaFeatureTests
         Assert.Equal(1, corrected.PlayerId);
         Assert.Equal(200, corrected.MaxMana);
         Assert.Equal(200, corrected.Mana);
+    }
+
+    /// <summary>
+    /// 包 40 SyncTalkNPC：服务端持有对话目标唯一真相，并把变化中继给**其他**玩家
+    /// （原版 ignoreClient = whoAmI，不回发本人）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_TalkNpc_Is_Tracked_Server_Side_And_Relayed_To_Others()
+    {
+        using var server = VanillaServer.Start();
+        await using var a = await server.ConnectAsync("Alice");
+        await using var b = await server.ConnectAsync("Bee");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, a, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        int townIndex;
+        lock (world.NpcsLock)
+        {
+            var npc = new WorldNpc
+            {
+                Type = 22,
+                NetId = 22,
+                Active = true,
+                IsTownNpc = true,
+                X = world.SpawnTileX * 16f + 8f,
+                Y = world.SpawnTileY * 16f - 8f,
+            };
+            world.Npcs.Add(npc);
+            townIndex = world.Npcs.IndexOf(npc);
+        }
+
+        // 包 40：客户端上报正在与城镇 NPC 对话（playerId 字段由服务端身份覆盖）
+        await a.SendAsync(PacketId.SyncTalkNPC, new SyncTalkNpcPacket(0, townIndex));
+
+        Assert.True(await TickUntilAsync(server, () => world.Players[1].TalkNpc == townIndex,
+            TimeSpan.FromSeconds(5)), "对话目标未被服务端跟踪");
+
+        await server.Host.FlushPlayerTalkNpcAsync();
+
+        var relayed = await b.ReadUntilAsync(p => p is SyncTalkNpcPacket, TimeSpan.FromSeconds(5));
+        var talk = Assert.Single(relayed.OfType<SyncTalkNpcPacket>());
+        Assert.Equal(1, talk.PlayerId);
+        Assert.Equal(townIndex, talk.TalkNpc);
+
+        // 原版中继排除发送者本人
+        var own = await a.ReadUntilAsync(p => p is SyncTalkNpcPacket, TimeSpan.FromMilliseconds(300));
+        Assert.DoesNotContain(own, p => p is SyncTalkNpcPacket);
+    }
+
+    /// <summary>包 40 越界索引：拒绝但按客户端行为噪声处理（不计违规、连接保持可用）。</summary>
+    [Fact]
+    public async Task Vanilla_Invalid_TalkNpc_Is_Rejected_Without_Violation()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 越界索引（≥ 原版 NPC 槽位总数 200）→ 拒绝且不改状态
+        await s.SendAsync(PacketId.SyncTalkNPC, new SyncTalkNpcPacket(0, 5000));
+
+        // 连接未被踢出：随后的合法法力包仍被处理
+        await s.SendAsync(PacketId.PlayerMana, new PlayerManaPacket(0, 30, 40));
+        Assert.True(await TickUntilAsync(server, () => world.Players[1].Mp == 30,
+            TimeSpan.FromSeconds(5)), "非法对话包后连接不可用（被误踢）");
+
+        Assert.Equal(-1, world.Players[1].TalkNpc);
     }
 
     [Fact]

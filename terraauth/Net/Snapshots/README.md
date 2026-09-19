@@ -71,14 +71,27 @@ if deviation > ShadowPredictionMaxDeviation → 可疑
 ### 6. 快照存储线程安全（`SnapshotStore`）
 
 仿真线程写入（`Add` / `TrimBefore`），网络线程读取（`Snapshot` / `Latest` / `Count`），二者并发。
-`SnapshotStore` 内部 `List<SnapshotFrame>` 全部经 `lock (_gate)` 保护，且**不暴露内部列表**：
-读取一律走 `Snapshot()` 返回的**一致视图副本**（`ToArray()`）。窗口判定、增量归并、追赶遍历都在同一份
-副本上完成，避免仿真线程插入其间导致漏帧、索引越界或枚举期「集合被修改」异常。
+`SnapshotStore` 内部为**定长环形数组**（字段 `_buf` / `_head` / `_count`，默认容量 300，即 15s @ 20Hz），
+全部经 `lock (_gate)` 保护，且**不暴露内部数组**：`Add` 未满时写入下一个逻辑槽，已满则覆写最旧槽并前移 `_head`；
+`TrimBefore` 仅前移 `_head` 并递减 `_count`，**不做元素搬移**。读取一律走 `Snapshot()` 返回的**一致视图副本**
+（按逻辑顺序逐槽复制到新数组）。窗口判定、增量归并、追赶遍历都在同一份副本上完成，避免仿真线程插入其间导致
+漏帧、索引越界或枚举期「集合被修改」异常。
 `LatestOrDefault` 在空 store 时返回 `null`（不抛异常），供仿真循环安全取上一帧。
 
-> **后续可能优化（暂不实施）**：`Snapshot()` 每次调用都 `ToArray()` 复制，而 `BuildFrameFor` 每玩家每轮
+> **后续可能优化（暂不实施）**：`Snapshot()` 每次调用都复制整个窗口，而 `BuildFrameFor` 每玩家每轮
 > `FlushAsync` 触发一次，复杂度 O(玩家 × 窗口帧数)。若实测成为瓶颈，可考虑按 tick 缓存一致视图，
 > 或引入不可变/持久化列表以消除复制（帧本身为不可变 record，需保证写入端不原地修改）。
+
+### 7. 帧拆分（`SnapshotConfig.MaxEntitiesPerPacket` / `SnapshotBroadcaster.SplitFrame`）
+
+单个快照帧的实体数可能很大，`SnapshotBroadcaster` 在下发前按 `SnapshotConfig.MaxEntitiesPerPacket`
+（默认 256，见 `Net/Snapshots/Snapshot.cs`）把帧拆成若干子帧，各自独立编码为一个快照包：
+
+- `Encode` 对 `SplitFrame(frame, MaxEntitiesPerPacket)` 返回的每个子帧调用 `IPacketEncoder.EncodeSnapshot`
+- `SplitFrame`：`maxPerPacket <= 0` 视为不限制（按 `int.MaxValue` 处理）；实体数未超限时原样返回单帧；
+  否则按 `maxPerPacket` 分块。每个子帧保留相同的 `Tick` / `BaseTick`，`Checksum` 由 `SnapshotFrame.Create`
+  按该子帧自身的实体与移除项重新计算
+- 帧自带的 `Removed` 并入首个子帧，避免产生无实体的子帧；客户端按各子帧独立解码
 
 ---
 

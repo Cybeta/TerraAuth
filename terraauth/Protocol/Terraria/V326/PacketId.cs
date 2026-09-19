@@ -43,6 +43,7 @@ public enum PacketId : byte
     SyncPlayerChestIndex = 34,  // 原版 SyncPlayerChestIndex：告知玩家当前打开的箱子索引（Byte 玩家 + Int16 箱子）
     PlayerHeal          = 35,   // 原版 PlayerHeal：治疗 / 回血事件
     SyncPlayerZone      = 36,   // 原版 SyncPlayerZone：生物群系 / 城镇 NPC 状态
+    SyncTalkNPC         = 40,   // 原版 SyncTalkNPC：玩家当前对话的城镇 NPC（Byte 玩家 + Int16 NPC 索引，-1 = 未对话）
     PlayerMana          = 42,   // 原版 PlayerMana：法力 / 法力上限
     InitialSpawn        = 49,   // 原版 InitialSpawn：无 payload
     PlayerBuffs         = 50,   // 原版 PlayerBuffs：增益 / 减益列表
@@ -52,6 +53,7 @@ public enum PacketId : byte
     RequestTeleportationByServer = 73, // 原版 RequestTeleportationByServer：回城药水 / 海螺等
     TilePlace           = 79,   // 原版 PlaceObject
     NetModule           = 82,   // 原版 LoadNetModule：模块帧（UInt16 moduleId + 模块负载；聊天走 NetTextModule）
+    QuickStackChests    = 85,   // 原版 QuickStackChests：客户端上报要快速堆叠的背包槽位 + smartStack
     PlayerHurtV2        = 117,  // 原版 PlayerHurtV2：玩家受击（含死亡原因）
     PlayerDeathV2       = 118,  // 原版 PlayerDeathV2：玩家死亡（含死亡原因）
     FinishedConnecting  = 129,  // 原版 FinishedConnectingToServer：无 payload

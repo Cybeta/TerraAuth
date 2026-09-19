@@ -2,6 +2,7 @@
 // 架构 §3.2 / §4.2：统一入站管线
 
 using System.Collections.Concurrent;
+using System.Threading;
 using TerraAuth.Protocol;
 using TerraAuth.Simulation;
 
@@ -27,6 +28,24 @@ public sealed record PacketContext(int PlayerId, long Tick, DateTimeOffset Recei
 internal sealed record OpenEyeOfCthulhuTreasureBagPacket(int Slot) : INetworkPacket
 {
     public PacketId Type => PacketId.InventorySlot;
+}
+
+/// <summary>
+/// SSC 背包守恒事务的内部暂存意图包：包 5 与服务端权威值不一致时由库存权威层转换，不来自网络解码。
+/// 终端阶段据此生成 <see cref="Simulation.StageInventorySlotCommand"/>，把客户端意图放进事务窗口。
+/// </summary>
+internal sealed record StageInventorySlotPacket(int Slot, int ItemId, int Stack, byte Prefix) : INetworkPacket
+{
+    public PacketId Type => PacketId.InventorySlot;
+}
+
+/// <summary>
+/// 快速堆叠到附近箱子（包 85）的内部意图包：库存权威层解析出玩家当前打开的箱子索引后转换，
+/// 终端阶段据此生成服务端规划的 <see cref="Simulation.BulkInventoryChestCommand"/>（客户端不能提交最终快照）。
+/// </summary>
+internal sealed record QuickStackChestsIntentPacket(int ChestIndex, IReadOnlyList<int> Slots, bool SmartStack) : INetworkPacket
+{
+    public PacketId Type => PacketId.QuickStackChests;
 }
 
 // ---------- 管线阶段 ----------
@@ -183,6 +202,12 @@ public sealed class WorldAuthorityStage : IPipelineStage
 public sealed class TerminalStage : IPipelineStage
 {
     public int Order => 1000;
+
+    /// <summary>服务端规划的箱子批量操作 ID 单调递增源（用于命令的幂等 / 重放保护）。</summary>
+    private static long _chestOperationSequence;
+
+    private static long NextChestOperationId() => Interlocked.Increment(ref _chestOperationSequence);
+
     public Task<AuthorityResult> ExecuteAsync(INetworkPacket packet, IPacketContext context,
         Func<INetworkPacket, Task<AuthorityResult>> next, CancellationToken ct)
     {
@@ -232,6 +257,9 @@ public sealed class TerminalStage : IPipelineStage
         // SSC 眼魔宝袋清空意图由库存权威层转换，终端阶段只映射为权威开袋命令。
         OpenEyeOfCthulhuTreasureBagPacket bag => new OpenEyeOfCthulhuTreasureBagCommand(
             context.Tick, context.PlayerId, bag.Slot),
+        // SSC 背包事务暂存意图 → 暂存命令（窗口到期后由守恒校验决定提交 / 回滚）
+        StageInventorySlotPacket staged => new StageInventorySlotCommand(context.Tick, context.PlayerId,
+            staged.Slot, staged.ItemId, staged.Stack, staged.Prefix),
         // 包 5 InventorySlot → 物品栏槽位写入（SSC 服务端唯一真相；装备区防御由此回填 Defense，前缀用于近战武器校验）
         InventorySlotPacket slot => new SetInventorySlotCommand(context.Tick, context.PlayerId,
             slot.Slot, slot.ItemId, slot.Stack, slot.Prefix),
@@ -240,9 +268,18 @@ public sealed class TerminalStage : IPipelineStage
         ChestPacket { X: < 0 } => new CloseChestCommand(context.Tick, context.PlayerId),
         ChestPacket { Y: < 0 } => new CloseChestCommand(context.Tick, context.PlayerId),
         ChestPacket chest => new OpenChestCommand(context.Tick, context.PlayerId, chest.X, chest.Y),
-        // 包 32 SyncChestItem → 箱子内物品写入（服务端持有箱子内容唯一真相）
-        SyncChestItemPacket chestItem => new SyncChestItemCommand(context.Tick, context.PlayerId,
+        // 包 32 SyncChestItem → 箱子守恒事务暂存意图（世界权威层校验通过后原样放行，
+        // 由 StageChestItemCommand 把客户端意图放进箱子事务窗口，窗口到期后按守恒提交 / 回滚）
+        SyncChestItemPacket chestItem => new StageChestItemCommand(context.Tick, context.PlayerId,
             chestItem.ChestIndex, chestItem.ItemSlot, chestItem.Stack, chestItem.Prefix, chestItem.ItemType),
+        // 包 85 QuickStackChests（库存权威层已解析出玩家当前打开的箱子）→ 服务端规划的批量装箱命令
+        QuickStackChestsIntentPacket quickStack => new BulkInventoryChestCommand(context.Tick, context.PlayerId,
+            quickStack.ChestIndex,
+            quickStack.SmartStack ? ChestBulkOperation.QuickStack : ChestBulkOperation.DepositAll,
+            NextChestOperationId())
+        {
+            SourceSlots = quickStack.Slots,
+        },
         // 包 82 模块 0（NetLiquid）→ 客户端液体编辑（服务端权威落盘并触发流动）
         LiquidModulePacket { IsClientMessage: true } liquid =>
             new LiquidEditCommand(context.Tick, context.PlayerId, liquid.Changes),
@@ -256,6 +293,8 @@ public sealed class TerminalStage : IPipelineStage
         PlayerManaPacket mana => new SetManaCommand(context.Tick, context.PlayerId, mana.Mana, mana.MaxMana),
         // 包 50 PlayerBuffs → 服务端持有增益列表
         PlayerBuffsPacket buffs => new SetBuffsCommand(context.Tick, context.PlayerId, buffs.BuffTypes),
+        // 包 40 SyncTalkNPC → 服务端持有对话目标并中继给其他玩家（playerId 由服务端身份覆盖）
+        SyncTalkNpcPacket talk => new SetTalkNpcCommand(context.Tick, context.PlayerId, talk.TalkNpc),
         // 包 53 AddNPCBuff → 命中给 NPC 施加单条减益（服务端权威并入该 NPC 增益列表）
         AddNpcBuffPacket nbc => new ApplyNpcBuffCommand(context.Tick, context.PlayerId, nbc.NpcId, nbc.BuffType, nbc.Time),
         // 包 12 PlayerSpawn（Playing 阶段）→ 复活请求（服务端划定复活点）

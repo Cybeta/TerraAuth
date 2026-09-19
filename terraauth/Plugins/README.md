@@ -86,6 +86,7 @@ cp bin/Release/net10.0/MyPlugin.dll <server>/plugins/
 | `TileBreakArgs` | WorldAuthority | ✅ | ❌ |
 | `NpcSpawnArgs` | WorldAuthority | ✅ | ❌ |
 | `ServerStartedArgs` | — | ❌ | ❌ |
+| `ServerStoppingArgs` | — | ❌ | ❌ |
 | `ServerTickArgs` | GameLoop 每帧 | ❌ | ❌ |
 | `CommandExecutingArgs` | — | ✅ | ❌ |
 

@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-16（第三十七轮：生命上限口径对齐 + 包 17 fail 标志语义修正 + 挖砖掉落 / 整棵树倒下 / 拾取提示 + SSC 档案持久化；464/464 通过）
+> 最后更新：2026-09-19（第三十八轮：SSC 背包 / 箱子守恒事务 + 宝袋解耦 + 包 40 补齐 + 召唤命中凭据；779/779 通过）
 
 ---
 
@@ -112,6 +112,71 @@
 ---
 
 ## 附：本轮回溯
+
+### 第三十八轮（2026-09-19）：SSC 背包 / 箱子守恒事务 + 宝袋解耦 + 包 40 + 召唤命中凭据
+
+**一、SSC 背包从「逐包回正」改为「守恒事务」（客户端能正常整理背包了）**
+
+- **根因**：SSC 下客户端拖拽 / 整理 / 拆分 / 合并 / 交换会在一个窗口内发出多个包 5（源槽清空 + 目标槽填入），
+  逐包与权威值比对回正会把合法操作**全部撤销** —— 表现为玩家无法整理背包；而反过来若全盘接受，
+  又无法区分「合法整理」与「凭空造物」。
+- **修复**：包 5 与服务端权威值不一致时不即时回正，而是暂存进 **15 tick（≈250ms）事务窗口**
+  （`PlayerRuntime.PendingInventoryChanges` + `StageInventorySlotCommand`）；窗口到期由
+  `WorldState.TryCommitInventoryTransaction` 做**守恒校验**：对每个 **(物品, 前缀)** 叠加暂存值后的**总堆叠数**
+  必须与当前权威总量一致 —— 拖拽 / 整理 / 拆分 / 合并 / 交换都保持总量不变 → **提交**（接受客户端整理结果）；
+  凭空造物或销毁必然破坏总量 → **回滚**并回写权威值。外部变更（`/give`、拾取、开袋、箱子转移）天然使总量对不上，
+  故与外部冲突的暂存意图自然回滚，无需版本号或冲突表。
+- 完全一致的包 5（客户端回显确认）走 `RejectSilent()`，不生成写入命令。
+- 该分流属客户端行为噪声，**不计违规**（否则正常游玩会被误踢）；对应用例
+  `Vanilla_ClientIsNotKicked_After_NormalInventoryOps`、`Vanilla_InventoryDrag_Is_Accepted_And_Conserved`、
+  `AntiCheat_Ssc_Forged_InventorySnapshot_Is_Rolled_Back`。
+- **注意**：守恒判据按 (物品, 前缀) 的**总堆叠数**，不能用 (物品, 前缀, 堆叠) 多重集 —— 后者会让「拆分」被判不守恒。
+
+**二、箱子守恒事务 + 背包 ↔ 箱子转移原子化 + 包 85 入站**
+
+- 包 32（SyncChestItem）同样改为窗口聚合（`StageChestItemCommand` + `WorldState.TryCommitChestTransaction`），
+  守恒基准是**「玩家权威背包 ∪ 该箱子」**的 (物品, 前缀) 总堆叠：箱内整理 / 交换守恒即提交，凭空造物即回滚。
+- **背包 ↔ 箱子单槽转移必须两侧同一事务**：原版同时发包 5（背包侧清空）+ 包 32（箱子侧填入），若各走各的事务，
+  背包侧会因总量减少被判不守恒回滚、箱子侧因总量增加被判不守恒回滚 → **存入箱子永远不生效**。
+  修复：开箱期间包 5 归入箱子事务（`PendingChestInventoryChanges` + `WorldState.EnsureChestTransaction`），
+  提交 / 回滚时背包侧与箱子侧一起落盘并一起回写。
+- **包 85（QuickStackChests）入站**：解码 `Int32 槽位数 + Int16×N 槽位 + Boolean smartStack`
+  （`QuickStackChestsPacket`）→ 权威层解析玩家当前打开的箱子 → 终端阶段生成 `BulkInventoryChestCommand`，
+  由服务端**自行规划**装箱（不接受客户端最终快照），`SourceSlots` 限定只处理客户端指定的来源槽位。
+- 对应用例：`Vanilla_ChestItem_Rearrange_Is_Conserved_And_Committed`、
+  `Vanilla_ChestDeposit_FromInventory_Is_Accepted_And_Conserved`、`Vanilla_ChestQuickStack_IsAccepted`、
+  `AntiCheat_Ssc_Forged_ChestSnapshot_Is_Rolled_Back`。
+
+**三、宝藏袋解耦（移除全背包 pending 静默屏障）**
+
+- **根因**：早期为「开袋后客户端回显本地奖励快照」建立了一层全背包静默屏障，导致正常玩家的其它槽位操作被静默丢弃
+  （背包看起来「卡住」），且开袋与背包权威强耦合。
+- **修复**：客户端清空袋槽（包 5 且该槽原为宝袋 3319）直接转换为权威开袋命令
+  （`OpenEyeOfCthulhuTreasureBagCommand`，服务端随机奖励并**原子**写入权威背包；重复触发由命令内再校验幂等）；
+  不再建立任何全背包屏障 —— 客户端随后上报的奖励快照按常规守恒事务收敛。
+  对应用例 `Vanilla_TreasureBag_DoesNotSilenceOtherSlots`。
+
+**四、包 40（SyncTalkNPC）补齐**
+
+- 前序版本只把包 40 当作未建模包拒绝，导致「玩家与城镇 NPC 对话」状态不会中继给其他玩家（他人看不到对话气泡指向）。
+- 修复：协议 `SyncTalkNpcPacket`（`Byte PlayerId + Int16 talkNPC`，-1 = 未对话）+ 编解码 + 权威边界校验
+  （越界按 `sync` 类审计、**不计违规**）+ `SetTalkNpcCommand`（目标非活跃 / 非城镇 NPC 一律回落 -1，状态变化才标记）
+  + `GameHost.FlushPlayerTalkNpcAsync` 向**其他玩家**广播。
+  测试：`SetTalkNpc_Tracks_State_And_Marks_Only_On_Change`、`SyncTalkNpc_RoundTrips_In_Codec`、
+  `Vanilla_TalkNpc_Is_Tracked_Server_Side_And_Relayed_To_Others`、`Vanilla_Invalid_TalkNpc_Is_Rejected_Without_Violation`。
+
+**五、召唤物命中凭据修复（收尾 `debug-summon-hp-resync` 调试记录）**
+
+- **症状**：召唤物撞击史莱姆后服务端日志显示 NPC 生命下降，但客户端血条瞬间回到 25（血条回满）。
+- **证据链**：客户端创建 BabySlime（弹幕类型 266）只发一次包 27，之后持续发包 28 而无同 Key 的位置更新；
+  旧实现要求「召唤物缓存位置与 NPC 当前碰撞盒重叠」，而弹幕位置冻结在创建点 → **所有命中都记 `summon-miss`**，
+  服务端生命从未下降，客户端先显示预测伤害、随后收到服务端权威生命 25 → 表现为「瞬间回满」。
+- **修复**：命中凭据改为**服务端已登记且存活的召唤实体**（`FindOwnedSummonProjectile`），不再要求缓存坐标当前时刻重叠；
+  归属 / 类型 / 伤害上限（≤ ceil(武器伤害 × 1.15)）/ NPC generation / 命中冷却校验全部保留。
+  回归用例 `Summon_Attack_Uses_ServerRegisteredEntity_Without_CurrentPositionOverlap`。
+
+**测试**：**779 / 779 通过**（新增：背包守恒事务 4 例 + 集成 3 例、箱子守恒 / 转移 / 快速堆叠 4 例、
+宝袋不静默、包 40 编解码与状态同步 4 例、召唤命中凭据；并改写 4 个仍期待「直接拒绝」旧语义的箱子用例）。
 
 ### 第三十七轮（2026-09-16）：真机联调收口 —— 生命上限口径 / 挖掘权威 / 挖砖掉落 / SSC 档案持久化
 
@@ -800,7 +865,7 @@ Listening on port 7778
 - **`PacketId` 常量数**：39 → **41**（`Protocol/PacketId.cs` 实际成员数）。
 - **编解码覆盖**：入站「31 / 28 个」→ **35 个**；出站「32 类」→ **37 类**（按 `PacketDecoder` / `PacketEncoder` 实际 case 统计）。
 - **持久化后端表述**：多处「默认内嵌 LiteDb / 可选 SQLite」→ **默认 SQLite（`USE_SQLITE`），`-p:NoSqlite=true` 降级 LiteDb**；删除 `SqliteImpl`「骨架」表述（第二轮已完整实装）。
-- **Vanilla-only 边界**：`Net/Transport/README.md` 与 `DELIVERY.md` 中「未建模包透明透传 / 编码侧原样写回 / 编解码无缺口」→ 改为与代码一致（**未建模包默认拒绝**）。
+- **Vanilla-only 边界**：`Net/Transport/README.md`（原同目录 `DELIVERY.md` 已并入该 README 并删除）中「未建模包透明透传 / 编码侧原样写回 / 编解码无缺口」→ 改为与代码一致（**未建模包默认拒绝**）。
 - **背压表述（第十九轮历史快照）**：「`CommandQueue` 满 → 丢弃最旧」「`Channel` 满 → 跳过增量快照」→ 当时记录为出站有界 `Channel(2048, FullMode = Wait)`、入站无界且上限待办；**后续已落地入站 `CommandQueue.MaxCount`、分片入站与审计队列有界策略，当前状态见本文 §三第 7 项。**
 - **文件树**：补 `WorldGenerator.cs` / `WorldFileWriter.cs` / `WorldEntities.cs` / `Authority/CommandService.cs`。
 - **`OPTIMIZATION_BACKLOG.md` §三**：把第十七轮列出的 12 项按「已修正 / 部分修正 / 仍待修正」重新标注（此前全部标为待办，与代码不符）。

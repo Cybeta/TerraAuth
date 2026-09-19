@@ -87,6 +87,7 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.SyncPlayerChestIndex => DecodePlayerChestIndex(reader),
             PacketId.PlayerHeal        => DecodePlayerHeal(reader),
             PacketId.SyncPlayerZone    => DecodeSyncPlayerZone(reader),
+            PacketId.SyncTalkNPC       => DecodeSyncTalkNpc(reader),
             PacketId.PlayerBuffs       => DecodePlayerBuffs(reader),
             PacketId.AddNpcBuff        => DecodeAddNpcBuff(reader),
             PacketId.NpcBuffSync       => DecodeNpcBuffSync(reader),
@@ -96,6 +97,7 @@ public sealed class PacketDecoder : IPacketDecoder
             PacketId.PlayerDeathV2     => DecodePlayerDeathV2(reader),
             PacketId.ProjectileNew     => DecodeProjectileNew(reader),
             PacketId.Chest             => DecodeChest(reader),
+            PacketId.QuickStackChests  => DecodeQuickStackChests(reader),
             PacketId.ProjectileDestroy => DecodeProjectileDestroy(reader),
             PacketId.Time              => DecodeTime(reader),
             PacketId.NpcUpdate         => DecodeNpcUpdate(reader),
@@ -435,6 +437,14 @@ public sealed class PacketDecoder : IPacketDecoder
         return new PlayerManaPacket(playerId, mana, maxMana);
     }
 
+    private INetworkPacket DecodeSyncTalkNpc(BinaryReader r)
+    {
+        // SyncTalkNPC（包 40）：Byte id + Int16 talkNPC（-1 = 未对话）
+        var playerId = r.ReadByte();
+        var talkNpc = r.ReadInt16();
+        return new SyncTalkNpcPacket(playerId, talkNpc);
+    }
+
     private INetworkPacket DecodeTileBreak(BinaryReader r)
     {
         // TileManipulation（包 17）：Byte action + Int16 x + Int16 y + Int16 tileType + Byte style
@@ -572,6 +582,30 @@ public sealed class PacketDecoder : IPacketDecoder
         var prefix = r.ReadByte();
         var itemType = r.ReadInt16();
         return new SyncChestItemPacket(chestIndex, itemSlot, stack, prefix, itemType);
+    }
+
+    /// <summary>
+    /// QuickStackChests（包 85）：Int32 numItems + numItems × Int16 slotId + Boolean smartStack。
+    /// 原版客户端把「作为来源的背包槽位列表」与 smartStack 标志发给服务端；
+    /// payload 长度为 0 时视为空列表（无 smartStack 字节，按 false 处理）。
+    /// </summary>
+    private static INetworkPacket DecodeQuickStackChests(BinaryReader r)
+    {
+        if (r.BaseStream.Position >= r.BaseStream.Length)
+            return new QuickStackChestsPacket(Array.Empty<int>(), SmartStack: false);
+
+        int count = r.ReadInt32();
+        if (count < 0) count = 0;
+        // 防御超大数量：最多只能有剩余字节数 / 2 个 Int16 槽位
+        int available = (int)((r.BaseStream.Length - r.BaseStream.Position) / sizeof(short));
+        if (count > available) count = available;
+
+        var slots = new int[count];
+        for (int i = 0; i < count; i++)
+            slots[i] = r.ReadInt16();
+
+        bool smartStack = r.BaseStream.Position < r.BaseStream.Length && r.ReadBoolean();
+        return new QuickStackChestsPacket(slots, smartStack);
     }
 
     private INetworkPacket DecodePlayerChestIndex(BinaryReader r)

@@ -837,6 +837,286 @@ public class SimulationTests
         Assert.Equal(40, player.MpMax);
     }
 
+    /// <summary>包 40 命令：对话目标写入服务端状态，仅在真正变化时标记中继；无效目标回落为「未对话」。</summary>
+    [Fact]
+    public void SetTalkNpc_Tracks_State_And_Marks_Only_On_Change()
+    {
+        var world = new WorldState();
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        int townIndex;
+        int monsterIndex;
+        lock (world.NpcsLock)
+        {
+            world.Npcs.Add(new WorldNpc { Type = 22, NetId = 22, Active = true, IsTownNpc = true });
+            world.Npcs.Add(new WorldNpc { Type = 1, NetId = 1, Active = true, IsTownNpc = false });
+            townIndex = 0;
+            monsterIndex = 1;
+        }
+        var rng = new XoshiroRng(1);
+
+        // 合法城镇 NPC → 记录并标记一次中继
+        Assert.True(new SetTalkNpcCommand(1, 1, townIndex).Apply(world, rng).Applied);
+        Assert.Equal(townIndex, player.TalkNpc);
+        Assert.Contains(1, world.DrainPlayerTalkNpcChanged(8));
+
+        // 重复同一目标 → 幂等，不重复广播
+        Assert.True(new SetTalkNpcCommand(2, 1, townIndex).Apply(world, rng).Applied);
+        Assert.Empty(world.DrainPlayerTalkNpcChanged(8));
+
+        // 非城镇 NPC → 视为未对话（不把无效目标中继给其他客户端）
+        Assert.True(new SetTalkNpcCommand(3, 1, monsterIndex).Apply(world, rng).Applied);
+        Assert.Equal(-1, player.TalkNpc);
+        Assert.Contains(1, world.DrainPlayerTalkNpcChanged(8));
+
+        // 越界索引 → 同样回落为未对话；已是 -1 故无变化标记
+        Assert.True(new SetTalkNpcCommand(4, 1, 99).Apply(world, rng).Applied);
+        Assert.Equal(-1, player.TalkNpc);
+        Assert.Empty(world.DrainPlayerTalkNpcChanged(8));
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：窗口内聚合的合法整理（拆分 / 移动）在守恒时整体提交。
+    /// 原版拖拽 = 源槽减少 + 目标槽增加，逐包校验会全部回正，必须窗口聚合后统一判。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Commits_Conserved_Move_And_Split()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[50] = 40;      // 泥土
+        player.ItemStacks[50] = 10;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        // 拆分 4 个到槽 51：源槽 6 + 目标槽 4
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 40, 6).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 40, 4).Apply(world, rng).Applied);
+
+        // 窗口未到期：不结算，权威背包保持不变
+        Assert.Equal(InventoryTransactionOutcome.None, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(10, player.ItemStacks[50]);
+        Assert.Equal(0, player.Items[51]);
+
+        // 窗口到期：总量 10 不变 → 守恒 → 提交
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(40, player.Items[50]);
+        Assert.Equal(6, player.ItemStacks[50]);
+        Assert.Equal(40, player.Items[51]);
+        Assert.Equal(4, player.ItemStacks[51]);
+    }
+
+    /// <summary>SSC 背包守恒事务：凭空造物破坏守恒 → 回滚，且把权威槽位标记回写以纠正客户端。</summary>
+    [Fact]
+    public void InventoryTransaction_RollsBack_On_Forgery()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        // 权威背包为空，客户端却声称槽 3 有泰拉刃
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 757, 1).Apply(world, rng).Applied);
+        world.Tick = 120;
+
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[3]);
+        // 回滚后仍要回写权威值（客户端被纠正回空槽）
+        Assert.Contains((1, player.SessionId, 3), world.DrainInventoryUpdates(8));
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：与外部变更（/give、拾取、开袋、箱子转移）冲突的暂存意图
+    /// 因权威总量对不上而自然回滚，无需额外版本号 / 冲突表。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Conflicting_With_External_Change_RollsBack()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[10] = 40;
+        player.ItemStacks[10] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        // 客户端把槽 10 的泥土移到槽 11
+        Assert.True(new StageInventorySlotCommand(100, 1, 10, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 11, 40, 1).Apply(world, rng).Applied);
+
+        // 窗口内服务端外部变更：/give 往槽 10 塞入另一件物品（拾取 / 开袋同理）
+        player.Items[10] = 757;
+        player.ItemStacks[10] = 1;
+
+        // 暂存的「清空槽 10」会销毁外部塞入的物品 → 守恒失败 → 回滚
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(757, player.Items[10]);
+        Assert.Equal(0, player.Items[11]);
+    }
+
+    /// <summary>SSC 背包守恒事务：会话切换后丢弃上一会话的暂存意图，避免重连复用槽位时串号。</summary>
+    [Fact]
+    public void InventoryTransaction_Drops_Staged_Values_After_Session_Switch()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true, SessionId = 7 };
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 757, 1).Apply(world, rng).Applied);
+        Assert.Single(player.PendingInventoryChanges);
+
+        // 重连拿到同一槽位（新会话）→ 旧暂存意图必须丢弃
+        player.SessionId = 8;
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.None, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Empty(player.PendingInventoryChanges);
+        Assert.Equal(0, player.Items[3]);
+    }
+
+    /// <summary>
+    /// SSC 箱子守恒事务（C1）：窗口内聚合的箱内整理（槽位移动）在守恒时整体提交，
+    /// 服务端接受客户端箱子改动（总量「玩家背包 ∪ 该箱子」不变）。
+    /// </summary>
+    [Fact]
+    public void ChestItem_Snapshot_Commits_When_Conserved()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        chest.Items[0] = new ChestItem { Type = 50, Stack = 10, Prefix = 3 };
+        world.Tick = 100;
+        var rng = new XoshiroRng(1);
+
+        // 箱内把槽 0 的 10 个移到槽 1：源槽清空 + 目标槽填入（总量不变）
+        Assert.True(new StageChestItemCommand(100, 1, 0, 0, 0, 0, 0) { SessionId = 22 }.Apply(world, rng).Applied);
+        Assert.True(new StageChestItemCommand(100, 1, 0, 1, 10, 3, 50) { SessionId = 22 }.Apply(world, rng).Applied);
+
+        // 窗口未到期：不结算，权威箱子保持不变
+        Assert.Equal(InventoryTransactionOutcome.None, world.TryCommitChestTransaction(1, 15));
+        Assert.Equal(10, chest.Items[0].Stack);
+        Assert.Equal(0, chest.Items[1].Stack);
+
+        // 窗口到期：总量 10 不变 → 守恒 → 提交
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitChestTransaction(1, 15));
+        Assert.Equal(0, chest.Items[0].Stack);
+        Assert.Equal(50, chest.Items[1].Type);
+        Assert.Equal(10, chest.Items[1].Stack);
+        Assert.Equal(3, chest.Items[1].Prefix);
+        // 提交也要回写权威槽位（幂等确认）
+        var updates = world.DrainChestUpdates(8);
+        Assert.Contains((0, 0), updates);
+        Assert.Contains((0, 1), updates);
+        _ = player;
+    }
+
+    /// <summary>
+    /// SSC 箱子守恒事务（C1）：凭空造物破坏「玩家背包 ∪ 该箱子」总量守恒 → 回滚，
+    /// 且通过 MarkChestChanged 把权威箱子槽位回写以纠正客户端。
+    /// </summary>
+    [Fact]
+    public void ChestItem_Staged_Forgery_RollsBack_And_MarksChestChanged()
+    {
+        var (world, _, chest) = CreateTransferWorld();
+        world.Tick = 100;
+        var rng = new XoshiroRng(1);
+
+        // 权威箱子为空，客户端却声称槽 5 有泰拉刃
+        Assert.True(new StageChestItemCommand(100, 1, 0, 5, 1, 0, 757) { SessionId = 22 }.Apply(world, rng).Applied);
+        world.Tick = 120;
+
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitChestTransaction(1, 15));
+        Assert.Equal(0, chest.Items[5].Stack);
+        // 回滚后仍要回写权威值（客户端被纠正回空槽）
+        Assert.Contains((0, 5), world.DrainChestUpdates(8));
+    }
+
+    /// <summary>SSC 箱子守恒事务：未打开该箱子（无会话）时暂存命令被拒绝，权威箱子不变。</summary>
+    [Fact]
+    public void ChestItem_Staged_Change_Without_Open_Session_Is_Rejected()
+    {
+        var (world, _, chest) = CreateTransferWorld(openSession: false);
+
+        var result = new StageChestItemCommand(100, 1, 0, 2, 4, 0, 50) { SessionId = 22 }
+            .Apply(world, new XoshiroRng(1));
+
+        Assert.False(result.Applied);
+        Assert.Equal(CommandFailures.ChestNotOpen, result.Reason);
+        Assert.Equal(0, chest.Items[2].Stack);
+        Assert.Empty(world.DrainChestUpdates(8));
+    }
+
+    /// <summary>SSC 箱子守恒事务：会话切换后丢弃上一会话的暂存意图，避免重连复用槽位时串号。</summary>
+    [Fact]
+    public void ChestItem_Staged_Drops_After_Session_Switch()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        world.Tick = 100;
+        Assert.True(new StageChestItemCommand(100, 1, 0, 5, 1, 0, 757) { SessionId = 22 }
+            .Apply(world, new XoshiroRng(1)).Applied);
+        Assert.Single(player.PendingChestChanges);
+
+        player.SessionId = 23;
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.None, world.TryCommitChestTransaction(1, 15));
+        Assert.Empty(player.PendingChestChanges);
+        Assert.Equal(0, chest.Items[5].Stack);
+    }
+
+    /// <summary>
+    /// C3：包 85 QuickStackChests 只处理客户端指定的来源槽位（未指定的槽位保持不动），
+    /// smartStack=false → DepositAll 语义（可填入空槽）。
+    /// </summary>
+    [Fact]
+    public void QuickStackChests_Command_Deposits_Only_Source_Slots()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        player.Items[9] = 50; player.ItemStacks[9] = 5; player.ItemPrefixes[9] = 3;
+        player.Items[10] = 50; player.ItemStacks[10] = 7; player.ItemPrefixes[10] = 3;
+        chest.Items[0] = new ChestItem { Type = 50, Stack = 1, Prefix = 3 };
+
+        var command = new BulkInventoryChestCommand(1, 1, 0, ChestBulkOperation.DepositAll, 300)
+        {
+            SessionId = 22,
+            SourceSlots = new[] { 9 },
+        };
+
+        Assert.True(command.Apply(world, new XoshiroRng(1)).Applied);
+        Assert.Equal(0, player.ItemStacks[9]);    // 指定来源槽已入库
+        Assert.Equal(6, chest.Items[0].Stack);    // 1 + 5
+        Assert.Equal(7, player.ItemStacks[10]);   // 未指定的来源槽保持不动
+    }
+
+    /// <summary>C3：包 85 真实线格式解码（Int32 数量 + Int16 槽位 + Boolean smartStack）。</summary>
+    [Fact]
+    public void QuickStackChests_Decode_Reads_Slots_And_SmartStack()
+    {
+        var payload = new byte[4 + 2 + 2 + 1];
+        BitConverter.GetBytes(2).CopyTo(payload, 0);
+        BitConverter.GetBytes((short)9).CopyTo(payload, 4);
+        BitConverter.GetBytes((short)10).CopyTo(payload, 6);
+        payload[8] = 1;
+
+        var decoder = new PacketDecoder();
+        var packet = Assert.IsType<QuickStackChestsPacket>(
+            decoder.Decode(PacketId.QuickStackChests, payload, new DecodeContext()));
+
+        Assert.Equal(new[] { 9, 10 }, packet.Slots);
+        Assert.True(packet.SmartStack);
+
+        // payload 长度 0 → 空列表（无 smartStack 字节）
+        var empty = Assert.IsType<QuickStackChestsPacket>(
+            decoder.Decode(PacketId.QuickStackChests, ReadOnlySpan<byte>.Empty, new DecodeContext()));
+        Assert.Empty(empty.Slots);
+        Assert.False(empty.SmartStack);
+    }
+
     [Fact]
     public void Existing_Projectile_Update_Preserves_Server_Authoritative_State()
     {
@@ -3877,6 +4157,24 @@ public class WorldGeneratorTests
         Assert.False(new ApplyNpcBuffCommand(2, 1, 0, 24, 300).Apply(world, rng).Applied);
         // 未标记任何变更
         Assert.Empty(world.DrainNpcBuffsChanged(8));
+    }
+
+    /// <summary>包 40（编码 → 解码）对称：SyncTalkNPC 载荷往返一致。</summary>
+    [Fact]
+    public void SyncTalkNpc_RoundTrips_In_Codec()
+    {
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var decoder = new PacketDecoder();
+        var memory = new ArrayBufferWriter<byte>();
+
+        encoder.Encode(memory, PacketId.SyncTalkNPC, new SyncTalkNpcPacket(PlayerId: 3, TalkNpc: 17));
+
+        var buffer = new ReadOnlySequence<byte>(memory.WrittenMemory);
+        Assert.True(decoder.TryDecodeFrame(ref buffer, new DecodeContext(), out var decoded));
+        var typed = Assert.IsType<SyncTalkNpcPacket>(decoded);
+
+        Assert.Equal(3, typed.PlayerId);
+        Assert.Equal(17, typed.TalkNpc);
     }
 
     /// <summary>包 54（编码 → 解码）对称：NpcBuffSync 载荷往返一致。</summary>

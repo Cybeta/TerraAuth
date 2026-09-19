@@ -345,6 +345,15 @@ public class AuthorityPacketCodecTests
     }
 
     [Fact]
+    public void Encode_Decode_QuickStackChests_RoundTrips()
+    {
+        var original = new QuickStackChestsPacket(new[] { 9, 12, 30 }, SmartStack: true);
+        var p = RoundTrip<QuickStackChestsPacket>(PacketId.QuickStackChests, original);
+        Assert.Equal(new[] { 9, 12, 30 }, p.Slots);
+        Assert.True(p.SmartStack);
+    }
+
+    [Fact]
     public void Encode_Decode_PlayerChestIndex_RoundTrips()
     {
         var p = RoundTrip<PlayerChestIndexPacket>(PacketId.SyncPlayerChestIndex,

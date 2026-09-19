@@ -67,6 +67,9 @@ internal sealed class PlayerAuthority : IPlayerAuthority
     private const int MinBuffId = 1;
     private const int MaxBuffId = 400;
 
+    /// <summary>原版 NPC 槽位总数（<c>Main.npc.Length == 200</c>）：包 40 对话索引的合法上界。</summary>
+    private const int MaxNpcSlots = 200;
+
     private readonly IAuditLogger _audit;
     private volatile PlayerLimits _limits;
     private readonly ConcurrentDictionary<int, PlayerStats> _stats = new();
@@ -86,6 +89,7 @@ internal sealed class PlayerAuthority : IPlayerAuthority
             PlayerBuffsPacket buffs => ValidateBuffs(buffs, playerId),
             PlayerHurtV2Packet hurt => ValidateHurt(hurt, playerId),
             PlayerDeathV2Packet death => ValidateDeath(death, playerId),
+            SyncTalkNpcPacket talk => ValidateTalkNpc(talk, playerId),
             _ => AuthorityResult.Accept(packet),
         };
     }
@@ -231,6 +235,23 @@ internal sealed class PlayerAuthority : IPlayerAuthority
             return AuthorityResult.Reject("invalid_damage");
         }
         return AuthorityResult.Accept(death);
+    }
+
+    /// <summary>
+    /// 对话 NPC（包 40 SyncTalkNPC）：仅做协议边界校验（-1 = 未对话，或落在原版 NPC 槽位区间内）。
+    /// 该状态为纯客户端表现，越界值按「客户端行为噪声」处理：只记录审计与指标，
+    /// category 用 sync（非 authority/rate/security）且不计入违规窗口，避免正常客户端被误踢；
+    /// NPC 是否真实存在 / 是否在交互距离内由仿真层命令按世界状态判定。
+    /// </summary>
+    private AuthorityResult ValidateTalkNpc(SyncTalkNpcPacket talk, int playerId)
+    {
+        if (talk.TalkNpc < -1 || talk.TalkNpc >= MaxNpcSlots)
+        {
+            _audit.Log(AuditEvent.Now(playerId, "sync", "talk_npc_rejected", "invalid_talk_npc",
+                new { talk.TalkNpc }));
+            return AuthorityResult.Reject("invalid_talk_npc", countsAsViolation: false);
+        }
+        return AuthorityResult.Accept(talk);
     }
 
     public int GetMaxHp(int playerId) => _stats.TryGetValue(playerId, out var s) ? s.MaxHp : _limits.MaxHp;
@@ -660,6 +681,7 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
         ItemDropPacket drop => ValidateDrop(drop, playerId),
         InventorySlotPacket slot => ValidateSlot(slot, playerId),
         SyncChestItemPacket chestItem => ValidateChestItem(chestItem, playerId),
+        QuickStackChestsPacket quickStack => ValidateQuickStackChests(quickStack, playerId),
         _ => AuthorityResult.Accept(packet),   // 箱子会话、距离由 WorldAuthority 校验（需世界数据）
     };
 
@@ -680,10 +702,36 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
             return Deny(playerId, "chest_item_rejected", "invalid_stack", new { chestItem.Stack, Max = _limits.MaxStackSize });
         if (chestItem.Stack > 0 && !IsValidItem(chestItem.ItemType))
             return Deny(playerId, "chest_item_rejected", "unknown_item", new { chestItem.ItemType });
-        if (_limits.SscEnabled)
-            return Deny(playerId, "chest_item_rejected", "chest_snapshot_forbidden", new { chestItem.ChestIndex, chestItem.ItemSlot });
 
+        // SSC：不再直接拒绝客户端箱子快照，而是交给箱子守恒事务窗口结算（见 StageChestItemCommand）。
+        // 逐包写入无法区分合法拖拽与凭空造物，窗口到期后按「玩家背包 ∪ 该箱子」总量守恒提交 / 回滚。
         return AuthorityResult.Accept(chestItem);
+    }
+
+    /// <summary>单帧 QuickStackChests 允许的最大来源槽位数。</summary>
+    private const int MaxQuickStackSlots = PlayerRuntime.InventorySlotCount;
+
+    /// <summary>
+    /// 快速堆叠到附近箱子（包 85）：来源槽位合法性 + 玩家当前打开的箱子。
+    /// 原版客户端把「要作为来源的背包槽位列表」与 smartStack 发给服务端，服务端用**玩家当前打开的箱子**
+    /// 作为目标执行 QuickStack；未开箱时无法定位目标箱子，直接拒绝（属正常交互噪声，不计违规）。
+    /// 通过后转换为内部意图包，由终端阶段映射为服务端规划的批量装箱命令。
+    /// </summary>
+    private AuthorityResult ValidateQuickStackChests(QuickStackChestsPacket quickStack, int playerId)
+    {
+        if (quickStack.Slots.Count > MaxQuickStackSlots)
+            return Deny(playerId, "quickstack_rejected", "too_many_slots",
+                new { quickStack.Slots.Count, Max = MaxQuickStackSlots });
+
+        foreach (int slot in quickStack.Slots)
+            if (slot < 0 || slot >= PlayerRuntime.InventorySlotCount)
+                return Deny(playerId, "quickstack_rejected", "invalid_slot", new { slot });
+
+        if (!_world.TryGetOpenedChestIndex(playerId, out int chestIndex))
+            return AuthorityResult.Reject("chest_not_open", countsAsViolation: false);
+
+        return AuthorityResult.Accept(
+            new QuickStackChestsIntentPacket(chestIndex, quickStack.Slots, quickStack.SmartStack));
     }
 
     private AuthorityResult ValidateSlot(InventorySlotPacket slot, int playerId)
@@ -711,27 +759,27 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
                         return AuthorityResult.RejectSilent();
                     }
 
-                    if (_world.IsPendingBagOpen(playerId, player.SessionId, slot.Slot))
-                    {
-                        return AuthorityResult.RejectSilent();
-                    }
-
+                    // SSC 眼魔宝袋：客户端开袋时会先清空袋槽（Stack==0），随后回显本地奖励快照。
+                    // 这里把「清空袋槽」直接转成权威开袋命令，不再建立全背包静默屏障：
+                    // 奖励由服务端在命令中原子生成（TryOpenEyeOfCthulhuTreasureBag），客户端随后
+                    // 上报的奖励快照会走下面的权威回正分支收敛。命令 Apply 时会再次校验袋仍在，
+                    // 因此重复触发是幂等的（不会凭空产出奖励）。
                     if (slot.Stack == 0 && player.Items[slot.Slot] == 3319 &&
                         player.ItemStacks[slot.Slot] > 0 && player.ItemPrefixes[slot.Slot] == 0)
                     {
-                        if (!_world.BeginPendingBagOpen(playerId, player.SessionId, slot.Slot))
-                            return AuthorityResult.RejectSilent();
-
-                        // 客户端会在发送开袋意图后立即发送本地奖励快照；先建立全背包静默屏障，等待服务端命令执行和权威库存同步。
-                        _world.PromotePendingBagOpen(playerId, player.SessionId);
                         return AuthorityResult.Accept(
                             new OpenEyeOfCthulhuTreasureBagPacket(slot.Slot));
                     }
                 }
             }
 
-            return Deny(playerId, "slot_rejected",
-                "inventory_snapshot_forbidden", new { slot.Slot });
+            // SSC：客户端上报与服务端权威槽位不一致 → 不立即回正，而是把意图暂存进背包事务窗口。
+            // 原版客户端拖拽 / 整理 / 拆分 / 合并 / 交换都会在一个窗口内发出多个包 5，
+            // 逐包回正会把合法操作全部撤销（玩家无法整理背包）；窗口到期后统一做守恒校验：
+            // 守恒 → 提交（接受整理结果），不守恒 → 回滚并回写权威值（拦截凭空造物）。
+            // 该类差异按客户端行为噪声处理：Accept 分支不参与违规累计，避免正常游玩被误踢。
+            return AuthorityResult.Accept(
+                new StageInventorySlotPacket(slot.Slot, slot.ItemId, slot.Stack, slot.Prefix));
         }
 
         return AuthorityResult.Accept(slot);
@@ -1037,7 +1085,8 @@ internal sealed class WorldAuthority : IWorldAuthority
 
     /// <summary>
     /// 箱子内物品写入（包 32）：箱子索引 / 槽位 / 堆叠 / 物品合法性 + 玩家在交互距离内。
-    /// 通过后由 <see cref="SyncChestItemCommand"/> 落盘到服务端箱子（服务端持有唯一真相）。
+    /// 通过后由 <see cref="StageChestItemCommand"/> 暂存进箱子守恒事务（服务端持有唯一真相），
+    /// 窗口到期后再按「玩家背包 ∪ 该箱子」守恒提交 / 回滚，凭空造物会被自然拦截。
     /// </summary>
     private AuthorityResult ValidateChestItem(
         SyncChestItemPacket item,
@@ -1065,7 +1114,7 @@ internal sealed class WorldAuthority : IWorldAuthority
             return Deny(playerId, "chest_rejected", "out_of_reach", new { item.ChestIndex });
 
         // 箱子会话由 OpenChestCommand 在仿真提交阶段建立；此处只做只读边界校验，
-        // 最终会话一致性由 SyncChestItemCommand.Apply 再次确认，避免同一批包因提交尚未发生而被提前拒绝。
+        // 最终会话一致性由 StageChestItemCommand.Apply 再次确认，避免同一批包因提交尚未发生而被提前拒绝。
         return AuthorityResult.Accept(item);
     }
 
