@@ -1515,6 +1515,19 @@ public sealed class GameHost : IDisposable
                           || life != npc.SyncedLife || npc.Active != npc.SyncedActive
                           || npc.Direction != npc.SyncedDirection
                           || !npc.Ai.AsSpan().SequenceEqual(npc.SyncedAi);
+
+            #region debug-point summon-hp-sync
+            if (DiagnosticLog.Enabled && (life != npc.SyncedLife || npc.SyncForced))
+            {
+                Console.WriteLine(
+                    $"[DIAG] Npc23-candidate idx={i} gen={npc.Generation} " +
+                    $"type={npc.Type} netId={npc.NetId} " +
+                    $"life={life} lifeMax={npc.LifeMax} " +
+                    $"previous={npc.SyncedLife} active={npc.Active} " +
+                    $"tick={world.Tick}");
+            }
+            #endregion
+
             if (!fullRate && !IsNpcHighPriority(npc, players)) continue;
 
             npc.SyncedX = npc.X;
@@ -1544,6 +1557,17 @@ public sealed class GameHost : IDisposable
 
             var baselineKey = (Index: i, Generation: npc.Generation);
             var sent = 0;
+            #region debug-point summon-hp-send
+            if (DiagnosticLog.Enabled && life < npc.LifeMax)
+            {
+                Console.WriteLine(
+                    $"[DIAG] Npc23-send idx={i} gen={npc.Generation} " +
+                    $"type={npc.Type} life={packet.Life} " +
+                    $"lifeMax={packet.LifeMax} changed={(changed ? 1 : 0)} " +
+                    $"tick={world.Tick}");
+            }
+            #endregion
+
             await Network.BroadcastWhereAsync(PacketId.NpcUpdate, packet, playerId =>
             {
                 if (!IsPlayerWithin(world, playerId, npc.X, npc.Y, radiusSq))

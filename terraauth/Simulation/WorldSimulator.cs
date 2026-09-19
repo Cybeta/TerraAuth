@@ -189,6 +189,7 @@ public partial class WorldSimulator : IWorldViewProvider
 
         // 1. Input：应用本 tick 的 Command
         ApplyCommandsForTick(_world.Tick);
+        SimulateHeldWeaponFire();
 
         // 1.5 Spawn：原版 NPC.SpawnNPC（生物群系 / 昼夜 / 事件规则）
         SimulateSpawning();
@@ -223,6 +224,117 @@ public partial class WorldSimulator : IWorldViewProvider
     }
 
     // ---------- 各阶段（扩展点，逐步填充） ----------
+
+    /// <summary>
+    /// 根据玩家当前按住状态生成服务端权威的普通武器弹幕。
+    /// Packet 13 只提供持续使用意图；最终弹幕仍通过 SpawnProjectileCommand 校验并提交。
+    /// </summary>
+    private void SimulateHeldWeaponFire()
+    {
+        List<(int PlayerId, int Key, int Type, Vector2 Position, Vector2 Velocity, int Damage)> attempts = new();
+
+        lock (_world.PlayersLock)
+        {
+            foreach (var (playerId, player) in _world.Players)
+            {
+                if (!player.Active || player.Dead || !player.HasReceivedPlayerControls ||
+                    !player.PressingUseItem || player.UseItemSelectedSlot != player.SelectedSlot ||
+                    player.SelectedSlot < 0 || player.SelectedSlot >= PlayerRuntime.InventorySlotCount ||
+                    player.ItemStacks[player.SelectedSlot] <= 0)
+                {
+                    continue;
+                }
+
+                int weaponItem = player.Items[player.SelectedSlot];
+                var behavior = WeaponUseBehaviorTable.For(weaponItem);
+                if (player.UseAnimationTicksRemaining <= 0)
+                    player.UseAnimationTicksRemaining = behavior.UseAnimation;
+
+                player.UseAnimationTicksRemaining--;
+                if (player.LastUseItemProjectileSpawnTick != long.MinValue &&
+                    _world.Tick - player.LastUseItemProjectileSpawnTick < behavior.UseTime)
+                {
+                    continue;
+                }
+
+                int projectileType;
+                if (WeaponProjectileTypeOf.Direct.TryGetValue(weaponItem, out int directType))
+                {
+                    projectileType = directType;
+                }
+                else if (WeaponAmmoTypeOf.Of.TryGetValue(weaponItem, out int ammoType) &&
+                         TryFindHeldAmmo(player, ammoType, out projectileType))
+                {
+                }
+                else
+                {
+                    continue;
+                }
+
+                var direction = new Vector2(
+                    player.AimPosition.X - player.Position.X,
+                    player.AimPosition.Y - player.Position.Y);
+                float length = MathF.Sqrt(direction.X * direction.X + direction.Y * direction.Y);
+                if (length <= 0.001f)
+                    direction = new Vector2(player.Direction, 0f);
+                else
+                    direction = new Vector2(direction.X / length, direction.Y / length);
+
+                const float projectileSpeed = 12f;
+                var size = ProjectileCapabilityTable.Sizes.TryGetValue(projectileType, out var projectileSize)
+                    ? projectileSize
+                    : (Width: 16f, Height: 16f);
+                var position = new Vector2(
+                    player.Position.X + 10f - projectileSize.Width / 2f + direction.X * 18f,
+                    player.Position.Y + 21f - projectileSize.Height / 2f + direction.Y * 18f);
+                int damage = ItemDamageTable.Of.TryGetValue(weaponItem, out var stats)
+                    ? CombatResolver.GetWeaponDamage(player, weaponItem, player.ItemPrefixes[player.SelectedSlot])
+                    : 0;
+
+                attempts.Add((
+                    playerId,
+                    _nextServerProjectileKey--,
+                    projectileType,
+                    position,
+                    new Vector2(direction.X * projectileSpeed, direction.Y * projectileSpeed),
+                    damage));
+            }
+        }
+
+        foreach (var attempt in attempts)
+        {
+            var result = new SpawnProjectileCommand(
+                _world.Tick,
+                attempt.PlayerId,
+                attempt.Key,
+                attempt.Type,
+                attempt.Position,
+                attempt.Velocity,
+                attempt.Damage).Apply(_world, _rng);
+            if (result.Applied)
+                _recorder.Record(new GameEvent(_world.Tick, attempt.PlayerId, "spawn_projectile", null));
+        }
+    }
+
+    private static bool TryFindHeldAmmo(PlayerRuntime player, int requiredAmmoType, out int projectileType)
+    {
+        for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+        {
+            int ammoItem = player.Items[slot];
+            if (player.ItemStacks[slot] <= 0 ||
+                !AmmoTypeOf.Of.TryGetValue(ammoItem, out int actualAmmoType) ||
+                actualAmmoType != requiredAmmoType ||
+                !WeaponProjectileTypeOf.Ammo.TryGetValue(ammoItem, out projectileType))
+            {
+                continue;
+            }
+
+            return true;
+        }
+
+        projectileType = 0;
+        return false;
+    }
 
     /// <summary>箱子交互最大距离（像素），与权威层 <c>ChestReachPx</c> 保持一致。</summary>
     private const float ChestReachPx = 160f;

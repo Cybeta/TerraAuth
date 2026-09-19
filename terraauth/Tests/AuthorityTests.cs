@@ -42,6 +42,7 @@ public class AuthorityTests
         Assert.Equal(AuthorityDecision.Accept, accept.Decision);
         Assert.Equal(AuthorityDecision.Reject, reject.Decision);
         Assert.Equal(AuthorityDecision.RejectSilent, silent.Decision);
+        Assert.False(silent.CountsAsViolation);
         Assert.Equal(AuthorityDecision.Correct, correct.Decision);
         Assert.Equal("snap", correct.Reason);
     }
@@ -291,6 +292,78 @@ public class AuthorityTests
 
         pipeline.ProcessAsync(new PlayerPositionPacket(1, new Vector2(0, 0)), 1, new CommandQueue()).Wait();
         Assert.Equal(new[] { 1, 2, 3 }, order);
+    }
+
+    [Fact]
+    public void InventoryAuthority_Ssc_MapsEyeOfCthulhuBagClearToOpenCommand()
+    {
+        var world = new WorldState();
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
+        lock (world.PlayersLock)
+        {
+            var player = new PlayerRuntime { Id = 1, Active = true };
+            player.Items[3] = 3319;
+            player.ItemStacks[3] = 1;
+            world.Players[1] = player;
+        }
+        var pipeline = new InboundPipeline(new IPipelineStage[]
+        {
+            new InventoryAuthorityStage(enforcers.Inventory, new NoOpAuditLogger()),
+            new TerminalStage(),
+        });
+
+        var result = pipeline.ProcessAsync(new InventorySlotPacket(3, 0, 0), 1, new CommandQueue()).Result;
+
+        Assert.Equal(AuthorityDecision.Accept, result.Decision);
+        Assert.IsType<OpenEyeOfCthulhuTreasureBagCommand>(result.Command);
+    }
+
+    [Fact]
+    public void InventoryAuthority_PendingBagOpen_SilencesWholeInventoryBeforeApply()
+    {
+        var world = new WorldState();
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
+        lock (world.PlayersLock)
+        {
+            var player = new PlayerRuntime { Id = 1, Active = true };
+            player.Items[3] = 3319;
+            player.ItemStacks[3] = 1;
+            world.Players[1] = player;
+        }
+
+        var inventory = enforcers.Inventory;
+        var bag = inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!);
+        var repeatedBagSlot = inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!);
+        var otherSlot = inventory.Validate(new InventorySlotPacket(4, 56, 1), 1, null!);
+
+        Assert.Equal(AuthorityDecision.Accept, bag.Decision);
+        Assert.Equal(AuthorityDecision.RejectSilent, repeatedBagSlot.Decision);
+        Assert.Equal(AuthorityDecision.RejectSilent, otherSlot.Decision);
+        Assert.False(otherSlot.CountsAsViolation);
+    }
+
+    [Fact]
+    public void InventoryAuthority_AppliedBagOpen_SilencesFastClientRewardSnapshots()
+    {
+        var world = new WorldState();
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
+        lock (world.PlayersLock)
+        {
+            var player = new PlayerRuntime { Id = 1, Active = true };
+            player.Items[3] = 3319;
+            player.ItemStacks[3] = 1;
+            world.Players[1] = player;
+        }
+
+        var inventory = enforcers.Inventory;
+        Assert.Equal(AuthorityDecision.Accept,
+            inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!).Decision);
+        world.PromotePendingBagOpen(1, world.Players[1].SessionId);
+
+        var rewardSnapshot = inventory.Validate(new InventorySlotPacket(4, 56, 30), 1, null!);
+
+        Assert.Equal(AuthorityDecision.RejectSilent, rewardSnapshot.Decision);
+        Assert.False(rewardSnapshot.CountsAsViolation);
     }
 
     [Fact]

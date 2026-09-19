@@ -449,6 +449,12 @@ public sealed class NetworkHost : IAsyncDisposable
             case InventorySlotPacket slot:
                 Console.WriteLine($"[DIAG] 5 InventorySlot pid={connection.PlayerId} slot={slot.Slot} id={slot.ItemId} stack={slot.Stack}");
                 break;
+            case ProjectileNewPacket projectile:
+                Console.WriteLine($"[DIAG] 27 ProjectileNew pid={connection.PlayerId} key={projectile.ProjectileKey} type={projectile.ProjectileType} pos=({projectile.Position.X:0.0},{projectile.Position.Y:0.0}) vel=({projectile.Velocity.X:0.0},{projectile.Velocity.Y:0.0}) dmg={projectile.Damage} ai=({projectile.Ai0:0.0},{projectile.Ai1:0.0},{projectile.Ai2:0.0})");
+                break;
+            case NpcStrikePacket strike:
+                Console.WriteLine($"[DIAG] 28 NpcStrike pid={connection.PlayerId} idx={strike.NpcId} gen={strike.Generation} dmg={strike.Damage} crit={(strike.Crit ? 1 : 0)}");
+                break;
             case UnknownPacket unk:
                 Console.WriteLine($"[DIAG] UNKNOWN pid={connection.PlayerId} type={unk.Type}");
                 break;

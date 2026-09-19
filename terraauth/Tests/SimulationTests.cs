@@ -5,6 +5,7 @@ using System.Buffers;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using TerraAuth.Authority;
 using TerraAuth.Net.Transport;
 using TerraAuth.Protocol;
 using TerraAuth.Simulation;
@@ -577,8 +578,8 @@ public class SimulationTests
             SelectedItem = 4,
             ControlBits = PlayerRuntime.ControlUseItem,
         }.Apply(world, rng).Applied);
-        Assert.Equal(3, player.UseItemSelectedSlot);
-        Assert.Equal(CommandFailures.ProjectileUseItemNotHeld,
+        Assert.Equal(4, player.UseItemSelectedSlot);
+        Assert.Equal(CommandFailures.ProjectileUseItemCooldown,
             new SpawnProjectileCommand(6, 1, 3, 985, origin, origin, 85).Apply(world, rng).Reason);
 
         Assert.True(new MoveCommand(7, 1, player.Position)
@@ -605,6 +606,60 @@ public class SimulationTests
         player.Items[3] = 99999;
         var unknownResult = new SpawnProjectileCommand(9, 1, 5, 1, origin, origin, 10).Apply(world, rng);
         Assert.True(unknownResult.Applied, unknownResult.Reason);
+    }
+
+    [Fact]
+    public void HeldWeaponFire_Uses_Server_Tick_Cadence_And_Stops_On_Release()
+    {
+        var world = new WorldState { MaxTilesX = 100, MaxTilesY = 100 };
+        var commands = new CommandQueue();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            SelectedSlot = 3,
+            Position = new Vector2(160, 160),
+            AimPosition = new Vector2(320, 160),
+        };
+        player.Items[3] = 533;
+        player.ItemStacks[3] = 1;
+        player.Items[4] = 97;
+        player.ItemStacks[4] = 4;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        Assert.True(commands.Enqueue(new MoveCommand(1, 1, player.Position)
+        {
+            SelectedItem = 3,
+            ControlBits = PlayerRuntime.ControlUseItem,
+        }));
+        var sim = new WorldSimulator(world, commands, new EventRecorder(), new SnapshotStore());
+
+        sim.Tick();
+        Assert.Single(world.Projectiles);
+        Assert.Equal(3, player.ItemStacks[4]);
+        Assert.Equal(14, world.Projectiles[0].Type);
+        Assert.Equal(533, world.Projectiles[0].SourceWeaponItem);
+        Assert.True(world.Projectiles[0].Velocity.X > 0);
+
+        for (int i = 0; i < 6; i++)
+            sim.Tick();
+        Assert.Single(world.Projectiles);
+
+        sim.Tick();
+        Assert.Equal(2, world.Projectiles.Count);
+        Assert.Equal(2, player.ItemStacks[4]);
+
+        Assert.True(commands.Enqueue(new MoveCommand(world.Tick + 1, 1, player.Position)
+        {
+            SelectedItem = 3,
+            ControlBits = 0,
+        }));
+        sim.Tick();
+        for (int i = 0; i < 8; i++)
+            sim.Tick();
+        Assert.Equal(2, world.Projectiles.Count);
+        Assert.Equal(2, player.ItemStacks[4]);
     }
 
     [Fact]
@@ -1632,6 +1687,84 @@ public class SimulationTests
     }
 
     [Fact]
+    public void OpenEyeOfCthulhuTreasureBag_ConsumesBagAndAddsRewards()
+    {
+        var world = new WorldState();
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
+        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
+        lock (world.PlayersLock)
+        {
+            var player = new PlayerRuntime { Id = 1, SessionId = 7, Active = true };
+            player.Items[3] = 3319;
+            player.ItemStacks[3] = 1;
+            world.Players[1] = player;
+        }
+
+        var result = new OpenEyeOfCthulhuTreasureBagCommand(1, 1, 3) { SessionId = 7 }
+            .Apply(world, new FixedRng(0, 0, 0, 0, 0));
+
+        Assert.True(result.Applied);
+        var playerAfter = world.Players[1];
+        Assert.DoesNotContain(playerAfter.Items.Zip(playerAfter.ItemStacks), item => item.First == 3319 && item.Second > 0);
+        Assert.Contains(56, playerAfter.Items);
+        Assert.Contains(47, playerAfter.Items);
+        Assert.Contains(59, playerAfter.Items);
+        Assert.Contains(2112, playerAfter.Items);
+        Assert.Contains(1299, playerAfter.Items);
+        Assert.Contains((1, 7L, 3), world.DrainInventoryUpdates(59));
+    }
+
+    [Fact]
+    public void OpenEyeOfCthulhuTreasureBag_FullInventory_DoesNotConsumeBag()
+    {
+        var world = new WorldState();
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
+        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
+        lock (world.PlayersLock)
+        {
+            var player = new PlayerRuntime { Id = 1, Active = true };
+            for (var slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            {
+                player.Items[slot] = 1;
+                player.ItemStacks[slot] = 999;
+            }
+            player.Items[3] = 3319;
+            player.ItemStacks[3] = 1;
+            world.Players[1] = player;
+        }
+
+        var result = new OpenEyeOfCthulhuTreasureBagCommand(1, 1, 3)
+            .Apply(world, new FixedRng(0, 0, 0, 1, 1));
+
+        Assert.False(result.Applied);
+        Assert.Equal(CommandFailures.InventoryFull, result.Reason);
+        Assert.Equal(3319, world.Players[1].Items[3]);
+        Assert.Equal(1, world.Players[1].ItemStacks[3]);
+    }
+
+    [Fact]
+    public void OpenEyeOfCthulhuTreasureBag_CannotBeOpenedTwice()
+    {
+        var world = new WorldState();
+        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
+        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
+        lock (world.PlayersLock)
+        {
+            var player = new PlayerRuntime { Id = 1, Active = true };
+            player.Items[3] = 3319;
+            player.ItemStacks[3] = 1;
+            world.Players[1] = player;
+        }
+
+        var command = new OpenEyeOfCthulhuTreasureBagCommand(1, 1, 3);
+        Assert.True(command.Apply(world, new FixedRng(0, 0, 0, 1, 1)).Applied);
+        var repeat = command.Apply(world, new FixedRng(0, 0, 0, 1, 1));
+
+        Assert.False(repeat.Applied);
+        Assert.Equal(CommandFailures.NotApplied, repeat.Reason);
+    }
+
+    [Fact]
     public void XoshiroRng_IsDeterministic()
     {
         var a = new XoshiroRng(123);
@@ -1673,6 +1806,8 @@ public class SimulationTests
         public bool ConsumeItem(int playerId, int itemId) => false;
         public bool TryAddItem(int playerId, int itemId, int stack) => false;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => false;
+        public InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(int playerId, int slot, IReadOnlyList<InventoryReward> rewards)
+            => InventoryBagOpenResult.InvalidBag;
     }
 
     /// <summary>背包一律接受（用于并发拾取等只关心原子性的用例）。</summary>
@@ -1681,6 +1816,8 @@ public class SimulationTests
         public bool ConsumeItem(int playerId, int itemId) => true;
         public bool TryAddItem(int playerId, int itemId, int stack) => true;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => true;
+        public InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(int playerId, int slot, IReadOnlyList<InventoryReward> rewards)
+            => InventoryBagOpenResult.Success;
     }
 }
 
@@ -2499,8 +2636,60 @@ public class WorldGeneratorTests
 
         Assert.True(new NpcStrikeCommand(10, 1, index, 60, Generation: 1)
             .Apply(world, new XoshiroRng(1)).Applied);
-        Assert.Equal(20, nearer.SummonNpcHitCooldownUntil[index]);
-        Assert.False(farther.SummonNpcHitCooldownUntil.ContainsKey(index));
+        Assert.Equal(20, farther.SummonNpcHitCooldownUntil[index]);
+        Assert.False(nearer.SummonNpcHitCooldownUntil.ContainsKey(index));
+    }
+
+    [Fact]
+    public void Summon_Attack_Uses_ServerRegisteredEntity_Without_CurrentPositionOverlap()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            SelectedSlot = 3,
+        };
+        player.Items[3] = 3474;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var slime = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 100,
+            LifeMax = 100,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(slime);
+        int index = world.Npcs.IndexOf(slime);
+
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 7,
+                Owner = 1,
+                Type = 266,
+                Position = new Vector2(1000f, 1000f),
+                Damage = 8,
+                Active = true,
+                IsSummon = true,
+                SummonKind = SummonKind.Minion,
+                SummonEntityId = 1,
+                Penetrate = -1,
+            });
+
+        var result = new NpcStrikeCommand(10, 1, index, 8, Generation: 3)
+            .Apply(world, new XoshiroRng(1));
+
+        Assert.True(result.Applied);
+        Assert.Equal(92, slime.Life);
     }
 
     [Fact]

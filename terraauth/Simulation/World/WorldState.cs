@@ -12,11 +12,21 @@ using TerraAuth.Protocol;
 namespace TerraAuth.Simulation;
 
 /// <summary>世界全局状态：元数据 + 图格矩阵 + 实体列表。</summary>
+public readonly record struct InventoryReward(int ItemId, int Stack);
+
+public enum InventoryBagOpenResult
+{
+    Success,
+    InvalidBag,
+    InventoryFull,
+}
+
 public interface IInventoryLedger
 {
     bool ConsumeItem(int playerId, int itemId);
     bool TryAddItem(int playerId, int itemId, int stack);
     bool TryAddItemExactly(int playerId, int itemId, int stack);
+    InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(int playerId, int slot, IReadOnlyList<InventoryReward> rewards);
 }
 
 public sealed class WorldState
@@ -396,7 +406,7 @@ public sealed class WorldState
         //   经典猩红（NotExpert + IsCrimson）：猩红矿(880) 30-90、猩红种子(2171) 1-3（均 100%）。
         //   两套通用：眼面具(2112) 1/7、望远镜(1299) 1/40。
         //   专家/大师：眼魔宝袋(3319) 必掉（原版 BossBag 为 DropBasedOnExpertMode(无,  宝袋)，
-        //   且上述经典掉落均带 NotExpert 条件 → 专家模式**只**掉宝袋，内容由客户端开袋产生）。
+        //   且上述经典掉落均带 NotExpert 条件 → 专家模式**只**掉宝袋，内容由服务端权威开袋命令生成）。
         [4] = new BossLootSpec(
             new[]
             {
@@ -815,6 +825,120 @@ public sealed class WorldState
     private readonly HashSet<(int ChestIndex, int Slot)> _pendingChestUpdates = new();
     private readonly HashSet<(int PlayerId, long SessionId, int Slot)> _pendingInventoryUpdates = new();
     private readonly Dictionary<(int PlayerId, long SessionId), HashSet<long>> _appliedInventoryChestOperations = new();
+    private readonly Dictionary<(int PlayerId, long SessionId), PendingBagOpen> _pendingBagOpens = new();
+    private readonly Dictionary<(int PlayerId, long SessionId, int Slot), PendingInventoryConfirmation> _pendingInventoryConfirmations = new();
+
+    private sealed record PendingBagOpen(int Slot, DateTimeOffset ExpiresAt);
+    private sealed record PendingInventoryConfirmation(
+        int ItemId,
+        int Stack,
+        byte Prefix,
+        DateTimeOffset ExpiresAt);
+
+    public void MarkInventoryConfirmation(
+        int playerId,
+        long sessionId,
+        int slot,
+        int itemId,
+        int stack,
+        byte prefix)
+    {
+        lock (ChestUpdatesLock)
+        {
+            _pendingInventoryConfirmations[(playerId, sessionId, slot)] =
+                new PendingInventoryConfirmation(
+                    stack > 0 ? itemId : 0,
+                    stack > 0 ? stack : 0,
+                    stack > 0 ? prefix : (byte)0,
+                    DateTimeOffset.UtcNow.AddSeconds(2));
+        }
+    }
+
+    public bool IsPendingInventoryConfirmation(
+        int playerId,
+        long sessionId,
+        int slot,
+        int itemId,
+        int stack,
+        byte prefix)
+    {
+        lock (ChestUpdatesLock)
+        {
+            var key = (playerId, sessionId, slot);
+            if (!_pendingInventoryConfirmations.TryGetValue(key, out var pending))
+                return false;
+
+            if (pending.ExpiresAt <= DateTimeOffset.UtcNow)
+            {
+                _pendingInventoryConfirmations.Remove(key);
+                return false;
+            }
+
+            return pending.ItemId == (stack > 0 ? itemId : 0) &&
+                   pending.Stack == (stack > 0 ? stack : 0) &&
+                   pending.Prefix == (stack > 0 ? prefix : (byte)0);
+        }
+    }
+
+    public bool BeginPendingBagOpen(int playerId, long sessionId, int slot)
+    {
+        lock (ChestUpdatesLock)
+        {
+            var key = (playerId, sessionId);
+            if (_pendingBagOpens.TryGetValue(key, out var current) &&
+                current.ExpiresAt > DateTimeOffset.UtcNow)
+                return false;
+
+            _pendingBagOpens[key] = new PendingBagOpen(slot, DateTimeOffset.UtcNow.AddSeconds(2));
+            return true;
+        }
+    }
+
+    public bool IsPendingBagOpen(int playerId, long sessionId, int slot)
+    {
+        lock (ChestUpdatesLock)
+        {
+            if (!_pendingBagOpens.TryGetValue((playerId, sessionId), out var pending))
+                return false;
+            if (pending.ExpiresAt <= DateTimeOffset.UtcNow)
+            {
+                _pendingBagOpens.Remove((playerId, sessionId));
+                return false;
+            }
+            return pending.Slot == -1 || pending.Slot == slot;
+        }
+    }
+
+    public bool HasPendingBagOpen(int playerId, long sessionId)
+    {
+        lock (ChestUpdatesLock)
+        {
+            if (!_pendingBagOpens.TryGetValue((playerId, sessionId), out var pending))
+                return false;
+            if (pending.ExpiresAt <= DateTimeOffset.UtcNow)
+            {
+                _pendingBagOpens.Remove((playerId, sessionId));
+                return false;
+            }
+            return true;
+        }
+    }
+
+    public void PromotePendingBagOpen(int playerId, long sessionId)
+    {
+        lock (ChestUpdatesLock)
+        {
+            var key = (playerId, sessionId);
+            if (_pendingBagOpens.TryGetValue(key, out var pending))
+                _pendingBagOpens[key] = pending with { Slot = -1 };
+        }
+    }
+
+    public void CompletePendingBagOpen(int playerId, long sessionId)
+    {
+        lock (ChestUpdatesLock)
+            _pendingBagOpens.Remove((playerId, sessionId));
+    }
 
     public void MarkInventoryChanged(int playerId, long sessionId, int slot)
     {
@@ -1741,6 +1865,9 @@ public sealed class PlayerRuntime
 
     /// <summary>上次获准创建受 UseItem 状态机约束弹幕的服务端 tick。</summary>
     public long LastUseItemProjectileSpawnTick = long.MinValue;
+
+    /// <summary>当前 UseItem 动画周期剩余 tick；松开或换槽位时清零。</summary>
+    public int UseAnimationTicksRemaining;
 
     /// <summary>服务器分配的下一次开火事务序号，绑定当前 UseItem 周期。</summary>
     public long NextFireTransactionId = 1;

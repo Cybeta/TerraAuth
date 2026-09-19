@@ -46,7 +46,7 @@ public sealed record AuthorityResult(
         => new(AuthorityDecision.Reject, null, Reason: reason, CountsAsViolation: countsAsViolation, Detail: detail);
 
     public static AuthorityResult RejectSilent()
-        => new(AuthorityDecision.RejectSilent, null);
+        => new(AuthorityDecision.RejectSilent, null, CountsAsViolation: false);
 
     public static AuthorityResult Correct(INetworkPacket correction, string reason)
         => new(AuthorityDecision.Correct, null, CorrectionPacket: correction, Reason: reason);

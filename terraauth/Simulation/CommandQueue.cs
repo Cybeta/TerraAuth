@@ -116,14 +116,22 @@ public sealed record MoveCommand(long Tick, int? PlayerId, Vector2 Position)
         if (ReportedVelocity is { } reported)
             player.Velocity = reported;
         bool wasPressingUseItem = player.PressingUseItem;
+        int previousUseSlot = player.UseItemSelectedSlot;
         player.ControlBits = ControlBits;
         if (SelectedItem < PlayerRuntime.InventorySlotCount)
             player.SelectedSlot = SelectedItem;
         player.HasReceivedPlayerControls = true;
         if (!player.PressingUseItem)
+        {
             player.UseItemSelectedSlot = -1;
-        else if (!wasPressingUseItem || player.UseItemSelectedSlot < 0)
+            player.UseAnimationTicksRemaining = 0;
+        }
+        else if (!wasPressingUseItem || player.UseItemSelectedSlot < 0 || previousUseSlot != player.SelectedSlot)
+        {
             player.UseItemSelectedSlot = player.SelectedSlot;
+            player.UseAnimationTicksRemaining = WeaponUseBehaviorTable.For(
+                player.Items[player.SelectedSlot]).UseAnimation;
+        }
         player.Active = true;
         world.MarkPlayerChanged(id);
         return new(true);
@@ -218,6 +226,62 @@ public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot,
         player.ItemPrefixes[Slot] = Stack > 0 ? Prefix : (byte)0;
         player.RecalculateDefense();
         return new(true);
+    }
+}
+
+/// <summary>SSC 眼魔宝袋开袋命令：奖励由服务端随机并原子写入权威背包。</summary>
+public sealed record OpenEyeOfCthulhuTreasureBagCommand(long Tick, int? PlayerId, int Slot)
+    : Command(Tick, PlayerId, "open_eye_of_cthulhu_treasure_bag")
+{
+    public override CommandApplyResult Apply(WorldState world, IRng rng)
+    {
+        if (PlayerId is not int playerId)
+            return new(false, CommandFailures.MissingPlayer);
+        if (world.InventoryLedger is null)
+            return new(false, CommandFailures.InventoryUnavailable);
+
+        bool crimson;
+        long playerSessionId;
+        lock (world.PlayersLock)
+        {
+            if (!world.Players.TryGetValue(playerId, out var player) ||
+                (SessionId != 0 && player.SessionId != SessionId) || !player.Active || player.Dead)
+            {
+                return new(false, CommandFailures.PlayerNotActive);
+            }
+            playerSessionId = player.SessionId;
+            crimson = world.Progress.Crimson;
+        }
+
+        var rewards = new List<InventoryReward>
+        {
+            crimson
+                ? new InventoryReward(880, 30 + rng.NextInt32(61))
+                : new InventoryReward(56, 30 + rng.NextInt32(61)),
+        };
+        if (crimson)
+            rewards.Add(new InventoryReward(2171, 1 + rng.NextInt32(3)));
+        else
+        {
+            rewards.Add(new InventoryReward(47, 20 + rng.NextInt32(31)));
+            rewards.Add(new InventoryReward(59, 1 + rng.NextInt32(3)));
+        }
+        if (rng.NextInt32(7) == 0) rewards.Add(new InventoryReward(2112, 1));
+        if (rng.NextInt32(40) == 0) rewards.Add(new InventoryReward(1299, 1));
+
+        var result = world.InventoryLedger.TryOpenEyeOfCthulhuTreasureBag(playerId, Slot, rewards);
+        switch (result)
+        {
+            case InventoryBagOpenResult.Success:
+                world.PromotePendingBagOpen(playerId, playerSessionId);
+                return new(true);
+            case InventoryBagOpenResult.InventoryFull:
+                world.CompletePendingBagOpen(playerId, playerSessionId);
+                return new(false, CommandFailures.InventoryFull);
+            default:
+                world.CompletePendingBagOpen(playerId, playerSessionId);
+                return new(false, CommandFailures.NotApplied);
+        }
     }
 }
 
@@ -1459,6 +1523,9 @@ public sealed record NpcStrikeCommand(
         if (!TryGetPlayer(world, playerId, out var player, out var failure))
             return failure;
 
+        if (DiagnosticLog.Enabled)
+            Console.WriteLine($"[DIAG] Apply28 pid={playerId} npc={NpcIndex} gen={Generation} dmg={Damage} crit={(Crit ? 1 : 0)} tick={Tick}");
+
         // 原版服务端在收到包 28 时**无条件**回一个包 162（且在校验之前），客户端据此出队一条待确认伤害。
         // 在此登记可保证后续因 generation / 存活校验而未生效的命中同样被确认，客户端的队列不会漏账。
         world.MarkNpcDamageAck(playerId);
@@ -1533,20 +1600,37 @@ public sealed record NpcStrikeCommand(
 
             if (summonAttackExpected)
             {
-                var summonProjectile = FindPlayerProjectileNearNpc(
-                    world, playerId, npc, out _, summonOnly: true);
+                // 原版召唤物的包 27 通常只在生成时上报位置；后续包 28 是客户端
+                // 依据仆从自身 AI 产生的命中确认，不能要求服务端缓存坐标仍与 NPC 重叠。
+                // 归属、活动状态、召唤类型、伤害上限、generation 和冷却仍在此处校验。
+                var summonProjectile = FindOwnedSummonProjectile(world, playerId, npc);
                 if (summonProjectile is null)
+                {
+                    if (DiagnosticLog.Enabled)
+                        Console.WriteLine($"[DIAG] Apply28 summon-miss pid={playerId} npc={NpcIndex} npcPos=({npc.X:0.0},{npc.Y:0.0})");
                     return new(false, CommandFailures.ProjectileRequired);
+                }
+
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[DIAG] Apply28 summon-match pid={playerId} npc={NpcIndex} key={summonProjectile.Key} type={summonProjectile.Type} pos=({summonProjectile.Position.X:0.0},{summonProjectile.Position.Y:0.0}) dmg={summonProjectile.Damage} summon={summonProjectile.IsSummon} kind={summonProjectile.SummonKind} entity={summonProjectile.SummonEntityId} sourceItem={summonProjectile.SourceWeaponItem} buff={summonProjectile.SourceSummonBuffId}");
 
                 if (summonProjectile.SummonNpcHitCooldownUntil.TryGetValue(
                         NpcIndex, out long summonCooldownUntil) &&
                     Tick < summonCooldownUntil)
+                {
+                    if (DiagnosticLog.Enabled)
+                        Console.WriteLine($"[DIAG] Apply28 summon-cooldown pid={playerId} npc={NpcIndex} until={summonCooldownUntil} tick={Tick}");
                     return new(false, CommandFailures.ProjectileHitCooldown);
+                }
 
                 int summonBound = (int)Math.Ceiling(summonProjectile.Damage * 1.15f)
                     * (Crit ? 2 : 1);
                 if (Damage > summonBound)
+                {
+                    if (DiagnosticLog.Enabled)
+                        Console.WriteLine($"[DIAG] Apply28 summon-damage-mismatch pid={playerId} npc={NpcIndex} reported={Damage} bound={summonBound} projectileDamage={summonProjectile.Damage}");
                     return new(false, CommandFailures.StrikeDamageMismatch);
+                }
                 summonProjectileMatched = true;
                 summonProjectile.SummonNpcHitCooldownUntil[NpcIndex] = Tick + 10;
                 if (summonProjectile.Penetrate > 0)
@@ -1689,6 +1773,35 @@ public sealed record NpcStrikeCommand(
     private static bool IsSummonProjectile(ProjectileEntity projectile)
         => projectile.IsSummon || SummonProjectileTable.Of.Contains(projectile.Type);
 
+    private static ProjectileEntity? FindOwnedSummonProjectile(
+        WorldState world, int playerId, WorldNpc npc)
+    {
+        ProjectileEntity? best = null;
+        lock (world.ProjectilesLock)
+        {
+            foreach (var p in world.Projectiles)
+            {
+                if (!p.Active || p.Destroyed || p.Owner != playerId || p.Damage <= 0 ||
+                    !IsSummonProjectile(p))
+                    continue;
+
+                if (best is null)
+                {
+                    best = p;
+                    continue;
+                }
+
+                long entityId = p.SummonEntityId > 0 ? p.SummonEntityId : long.MaxValue;
+                long bestEntityId = best.SummonEntityId > 0 ? best.SummonEntityId : long.MaxValue;
+                if (entityId < bestEntityId ||
+                    entityId == bestEntityId && p.Key < best.Key)
+                    best = p;
+            }
+        }
+
+        return best;
+    }
+
     private static ProjectileEntity? FindPlayerProjectileNearNpc(
         WorldState world, int playerId, WorldNpc npc, out bool hasOwnedProjectile,
         bool summonOnly = false)
@@ -1821,7 +1934,29 @@ public sealed record SpawnProjectileCommand(
             var existing = world.Projectiles.FirstOrDefault(p => p.Owner == playerId && p.Key == Key);
             if (existing is not null)
             {
-                // 已有弹幕由服务端仿真推进；包 27 更新不采信客户端的位置、速度或生命周期状态。
+                // 召唤 / 哨兵的位置和速度由客户端 AI 持续上报；只接受经过边界校验的运动状态，
+                // 不接受客户端对伤害、类型、归属或生命周期字段的修改。
+                if (existing.IsSummon || SummonProjectileTable.Of.Contains(existing.Type))
+                {
+                    if (!float.IsFinite(Position.X) || !float.IsFinite(Position.Y) ||
+                        !float.IsFinite(Velocity.X) || !float.IsFinite(Velocity.Y))
+                        return new(false, CommandFailures.ProjectileSpawnInvalid);
+
+                    float existingWorldWidth = world.MaxTilesX * 16f;
+                    float existingWorldHeight = world.MaxTilesY * 16f;
+                    if (Position.X < 0f || Position.Y < 0f ||
+                        Position.X + existing.Width > existingWorldWidth ||
+                        Position.Y + existing.Height > existingWorldHeight)
+                        return new(false, CommandFailures.ProjectileSpawnOutOfWorld);
+
+                    if (Velocity.X * Velocity.X + Velocity.Y * Velocity.Y > 512f * 512f)
+                        return new(false, CommandFailures.ProjectileSpeedExceeded);
+
+                    existing.Position = Position;
+                    existing.Velocity = Velocity;
+                }
+
+                // 普通弹幕由服务端仿真推进；包 27 更新不采信客户端的位置、速度或生命周期状态。
                 return new(true);
             }
 
@@ -2050,7 +2185,7 @@ public sealed record SpawnProjectileCommand(
                 world.MarkInventoryChanged(playerId, player.SessionId, ammoSlot);
             }
 
-            world.Projectiles.Add(new ProjectileEntity
+            var projectile = new ProjectileEntity
             {
                 Key = Key,
                 Owner = playerId,
@@ -2076,7 +2211,10 @@ public sealed record SpawnProjectileCommand(
                 Width = size.Width,
                 Height = size.Height,
                 NewNotified = false,
-            });
+            };
+            world.Projectiles.Add(projectile);
+            if (DiagnosticLog.Enabled && Type == 266)
+                Console.WriteLine($"[DIAG] Apply27 summon-created pid={playerId} key={projectile.Key} type={projectile.Type} pos=({projectile.Position.X:0.0},{projectile.Position.Y:0.0}) dmg={projectile.Damage} summon={projectile.IsSummon} kind={projectile.SummonKind} entity={projectile.SummonEntityId} sourceItem={projectile.SourceWeaponItem} prefix={projectile.SourceWeaponPrefix} buff={projectile.SourceSummonBuffId} tick={projectile.SpawnTick}");
             if (controlledFire)
             {
                 player.LastUseItemProjectileSpawnTick = world.Tick;

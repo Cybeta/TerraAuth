@@ -23,6 +23,12 @@ public sealed class RateLimits
 
 public sealed record PacketContext(int PlayerId, long Tick, DateTimeOffset ReceivedAt, long SessionId = 0) : IPacketContext;
 
+/// <summary>SSC 权威校验后由眼魔宝袋清空请求转换的内部意图包，不来自网络解码。</summary>
+internal sealed record OpenEyeOfCthulhuTreasureBagPacket(int Slot) : INetworkPacket
+{
+    public PacketId Type => PacketId.InventorySlot;
+}
+
 // ---------- 管线阶段 ----------
 
 public interface IPipelineStage
@@ -95,7 +101,7 @@ public sealed class InventoryAuthorityStage : IPipelineStage
     {
         var result = _inv.Validate(packet, context.PlayerId, null!);
         if (result.Decision != AuthorityDecision.Accept) return result;
-        return await next(packet).ConfigureAwait(false);
+        return await next(result.Packet ?? packet).ConfigureAwait(false);
     }
 }
 
@@ -223,6 +229,9 @@ public sealed class TerminalStage : IPipelineStage
         ItemPickupPacket pickup => new PickupItemCommand(context.Tick, context.PlayerId, pickup.ItemSlotIndex),
         // 包 151 ItemDestroy → 物品拾取（原版 1.4.5 客户端拾取物品后的真实通知路径）
         ItemDestroyPacket destroy => new PickupItemCommand(context.Tick, context.PlayerId, destroy.ItemSlotIndex),
+        // SSC 眼魔宝袋清空意图由库存权威层转换，终端阶段只映射为权威开袋命令。
+        OpenEyeOfCthulhuTreasureBagPacket bag => new OpenEyeOfCthulhuTreasureBagCommand(
+            context.Tick, context.PlayerId, bag.Slot),
         // 包 5 InventorySlot → 物品栏槽位写入（SSC 服务端唯一真相；装备区防御由此回填 Defense，前缀用于近战武器校验）
         InventorySlotPacket slot => new SetInventorySlotCommand(context.Tick, context.PlayerId,
             slot.Slot, slot.ItemId, slot.Stack, slot.Prefix),
@@ -318,7 +327,9 @@ public sealed class InboundPipeline : IInboundPipeline
         {
             // 命令队列有界时，超限返回 false：拒绝该次操作（不吞命令、不计违规，仅防队列被恶愈占用撑爆）。
             if (!commands.Enqueue(result.Command))
-                return AuthorityResult.Reject(CommandFailures.NotApplied, countsAsViolation: false);
+                return AuthorityResult.Reject(
+                    CommandFailures.NotApplied,
+                    countsAsViolation: false);
         }
 
         return result;

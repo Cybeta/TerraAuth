@@ -696,9 +696,43 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
         if (slot.Stack > 0 && !IsValidItem(slot.ItemId))
             return Deny(playerId, "slot_rejected", "unknown_item", new { slot.ItemId });
 
-        // SSC：客户端槽位快照不能覆盖服务端权威背包；物品变更只能来自服务端受控事件。
+        // SSC：客户端会回显服务端刚下发的槽位。完全一致时只作确认，不能再生成写入命令；
+        // 只有与服务端当前权威状态不一致时，才视为客户端试图覆盖背包。
         if (_limits.SscEnabled)
-            return Deny(playerId, "slot_rejected", "inventory_snapshot_forbidden", new { slot.Slot });
+        {
+            lock (_world.PlayersLock)
+            {
+                if (_world.Players.TryGetValue(playerId, out var player))
+                {
+                    if (player.Items[slot.Slot] == (slot.Stack > 0 ? slot.ItemId : 0) &&
+                        player.ItemStacks[slot.Slot] == slot.Stack &&
+                        player.ItemPrefixes[slot.Slot] == (slot.Stack > 0 ? slot.Prefix : (byte)0))
+                    {
+                        return AuthorityResult.RejectSilent();
+                    }
+
+                    if (_world.IsPendingBagOpen(playerId, player.SessionId, slot.Slot))
+                    {
+                        return AuthorityResult.RejectSilent();
+                    }
+
+                    if (slot.Stack == 0 && player.Items[slot.Slot] == 3319 &&
+                        player.ItemStacks[slot.Slot] > 0 && player.ItemPrefixes[slot.Slot] == 0)
+                    {
+                        if (!_world.BeginPendingBagOpen(playerId, player.SessionId, slot.Slot))
+                            return AuthorityResult.RejectSilent();
+
+                        // 客户端会在发送开袋意图后立即发送本地奖励快照；先建立全背包静默屏障，等待服务端命令执行和权威库存同步。
+                        _world.PromotePendingBagOpen(playerId, player.SessionId);
+                        return AuthorityResult.Accept(
+                            new OpenEyeOfCthulhuTreasureBagPacket(slot.Slot));
+                    }
+                }
+            }
+
+            return Deny(playerId, "slot_rejected",
+                "inventory_snapshot_forbidden", new { slot.Slot });
+        }
 
         return AuthorityResult.Accept(slot);
     }
@@ -797,6 +831,68 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
             }
             player.RecalculateDefense();
             return true;
+        }
+    }
+
+    public InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(
+        int playerId, int slot, IReadOnlyList<InventoryReward> rewards)
+    {
+        if (slot < 0 || slot >= PlayerRuntime.InventorySlotCount)
+            return InventoryBagOpenResult.InvalidBag;
+
+        lock (_world.PlayersLock)
+        {
+            if (!_world.Players.TryGetValue(playerId, out var player) ||
+                player.Items[slot] != 3319 || player.ItemStacks[slot] <= 0 || player.ItemPrefixes[slot] != 0)
+            {
+                return InventoryBagOpenResult.InvalidBag;
+            }
+
+            var itemIds = (int[])player.Items.Clone();
+            var stacks = (int[])player.ItemStacks.Clone();
+            var prefixes = (byte[])player.ItemPrefixes.Clone();
+            if (--stacks[slot] == 0)
+            {
+                itemIds[slot] = 0;
+                prefixes[slot] = 0;
+            }
+
+            foreach (var reward in rewards)
+            {
+                var remaining = reward.Stack;
+                for (var target = 0; target < PlayerRuntime.InventorySlotCount && remaining > 0; target++)
+                {
+                    if (itemIds[target] != reward.ItemId || stacks[target] <= 0 || stacks[target] >= _limits.MaxStackSize)
+                        continue;
+                    var add = Math.Min(remaining, _limits.MaxStackSize - stacks[target]);
+                    stacks[target] += add;
+                    remaining -= add;
+                }
+                for (var target = 0; target < PlayerRuntime.InventorySlotCount && remaining > 0; target++)
+                {
+                    if (stacks[target] > 0) continue;
+                    var add = Math.Min(remaining, _limits.MaxStackSize);
+                    itemIds[target] = reward.ItemId;
+                    stacks[target] = add;
+                    prefixes[target] = 0;
+                    remaining -= add;
+                }
+                if (remaining > 0)
+                    return InventoryBagOpenResult.InventoryFull;
+            }
+
+            for (var target = 0; target < PlayerRuntime.InventorySlotCount; target++)
+            {
+                if (player.Items[target] == itemIds[target] && player.ItemStacks[target] == stacks[target] &&
+                    player.ItemPrefixes[target] == prefixes[target])
+                    continue;
+                player.Items[target] = itemIds[target];
+                player.ItemStacks[target] = stacks[target];
+                player.ItemPrefixes[target] = prefixes[target];
+                _world.MarkInventoryChanged(playerId, player.SessionId, target);
+            }
+            player.RecalculateDefense();
+            return InventoryBagOpenResult.Success;
         }
     }
 
