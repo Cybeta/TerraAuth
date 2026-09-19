@@ -115,6 +115,18 @@ public sealed class ProjectileEntity
     /// <summary>召唤弹幕对同一 NPC 的下一次可命中 tick。</summary>
     public Dictionary<int, long> SummonNpcHitCooldownUntil { get; } = new();
 
+    /// <summary>
+    /// 服务端**自算**的权威位置（**判定用**）；null = 该本体不由服务端持有位置（判定退回 <see cref="Position"/>）。
+    /// 与 <see cref="Position"/> 的分工（W-2 第三档 `ServerAi` 的**混合模型**）：
+    /// <see cref="Position"/> 始终是客户端包 27 上报的**表现用**坐标、原样广播给所有客户端（含主人），主人视角无抖动；
+    /// 本字段只用于**存活 / 命中几何**判定，客户端无法影响它。
+    /// 目前仅 AI_062 族（373 / 375 / 407 / 423 / 613 / 963）在 `ServerAi` 及以上被维护。
+    /// </summary>
+    public Vector2? ServerPosition { get; set; }
+
+    /// <summary>服务端自算位置的速度状态（配合 <see cref="ServerPosition"/> 做惯性插值）。</summary>
+    public Vector2? ServerVelocity { get; set; }
+
     /// <summary>碰撞盒尺寸（按原版 Projectile.SetDefaults 逐类型 width/height；未登记类型取 16 近似）。</summary>
     public float Width = 16f;
     public float Height = 16f;

@@ -4385,6 +4385,329 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
+    /// W-2 第三档 `ServerAi` 第二刀：**位置硬绑定**族（`Mode == PositionBound`，831 / 970 的家点、626-628 的父节）。
+    /// 原版精确位置依赖**客户端视觉状态**（公转相位 / 头饰偏移 / gfxOffY）或客户端驱动的父节，服务端无法逐帧复刻，
+    /// 故只做**锚点约束**：超出 200px 容忍圈的坐标判为越权 → 吸附回锚点；圈内照常接受（不误拒合法位置）。
+    /// </summary>
+    [Fact]
+    public void ServerAi_PositionBound_Body_Snaps_Back_To_Anchor()
+    {
+        static (WorldState World, PlayerRuntime Player) CreateScenario()
+        {
+            var world = WorldGenerator.GenerateSmall();
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(320f, 460f),
+                DeathNotified = true,
+            };
+            lock (world.PlayersLock) world.Players[1] = player;
+            return (world, player);
+        }
+
+        static ProjectileEntity Add(WorldState world, int type, int key, Vector2 pos)
+        {
+            var p = new ProjectileEntity
+            {
+                Key = key,
+                Owner = 1,
+                Type = type,
+                IsSummon = true,
+                SummonEntityId = key,
+                SummonKind = SummonProjectileTable.KindOf(type),
+                Position = pos,
+                Damage = 100,
+                Penetrate = -1,
+                Active = true,
+            };
+            lock (world.ProjectilesLock) world.Projectiles.Add(p);
+            return p;
+        }
+
+        static CommandApplyResult Move(WorldState world, int type, int key, Vector2 pos) =>
+            new SpawnProjectileCommand(10, 1, key, type, pos, new Vector2(0f, 0f), 100)
+                .Apply(world, new XoshiroRng(1));
+
+        // 锚点 = 主人中心 (330, 481) 上方 61 → (330, 420)
+        var expectedAnchor = new Vector2(330f, 420f);
+
+        // 831：远离主人 → 吸附回锚点
+        var gem = CreateScenario();
+        gem.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        var gemBody = Add(gem.World, 831, 7, expectedAnchor);
+        Assert.True(Move(gem.World, 831, 7, new Vector2(5000f, 400f)).Applied);
+        Assert.Equal(expectedAnchor, gemBody.Position);
+        Assert.Equal(new Vector2(0f, 0f), gemBody.Velocity);
+
+        // 831：容忍圈内的合法偏移（公转环）→ 原样接受，不吸附
+        // 注：项目自带的 Vector2 是纯 record（无运算符），一切向量运算按标量写
+        var orbit = CreateScenario();
+        orbit.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        var orbitBody = Add(orbit.World, 831, 7, expectedAnchor);
+        var legal = new Vector2(expectedAnchor.X + 30f, expectedAnchor.Y - 20f);
+        Assert.True(Move(orbit.World, 831, 7, legal).Applied);
+        Assert.Equal(legal, orbitBody.Position);
+
+        // 970 AbigailCounter 同族 → 同样约束
+        var counter = CreateScenario();
+        counter.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        var counterBody = Add(counter.World, 970, 7, expectedAnchor);
+        Assert.True(Move(counter.World, 970, 7, new Vector2(5000f, 400f)).Applied);
+        Assert.Equal(expectedAnchor, counterBody.Position);
+
+        // 626 星尘龙节段：锚点 = 同属主头节 625 的位置 → 瞬移被拉回
+        // （注意用**世界内**的远点：越界坐标会在更早的 ProjectileSpawnOutOfWorld 校验就被拒）
+        var dragon = CreateScenario();
+        dragon.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        var head = Add(dragon.World, 625, 1, new Vector2(600f, 500f));
+        var seg = Add(dragon.World, 626, 2, new Vector2(600f, 520f));
+        Assert.True(Move(dragon.World, 626, 2, new Vector2(5000f, 400f)).Applied);
+        Assert.Equal(head.Position, seg.Position);
+
+        // 没有存活头节 → 锚点未知 → 不接管（失败放行，绝不误拒）
+        var orphan = CreateScenario();
+        orphan.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        var orphanSeg = Add(orphan.World, 627, 2, new Vector2(600f, 520f));
+        var orphanMove = new Vector2(5000f, 400f);
+        Assert.True(Move(orphan.World, 627, 2, orphanMove).Applied);
+        Assert.Equal(orphanMove, orphanSeg.Position);
+
+        // ClientDriven（默认档）：一切照旧，不做任何吸附 —— 锁定现状
+        var client = CreateScenario();
+        var clientBody = Add(client.World, 831, 7, expectedAnchor);
+        Assert.True(Move(client.World, 831, 7, new Vector2(5000f, 400f)).Applied);
+        Assert.Equal(new Vector2(5000f, 400f), clientBody.Position);
+    }
+
+    /// <summary>
+    /// W-2 第三档 `ServerAi` 第三刀（混合模型）：**AI_062 族**（373 / 375 / 407 / 423 / 613 / 963）的
+    /// 服务端自算位置只写 <c>ServerPosition</c>（判定用）——表现用的 <c>Position</c> 仍是客户端上报值、不被改写。
+    /// 复刻「跟随主人 + 惯性 + 速度上限 + 召回 + 超远传送」，不复刻索敌 / 冲刺。
+    /// </summary>
+    [Fact]
+    public void ServerAi_Ai062_Body_Server_Position_Follows_Owner()
+    {
+        static (WorldState World, PlayerRuntime Player) CreateScenario()
+        {
+            var world = WorldGenerator.GenerateSmall();
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(320f, 460f),
+                Direction = 1,
+                DeathNotified = true,
+            };
+            lock (world.PlayersLock) world.Players[1] = player;
+            return (world, player);
+        }
+
+        // 本体 373 停在主人待命点（主人中心 (330,481) 上方 60 → (330,421)）
+        var world0 = CreateScenario();
+        var body0 = new ProjectileEntity
+        {
+            Key = 7, Owner = 1, Type = 373, IsSummon = true, SummonEntityId = 1,
+            SummonKind = SummonKind.Minion, Position = new Vector2(330f, 421f),
+            Damage = 30, Penetrate = -1, Active = true,
+        };
+        lock (world0.World.ProjectilesLock) world0.World.Projectiles.Add(body0);
+
+        // ClientDriven：服务端完全不碰位置（ServerPosition 保持 null）
+        var idleSim = new WorldSimulator(world0.World, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        idleSim.Tick();
+        Assert.Null(body0.ServerPosition);
+
+        // ServerAi：自算位置；已停在待命点时基本不动
+        var world = CreateScenario();
+        world.World.SummonAuthority = SummonAuthorityMode.ServerAi;
+        var body = new ProjectileEntity
+        {
+            Key = 7, Owner = 1, Type = 373, IsSummon = true, SummonEntityId = 1,
+            SummonKind = SummonKind.Minion, Position = new Vector2(330f, 421f),
+            Damage = 30, Penetrate = -1, Active = true,
+        };
+        lock (world.World.ProjectilesLock) world.World.Projectiles.Add(body);
+
+        var sim = new WorldSimulator(world.World, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        sim.Tick();
+        Assert.NotNull(body.ServerPosition);
+        Assert.True(Math.Abs(body.ServerPosition!.Value.X - 330f) < 1f);
+        Assert.True(Math.Abs(body.ServerPosition!.Value.Y - 421f) < 1f);
+
+        // 主人瞬移到 900px 外 → 服务端位置朝主人靠拢，但**表现坐标（Position）不被改写**
+        float presentationX = body.Position.X;
+        world.Player.Position = new Vector2(1220f, 460f);
+        for (int i = 0; i < 30; i++) sim.Tick();
+        float before = Math.Abs(body.ServerPosition!.Value.X - 1230f);
+        for (int i = 0; i < 30; i++) sim.Tick();
+        float after = Math.Abs(body.ServerPosition!.Value.X - 1230f);
+        Assert.True(after < before, $"服务端位置应持续朝主人靠拢：{before} → {after}");
+        Assert.Equal(presentationX, body.Position.X);   // 混合模型：表现坐标始终是客户端上报值
+
+        // 超过召回阈值（1000）→ 提速到 15（每 tick 位移明显大于基准 6）
+        Assert.True(body.ServerVelocity!.Value.X > 6f);
+
+        // 超过超远传送阈值（2000）→ 直接吸到主人中心
+        world.Player.Position = new Vector2(4000f, 460f);
+        sim.Tick();
+        Assert.True(Math.Abs(body.ServerPosition!.Value.X - 4010f) < 0.01f);
+        Assert.Equal(0f, body.ServerVelocity!.Value.X);
+    }
+
+    /// <summary>
+    /// 配对收口：对**服务端自算位置**的本体（AI_062 族），包 28 命中必须落在服务端位置的可达圈内 ——
+    /// 堵住「把本体挪到全图任意 NPC 旁再报命中」。未自算位置的族（ServerPosition 为 null）不判，保持失败放行。
+    /// </summary>
+    [Fact]
+    public void ServerAi_Ai062_Hit_Requires_Npc_Within_Server_Reach()
+    {
+        static (WorldState World, PlayerRuntime Player, int Index) CreateScenario(float npcX)
+        {
+            var world = WorldGenerator.GenerateSmall();
+            world.SummonAuthority = SummonAuthorityMode.ServerAi;
+            world.StrikeWeaponCheck = true;
+
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(320f, 460f),
+                Direction = 1,
+                SelectedSlot = 3,
+                DeathNotified = true,
+            };
+            player.Items[3] = 3474; // 召唤法杖 → summonAttackExpected
+            player.ItemStacks[3] = 1;
+            lock (world.PlayersLock) world.Players[1] = player;
+
+            var npc = new WorldNpc
+            {
+                Type = 1, NetId = 1, Active = true, Life = 50_000, LifeMax = 50_000,
+                Generation = 3, X = npcX, Y = 400f,
+            };
+            lock (world.NpcsLock) world.Npcs.Add(npc);
+            return (world, player, world.Npcs.IndexOf(npc));
+        }
+
+        static void AddBody(WorldState world, int type)
+        {
+            lock (world.ProjectilesLock)
+                world.Projectiles.Add(new ProjectileEntity
+                {
+                    Key = 7, Owner = 1, Type = type, IsSummon = true, SummonEntityId = 1,
+                    SummonKind = SummonKind.Minion, Position = new Vector2(330f, 421f),
+                    Damage = 30, Penetrate = -1, Active = true,
+                });
+        }
+
+        // 目标在 5000px 外：373 的服务端位置在主人身边（约 330,421）→ 超出可达圈 → 拒绝
+        var far = CreateScenario(5000f);
+        AddBody(far.World, 373);
+        var farSim = new WorldSimulator(far.World, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        farSim.Tick();
+        Assert.NotNull(far.World.Projectiles[0].ServerPosition);
+        Assert.Equal(CommandFailures.ProjectileNotColliding,
+            new NpcStrikeCommand(10, 1, far.Index, 30, Generation: 3)
+                .Apply(far.World, new XoshiroRng(2)).Reason);
+
+        // 目标在可达圈内 → 照常结算
+        var near = CreateScenario(600f);
+        AddBody(near.World, 373);
+        var nearSim = new WorldSimulator(near.World, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        nearSim.Tick();
+        Assert.True(new NpcStrikeCommand(10, 1, near.Index, 30, Generation: 3)
+            .Apply(near.World, new XoshiroRng(2)).Applied);
+
+        // 未自算位置的族（387 Fly）不受几何判定影响 → 远处目标仍照旧（失败放行）
+        var other = CreateScenario(5000f);
+        AddBody(other.World, 387);
+        var otherSim = new WorldSimulator(other.World, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        otherSim.Tick();
+        Assert.Null(other.World.Projectiles[0].ServerPosition);
+        Assert.True(new NpcStrikeCommand(10, 1, other.Index, 30, Generation: 3)
+            .Apply(other.World, new XoshiroRng(2)).Applied);
+    }
+
+    /// <summary>
+    /// W-2 第三档 `ServerAi` 第四刀：**贴地族** AI_026（Pygmy / BabySlime / 蜘蛛 / Foxsparks）与
+    /// AI_067（海盗 / 蛙 / 老虎 / Flinx / 蘑菇小子 / Cattiva / 陶罐 / 禁咒）纳入服务端自算位置。
+    /// 这些族按 `StanceBase + StanceStep × 同类序号` 在主人**面朝方向**横向站位；竖直取主人脚下。
+    /// 本用例同时验证第二代同类型本体按步长排队，以及几何收紧对该族生效。
+    /// </summary>
+    [Fact]
+    public void ServerAi_Ground_Families_Follow_Owner_Stance()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.SummonAuthority = SummonAuthorityMode.ServerAi;
+        world.StrikeWeaponCheck = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1, Active = true, Hp = 100, HpMax = 100,
+            Position = new Vector2(320f, 460f), Direction = 1,
+            SelectedSlot = 3, DeathNotified = true,
+        };
+        player.Items[3] = 3474;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        // 主人中心 (330,481)、脚下 (330,502)
+        static ProjectileEntity Body(int type, int key, Vector2 pos) => new()
+        {
+            Key = key, Owner = 1, Type = type, IsSummon = true, SummonEntityId = key,
+            SummonKind = SummonKind.Minion, Position = pos, Damage = 30, Penetrate = -1, Active = true,
+        };
+
+        var slime1 = Body(266, 1, new Vector2(370f, 502f));   // BabySlime：站位 40 + 40×序号
+        var slime2 = Body(266, 2, new Vector2(410f, 502f));   // 第二只 → 40 + 40×1 = 80
+        var flinx = Body(951, 3, new Vector2(385f, 502f));    // FlinxMinion：站位 55 + 30×序号
+        lock (world.ProjectilesLock)
+        {
+            world.Projectiles.Add(slime1);
+            world.Projectiles.Add(slime2);
+            world.Projectiles.Add(flinx);
+        }
+
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        sim.Tick();
+
+        // 三枚本体都拿到了服务端自算位置，且落在各自的站位上（已停在站位点时几乎不动）
+        Assert.NotNull(slime1.ServerPosition);
+        Assert.True(Math.Abs(slime1.ServerPosition!.Value.X - 370f) < 1f, $"第一只史莱姆应在 370：{slime1.ServerPosition!.Value.X}");
+        Assert.True(Math.Abs(slime2.ServerPosition!.Value.X - 410f) < 1f, $"第二只史莱姆应按步长排到 410：{slime2.ServerPosition!.Value.X}");
+        Assert.True(Math.Abs(flinx.ServerPosition!.Value.X - 385f) < 1f, $"Flinx 应在 385：{flinx.ServerPosition!.Value.X}");
+        Assert.True(Math.Abs(slime1.ServerPosition!.Value.Y - 502f) < 1f);
+        // 表现坐标不被改写（混合模型）
+        Assert.Equal(370f, slime1.Position.X);
+
+        // 主人掉头（direction = -1）→ 站位翻到另一侧
+        player.Direction = -1;
+        for (int i = 0; i < 60; i++) sim.Tick();
+        Assert.True(slime1.ServerPosition!.Value.X < 330f, $"掉头后应站到主人左侧：{slime1.ServerPosition!.Value.X}");
+
+        // 几何收紧对该族生效：目标在 5000px 外 → 拒绝；拉近到可达圈内 → 结算
+        var npc = new WorldNpc
+        {
+            Type = 1, NetId = 1, Active = true, Life = 50_000, LifeMax = 50_000,
+            Generation = 3, X = 5000f, Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(npc);
+        int index = world.Npcs.IndexOf(npc);
+        Assert.Equal(CommandFailures.ProjectileNotColliding,
+            new NpcStrikeCommand(10, 1, index, 30, Generation: 3).Apply(world, new XoshiroRng(2)).Reason);
+
+        npc.X = 400f;
+        Assert.True(new NpcStrikeCommand(11, 1, index, 30, Generation: 3).Apply(world, new XoshiroRng(2)).Applied);
+    }
+
+    /// <summary>
     /// 阶段 G：召唤弹幕**不因背包武器移除而销毁**（原版仆从不随武器移动消失）——
     /// 武器移出背包后弹幕基准仍生效：999 拒绝、合法 46 接受。
     /// 若此处销毁弹幕，「召唤 → 移除武器 → 报 999」即无任何上界而被放行。

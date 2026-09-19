@@ -277,6 +277,9 @@ public partial class WorldSimulator : IWorldViewProvider
         // 5.5 世界实体：掉落物重力落地 / 弹幕运动与生命周期
         SimulateEntities();
 
+        // 5.55 召唤本体（ServerAi 档）：服务端自算**判定用**位置（表现仍用客户端上报坐标）
+        SimulateSummonMovement();
+
         // 5.6 液体：按脏格集合推进简化流动（下落优先，受阻后向两侧均衡）
         SimulateLiquids();
 
@@ -620,6 +623,155 @@ public partial class WorldSimulator : IWorldViewProvider
                 && (p.RemovalNotified || _world.Tick - p.DeadTick > EntityRemovalGraceTicks));
         }
     }
+
+    /// <summary>
+    /// W-2 第三档 `ServerAi`：**服务端自算本体位置**（只维护 <see cref="ProjectileEntity.ServerPosition"/>，
+    /// 供存活与命中几何判定使用）。表现用的 <see cref="ProjectileEntity.Position"/> 仍由客户端包 27 上报并原样广播，
+    /// 因此主人视角无抖动（混合模型）。
+    ///
+    /// 覆盖族与复刻范围：
+    ///   · **AI_062**（373 / 375 / 407 / 423 / 613 / 963）：空中待命点（主人中心上方 60，407/375/963 各有偏移）+
+    ///     惯性 `v=(v×20+Δ)/21` + 距离分档速度上限 + 召回提到 15 + 超远传送；
+    ///   · **AI_026**（191-194 / 266 / 390-392 / 1094 / 1113）与 **AI_067**（393-395 / 758 / 833-835 / 951 /
+    ///     1022 / 1093 / 1112 / 1118）：贴地族，按 `StanceBase + StanceStep × 同类序号` 在主人**面朝方向**横向站位，
+    ///     竖直取「主人脚下同一水平线」。
+    ///
+    /// **近似之处（写判定前必须知情）**：
+    ///   ① 贴地族**不做重力与图块碰撞**——真正的贴地需要读图格（`SectionLocks`），而本阶段持有 `ProjectilesLock`，
+    ///      反序取区块锁会死锁；故竖直用「主人脚下」近似（丘陵地形下误差为坡度高度，远小于几何容忍圈 1200px）；
+    ///   ② 待命横向排队用「同类存活序号」近似原版 `minionPos`（原版取玩家当前的仆从数）；
+    ///   ③ **不复刻**索敌 / 冲刺 / 跳跃 / 绕飞等战斗机动——服务端没有目标选择。
+    /// </summary>
+    private void SimulateSummonMovement()
+    {
+        if (!_world.ServerOwnsSummonPositions) return;
+
+        // 主人位置快照：必须在 ProjectilesLock **之前**取（锁序 PlayersLock → … → ProjectilesLock）
+        var owners = new Dictionary<int, (float X, float Y, float Dir)>();
+        lock (_world.PlayersLock)
+        {
+            foreach (var player in _world.Players.Values)
+            {
+                if (!player.Active) continue;
+                // 玩家碰撞盒 20×42 → 中心 = Position + (10, 21)，脚下 = 中心 Y + 21
+                owners[player.Id] = (player.Position.X + 10f, player.Position.Y + 21f, player.Direction);
+            }
+        }
+
+        if (owners.Count == 0) return;
+
+        // 同类存活序号（近似原版 minionPos：用于横向排队）
+        var stanceSlots = new Dictionary<(int Owner, int Type), int>();
+
+        lock (_world.ProjectilesLock)
+        {
+            foreach (var p in _world.Projectiles)
+            {
+                if (!p.Active || !p.IsSummon) continue;
+                if (Array.IndexOf(ServerOwnedBodyTypes, p.Type) < 0) continue;
+                if (!owners.TryGetValue(p.Owner, out var owner)) continue;
+
+                var movement = SummonMovementTable.Of[p.Type];
+                var slotKey = (p.Owner, p.Type);
+                stanceSlots.TryGetValue(slotKey, out int slot);
+                stanceSlots[slotKey] = slot + 1;
+
+                // 首次见到：以客户端上报的**生成点**为权威起点（与 Static 族同一约定）
+                float px = p.ServerPosition?.X ?? p.Position.X;
+                float py = p.ServerPosition?.Y ?? p.Position.Y;
+                float vx = p.ServerVelocity?.X ?? 0f;
+                float vy = p.ServerVelocity?.Y ?? 0f;
+
+                float targetX, targetY;
+                float speedCap;
+                if (movement.StanceBase > 0)
+                {
+                    // 贴地族：主人面朝方向横向站位，竖直取主人脚下
+                    targetX = owner.X + (movement.StanceBase + movement.StanceStep * slot) * owner.Dir;
+                    targetY = owner.Y + 21f;
+                    speedCap = movement.SpeedLimit ?? 6f;
+                }
+                else
+                {
+                    // AI_062：空中待命点（默认主人中心上方 60；407 → 下方 20；375 → 前移 10 且上方 10；963 → 前移 40 且下方 20）
+                    targetX = owner.X;
+                    targetY = owner.Y - 60f;
+                    switch (p.Type)
+                    {
+                        case 407:
+                            targetY = owner.Y - 20f;
+                            break;
+                        case 375:
+                            targetX -= 10f * owner.Dir;
+                            targetY = owner.Y - 10f;
+                            break;
+                        case 963:
+                            targetX -= 40f * owner.Dir;
+                            targetY = owner.Y - 20f;
+                            break;
+                    }
+
+                    // 速度上限：基准 6；407 固定 9；963 ×0.8；>200 提到 9；(423|407) 且 >300 提到 12；375 ×0.75
+                    speedCap = 6f;
+                    if (p.Type == 407) speedCap = 9f;
+                    if (p.Type == 963) speedCap *= 0.8f;
+                }
+
+                float dx = targetX - px;
+                float dy = targetY - py;
+                float distance = MathF.Sqrt(dx * dx + dy * dy);
+
+                if (movement.StanceBase == 0)
+                {
+                    if (distance > 200f) speedCap = Math.Max(speedCap, 9f);
+                    if ((p.Type is 423 or 407) && distance > 300f) speedCap = Math.Max(speedCap, 12f);
+                    if (p.Type == 375) speedCap = (int)(speedCap * 0.75f);
+                }
+
+                // 召回：水平超阈值，**或**竖直偏离 > 300（原版贴地族的第二个召回触发器）
+                int recall = movement.RecallWithTargetDistance ?? movement.RecallDistance ?? int.MaxValue;
+                if (distance > recall || Math.Abs(dy) > 300f)
+                    speedCap = movement.RecallSpeedLimit ?? movement.SpeedLimit ?? speedCap;
+
+                // 惯性插值（原版 `v = (v×20 + Δ)/21`）后按上限截断
+                vx = (vx * 20f + dx) / 21f;
+                vy = (vy * 20f + dy) / 21f;
+                float speed = MathF.Sqrt(vx * vx + vy * vy);
+                if (speed > speedCap && speed > 0f)
+                {
+                    float scale = speedCap / speed;
+                    vx *= scale;
+                    vy *= scale;
+                }
+
+                px += vx;
+                py += vy;
+
+                // 超远传送（原版：离主人 > TeleportDistance → 直接吸到主人中心）
+                if (movement.TeleportDistance is int teleport && distance > teleport)
+                {
+                    px = owner.X;
+                    py = owner.Y;
+                    vx = 0f;
+                    vy = 0f;
+                }
+
+                p.ServerPosition = new Vector2(px, py);
+                p.ServerVelocity = new Vector2(vx, vy);
+            }
+        }
+    }
+
+    /// <summary>服务端自算位置的本体（W-2 第三档已接管的族）。</summary>
+    private static readonly int[] ServerOwnedBodyTypes =
+    {
+        // AI_062（空中编队）
+        373, 375, 407, 423, 613, 963,
+        // AI_026（贴地：Pygmy / BabySlime / 蜘蛛 / Foxsparks）
+        191, 192, 193, 194, 266, 390, 391, 392, 1094, 1113,
+        // AI_067（贴地：海盗 / 蛙 / 老虎 / Flinx / 蘑菇小子 / Cattiva / 陶罐 / 禁咒）
+        393, 394, 395, 758, 833, 834, 835, 951, 1022, 1093, 1112, 1118,
+    };
 
     /// <summary>
     /// 已失效掉落物 / 弹幕的回收宽限（tick）：销毁包下发成功（<c>RemovalNotified</c>）即可移除；

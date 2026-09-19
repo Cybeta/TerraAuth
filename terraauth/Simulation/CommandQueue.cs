@@ -1708,6 +1708,24 @@ public sealed record NpcStrikeCommand(
                     return new(false, CommandFailures.ProjectileHitCooldown);
                 }
 
+                // ServerAi 混合模型：对**服务端自算位置**的本体（目前 AI_062 族），命中必须落在
+                // 服务端位置的**可达圈**内——客户端无法影响该位置，故「把本体挪到全图任意 NPC 旁再报命中」
+                // 不再可行。可达圈取 1200px（服务端只复刻跟随、不复刻索敌/冲刺，必须留足余量；
+                // 详见 SummonMovementTable.HitGeometryTolerance）。未自算位置的族 ServerPosition 为 null → 不判（失败放行）。
+                if (summonProjectile.ServerPosition is Vector2 authoritative)
+                {
+                    var (npcWidth, npcHeight) = NpcSizes.Of(npc.Type);
+                    float ax = npc.X + npcWidth / 2f - authoritative.X;
+                    float ay = npc.Y + npcHeight / 2f - authoritative.Y;
+                    if (ax * ax + ay * ay >
+                        SummonMovementTable.HitGeometryTolerance * SummonMovementTable.HitGeometryTolerance)
+                    {
+                        if (DiagnosticLog.Enabled)
+                            Console.WriteLine($"[DIAG] Apply28 summon-out-of-reach pid={playerId} npc={NpcIndex} type={summonProjectile.Type} serverPos=({authoritative.X:0.0},{authoritative.Y:0.0}) npcCenter=({npc.X + npcWidth / 2f:0.0},{npc.Y + npcHeight / 2f:0.0})");
+                        return new(false, CommandFailures.ProjectileNotColliding);
+                    }
+                }
+
                 if (serverSettlesSummonDamage && IsSummonBody(summonProjectile))
                 {
                     // ServerDamage 档：包 28 对**本体**只作「命中触发」，上报的 Damage 不参与结算——
@@ -2138,9 +2156,31 @@ public sealed record SpawnProjectileCommand(
                     // 边界：本批只拒绝客户端坐标，**尚未反向广播**服务端坐标（留在下一批，与 owner 特权回退一起做）；
                     // 对 Static 族而言客户端本就不会移动它，故实际不产生可见偏差。
                     if (world.ServerOwnsSummonPositions &&
-                        SummonMovementTable.Of.TryGetValue(existing.Type, out var movement) &&
-                        movement.Mode == SummonMoveMode.Static)
-                        return new(true);
+                        SummonMovementTable.Of.TryGetValue(existing.Type, out var movement))
+                    {
+                        if (movement.Mode == SummonMoveMode.Static)
+                            return new(true);
+
+                        // 位置**硬绑定**的本体（831 / 970 的家点、626-628 的父节）：原版精确位置依赖
+                        // **客户端视觉状态**（831/970 的公转相位 `miscCounterNormalized`、`bodyFrame` 头饰偏移、
+                        // `gfxOffY`）或客户端驱动的父节，服务端无法逐帧复刻。故此处只做**锚点约束**：
+                        // 超出容忍圈的坐标判为越权 → 吸附回锚点；圈内的照常接受。
+                        // 容忍圈取 200px（远大于合法范围：831/970 的公转半径 ≤ 8+12×排号且排号很小，
+                        // 626-628 距头节 ≤ 3×16×1.5 ≈ 72），因此**不会误拒合法位置**，只拦明显瞬移。
+                        if (movement.Mode == SummonMoveMode.PositionBound &&
+                            SummonMovementTable.PositionBoundAnchorOf(world, existing, player!) is Vector2 anchor)
+                        {
+                            float ax = Position.X - anchor.X;
+                            float ay = Position.Y - anchor.Y;
+                            if (ax * ax + ay * ay >
+                                SummonMovementTable.PositionBoundTolerance * SummonMovementTable.PositionBoundTolerance)
+                            {
+                                existing.Position = anchor;
+                                existing.Velocity = new Vector2(0f, 0f);
+                                return new(true);
+                            }
+                        }
+                    }
 
                     existing.Position = Position;
                     existing.Velocity = Velocity;
