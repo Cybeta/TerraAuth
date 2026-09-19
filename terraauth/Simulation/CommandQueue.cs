@@ -2391,11 +2391,16 @@ public sealed record StageInventorySlotCommand(long Tick, int? PlayerId, int Slo
             if (player!.InventoryTransactionSessionId != player.SessionId)
             {
                 player.PendingInventoryChanges.Clear();
+                player.InventoryTransactionBaseline.Clear();
                 player.InventoryTransactionSessionId = player.SessionId;
             }
 
             if (player.PendingInventoryChanges.Count == 0)
+            {
                 player.InventoryTransactionStartTick = world.Tick;
+                // 窗口开始时取基准：约束本窗口内可消耗 / 可作合成材料的物品上限（见 InventoryTransactionBaseline）。
+                PlayerRuntime.CaptureInventoryBaseline(player);
+            }
 
             player.PendingInventoryChanges[Slot] = (ItemId, Stack, Prefix);
         }

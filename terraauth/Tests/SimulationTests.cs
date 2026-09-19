@@ -982,6 +982,232 @@ public class SimulationTests
     }
 
     /// <summary>
+    /// SSC 背包守恒事务：原版合成（3 铜矿 → 1 铜锭）改变背包总量，但净增量可由原版配方解释
+    /// → 必须提交（此前判据只看「总量不变」，把合成当成凭空造物整窗回滚，表现为合成后物品被吃掉）。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Commits_Recipe_Explained_Craft()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[50] = 12;   // 铜矿
+        player.ItemStacks[50] = 3;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        // 客户端合成：槽 50 的 3 个铜矿清空，槽 51 出现 1 个铜锭
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 20, 1).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[50]);
+        Assert.Equal(20, player.Items[51]);
+        Assert.Equal(1, player.ItemStacks[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：纯消耗（喝药水 / 投掷物 / 一次性道具）只减不增，不可能借此凭空造物
+    /// → 放行；原版「丢弃物品」（包 21 生成世界掉落物 + 包 5 清空槽位）也依赖这一条才不会回滚。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Commits_Pure_Consumption()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[50] = 28;   // 弱效治疗药水
+        player.ItemStacks[50] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[50]);
+        Assert.Equal(0, player.ItemStacks[50]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：材料不足的「合成」（只有 2 铜矿却报出 1 铜锭）无法被配方解释 → 回滚。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_RollsBack_Craft_Short_Of_Materials()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[50] = 12;
+        player.ItemStacks[50] = 2;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 20, 1).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(12, player.Items[50]);
+        Assert.Equal(2, player.ItemStacks[50]);
+        Assert.Equal(0, player.Items[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：合成产物恒为 0 前缀 —— 原材料被消耗、却凭空出现带前缀的同名物品
+    /// （把普通产物「洗」成传奇等）一律判不守恒。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_RollsBack_Forged_Prefixed_Item()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[50] = 12;
+        player.ItemStacks[50] = 3;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 20, 1, 5).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(12, player.Items[50]);
+        Assert.Equal(0, player.Items[51]);
+    }
+
+    /// <summary>合成 / 消耗判据的纯函数用例：总量完全一致走快路径。</summary>
+    [Fact]
+    public void CraftingConservation_Fast_Path_Requires_Exact_Totals()
+    {
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int> { [(12, 0)] = 3 };
+        var same = new Dictionary<(int ItemId, byte Prefix), int> { [(12, 0)] = 3 };
+        var moved = new Dictionary<(int ItemId, byte Prefix), int> { [(12, (byte)5)] = 3 };
+
+        Assert.True(CraftingConservation.IsConserved(authoritative, same, allowConsumption: false));
+        Assert.False(CraftingConservation.IsConserved(authoritative, moved, allowConsumption: true));
+    }
+
+    /// <summary>
+    /// 合成 / 消耗判据：配方组按「组内任意成员合计」扣减 —— 火把是
+    /// 1 木材（Wood 组任意木种）+ 1 凝胶 → 3 火把，用黑檀木也应能解释通。
+    /// </summary>
+    [Fact]
+    public void CraftingConservation_Explains_Recipe_With_Group_Requirement()
+    {
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int> { [(619, 0)] = 2, [(23, 0)] = 1 };
+        var proposed = new Dictionary<(int ItemId, byte Prefix), int> { [(619, 0)] = 1, [(8, 0)] = 3 };
+
+        Assert.True(CraftingConservation.IsConserved(authoritative, proposed, allowConsumption: false));
+    }
+
+    /// <summary>合成 / 消耗判据：带非 0 前缀的「增加」一律拒绝。</summary>
+    [Fact]
+    public void CraftingConservation_Rejects_NonZero_Prefix_Creation()
+    {
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int> { [(12, 0)] = 3 };
+        var proposed = new Dictionary<(int ItemId, byte Prefix), int> { [(20, (byte)5)] = 1 };
+
+        Assert.False(CraftingConservation.IsConserved(authoritative, proposed, allowConsumption: true));
+    }
+
+    /// <summary>合成 / 消耗判据：纯消耗仅在 <c>allowConsumption</c> 打开时放行（背包放行、箱子不放行）。</summary>
+    [Fact]
+    public void CraftingConservation_Pure_Consumption_Follows_AllowFlag()
+    {
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int> { [(28, 0)] = 1 };
+        var empty = new Dictionary<(int ItemId, byte Prefix), int>();
+
+        Assert.True(CraftingConservation.IsConserved(authoritative, empty, allowConsumption: true));
+        Assert.False(CraftingConservation.IsConserved(authoritative, empty, allowConsumption: false));
+    }
+
+    /// <summary>合成 / 消耗判据：不放行消耗时，未被配方解释的多余「减少」也必须回滚（防顺手销毁箱内物品）。</summary>
+    [Fact]
+    public void CraftingConservation_Requires_All_Removals_Explained_When_Consumption_Disabled()
+    {
+        // 4 铜矿 → 1 铜锭：配方只吃 3 个，多出的 1 个铜矿属于未解释的减少
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int> { [(12, 0)] = 4 };
+        var proposed = new Dictionary<(int ItemId, byte Prefix), int> { [(20, 0)] = 1 };
+
+        Assert.False(CraftingConservation.IsConserved(authoritative, proposed, allowConsumption: false));
+        Assert.True(CraftingConservation.IsConserved(authoritative, proposed, allowConsumption: true));
+    }
+
+    /// <summary>
+    /// 合成 / 消耗判据：消耗上限按窗口开始时的权威总量计 —— 窗口期内服务端外部塞入的物品
+    /// （/give、拾取、开袋）不在基准内，客户端「清空该槽」的暂存意图会超出上限而被判不守恒。
+    /// </summary>
+    [Fact]
+    public void CraftingConservation_Removal_Limit_Rejects_Externally_Added_Items()
+    {
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int> { [(40, 0)] = 5 };
+        var empty = new Dictionary<(int ItemId, byte Prefix), int>();
+        var emptyBaseline = new Dictionary<int, int>();
+
+        Assert.False(CraftingConservation.IsConserved(authoritative, empty, allowConsumption: true, emptyBaseline));
+        Assert.True(CraftingConservation.IsConserved(authoritative, empty, allowConsumption: true));
+    }
+
+    /// <summary>配方表抽取自检：关键配方（铜锭 / 天顶剑）必须与原始材料一致。</summary>
+    [Fact]
+    public void RecipeTable_Extracts_Key_Vanilla_Recipes()
+    {
+        Assert.True(RecipeTable.All.Length > 3000, "配方表条目过少，抽取可能失真");
+        Assert.Equal(34, RecipeTable.Groups.Length);
+
+        Assert.True(RecipeTable.TryGetRecipes(20, out var bar));   // 铜锭
+        Assert.Contains(bar, r => r.ProductStack == 1 &&
+            r.Requirements.Length == 1 && r.Requirements[0] is { ItemId: 12, GroupId: -1, Stack: 3 });
+
+        Assert.True(RecipeTable.TryGetRecipes(4956, out var zenith));   // 天顶剑
+        Assert.Contains(zenith, r => r.Requirements.Length == 10);
+    }
+
+    /// <summary>
+    /// SSC 箱子守恒事务：原版合成可取用已打开箱子的材料（箱内铜矿 → 背包铜锭），
+    /// 材料的减少与产物的增加都可被配方解释 → 提交（背包侧与箱子侧一起落盘）。
+    /// </summary>
+    [Fact]
+    public void ChestTransaction_Commits_Craft_From_Chest()
+    {
+        var (world, player, chest) = CreateTransferWorld();
+        chest.Items[0] = new ChestItem { Type = 12, Stack = 3 };
+        world.Tick = 100;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageChestItemCommand(100, 1, 0, 0, 0, 0, 0) { SessionId = 22 }.Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 9, 20, 1).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitChestTransaction(1, 15));
+        Assert.Equal(0, chest.Items[0].Stack);
+        Assert.Equal(20, player.Items[9]);
+        Assert.Equal(1, player.ItemStacks[9]);
+    }
+
+    /// <summary>
+    /// SSC 箱子守恒事务：箱子侧**不放行纯消耗** —— 客户端用包 32 清空箱内物品而不产生任何产物，
+    /// 「减少」无法被配方解释，必须回滚（否则可静默清空箱子内容）。
+    /// </summary>
+    [Fact]
+    public void ChestTransaction_RollsBack_Pure_Consumption()
+    {
+        var (world, _, chest) = CreateTransferWorld();
+        chest.Items[0] = new ChestItem { Type = 12, Stack = 3 };
+        world.Tick = 100;
+
+        Assert.True(new StageChestItemCommand(100, 1, 0, 0, 0, 0, 0) { SessionId = 22 }
+            .Apply(world, new XoshiroRng(1)).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitChestTransaction(1, 15));
+        Assert.Equal(3, chest.Items[0].Stack);
+    }
+
+    /// <summary>
     /// SSC 箱子守恒事务（C1）：窗口内聚合的箱内整理（槽位移动）在守恒时整体提交，
     /// 服务端接受客户端箱子改动（总量「玩家背包 ∪ 该箱子」不变）。
     /// </summary>

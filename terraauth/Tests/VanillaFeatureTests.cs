@@ -559,6 +559,83 @@ public class VanillaFeatureTests
     }
 
     /// <summary>
+    /// SSC 背包守恒事务：原版合成（3 铜矿 → 1 铜锭）在真机链路上（TCP → 管线 → 事务窗口）必须被提交 ——
+    /// 这是「SSC 守恒」此前的唯一硬缺口：材料减少 + 产物增加被逐项判成不守恒，合成结果被整窗回滚。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_InventoryCraft_Is_Accepted_And_Conserved()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        // 服务端权威背包：槽 50 有 3 个铜矿（物品 12）
+        player.Items[50] = 12;
+        player.ItemStacks[50] = 3;
+
+        // 客户端上报合成结果：槽 50 清空，槽 51 出现 1 个铜锭（物品 20）
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 0, 0));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(51, 20, 1));
+
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+
+        // 配方可解释 → 提交：材料被消耗、产物入包（此前会被判不守恒整窗回滚）
+        Assert.Equal(0, player.Items[50]);
+        Assert.Equal(20, player.Items[51]);
+        Assert.Equal(1, player.ItemStacks[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：消耗类物品（药水）只减不增 → 放行。
+    /// 原版「丢弃物品」同样依赖这一条：包 21 已生成世界掉落物，清空槽位的包 5 若被回滚会留下复制缺口。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_InventoryConsume_Is_Accepted()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        player.Items[50] = 28;   // 弱效治疗药水
+        player.ItemStacks[50] = 1;
+
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 0, 0));
+
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+        Assert.Equal(0, player.Items[50]);
+    }
+
+    /// <summary>SSC 背包守恒事务：材料不足的「合成」无法被配方解释 → 仍须回滚。</summary>
+    [Fact]
+    public async Task Vanilla_InventoryCraft_Short_Of_Materials_Rolls_Back()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        player.Items[50] = 12;
+        player.ItemStacks[50] = 2;   // 只有 2 个铜矿，却要报出 1 个铜锭
+
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 0, 0));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(51, 20, 1));
+
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+
+        Assert.Equal(12, player.Items[50]);
+        Assert.Equal(2, player.ItemStacks[50]);
+        Assert.Equal(0, player.Items[51]);
+    }
+
+    /// <summary>
     /// B2：开宝藏袋不得给整包建立静默屏障。原版开袋后会继续上报其它槽位（奖励入包 / 后续整理），
     /// 若这些包被静默丢弃，玩家会看到背包「卡住」；此处验证开袋同时另一槽位的守恒整理仍被提交。
     /// </summary>

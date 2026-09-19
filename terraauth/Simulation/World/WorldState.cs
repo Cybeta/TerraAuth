@@ -1195,6 +1195,7 @@ public sealed class WorldState
             if (player.InventoryTransactionSessionId != player.SessionId || !player.Active)
             {
                 player.PendingInventoryChanges.Clear();
+                player.InventoryTransactionBaseline.Clear();
                 player.InventoryTransactionStartTick = -1;
                 CloseInventoryTransaction(playerId);
                 return InventoryTransactionOutcome.None;
@@ -1218,6 +1219,7 @@ public sealed class WorldState
             }
 
             player.PendingInventoryChanges.Clear();
+            player.InventoryTransactionBaseline.Clear();
             player.InventoryTransactionStartTick = -1;
             CloseInventoryTransaction(playerId);
 
@@ -1231,9 +1233,11 @@ public sealed class WorldState
     }
 
     /// <summary>
-    /// 守恒校验：把暂存意图叠加到权威背包后，每个 (物品, 前缀) 的总数量必须与权威值一致。
+    /// 守恒校验：把暂存意图叠加到权威背包后，每个 (物品, 前缀) 的总数量必须与权威值一致；
+    /// 此外还放行**原版配方可解释**的合成净增量与纯消耗性减少（见 <see cref="CraftingConservation"/>）。
     /// 权威侧含一切外部变更（/give、拾取、开袋、箱子转移），因此与外部变更冲突的暂存意图
-    /// 会因总量对不上而自然回滚，无需额外的版本号或冲突表。
+    /// 会因总量对不上而自然回滚，无需额外的版本号或冲突表；消耗上限取窗口开始时的权威总量，
+    /// 使「窗口期内服务端外部塞入的物品」无法被客户端的清空意图「消耗」掉。
     /// </summary>
     private static bool IsInventoryConserved(PlayerRuntime player)
     {
@@ -1264,12 +1268,21 @@ public sealed class WorldState
             }
         }
 
-        if (authoritative.Count != proposed.Count) return false;
-        foreach (var (key, total) in authoritative)
-            if (!proposed.TryGetValue(key, out int proposedTotal) || proposedTotal != total)
-                return false;
+        return CraftingConservation.IsConserved(
+            authoritative, proposed, allowConsumption: true, BuildRemovalLimit(player.InventoryTransactionBaseline));
+    }
 
-        return true;
+    /// <summary>
+    /// 把窗口开始时的 (物品, 前缀) 基准折叠成「物品 → 允许被消耗的总量」。
+    /// 基准为空即该窗口内不允许任何减少（玩家当时两手空空，不可能消耗 / 合成材料）。
+    /// </summary>
+    private static Dictionary<int, int> BuildRemovalLimit(
+        Dictionary<(int ItemId, byte Prefix), int> baseline)
+    {
+        var limit = new Dictionary<int, int>();
+        foreach (var (key, total) in baseline)
+            limit[key.ItemId] = limit.GetValueOrDefault(key.ItemId) + total;
+        return limit;
     }
 
     // ---- SSC 箱子守恒事务（包 32 窗口聚合 → 守恒校验 → 提交 / 回滚）----
@@ -1458,9 +1471,11 @@ public sealed class WorldState
 
     /// <summary>
     /// 箱子守恒校验：把暂存意图叠加到「该箱子 ∪ 玩家背包」后，与窗口开始时的
-    /// (物品, 前缀) 总堆叠逐项一致。背包侧优先取本窗口暂存的意图（背包 ↔ 箱子拖拽的包 5 半边），
-    /// 未暂存的槽位取权威值——因此与外部变更（/give、拾取、其他玩家操作箱子）冲突的意图
-    /// 会因总量对不上而自然回滚。
+    /// (物品, 前缀) 总堆叠逐项一致；同时放行**原版配方可解释**的合成净增量
+    /// （原版合成可取用附近 / 已打开箱子里的材料，产物落背包）。背包侧优先取本窗口暂存的意图
+    /// （背包 ↔ 箱子拖拽的包 5 半边），未暂存的槽位取权威值——因此与外部变更（/give、拾取、
+    /// 其他玩家操作箱子）冲突的意图会因总量对不上而自然回滚。
+    /// 箱子侧**不放行纯消耗**：否则客户端可用包 32 静默清空箱子内容而「守恒」（减少不受任何解释约束）。
     /// </summary>
     private static bool IsChestConserved(PlayerRuntime player, Chest chest, int chestIndex)
     {
@@ -1498,12 +1513,7 @@ public sealed class WorldState
             AddTotals(proposed, itemId, stack, prefix);
         }
 
-        if (baseline.Count != proposed.Count) return false;
-        foreach (var (key, total) in baseline)
-            if (!proposed.TryGetValue(key, out int proposedTotal) || proposedTotal != total)
-                return false;
-
-        return true;
+        return CraftingConservation.IsConserved(baseline, proposed, allowConsumption: false);
     }
 
     // ---- 对话 NPC 变更推送（仿真接受包 40 后生成原版包 40，中继给其他玩家）----
@@ -2181,6 +2191,13 @@ public sealed class PlayerRuntime
     /// <summary>背包事务所属会话（会话切换后丢弃上一会话的暂存意图；-1 = 尚未建立）。</summary>
     public long InventoryTransactionSessionId = -1;
 
+    /// <summary>
+    /// 背包事务基准：窗口开始时权威背包按 (物品, 前缀) 的总堆叠数。
+    /// 用于约束「可被消耗 / 可作合成材料」的上限——窗口期内由服务端外部塞入的物品（/give、拾取、开袋）
+    /// 不在基准内，故客户端「清空该槽」的暂存意图会超出上限而被判不守恒（保留与外部变更冲突回滚的语义）。
+    /// </summary>
+    public readonly Dictionary<(int ItemId, byte Prefix), int> InventoryTransactionBaseline = new();
+
     // ---- SSC 箱子守恒事务（包 32 的窗口聚合）----
 
     /// <summary>
@@ -2211,6 +2228,23 @@ public sealed class PlayerRuntime
     /// 提交前把暂存意图叠加到箱子上后，各 (物品, 前缀) 总量必须与基准完全一致。
     /// </summary>
     public readonly Dictionary<(int ItemId, byte Prefix), int> ChestTransactionBaseline = new();
+
+    /// <summary>
+    /// 重取背包事务基准（窗口开始时调用）：暂存意图尚未写入 <see cref="Items"/>，故基准即当时的权威背包。
+    /// 见 <see cref="InventoryTransactionBaseline"/>。
+    /// </summary>
+    public static void CaptureInventoryBaseline(PlayerRuntime player)
+    {
+        player.InventoryTransactionBaseline.Clear();
+        for (int slot = 0; slot < InventorySlotCount; slot++)
+        {
+            int itemId = player.Items[slot];
+            int stack = player.ItemStacks[slot];
+            if (itemId == 0 || stack <= 0) continue;
+            var key = (itemId, player.ItemPrefixes[slot]);
+            player.InventoryTransactionBaseline[key] = player.InventoryTransactionBaseline.GetValueOrDefault(key) + stack;
+        }
+    }
 
     /// <summary>装备区槽位闭区间 [0, 8]：0-2 头盔/胸甲/护腿、3-7 饰品、8 盾牌（原版给防御的装备区）。</summary>
     public const int EquipmentSlotStart = 0;
