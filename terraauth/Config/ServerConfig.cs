@@ -107,6 +107,15 @@ public record ServerConfig
     /// </summary>
     public bool DestroySummonsOnWeaponRemoval { get; init; } = false;
 
+    /// <summary>
+    /// 召唤 / 哨兵的服务端权威档位（server.json 用字符串枚举："ClientDriven" / "ServerDamage" / "ServerAi" / "ServerShots"）。
+    /// 默认 <see cref="Simulation.SummonAuthorityMode.ClientDriven"/> = 现状（本体位置与节奏由客户端 AI 驱动，
+    /// 命中经包 28 上报并按上报值结算，服务端只校验归属 / 类型 / 上界 / 冷却）；
+    /// <see cref="Simulation.SummonAuthorityMode.ServerDamage"/> 起，本体命中的**伤害数值改由服务端裁定**，
+    /// 且本体不再作为包 28 的伤害凭据（派生弹幕仍走既有校验）。可热重载。
+    /// </summary>
+    public SummonAuthorityMode SummonAuthority { get; init; } = SummonAuthorityMode.ClientDriven;
+
     // ---- 封禁 / 违规处置 (Phase 6 IBanManager + Phase 5 连接处置) ----
     public int MaxViolationsBeforeBan { get; init; } = 10; // 窗口内累计违规达此值 → 封禁记录 + 踢出连接
     public int ViolationWindowMinutes { get; init; } = 60; // 违规时间窗口（滑动，分钟）

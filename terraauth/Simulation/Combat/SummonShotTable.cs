@@ -41,7 +41,8 @@
 //       625-628 的 AI（`AI_121`）**只做节段重连**，本身不发射任何弹幕。
 //   · 本表只列「会发射什么」；**索敌射程 / 攻击间隔 / 冷却 / 触发前置条件**尚未抽取（属 backlog W-2 的下一步），
 //     未定稿前不得据此实现 `ServerShots`。
-//   · 本表是**只读数据**：`SummonProjectileTable.Of` / `SentryTypes` 的改正属行为改动，留给 W-2 第二步。
+//   · 本表已接入运行时：`SummonProjectileTable.Shots` 由本表算出（25 条），与 `Bodies` 并集成身份集合 `Of`，
+//     从而修掉「派生弹幕不在身份集合里 → 包 28 被拒 → 伤害丢失」的缺陷。
 
 using System.Collections.Generic;
 

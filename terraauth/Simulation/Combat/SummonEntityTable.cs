@@ -23,11 +23,16 @@
 //   · `usesLocalNPCImmunity && localNPCHitCooldown != -2` → `localNPCImmunity[victim] = localNPCHitCooldown`
 //     （`targetNPC.immune[owner] = 0`）——即 **本弹幕对每个目标各自冷却**；
 //   · `usesIDStaticNPCImmunity` → 同 `immunityIdentity` 全服共享冷却；
+//     **已核实（1.4.5.8）**：`immunityIdentity` 只在 `SetDefaults` 复位块里写 `immunityIdentity = type`（L807），
+//     **没有任何类型把它改成别的 type** —— 所以「共享」的实际含义是**同一 type 的所有实例共享**，
+//     不存在跨 type 的共享组（387/388 与 390/391/392 各自独立，不是一组）。服务端据此按 (type, npc) 存冷却。
+//   · 另有一处特例：星尘龙节段 **626/627/628 共用头节 625 的 `localNPCImmunity` 数组**（L12732-12739），
+//     即使它们各自是 `LocalPerTarget`，冷却也必须记在**头节 625** 上。
 //   · 其余（含 `localNPCHitCooldown = -2` 默认值）→ `targetNPC.immune[owner] = 10`，即 **默认 10 tick**。
 //   · `localNPCHitCooldown = -1`（755 BatOfLight / 946 EmpressBlade）：命中后写 `localNPCImmunity[victim] = -1`，
 //     而命中条件要求 `== 0`，故 **同一弹幕对同一目标终身只能命中一次**（不是"未知"，上一版记 null 是错的）。
-//   · 626/627/628（StardustDragon2/3/4）**共用头节 625 的 `localNPCImmunity` 数组**（L12732-12739）。
-//   服务端将来结算召唤伤害时**必须用这里的节奏**，不要另造冷却。
+//   · 626/627/628 的头节特例见上。
+//   服务端结算召唤伤害时**必须用这里的节奏**（`ImmunityOf` / `HitCooldownOf`），不要另造冷却。
 //
 // 口径与边界（**抽不到的不猜**）：
 //   · `ItemId = null` 的 16 条是**本体变体**（由另一个本体 / 增益生成，物品不直接生成），但它们仍是 `minion = true`
@@ -41,8 +46,8 @@
 //   · **索敌射程 / 攻击间隔 / 攻击冷却仍未抽取**：这些在巨型共享 AI（`AI_026` 7600+ 行、`AI_062` 1600+ 行）
 //     内部按 `type` 分支分派，需人工读代码，两表都不猜。未定稿前不得据此实现 `ServerShots`。
 //   · `minionSlots`（占几个仆从位）已抽出但**未入表**（当前无消费者，避免造无用的字段）。
-//   · `SummonProjectileTable.Of` 仍把本体与派生弹幕混在一张表里（`SentryTypes` 亦有多处误标）。
-//     本表是**只读数据**：修正 `Of` / `SentryTypes` 属行为改动，留给 backlog W-2 的第二步。
+//   · `SummonProjectileTable` 已按本表重写（W-2 第二步完成）：身份集合 `Of` = 本表 62 条 ∪ `SummonShotTable` 25 条派生，
+//     `KindOf` 也改为按本表的 `Kind` 回答（旧手写 `SentryTypes` 已删除，其 4 处误标随之消失）。
 
 using System.Collections.Generic;
 
@@ -90,6 +95,21 @@ public sealed record SummonEntityInfo(
 /// </summary>
 public static class SummonEntityTable
 {
+    /// <summary>未登记类型（含本体发射的派生弹幕）的兜底命中冷却：原版默认每玩家 10 tick。</summary>
+    public const int DefaultHitCooldownTicks = 10;
+
+    /// <summary>取本体静态数据；未登记（含派生弹幕）返回 null。</summary>
+    public static SummonEntityInfo? InfoOf(int projectileType)
+        => Of.TryGetValue(projectileType, out var info) ? info : null;
+
+    /// <summary>命中免疫归属；未登记类型按原版默认档（每玩家 10 tick）。</summary>
+    public static SummonHitImmunity ImmunityOf(int projectileType)
+        => InfoOf(projectileType)?.Immunity ?? SummonHitImmunity.Default;
+
+    /// <summary>命中冷却 tick；未登记类型按 <see cref="DefaultHitCooldownTicks"/>。`-1` = 同一弹幕对同一目标终身一次。</summary>
+    public static int HitCooldownOf(int projectileType)
+        => InfoOf(projectileType)?.HitCooldownTicks ?? DefaultHitCooldownTicks;
+
     /// <summary>本体弹幕类型 → 静态数据。</summary>
     public static readonly IReadOnlyDictionary<int, SummonEntityInfo> Of = new Dictionary<int, SummonEntityInfo>
     {

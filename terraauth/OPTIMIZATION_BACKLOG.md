@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-19（W-2 第一步数据表**收口** + 第二步前置 **P0-1 守卫**落库；现状核查确认无活跃 P0-1；822/822 通过）
+> 最后更新：2026-09-19（W-2 第一步数据表收口；**第二步 4 项全部落地**：ServerDamage 档 / 免疫三档 / 哨兵生命周期 / 拆表并修掉派生弹幕伤害丢失；828/828 通过）
 
 ---
 
@@ -164,15 +164,21 @@ git stash show -p stash@{0} --stat
 
 **权威边界三档（第二~四步，每档独立可验证、可回退）**：
 
-1. **`ServerDamage`**：位置仍收客户端包 27；服务端维护本体集合与生命周期，
-   **命中改由服务端判定并结算**（本体不直接扣血，派生弹幕走既有弹幕物理管线）。
+1. **`ServerDamage`** ✅ **已落地第一刀（2026-09-19）**：本体命中的**伤害数值由服务端裁定** ——
+   包 28 只作「命中触发」，上报的 Damage 不参与结算（服务端按本体登记伤害掷 `DamageVar` ±15% × 上报 Crit 位），
+   且**本体不再作为包 28 的伤害凭据**（否则手持任意武器就能拿高伤本体当"上界"）。
+   **本档刻意不做服务端重叠判定**：本体位置由客户端包 27 驱动，原版 minion 的 27 上报频率不足以保证
+   命中帧坐标新鲜，服务端自行求交会**漏伤**（玩家体感：仆从打了但没伤害）——位置权威要等 `ServerAi` 档。
+   派生弹幕仍走既有校验口径（客户端上报 + 上界比对），未改动。
 2. **`ServerAi`**：本体跟随 / 驻守 / 索敌 / 节奏 / 暴击在服务端，包 27 只用于创建登记；
    服务端反向广播位置。**必须预留 owner 特权回退**（主人视角抖动的兜底：owner 保持本地表现、
    服务端只掌存活与伤害），并真机验证。
 3. **`ServerShots`**：本体的攻击由服务端 `NewProjectile` 生成派生弹幕（用 `SummonShotTable`），
    退掉"本体直扣血"的简化。
 
-配置建议：`ServerConfig.SummonAuthorityMode { ClientDriven(默认), ServerDamage, ServerAi, ServerShots }`，
+配置：`ServerConfig.SummonAuthority`（`TerraAuth.Simulation.SummonAuthorityMode { ClientDriven(默认), ServerDamage, ServerAi, ServerShots }`，
+server.json 用字符串枚举），组合根注入 `WorldState.SummonAuthority` 并支持热重载；
+`WorldState.ServerSettlesSummonDamage` 是「是否已接管本体伤害结算」的唯一判据。
 默认 `ClientDriven` = 现状、零风险；逐档开、逐档验。
 
 **包处置矩阵（写死并逐格测）**：
@@ -181,14 +187,16 @@ git stash show -p stash@{0} --stat
 |---|---|---|
 | 27 创建 | 接受（登记 + 归属 / buff / 伤害上界校验） | 接受，走普通弹幕路径 |
 | 27 更新 | `ServerDamage` 接受位置；`ServerAi` 起拒绝（owner 特权除外） | 接受 |
-| 28 命中 | **拒绝**（服务端自己算） | 走现有普通弹幕通道校验 |
+| 28 命中 | `ClientDriven` 按上报值结算；`ServerDamage` **只作触发**，数值由服务端裁定 | 走现有普通弹幕通道校验 |
 | 29 销毁 | 拒绝（服务端为唯一销毁方） | **接受**（客户端 + 服务端超时双通道） |
 
-**数值口径（一律取原版）**：本体存活 = owner 在线 ∧ 对应召唤 buff 在身 ∧（哨兵）`timeLeft = 36000`；
+**数值口径（一律取原版）**：本体存活 = owner 在线 ∧ 对应召唤 buff 在身 ∧（哨兵）`timeLeft = 36000`
+（**已落地**：前两条是事件驱动 —— 断线清场 / 包 50 即时销毁；第三条为哨兵时间递减，见下方第 2 项）；
 越界 / 超远归位用原版 `Center = player.Center`（`Projectile.cs` L18393-18402）；
 命中免疫按 `Simulation/Combat/SummonEntityTable.cs` 的**三档 + 冷却**（默认每玩家 10 tick / `LocalPerTarget` 3-30 /
-`IdStaticShared` 10-16 / `-1` = 终身一次 / 星尘龙 626-628 共用头节 625 的免疫数组），
-**不要**再自造冷却或统一按 10 tick；伤害照玩家装备算暴击；射程与攻击节奏取 `SummonBehaviorTable`。
+`IdStaticShared` 10-16 / `-1` = 终身一次 / 星尘龙 626-628 共用头节 625 的免疫数组）——
+**已落地**，取值一律走 `ImmunityOf / HitCooldownOf`，不要再自造冷却；
+伤害照玩家装备算暴击；射程与攻击节奏取 `SummonBehaviorTable`。
 
 **工程注意**：先在锁外快照（PlayersLock → NpcsLock），再只持 `ProjectilesLock` 改实体，
 最后单独持 `NpcsLock` 结算伤害（同 `RefreshProjectileTargets` 模式）；本体位移同步要聚合/节流，
@@ -205,15 +213,68 @@ git stash show -p stash@{0} --stat
   用例刻意让**召唤上界远低于武器上界**（召唤 Damage 5 → 上界 6；手持 FieryGreatsword 121 → 上界 46），
   断言合法近战 40 / 贴边 46 / 合法暴击 80 全部 `Applied`、47 被拒（防上界被放大成"全放行"），
   并给出**空手 + 有召唤弹幕**时按召唤口径拒绝的对照——若日后把召唤通道改回"强制"，该用例立即变红。
-- **第二步剩余工作**（尚未开始）：
-  1. `ServerConfig.SummonAuthorityMode`（默认 `ClientDriven`）与 `WorldState` 侧开关（当前**不存在**该配置）；
-  2. 本体集合的**服务端生命周期**（存活 = owner 在线 ∧ 召唤 buff 在身 ∧ 哨兵 `timeLeft`）；
-  3. 命中免疫改按 `SummonEntityTable` 的**三档 + 冷却**（现为硬编码 `Tick + 10`，且 `LocalPerTarget` /
-     `IdStaticShared` / `-1`（终身一次）/ 星尘龙 626-628 共用头节数组都还没建模）；
-  4. `SummonProjectileTable.Of` / `SentryTypes` 按 `SummonEntityTable` 改正（本体与派生弹幕拆开）。
-- **注意**：现命中冷却写成 `SummonNpcHitCooldownUntil[NpcIndex] = Tick + 10`（`CommandQueue.cs` L1719），
-  与数据表的口径不符（表里是默认 10 / `LocalPerTarget` 3-30 / `IdStaticShared` 10-16 / `-1`），
-  属第二步要替换项，**不要**在新代码里继续复用这个硬编码。
+- **第二步工作项（1~4 全部落地，2026-09-19）**：
+  1. ✅ **已完成（2026-09-19）**：`SummonAuthorityMode` 枚举 + `ServerConfig.SummonAuthority`
+     （默认 `ClientDriven`）+ `WorldState.SummonAuthority` / `ServerSettlesSummonDamage` + 组合根注入与热重载
+     + `ServerDamage` 档的服务端裁定结算（`CommandQueue.NpcStrikeCommand.Apply`）。
+     测试：`SummonAuthority_Defaults_To_ClientDriven`、`ServerDamage_Settles_Body_Hit_With_Server_Damage`、
+     `ServerDamage_Excludes_Body_From_Packet28_Bound`（含 P0-1 不变量在该档下仍成立的断言）。
+  2. ✅ **已完成（2026-09-19）**：本体的服务端生命周期。核查后确认三条存活判据里**两条本就是事件驱动**的，
+     不需要每 tick 轮询：
+     · **属主离线** → `WorldState.MarkPlayerOffline` 调 `KillSummonedProjectiles`（断线即清场，对齐原版）；
+     · **召唤 Buff 消失** → 包 50 `SetBuffsCommand` 对「被移除的召唤 Buff」调 `KillSummonedProjectilesForBuff`
+       （只杀该 Buff 维持的 Minion，Sentry 不受影响）。
+     **轮询也查不出新信息**：服务端不建模 Buff 时长，客户端不再上报包 50 时列表是静止的。
+     故本轮只补唯一一条**时间驱动**的：**哨兵 `timeLeft = 36000` 到点自毁**——
+     spawn 时按本体表起算（`SpawnProjectileCommand`），仿真在 `SimulateEntities` 里逐 tick 递减，
+     归零即 `Active = false` + `Destroyed = true`（拒绝被后续包 27 更新复活）+ `DeadTick`（世界同步补发包 29）。
+     **仆从不受影响**（表值 0 = 由 Buff 驱动）；3 个表值 60 的短命本体（831 / 864 / 970）**刻意不做服务端递减**——
+     它们由客户端反复重新召唤来续命，服务端提前销毁会与「同 key 重建」撞车，属保留边界。
+     测试：`Sentry_Lifetime_Seeded_From_Table_And_Expires`。
+  3. ✅ **已完成（2026-09-19）**：命中免疫改按 `SummonEntityTable` 的**三档 + 冷却**（不再硬编码 `Tick + 10`）。
+     `SummonEntityTable.InfoOf / ImmunityOf / HitCooldownOf` 为唯一取值入口；落点：
+     `LocalPerTarget` → **弹幕实例**数组（`ProjectileEntity.SummonNpcHitCooldownUntil`）、
+     `IdStaticShared` → `WorldState.SummonTypeHitCooldownUntil[(type, npc)]`（同 type 所有实例共享）、
+     默认档 → `WorldState.SummonPlayerHitCooldownUntil[(playerId, npc)]`（该玩家的任意本体共享）；
+     `-1` 写 `long.MaxValue` = 同一弹幕对同一目标终身一次。
+     **`immunityIdentity` 已核实**：1.4.5.8 里只在复位块写 `immunityIdentity = type`（L807），
+     **没有任何类型改成别的 type** → 不存在跨 type 共享组（387/388、390/391/392 各自独立），
+     故 `IdStaticShared` 落地为「同 type 共享」，**不需要**引入 identity 字段。
+     **星尘龙特例已实现**：节段 626/627/628 的冷却落在**头节 625** 的数组上（原版 L12732-12739），
+     找不到存活头节时退回按实例记。
+     测试：`Summon_Hit_Immunity_Follows_Table_Tiers`（五档逐一区分：默认档换实例也拦 / LocalPerTarget 换实例放行 /
+     IdStaticShared 同 type 换实例拦 / `-1` 终身一次 / 星尘龙节段写在头节上），
+     并把 `Summon_Attack_Uses_Separate_Npc_Hit_Cooldown`、`Summon_Attack_Selects_Overlapping_Entity_Deterministically`
+     的机制断言改用新落点（后者改用 317 以保持"归因到哪一枚实例"可观测）。
+  4. ✅ **已完成（2026-09-19）**：拆 `SummonProjectileTable`（本体与派生弹幕分开），并修掉派生弹幕伤害丢失。
+     · `Of` 不再手写：`Bodies` = `SummonEntityTable.Of.Keys`（62），`Shots` = `SummonShotTable` 全部派生（25），
+       `Of` = 二者并集（87，不相交）= 身份判定集合；`SentryTypes` 整段删除；
+     · `KindOf` 改为按数据表回答：本体取 `SummonEntityTable.Kind`，派生弹幕取**发射者本体**的档位
+       （⇒ 顺手修掉旧 `SentryTypes` 把 831/946/951/970 误标为哨兵、又漏掉 308/377/641/643/663-693/966/1025 的问题。
+       连带效果：这 4 个仆从现在能正确拿到 `SourceSummonBuffId`，Buff 消失时会被 `KillSummonedProjectilesForBuff` 清掉）；
+     · **派生弹幕伤害丢失修复**：详见下方「新发现」。
+     **两处刻意的取舍（写代码前必读）**：
+     ①`SpawnProjectileCommand` 的**召唤伤害上界校验只对本体生效**（`SummonEntityTable.Of.ContainsKey`）——
+       派生弹幕的伤害倍率逐弹幕不同（1044 是 `damage × 1.33`、389 是 `damage × 1.15`），用「≤ 武器伤害 ×1.15」卡会误拒；
+       它们的伤害基准仍由包 28 的召唤通道上界把关（由弹幕自身 Damage 反推，与倍率无关）。
+     ②派生弹幕现在也被「不积分、不超时」覆盖（同本体），位置改为**接受客户端包 27 更新**——
+       此前它们被服务端自行积分且忽略客户端坐标（会漂移）；代价是失去 300 tick 兜底，只能靠包 29 销毁
+       （与本体同一策略，断线有 `KillSummonedProjectiles` 兜底）。
+     测试：`Summon_Derived_Shot_Is_Registered_And_Backs_Packet28`（本轮回归）、
+     `SummonEntityTable_Matches_Vanilla_SetDefaults`（新增身份集合 / 档位断言）、
+     `Summon_Entities_Have_Stable_Ids_And_Kinds`（哨兵样改用真哨兵 308，原用的 831 是旧误标）。
+- **注意**：命中免疫的**唯一取值入口**是 `SummonEntityTable.ImmunityOf / HitCooldownOf`；
+  新增召唤 / 哨兵相关结算时**不要**再写 `Tick + 10` 这类硬编码，也不要在调用点自行分档。
+
+**已修复（2026-09-19，第 4 项）**：**旧 `SummonProjectileTable.Of` 之外（或 `KindOf` 返回 `None`）的派生弹幕，
+其包 28 会被拒**——旧表只收了 389 / 676 / 687 三个"派生"类型。`FindOwnedSummonProjectile` 用
+`IsSummon || Of.Contains(Type)` 判定，而 `KindOf(Type)` 对不在旧表的类型返回 `None`，于是
+`SpawnProjectileCommand` 给 374 HornetStinger / 376 ImpFireball / 378 SpiderEgg / 408 MiniSharkron /
+433 UFOLaser / 614 StardustCellMinionShot / 642 / 644 / 664 / 666 / 668 / 680 / 694-696 / 818 / 967 /
+1026 / 1097 / 1106 / 1120 建的实体 `IsSummon = false`；玩家手持召唤法杖时 `summonAttackExpected` 为真，
+这些派生弹幕既进不了 `FindOwnedSummonProjectile` → 直接 `ProjectileRequired` → **伤害丢失**。
+修法（已落地）：身份集合由数据表算出（本体 ∪ 派生 25 条），`KindOf` 按发射者档位回答；
+相应地 `SimulateEntities` 的「不积分、不超时」判断也一并覆盖这些派生弹幕（这正是当初必须与拆表同批设计的原因）。
 
 ---
 

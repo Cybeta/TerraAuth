@@ -1642,6 +1642,9 @@ public sealed record NpcStrikeCommand(
                 (HasOwnedSummonProjectile(world, playerId) || HasSummonWeaponInInventory(player!));
             bool projectileMatched = false;
             bool summonProjectileMatched = false;
+            // W-2 档位：ServerDamage 起本体命中的**伤害数值由服务端裁定**（见 SummonAuthorityMode 文件头）。
+            bool serverSettlesSummonDamage = world.ServerSettlesSummonDamage;
+            int? serverSettledDamage = null;
             if (world.StrikeProjectileMatch || projectileRequired)
             {
                 var proj = FindPlayerProjectileNearNpc(world, playerId, npc, out bool hasOwnedProjectile);
@@ -1698,25 +1701,34 @@ public sealed record NpcStrikeCommand(
                 if (DiagnosticLog.Enabled)
                     Console.WriteLine($"[DIAG] Apply28 summon-match pid={playerId} npc={NpcIndex} key={summonProjectile.Key} type={summonProjectile.Type} pos=({summonProjectile.Position.X:0.0},{summonProjectile.Position.Y:0.0}) dmg={summonProjectile.Damage} summon={summonProjectile.IsSummon} kind={summonProjectile.SummonKind} entity={summonProjectile.SummonEntityId} sourceItem={summonProjectile.SourceWeaponItem} buff={summonProjectile.SourceSummonBuffId}");
 
-                if (summonProjectile.SummonNpcHitCooldownUntil.TryGetValue(
-                        NpcIndex, out long summonCooldownUntil) &&
-                    Tick < summonCooldownUntil)
+                if (IsSummonHitOnCooldown(world, summonProjectile, playerId, NpcIndex, Tick))
                 {
                     if (DiagnosticLog.Enabled)
-                        Console.WriteLine($"[DIAG] Apply28 summon-cooldown pid={playerId} npc={NpcIndex} until={summonCooldownUntil} tick={Tick}");
+                        Console.WriteLine($"[DIAG] Apply28 summon-cooldown pid={playerId} npc={NpcIndex} type={summonProjectile.Type} tick={Tick}");
                     return new(false, CommandFailures.ProjectileHitCooldown);
                 }
 
-                int summonBound = (int)Math.Ceiling(summonProjectile.Damage * 1.15f)
-                    * (Crit ? 2 : 1);
-                if (Damage > summonBound)
+                if (serverSettlesSummonDamage && IsSummonBody(summonProjectile))
                 {
-                    if (DiagnosticLog.Enabled)
-                        Console.WriteLine($"[DIAG] Apply28 summon-damage-mismatch pid={playerId} npc={NpcIndex} reported={Damage} bound={summonBound} projectileDamage={summonProjectile.Damage}");
-                    return new(false, CommandFailures.StrikeDamageMismatch);
+                    // ServerDamage 档：包 28 对**本体**只作「命中触发」，上报的 Damage 不参与结算——
+                    // 客户端可选 ≤ 上界的任意数值，采信它等于把伤害数值的决定权留在客户端。
+                    // 改由服务端按本体登记伤害掷 ±15% 浮动（原版 Projectile.Damage 的口径），暴击倍率沿用上报 Crit 位
+                    // （服务端当前没有暴击率来源，属本档已知边界，见 backlog W-2）。
+                    serverSettledDamage = CombatResolver.DamageVar(summonProjectile.Damage, rng);
+                }
+                else
+                {
+                    int summonBound = (int)Math.Ceiling(summonProjectile.Damage * 1.15f)
+                        * (Crit ? 2 : 1);
+                    if (Damage > summonBound)
+                    {
+                        if (DiagnosticLog.Enabled)
+                            Console.WriteLine($"[DIAG] Apply28 summon-damage-mismatch pid={playerId} npc={NpcIndex} reported={Damage} bound={summonBound} projectileDamage={summonProjectile.Damage}");
+                        return new(false, CommandFailures.StrikeDamageMismatch);
+                    }
                 }
                 summonProjectileMatched = true;
-                summonProjectile.SummonNpcHitCooldownUntil[NpcIndex] = Tick + 10;
+                MarkSummonHitCooldown(world, summonProjectile, playerId, NpcIndex, Tick);
                 if (summonProjectile.Penetrate > 0)
                 {
                     summonProjectile.Penetrate--;
@@ -1765,7 +1777,8 @@ public sealed record NpcStrikeCommand(
 
                 // 通道 2：召唤 / 哨兵上界（阶段 G）。只使用服务端仍存活的召唤弹幕，
                 // 不以当前背包内容替代召唤物实体作为命中凭据。
-                if (CombatResolver.SummonDamageBound(world, playerId, Crit) is int sb)
+                // ServerDamage 档起排除**本体**：本体命中已由服务端裁定，不能再充当"上界"凭据。
+                if (CombatResolver.SummonDamageBound(world, playerId, Crit, excludeBodies: serverSettlesSummonDamage) is int sb)
                     upperBound = Math.Max(upperBound ?? 0, sb);
 
                 if (upperBound is int ub && Damage > ub)
@@ -1781,7 +1794,9 @@ public sealed record NpcStrikeCommand(
             // 即**先按 NPC 防御减伤**（dmg − def×0.5，最低 1），**再应用暴击倍率**。
             // 漏掉 ×2 会造成「客户端按暴击打死、服务端还差一半血」——客户端贴图消失，服务端该怪仍存活
             // 并继续造成接触伤害（幽灵碰撞）；漏掉防御减伤则服务端扣血多于客户端显示，血量口径不一致。
-            int applied = CombatResolver.CalculateDamageNPCsTake(Damage, npc.Defense) * (Crit ? 2 : 1);
+            // ServerDamage 档：本体命中的结算值由服务端裁定（serverSettledDamage），客户端上报值只作触发。
+            int settledDamage = serverSettledDamage ?? Damage;
+            int applied = CombatResolver.CalculateDamageNPCsTake(settledDamage, npc.Defense) * (Crit ? 2 : 1);
             npc.Life -= applied;
             if (npc.Life <= 0)
             {
@@ -1850,12 +1865,92 @@ public sealed record NpcStrikeCommand(
     }
 
     /// <summary>
-    /// 查找归属该玩家、存活且与目标 NPC 碰撞盒实际接触的弹幕。客户端同步与服务端积分之间
-    /// 允许 2 像素余量；普通弹幕按最高伤害保留兼容行为，召唤候选按距 NPC 中心最近、再按稳定实体 ID
-    /// 和弹幕 Key 排序，保证重叠召唤物的命中归因不受列表顺序或伤害配置影响。
+    /// 是否为召唤体系的弹幕（本体 ∪ 派生，见 <see cref="SummonProjectileTable.Of"/>）。
+    /// 用于归属 / 生命周期 / 命中归因；**不要**用它判断"是否本体"——那是
+    /// <see cref="IsSummonBody"/>（<see cref="SummonEntityTable"/>）的职责。
     /// </summary>
     private static bool IsSummonProjectile(ProjectileEntity projectile)
         => projectile.IsSummon || SummonProjectileTable.Of.Contains(projectile.Type);
+
+    /// <summary>
+    /// 是否为召唤 / 哨兵的**本体**（<see cref="SummonEntityTable"/> 的 62 条），而非本体发射的派生弹幕
+    /// （如 374 HornetStinger / 389 MiniRetinaLaser）。派生弹幕见 <see cref="SummonShotTable"/>。
+    /// </summary>
+    private static bool IsSummonBody(ProjectileEntity projectile)
+        => SummonEntityTable.Of.ContainsKey(projectile.Type);
+
+    /// <summary>星尘龙**头节**类型：节段 626/627/628 与它共用命中免疫数组（原版 Projectile.cs L12732-12739）。</summary>
+    private const int StardustDragonHeadType = 625;
+
+    /// <summary>
+    /// 本体命中是否仍在冷却中。口径取自 <see cref="SummonEntityTable"/> 的**三档**（原版 `Projectile.Damage`）：
+    /// <list type="bullet">
+    /// <item><see cref="SummonHitImmunity.LocalPerTarget"/>：冷却记在**该弹幕实例**上（626/627/628 记在头节 625 上）；</item>
+    /// <item><see cref="SummonHitImmunity.IdStaticShared"/>：冷却按 <c>(type, npc)</c> 记，**同 type 所有实例共享**；</item>
+    /// <item>默认档：冷却按 <c>(playerId, npc)</c> 记，**该玩家的任意本体**在同一 NPC 上都受约束。</item>
+    /// </list>
+    /// </summary>
+    private static bool IsSummonHitOnCooldown(
+        WorldState world, ProjectileEntity projectile, int playerId, int npcIndex, long tick)
+    {
+        long until;
+        switch (SummonEntityTable.ImmunityOf(projectile.Type))
+        {
+            case SummonHitImmunity.LocalPerTarget:
+                return SummonImmunityStoreOf(world, projectile).TryGetValue(npcIndex, out until) && tick < until;
+            case SummonHitImmunity.IdStaticShared:
+                return world.SummonTypeHitCooldownUntil.TryGetValue((projectile.Type, npcIndex), out until) &&
+                    tick < until;
+            default:
+                return world.SummonPlayerHitCooldownUntil.TryGetValue((playerId, npcIndex), out until) &&
+                    tick < until;
+        }
+    }
+
+    /// <summary>
+    /// 记下本体命中冷却（冷却值取自 <see cref="SummonEntityTable"/>；`-1` = 同一弹幕对同一目标终身一次）。
+    /// 落点与 <see cref="IsSummonHitOnCooldown"/> 的分档一致。
+    /// </summary>
+    private static void MarkSummonHitCooldown(
+        WorldState world, ProjectileEntity projectile, int playerId, int npcIndex, long tick)
+    {
+        int cooldown = SummonEntityTable.HitCooldownOf(projectile.Type);
+        long until = cooldown < 0 ? long.MaxValue : tick + cooldown;
+        switch (SummonEntityTable.ImmunityOf(projectile.Type))
+        {
+            case SummonHitImmunity.LocalPerTarget:
+                SummonImmunityStoreOf(world, projectile)[npcIndex] = until;
+                break;
+            case SummonHitImmunity.IdStaticShared:
+                world.SummonTypeHitCooldownUntil[(projectile.Type, npcIndex)] = until;
+                break;
+            default:
+                world.SummonPlayerHitCooldownUntil[(playerId, npcIndex)] = until;
+                break;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="SummonHitImmunity.LocalPerTarget"/> 档的冷却落点：默认是**该弹幕实例自己的**数组；
+    /// 但星尘龙节段 626/627/628 在原版里共用**头节 625** 的 <c>localNPCImmunity</c>，
+    /// 故先找同属主的存活 625 头节，找不到再退回自己（无头节的独立节段按实例记）。
+    /// </summary>
+    private static Dictionary<int, long> SummonImmunityStoreOf(WorldState world, ProjectileEntity projectile)
+    {
+        if (projectile.Type is 626 or 627 or 628)
+        {
+            lock (world.ProjectilesLock)
+            {
+                foreach (var p in world.Projectiles)
+                {
+                    if (p.Active && p.Owner == projectile.Owner && p.Type == StardustDragonHeadType)
+                        return p.SummonNpcHitCooldownUntil;
+                }
+            }
+        }
+
+        return projectile.SummonNpcHitCooldownUntil;
+    }
 
     private static ProjectileEntity? FindOwnedSummonProjectile(
         WorldState world, int playerId, WorldNpc npc)
@@ -2145,7 +2240,11 @@ public sealed record SpawnProjectileCommand(
             //   · 空手 / 手持明确非召唤武器（近战 / 远程 / 魔法）：拒绝（原版只有召唤武器能 spawn 召唤弹幕，
             //     空手 spawn 只存在于客户端本地，登记会造成幽灵弹幕）；
             //   · 手持未收录武器（mod 等）：放行（绝不误拒未知物品）。
-            if (SummonProjectileTable.Of.Contains(Type))
+            // **只对本体（SummonEntityTable）做这条上界校验**：派生弹幕的伤害倍率逐弹幕不同
+            // （例如 1044 是 `damage × 1.33`、389 是 `damage × 1.15`），用「≤ 武器伤害 ×1.15」去卡会误拒，
+            // 故派生弹幕刻意**放行**——它们的伤害基准仍由包 28 的召唤通道上界把关
+            // （该通道由弹幕自身的 Damage 反推，与倍率无关）。
+            if (SummonEntityTable.Of.ContainsKey(Type))
             {
                 bool heldHasItem = false, heldIsKnown = false, heldIsSummon = false;
                 int weaponDamage = 0;
@@ -2288,7 +2387,10 @@ public sealed record SpawnProjectileCommand(
                 SummonEntityId = summonKind != SummonKind.None
                     ? world.AllocateSummonEntityId() : 0,
                 SummonKind = summonKind,
+                // 召唤 Buff 归属只记在**本体**上：Buff 消失时原版杀的是仆从本体，
+                // 派生弹幕（在飞的弹幕）不受 Buff 移除影响（见 WorldState.KillSummonedProjectilesForBuff）。
                 SourceSummonBuffId = summonKind == SummonKind.Minion &&
+                    SummonEntityTable.Of.ContainsKey(Type) &&
                     SummonProjectileTable.SummonWeaponBuff.TryGetValue(sourceWeaponItem, out int summonBuffId)
                         ? summonBuffId : 0,
                 Penetrate = -1,
@@ -2296,6 +2398,10 @@ public sealed record SpawnProjectileCommand(
                 Height = size.Height,
                 NewNotified = false,
             };
+            // 哨兵按原版 timeLeft = 36000 起算（值取自本体表），由仿真逐 tick 递减、到期自毁（见 SimulateEntities）。
+            // 仆从表值为 0 = 生命由召唤 Buff 驱动、不按计时销毁，故**不动**它的默认 timeLeft。
+            if (SummonEntityTable.InfoOf(Type) is { TimeLeft: > 0 } summonInfo)
+                projectile.TimeLeft = summonInfo.TimeLeft;
             world.Projectiles.Add(projectile);
             if (DiagnosticLog.Enabled && Type == 266)
                 Console.WriteLine($"[DIAG] Apply27 summon-created pid={playerId} key={projectile.Key} type={projectile.Type} pos=({projectile.Position.X:0.0},{projectile.Position.Y:0.0}) dmg={projectile.Damage} summon={projectile.IsSummon} kind={projectile.SummonKind} entity={projectile.SummonEntityId} sourceItem={projectile.SourceWeaponItem} prefix={projectile.SourceWeaponPrefix} buff={projectile.SourceSummonBuffId} tick={projectile.SpawnTick}");

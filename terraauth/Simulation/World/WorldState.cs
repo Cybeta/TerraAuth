@@ -63,6 +63,37 @@ public sealed class WorldState
     /// </summary>
     public bool DestroySummonsOnWeaponRemoval { get; set; } = false;
 
+    /// <summary>
+    /// 召唤 / 哨兵的服务端权威档位，对应 <c>ServerConfig.SummonAuthority</c>（组合根注入，可热重载）。
+    /// 默认 <see cref="SummonAuthorityMode.ClientDriven"/> = 现状、零风险；
+    /// <see cref="SummonAuthorityMode.ServerDamage"/> 起本体命中的伤害数值改由服务端裁定
+    /// （<see cref="ServerSettlesSummonDamage"/> 为判据）。
+    /// </summary>
+    public SummonAuthorityMode SummonAuthority { get; set; } = SummonAuthorityMode.ClientDriven;
+
+    /// <summary>
+    /// 服务端是否已接管本体命中的伤害结算（<see cref="SummonAuthorityMode.ServerDamage"/> 及以上）。
+    /// 为真时：包 28 对本体只作「命中触发」，结算值由服务端按本体登记伤害掷浮动后自算；
+    /// 且本体不再作为包 28 的伤害凭据（<c>CombatResolver.SummonDamageBound</c> 需排除本体）。
+    /// </summary>
+    public bool ServerSettlesSummonDamage => SummonAuthority >= SummonAuthorityMode.ServerDamage;
+
+    /// <summary>
+    /// <see cref="SummonHitImmunity.Default"/> 档（27 个本体，如 191 Pygmy / 613 StardustCellMinion）的命中免疫：
+    /// 键 <c>(playerId, npcIndex)</c> → 可再次命中的 tick。对应原版 <c>targetNPC.immune[owner] = 10</c>
+    /// —— **该玩家**对所有 NPC 各自独立，但同一 NPC 上**该玩家的任意本体**（即使换了本体）都受同一冷却约束。
+    /// 由仿真线程独占访问（与 <see cref="ProjectileEntity.NpcHitCooldownUntil"/> 同一并发假设，快照线程不读）。
+    /// 键按 **NPC 槽位**索引（与既有弹幕冷却口径一致）：槽位被新 NPC 复用且仍落在冷却窗内时会短暂免疫。
+    /// </summary>
+    public readonly Dictionary<(int PlayerId, int NpcIndex), long> SummonPlayerHitCooldownUntil = new();
+
+    /// <summary>
+    /// <see cref="SummonHitImmunity.IdStaticShared"/> 档（9 个本体，如 266 BabySlime / 387 Retanimini）的命中免疫：
+    /// 键 <c>(projectileType, npcIndex)</c> → 可再次命中的 tick，**同一 type 的所有实例共享**
+    /// （原版 <c>perIDStaticNPCImmunity[immunityIdentity, npc]</c>，而 1.4.5.8 里 `immunityIdentity` 恒等于自身 type）。
+    /// </summary>
+    public readonly Dictionary<(int ProjectileType, int NpcIndex), long> SummonTypeHitCooldownUntil = new();
+
     // ---- Phase 3 兼容字段 ----
     public long Tick { get; set; }
 

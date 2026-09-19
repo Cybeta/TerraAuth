@@ -30,6 +30,7 @@
   "SscEnabled": true,
   "MaxStackSize": 999,
   "DestroySummonsOnWeaponRemoval": true,
+  "SummonAuthority": "ClientDriven",
   "MaxViolationsBeforeBan": 10,
   "ViolationWindowMinutes": 60,
   "PlayerWhitelist": [],

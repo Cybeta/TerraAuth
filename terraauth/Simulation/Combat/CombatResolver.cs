@@ -207,13 +207,19 @@ public static class CombatResolver
     /// <summary>
     /// 阶段 G：召唤 / 哨兵命中的**上报值上界**——玩家拥有的存活召唤弹幕**最高**伤害。
     /// 原版召唤物仆从伤害 ≠ 手持武器（召唤后切换武器仍沿用创建时伤害），故按手持武器校验
-    /// 会误拒合法命中；改为取该玩家所有存活召唤弹幕（<see cref="SummonProjectileTable"/>）的
-    /// 最高 Damage 作基准（客户端打中的任意一枚召唤物伤害 ≤ 最高者，永不误拒）。
+    /// 会误拒合法命中；改为取该玩家所有存活召唤弹幕（<see cref="SummonProjectileTable"/> 的
+    /// 身份集合 = 本体 ∪ 派生弹幕）的最高 Damage 作基准（客户端打中的任意一枚召唤物伤害 ≤ 最高者，永不误拒）。
     /// 弹幕伤害由客户端包 27 创建时上报（已含 minionDamage 修饰，攻击时经 DamageVar ±15% × 暴击），
     /// 上界 = <c>ceil(最高弹幕伤害 × 1.15) × (crit ? 2 : 1)</c>。
     /// 返回 null（无存活召唤弹幕）→ 调用方失败放行，绝不误拒。
     /// </summary>
-    public static int? SummonDamageBound(WorldState world, int playerId, bool crit)
+    /// <param name="excludeBodies">
+    /// 是否排除召唤 / 哨兵的**本体**（<see cref="SummonEntityTable"/> 的 62 条）。
+    /// <see cref="SummonAuthorityMode.ServerDamage"/> 及以上档位必须为 true：本体的命中伤害已由服务端裁定，
+    /// 若仍把本体计入上界，玩家就能手持任意武器、拿高伤本体当"上界"上报伤害。
+    /// 本体发射的派生弹幕不在此列（它们仍走客户端上报 + 既有校验）。
+    /// </param>
+    public static int? SummonDamageBound(WorldState world, int playerId, bool crit, bool excludeBodies = false)
     {
         int best = 0;
         lock (world.ProjectilesLock)
@@ -222,6 +228,7 @@ public static class CombatResolver
             {
                 if (!p.Active || p.Owner != playerId || p.Damage <= 0) continue;
                 if (!p.IsSummon && !SummonProjectileTable.Of.Contains(p.Type)) continue;
+                if (excludeBodies && SummonEntityTable.Of.ContainsKey(p.Type)) continue;
                 if (p.Damage > best) best = p.Damage;
             }
         }

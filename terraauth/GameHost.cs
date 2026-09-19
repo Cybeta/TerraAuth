@@ -168,6 +168,7 @@ public sealed class GameHost : IDisposable
         world.SscEnabled = config.Current.SscEnabled;   // 全局 SSC 开关：开=服务器背包权威，关=原版客户端本地背包
         world.DestroySummonsOnWeaponRemoval =
             config.Current.DestroySummonsOnWeaponRemoval; // 移除召唤武器即销毁对应召唤弹幕（可热重载）
+        world.SummonAuthority = config.Current.SummonAuthority; // W-2 召唤权威档位（默认 ClientDriven = 现状）
 
         // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
         // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
@@ -1773,6 +1774,7 @@ public sealed class GameHost : IDisposable
         _enforcers.UpdateThresholds(t.Rate, t.Player, t.Movement, t.Combat, t.Inventory, t.World);
         _world.SscEnabled = cfg.SscEnabled; // 全局 SSC 开关热重载（新连接 / 下次 WorldInfo 生效）
         _world.DestroySummonsOnWeaponRemoval = cfg.DestroySummonsOnWeaponRemoval; // 移除召唤武器即销毁（即时生效）
+        _world.SummonAuthority = cfg.SummonAuthority; // W-2 召唤权威档位热重载（即时生效）
         DiagnosticLog.Enabled = cfg.VerboseDiagnostics; // 诊断日志开关热重载（排障时无需重启）
 
         Console.WriteLine(

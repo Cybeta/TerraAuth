@@ -569,8 +569,24 @@ public partial class WorldSimulator : IWorldViewProvider
                 // 完全由客户端包 27 权威上报，服务端直线积分反而会漂移；且默认 300 tick
                 // 超时会在合法召唤物命中前销毁弹幕、丢失伤害基准。故**不积分、不超时**，
                 // 生命周期由客户端包 29（销毁）驱动，掉线兜底见下方统一回收。
+                //
+                // W-2 本体生命周期：三条存活判据里两条是**事件驱动**的 —— 属主离线由
+                // WorldState.MarkPlayerOffline → KillSummonedProjectiles，召唤 Buff 消失由包 50
+                // （SetBuffsCommand → KillSummonedProjectilesForBuff）即时销毁，二者都不需要每 tick 轮询
+                // （轮询也查不出更新：服务端不建模 Buff 时长，客户端不再上报包 50 时列表是静止的）。
+                // 这里只补原版唯一一条**时间驱动**的：哨兵 timeLeft = 36000 到点自毁
+                // （仆从表值 0 = 由 Buff 驱动，不参与递减）。
                 if (p.IsSummon || SummonProjectileTable.Of.Contains(p.Type))
+                {
+                    if (SummonEntityTable.InfoOf(p.Type) is { Kind: SummonKind.Sentry } &&
+                        p.TimeLeft > 0 && --p.TimeLeft == 0)
+                    {
+                        p.Active = false;
+                        p.Destroyed = true;        // 永久销毁：拒绝被后续包 27 更新复活
+                        p.DeadTick = _world.Tick;  // 由世界同步补发包 29
+                    }
                     continue;
+                }
 
                 // 原版字段驱动的行为（图格碰撞 / 重力 / extraUpdates / 生存期钳制）：
                 // 仅登记过的类型（服务端发射的 Boss 弹幕）生效，其余保持简化直线积分。

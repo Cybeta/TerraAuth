@@ -25,8 +25,8 @@
 //   · 移动 / 回位 / 贴地或飞行 / 越界传送等**尚未抽取**（属 W-2 下一步），本表不含。
 //   · 首射前摇单独记在 `FirstShotDelayTicks`：哨兵由 `ai[0] = 120` 初始化，
 //     `AI_053` 系（308/377/966）因此首射比后续晚 120 tick；其余为 0。
-//   · 本表是**只读数据**，没有任何消费者；`SummonProjectileTable` / `SummonProjectileTable.SentryTypes`
-//     的改正仍属 W-2 第二步的行为改动。
+//   · 本表是**只读数据**，没有任何消费者；射程 / 间隔要等 `ServerAi` / `ServerShots` 才有用武之地
+//     （`SummonProjectileTable` 的身份集合已另行按 `SummonEntityTable` / `SummonShotTable` 重写）。
 
 using System.Collections.Generic;
 

@@ -298,7 +298,8 @@ public class SimulationTests
         var rng = new XoshiroRng(1);
         Assert.True(new SpawnProjectileCommand(1, 1, 7, 191,
             new Vector2(0f, 0f), new Vector2(0f, 0f), 60).Apply(world, rng).Applied);
-        Assert.True(new SpawnProjectileCommand(2, 1, 8, 831,
+        // 308 FrostHydra 是**真哨兵**（旧手写 SentryTypes 把 831 StormTigerGem 误标为哨兵，已随拆表修正）
+        Assert.True(new SpawnProjectileCommand(2, 1, 8, 308,
             new Vector2(0f, 0f), new Vector2(0f, 0f), 60).Apply(world, rng).Applied);
 
         lock (world.ProjectilesLock)
@@ -3695,6 +3696,176 @@ public class WorldGeneratorTests
             new NpcStrikeCommand(7, 1, index, 40, Generation: 3).Apply(world, rng).Reason);
     }
 
+    /// <summary>
+    /// W-2 第二步 `ServerDamage`：默认档必须是 <see cref="SummonAuthorityMode.ClientDriven"/>（零风险），
+    /// 且 <c>ServerSettlesSummonDamage</c> 只在 `ServerDamage` 及以上为真。
+    /// </summary>
+    [Fact]
+    public void SummonAuthority_Defaults_To_ClientDriven()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        Assert.Equal(SummonAuthorityMode.ClientDriven, world.SummonAuthority);
+        Assert.False(world.ServerSettlesSummonDamage);
+
+        world.SummonAuthority = SummonAuthorityMode.ServerDamage;
+        Assert.True(world.ServerSettlesSummonDamage);
+        world.SummonAuthority = SummonAuthorityMode.ServerAi;
+        Assert.True(world.ServerSettlesSummonDamage);
+    }
+
+    /// <summary>
+    /// `ServerDamage` 档：**本体**命中的伤害数值由服务端裁定——包 28 上报的 Damage 只作命中触发，不参与结算。
+    /// 用例让客户端上报 1（合法但极小），断言服务端按本体登记伤害 60 掷 ±15% 浮动后结算，
+    /// 从而证明"上报值被忽略"；并验证本体命中的冷却（现为 10 tick，待 W-2 第二步换成表驱动三档）。
+    /// </summary>
+    [Fact]
+    public void ServerDamage_Settles_Body_Hit_With_Server_Damage()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.StrikeWeaponCheck = true;
+        world.SummonAuthority = SummonAuthorityMode.ServerDamage;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            SelectedSlot = 3,
+            DeathNotified = true,
+        };
+        player.Items[3] = 3474; // StardustCellStaff（Summon 职业）→ summonAttackExpected
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        var npc = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 500,
+            LifeMax = 500,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(npc);
+        int index = world.Npcs.IndexOf(npc);
+
+        // 本体 613 StardustCellMinion（本体表在册 → IsSummonBody 为真），登记伤害 60。
+        lock (world.ProjectilesLock)
+            world.Projectiles.Add(new ProjectileEntity
+            {
+                Key = 7,
+                Owner = 1,
+                Type = 613,
+                IsSummon = true,
+                SummonEntityId = 1,
+                SummonKind = SummonKind.Minion,
+                Position = new Vector2(320f, 400f),
+                Damage = 60,
+                Penetrate = -1, // 召唤本体由包 27 创建时即 -1（不因命中消耗）
+                Active = true,
+            });
+
+        // 上报 1：服务端应忽略它，按 60 掷浮动（[51, 69]）结算。
+        Assert.True(new NpcStrikeCommand(3, 1, index, 1, Generation: 3).Apply(world, rng).Applied);
+        Assert.InRange(npc.Life, 500 - 69, 500 - 51);
+
+        // 同一本体的命中冷却内（10 tick）再次上报 → 拒绝。
+        Assert.Equal(CommandFailures.ProjectileHitCooldown,
+            new NpcStrikeCommand(4, 1, index, 1, Generation: 3).Apply(world, rng).Reason);
+
+        // 冷却过后（3 + 10 = 13 < 14）可再次命中；暴击倍率仍沿用上报 Crit 位 → 结算翻倍。
+        int before = npc.Life;
+        Assert.True(new NpcStrikeCommand(14, 1, index, 1, Generation: 3, Crit: true).Apply(world, rng).Applied);
+        Assert.InRange(before - npc.Life, 51 * 2, 69 * 2);
+    }
+
+    /// <summary>
+    /// `ServerDamage` 档：**本体不再作为包 28 的伤害凭据**——否则玩家可手持任意武器、拿高伤本体当"上界"。
+    /// 对照组：同一场景在 ClientDriven 档下 60 因本体上界（69）被放行，在 ServerDamage 档下只剩武器上界 9 → 拒绝；
+    /// 同时确认 P0-1 不变量在该档下仍成立（合法武器命中 9 照常 `Applied`）。
+    /// </summary>
+    [Fact]
+    public void ServerDamage_Excludes_Body_From_Packet28_Bound()
+    {
+        static (WorldState World, WorldNpc Npc, int Index) CreateScenario()
+        {
+            var world = WorldGenerator.GenerateSmall();
+            world.StrikeWeaponCheck = true;
+
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                Position = new Vector2(320f, 460f),
+                AimPosition = new Vector2(320f, 460f),
+                SelectedSlot = 3,
+                DeathNotified = true,
+            };
+            player.Items[3] = 24; // 木剑（近战 7 伤 → 上界 9）
+            player.ItemStacks[3] = 1;
+            lock (world.PlayersLock) world.Players[1] = player;
+
+            var npc = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                Active = true,
+                Life = 500,
+                LifeMax = 500,
+                Generation = 3,
+                X = 320f,
+                Y = 400f,
+            };
+            lock (world.NpcsLock) world.Npcs.Add(npc);
+            int index = world.Npcs.IndexOf(npc);
+
+            lock (world.ProjectilesLock)
+                world.Projectiles.Add(new ProjectileEntity
+                {
+                    Key = 7,
+                    Owner = 1,
+                    Type = 613,
+                    IsSummon = true,
+                    SummonEntityId = 1,
+                    SummonKind = SummonKind.Minion,
+                    Position = new Vector2(320f, 400f),
+                    Damage = 60,
+                    Active = true,
+                });
+
+            return (world, npc, index);
+        }
+
+        var rng = new XoshiroRng(1);
+
+        // ClientDriven（默认档）：本体 60 → 上界 69 ≥ 60 → 放行。
+        var client = CreateScenario();
+        Assert.Equal(69, CombatResolver.SummonDamageBound(client.World, 1, false));
+        Assert.True(new NpcStrikeCommand(3, 1, client.Index, 60, Generation: 3).Apply(client.World, rng).Applied);
+        Assert.Equal(440, client.Npc.Life);
+
+        // ServerDamage：本体被排除 → 上界只剩武器 9 → 同一上报 60 被拒。
+        var server = CreateScenario();
+        server.World.SummonAuthority = SummonAuthorityMode.ServerDamage;
+        Assert.Null(CombatResolver.SummonDamageBound(server.World, 1, false, excludeBodies: true));
+        Assert.Equal(CommandFailures.StrikeDamageMismatch,
+            new NpcStrikeCommand(3, 1, server.Index, 60, Generation: 3).Apply(server.World, rng).Reason);
+        Assert.Equal(500, server.Npc.Life);
+
+        // P0-1 不变量在该档下仍成立：合法近战 9（≤ 武器上界）照常结算。
+        Assert.True(new NpcStrikeCommand(4, 1, server.Index, 9, Generation: 3).Apply(server.World, rng).Applied);
+        Assert.Equal(491, server.Npc.Life);
+    }
+
     [Fact]
     public void Summon_Attack_Selects_Overlapping_Entity_Deterministically()
     {
@@ -3718,15 +3889,17 @@ public class WorldGeneratorTests
         lock (world.NpcsLock) world.Npcs.Add(npc);
         int index = world.Npcs.IndexOf(npc);
 
+        // 用 LocalPerTarget 档（317 Raven）——冷却记在**被选中的那枚实例**上，据此可观测归因结果；
+        // 默认档的冷却记在 (玩家, NPC) 上，反而看不出选的是哪一枚。
         var nearer = new ProjectileEntity
         {
-            Key = 8, Owner = 1, Type = 191, IsSummon = true,
+            Key = 8, Owner = 1, Type = 317, IsSummon = true,
             SummonEntityId = 2, SummonKind = SummonKind.Minion,
             Position = new Vector2(320f, 400f), Damage = 60, Active = true, Penetrate = -1,
         };
         var farther = new ProjectileEntity
         {
-            Key = 7, Owner = 1, Type = 191, IsSummon = true,
+            Key = 7, Owner = 1, Type = 317, IsSummon = true,
             SummonEntityId = 1, SummonKind = SummonKind.Minion,
             Position = new Vector2(320f, 398f), Damage = 100, Active = true, Penetrate = -1,
         };
@@ -3846,10 +4019,240 @@ public class WorldGeneratorTests
 
         var rng = new XoshiroRng(1);
         Assert.True(new NpcStrikeCommand(10, 1, index, 60, Generation: 3).Apply(world, rng).Applied);
-        Assert.Equal(20, projectile.SummonNpcHitCooldownUntil[index]);
+        // 191 Pygmy 属**默认档**（原版 targetNPC.immune[owner] = 10）→ 冷却按 (玩家, NPC) 记，不在弹幕实例上。
+        Assert.Equal(20, world.SummonPlayerHitCooldownUntil[(1, index)]);
+        Assert.Empty(projectile.SummonNpcHitCooldownUntil);
         Assert.Equal(0, projectile.NpcHitCooldownUntil[index]);
         Assert.False(new NpcStrikeCommand(11, 1, index, 60, Generation: 3).Apply(world, rng).Applied);
         Assert.True(new NpcStrikeCommand(20, 1, index, 60, Generation: 3).Apply(world, rng).Applied);
+    }
+
+    /// <summary>
+    /// 本体命中免疫按 <see cref="SummonEntityTable"/> 的**三档**建模（原版 <c>Projectile.Damage</c>）：
+    /// 默认档 = 每（玩家, NPC）10 tick；<c>LocalPerTarget</c> = 每**弹幕实例**各目标；
+    /// <c>IdStaticShared</c> = 同 **type** 所有实例共享；冷却 <c>-1</c> = 同一弹幕对同一目标终身一次。
+    /// 用例通过「命中后停用旧本体、换一枚同档新本体」区分三档：默认档与 IdStaticShared 会**拦住新本体**，
+    /// LocalPerTarget **不会**。
+    /// </summary>
+    [Fact]
+    public void Summon_Hit_Immunity_Follows_Table_Tiers()
+    {
+        static (WorldState World, int Index) CreateScenario()
+        {
+            var world = WorldGenerator.GenerateSmall();
+            var player = new PlayerRuntime
+            {
+                Id = 1,
+                Active = true,
+                Hp = 100,
+                HpMax = 100,
+                SelectedSlot = 3,
+                DeathNotified = true,
+            };
+            player.Items[3] = 3474; // 召唤法杖 → summonAttackExpected 走本体路径
+            player.ItemStacks[3] = 1;
+            lock (world.PlayersLock) world.Players[1] = player;
+
+            var npc = new WorldNpc
+            {
+                Type = 1,
+                NetId = 1,
+                Active = true,
+                Life = 1_000_000,
+                LifeMax = 1_000_000,
+                Generation = 3,
+                X = 320f,
+                Y = 400f,
+            };
+            lock (world.NpcsLock) world.Npcs.Add(npc);
+
+            return (world, world.Npcs.IndexOf(npc));
+        }
+
+        static ProjectileEntity Body(int type, long entityId) => new()
+        {
+            Key = (int)entityId,
+            Owner = 1,
+            Type = type,
+            IsSummon = true,
+            SummonEntityId = entityId,
+            SummonKind = SummonKind.Minion,
+            Position = new Vector2(320f, 400f),
+            Damage = 5,
+            Penetrate = -1,
+            Active = true,
+        };
+
+        static void Add(WorldState world, ProjectileEntity p)
+        {
+            lock (world.ProjectilesLock) world.Projectiles.Add(p);
+        }
+
+        var rng = new XoshiroRng(1);
+
+        // ---- 默认档（191 Pygmy，10 tick）：换一枚**不同实例**的本体也拦 —— 冷却记在 (玩家, NPC) 上 ----
+        var def = CreateScenario();
+        var pygmy = Body(191, 1);
+        Add(def.World, pygmy);
+        Assert.True(new NpcStrikeCommand(10, 1, def.Index, 5, Generation: 3).Apply(def.World, rng).Applied);
+        pygmy.Active = false;
+        Add(def.World, Body(613, 2)); // 换 613 StardustCellMinion（同属默认档）
+        Assert.Equal(CommandFailures.ProjectileHitCooldown,
+            new NpcStrikeCommand(11, 1, def.Index, 5, Generation: 3).Apply(def.World, rng).Reason);
+        Assert.True(new NpcStrikeCommand(21, 1, def.Index, 5, Generation: 3).Apply(def.World, rng).Applied);
+
+        // ---- LocalPerTarget（317 Raven，10 tick）：换实例即各算各的 ----
+        var local = CreateScenario();
+        var raven1 = Body(317, 1);
+        Add(local.World, raven1);
+        Assert.True(new NpcStrikeCommand(10, 1, local.Index, 5, Generation: 3).Apply(local.World, rng).Applied);
+        Assert.Equal(20, raven1.SummonNpcHitCooldownUntil[local.Index]);
+        raven1.Active = false;
+        Add(local.World, Body(317, 2));
+        Assert.True(new NpcStrikeCommand(11, 1, local.Index, 5, Generation: 3).Apply(local.World, rng).Applied);
+        // 但**同一实例**在冷却内仍被拦
+        Assert.Equal(CommandFailures.ProjectileHitCooldown,
+            new NpcStrikeCommand(12, 1, local.Index, 5, Generation: 3).Apply(local.World, rng).Reason);
+
+        // ---- IdStaticShared（387 Retanimini，16 tick）：同 type 换实例共享冷却 ----
+        var shared = CreateScenario();
+        var ret1 = Body(387, 1);
+        Add(shared.World, ret1);
+        Assert.True(new NpcStrikeCommand(10, 1, shared.Index, 5, Generation: 3).Apply(shared.World, rng).Applied);
+        Assert.Equal(26, shared.World.SummonTypeHitCooldownUntil[(387, shared.Index)]);
+        ret1.Active = false;
+        Add(shared.World, Body(387, 2));
+        Assert.Equal(CommandFailures.ProjectileHitCooldown,
+            new NpcStrikeCommand(11, 1, shared.Index, 5, Generation: 3).Apply(shared.World, rng).Reason);
+        Assert.True(new NpcStrikeCommand(26, 1, shared.Index, 5, Generation: 3).Apply(shared.World, rng).Applied);
+
+        // ---- 冷却 -1（755 BatOfLight）：同一弹幕对同一目标终身一次 ----
+        var once = CreateScenario();
+        var bat = Body(755, 1);
+        Add(once.World, bat);
+        Assert.True(new NpcStrikeCommand(10, 1, once.Index, 5, Generation: 3).Apply(once.World, rng).Applied);
+        Assert.Equal(long.MaxValue, bat.SummonNpcHitCooldownUntil[once.Index]);
+        Assert.Equal(CommandFailures.ProjectileHitCooldown,
+            new NpcStrikeCommand(10_000, 1, once.Index, 5, Generation: 3).Apply(once.World, rng).Reason);
+
+        // ---- 星尘龙：节段 626 的冷却必须落在**头节 625** 上（原版共用 localNPCImmunity 数组）----
+        var dragon = CreateScenario();
+        var head = Body(625, 2);   // 头节 entity id 更大
+        var seg = Body(626, 1);    // 节段 entity id 更小 → 命中归因到 626
+        Add(dragon.World, head);
+        Add(dragon.World, seg);
+        Assert.True(new NpcStrikeCommand(10, 1, dragon.Index, 5, Generation: 3).Apply(dragon.World, rng).Applied);
+        Assert.Equal(17, head.SummonNpcHitCooldownUntil[dragon.Index]); // 头节 625 的冷却 7 → 写入头节数组
+        Assert.Empty(seg.SummonNpcHitCooldownUntil);                    // 节段自己不留冷却
+        Assert.Equal(CommandFailures.ProjectileHitCooldown,
+            new NpcStrikeCommand(11, 1, dragon.Index, 5, Generation: 3).Apply(dragon.World, rng).Reason);
+    }
+
+    /// <summary>
+    /// W-2 本体生命周期：三条存活判据里 ①属主离线 与 ②召唤 Buff 消失都是**事件驱动**的
+    /// （<see cref="WorldState.KillSummonedProjectiles"/> 由断线清场触发、
+    /// <see cref="WorldState.KillSummonedProjectilesForBuff"/> 由包 50 触发），故本轮补的是
+    /// 唯一一条**时间驱动**的：③哨兵 <c>timeLeft = 36000</c> 到点自毁（仆从表值为 0，不吃时间销毁）。
+    /// </summary>
+    [Fact]
+    public void Sentry_Lifetime_Seeded_From_Table_And_Expires()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            SelectedSlot = 3,
+            Position = new Vector2(320f, 460f),
+        };
+        player.Items[3] = 1572; // StaffoftheFrostHydra（Summon 职业）
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var rng = new XoshiroRng(1);
+
+        // 哨兵 308 FrostHydra：spawn 时按本体表起算 timeLeft = 36000（原版 10 分钟）
+        Assert.True(new SpawnProjectileCommand(1, 1, 1, 308, new Vector2(320f, 460f), new Vector2(0f, 0f), 100)
+            .Apply(world, rng).Applied);
+        var sentry = world.Projectiles.First(p => p.Type == 308);
+        Assert.Equal(36000, sentry.TimeLeft);
+
+        // 仆从 613 StardustCellMinion：表值 0 = 由召唤 Buff 驱动 → 保留默认 timeLeft、不参与递减
+        Assert.True(new SpawnProjectileCommand(2, 1, 2, 613, new Vector2(320f, 460f), new Vector2(0f, 0f), 60)
+            .Apply(world, rng).Applied);
+        var minion = world.Projectiles.First(p => p.Type == 613);
+        Assert.Equal(300, minion.TimeLeft);
+
+        // 把哨兵剩余时间压到 2 tick 推进仿真：到点自毁（Active=false + Destroyed=true → 拒绝被包 27 复活）
+        sentry.TimeLeft = 2;
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        sim.Tick();
+        Assert.True(sentry.Active);
+        Assert.Equal(1, sentry.TimeLeft);
+        sim.Tick();
+        Assert.False(sentry.Active);
+        Assert.True(sentry.Destroyed);
+
+        // 仆从不受时间驱动影响（生命周期只由 Buff / 断线决定）
+        Assert.True(minion.Active);
+    }
+
+    /// <summary>
+    /// W-2 拆表回归：**本体发射的派生弹幕**（如 374 HornetStinger）在服务端必须被登记为召唤体系弹幕，
+    /// 否则玩家手持召唤法杖时包 28 找不到凭据 → `ProjectileRequired` → **派生弹幕伤害全部丢失**。
+    /// 旧版把 374 这类类型排除在身份集合之外、`KindOf` 又返回 `None`，正是这个缺陷。
+    /// </summary>
+    [Fact]
+    public void Summon_Derived_Shot_Is_Registered_And_Backs_Packet28()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.StrikeWeaponCheck = true;
+
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Hp = 100,
+            HpMax = 100,
+            SelectedSlot = 3,
+            Position = new Vector2(320f, 460f),
+            AimPosition = new Vector2(320f, 460f),
+            DeathNotified = true,
+        };
+        player.Items[3] = 3474; // StardustCellStaff（Summon 职业）→ 手持召唤法杖
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock) world.Players[1] = player;
+
+        var npc = new WorldNpc
+        {
+            Type = 1,
+            NetId = 1,
+            Active = true,
+            Life = 500,
+            LifeMax = 500,
+            Generation = 3,
+            X = 320f,
+            Y = 400f,
+        };
+        lock (world.NpcsLock) world.Npcs.Add(npc);
+        int index = world.Npcs.IndexOf(npc);
+
+        var rng = new XoshiroRng(1);
+
+        // 本体 613 → 派生弹幕 374 的登记：kind 由发射者决定，IsSummon 为真（旧版是 false）
+        Assert.True(new SpawnProjectileCommand(1, 1, 7, 374, new Vector2(320f, 400f), new Vector2(0f, 0f), 60)
+            .Apply(world, rng).Applied);
+        var shot = world.Projectiles.First(p => p.Type == 374);
+        Assert.True(shot.IsSummon, "派生弹幕必须被登记为召唤体系弹幕（旧版为 false → 包 28 被拒）");
+        Assert.NotEqual(SummonKind.None, SummonProjectileTable.KindOf(374));
+        Assert.True(shot.SummonEntityId > 0);
+        // 召唤 Buff 归属只挂本体：派生弹幕不该被「Buff 消失」连带销毁
+        Assert.Equal(0, shot.SourceSummonBuffId);
+
+        // 包 28 由这枚派生弹幕背书 → 结算（旧版此处为 ProjectileRequired）
+        var strike = new NpcStrikeCommand(2, 1, index, 60, Generation: 3).Apply(world, rng);
+        Assert.True(strike.Applied, $"派生弹幕的合法命中被拒：{strike.Reason}");
+        Assert.Equal(440, npc.Life);
     }
 
     /// <summary>
@@ -4263,10 +4666,23 @@ public class WorldGeneratorTests
         // 穿墙本体（tileCollide = false）共 32 个
         Assert.Equal(32, SummonEntityTable.Of.Values.Count(e => !e.TileCollide));
 
-        // 与旧表的关系：旧表漏收 17 个本体（按「宽于实际」的既有口径，漏收只会失败放行，安全），
-        // 另把 389 MiniRetinaLaser / 614 一类派生弹幕与 676 / 687 等混收——属第二步要拆开的部分。
-        Assert.Equal(new[] { 390, 391, 392, 393, 394, 395, 663, 665, 677, 678, 679, 688, 689, 690, 691, 692, 693 },
-            SummonEntityTable.Of.Keys.Where(t => !SummonProjectileTable.Of.Contains(t)).OrderBy(x => x));
+        // 身份集合已按数据表拆开（W-2 第二步）：本体 62 ∪ 派生 25 = 87，且两者不相交。
+        // 旧手写列表漏了 19 个本体、只收了 3 个派生类型（389 / 676 / 687）——那正是
+        // 「派生弹幕包 28 被拒 → 伤害丢失」的根因。
+        Assert.Equal(62, SummonProjectileTable.Bodies.Count);
+        Assert.Equal(25, SummonProjectileTable.Shots.Count);
+        Assert.Empty(SummonProjectileTable.Bodies.Intersect(SummonProjectileTable.Shots));
+        Assert.Equal(87, SummonProjectileTable.Of.Count);
+        Assert.All(SummonEntityTable.Of.Keys, t => Assert.Contains(t, SummonProjectileTable.Of));
+        Assert.All(SummonProjectileTable.Bodies, t => Assert.True(SummonEntityTable.Of.ContainsKey(t)));
+        // 档位也由数据表回答（旧 SentryTypes 把 831/946/951/970 误标为哨兵、又漏了真哨兵）
+        Assert.Equal(SummonKind.Minion, SummonProjectileTable.KindOf(831));
+        Assert.Equal(SummonKind.Minion, SummonProjectileTable.KindOf(970));
+        Assert.Equal(SummonKind.Sentry, SummonProjectileTable.KindOf(308));
+        Assert.Equal(SummonKind.Sentry, SummonProjectileTable.KindOf(1025));
+        Assert.Equal(SummonKind.Minion, SummonProjectileTable.KindOf(374)); // 派生跟随发射者档位
+        Assert.Equal(SummonKind.Sentry, SummonProjectileTable.KindOf(664));
+        Assert.Equal(SummonKind.None, SummonProjectileTable.KindOf(3));     // 普通弹幕
     }
 
     /// <summary>
