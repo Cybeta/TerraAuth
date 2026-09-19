@@ -75,8 +75,9 @@ public record ServerConfig
     // ---- 战斗权威 (Phase 2 ICombatAuthority) ----
     /// <summary>
     /// 游戏难度（server.json 用字符串枚举："Classic" / "Expert" / "Master"）。
-    /// 决定玩家受击伤害公式（原版 <c>Main.CalculateDamagePlayersTake</c>）：
-    /// 经典 <c>dmg−def×0.5</c>、专家 <c>dmg×2−def×0.75</c>、大师 <c>dmg×3−def</c>（最低 1）。
+    /// 决定两件事：①玩家受击公式的减防系数（原版 <c>Main.CalculateDamagePlayersTake</c>）：
+    /// 经典 <c>dmg−def×0.5</c>、专家 <c>dmg−def×0.75</c>、大师 <c>dmg−def</c>（最低 1）；
+    /// ②NPC 生成时的生命 / 伤害倍率（原版 <c>NPC.ScaleStats_ByDifficulty</c>）：专家 ×2、大师 ×3。
     /// 包 117 区间校验与接触兜底结算均按此取分支，保证服务端权威口径 = 客户端显示。
     /// </summary>
     public GameMode GameMode { get; init; } = GameMode.Classic;

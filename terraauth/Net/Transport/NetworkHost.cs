@@ -1086,6 +1086,15 @@ public sealed class NetworkHost : IAsyncDisposable
         _playerAppearances[connection.PlayerId] = new SessionAppearance(
             connection.SessionId,
             info with { Name = name, Slot = (byte)connection.PlayerId });
+
+        // 火把神恩（原版 Player.unlockedBiomeTorches = 包 4 TorchFlags 的 bit2）：服务端持为玩家状态，
+        // 供合成前置条件 needTorchGodsFavor 校验（原版服务端同样以客户端上报为准）。
+        lock (_world.PlayersLock)
+        {
+            if (_world.Players.TryGetValue(connection.PlayerId, out var runtime) &&
+                runtime.SessionId == connection.SessionId)
+                runtime.UnlockedBiomeTorches = (info.TorchFlags & (1 << 2)) != 0;
+        }
         Console.WriteLine(resumed
             ? $"[Net] 玩家 #{connection.PlayerId} 名称 \"{name}\"（会话已恢复）"
             : $"[Net] 玩家 #{connection.PlayerId} 名称 \"{name}\"");

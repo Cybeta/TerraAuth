@@ -52,7 +52,7 @@ public readonly struct CraftRequirement
     public readonly int Stack;
 }
 
-/// <summary>配方要求的液体环境（原版 <c>needWater</c> / <c>needHoney</c> / <c>needLava</c>）。</summary>
+/// <summary>配方要求的液体 / 场景前置条件（原版 <c>Recipe.PlayerMeetsEnvironmentConditions</c> 的各标志）。</summary>
 [System.Flags]
 public enum CraftEnvironment
 {
@@ -66,6 +66,18 @@ public enum CraftEnvironment
 
     /// <summary>需要紧邻岩浆（液体 &gt; 200 且 LiquidType == 1）。</summary>
     Lava = 4,
+
+    /// <summary>需要身处雪原生物群系（原版 <c>needSnowBiome</c> → <c>player.ZoneSnow</c>）。</summary>
+    SnowBiome = 8,
+
+    /// <summary>需要身处墓地生物群系（原版 <c>needGraveyardBiome</c> → <c>player.ZoneGraveyard</c>）。</summary>
+    GraveyardBiome = 16,
+
+    /// <summary>需要「机械三王」世界特性（原版 <c>needMechdusa</c> → <c>SpecialSeedFeatures.Mechdusa</c>）。</summary>
+    Mechdusa = 32,
+
+    /// <summary>需要玩家已解锁火把神恩（原版 <c>needTorchGodsFavor</c> → <c>player.unlockedBiomeTorches</c>）。</summary>
+    TorchGodsFavor = 64,
 }
 
 /// <summary>单条原版配方：产物 + 产物堆叠 + 合成站 + 液体环境 + 材料需求。</summary>

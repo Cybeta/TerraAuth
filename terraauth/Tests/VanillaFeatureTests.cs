@@ -1329,6 +1329,35 @@ public class VanillaFeatureTests
         Assert.Equal((short)22, npc.NetId); // NPCID.Guide
     }
 
+    /// <summary>
+    /// 包 23 的**难度覆盖段**（原版 <c>NPC.difficulty</c> → bitsB.bit2 + float）：
+    /// 专家世界上报 2、大师上报 3、经典不带该段（客户端缺省 1）。
+    /// 客户端据此自算 NPC 的 <c>lifeMax</c>（包 23 不下发上限）——不写这一段，
+    /// 专家 / 大师的服务端生命值会与客户端血条发散。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_Npc_Sync_Carries_Difficulty_Override()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+
+        world.GameMode = (int)GameMode.Expert;
+        await server.Host.BroadcastNpcUpdatesAsync();
+
+        var expert = await s.ReadUntilAsync(p => p is NpcUpdatePacket, TimeSpan.FromSeconds(5));
+        Assert.Contains(expert, p => p is NpcUpdatePacket { Difficulty: 2f });
+
+        // 大师：NPC 状态已发过一次，心跳 / 变化检测会重发（同步强制一次）
+        world.GameMode = (int)GameMode.Master;
+        lock (world.NpcsLock)
+            foreach (var npc in world.Npcs) npc.SyncForced = true;
+        await server.Host.BroadcastNpcUpdatesAsync();
+
+        var master = await s.ReadUntilAsync(p => p is NpcUpdatePacket { Difficulty: 3f }, TimeSpan.FromSeconds(5));
+        Assert.Contains(master, p => p is NpcUpdatePacket { Difficulty: 3f });
+    }
+
     [Fact]
     public async Task Vanilla_Enemy_Spawns_Then_Dies_From_Strike()
     {

@@ -7,14 +7,15 @@
 // 「只有减少、没有增加」的纯消耗由守恒层单独放行，不需要配方。
 //
 // 每条配方携带：<产物, 产物堆叠, RequiredTile（原版 requiredTile / SetCraftingStation；-1 = 手工合成）,
-// CraftEnvironment（原版 needWater / needHoney / needLava）, 材料需求[]（含配方组需求）>。
+// CraftEnvironment（原版 needWater / needHoney / needLava / needSnowBiome / needGraveyardBiome /
+//   needMechdusa / needTorchGodsFavor）, 材料需求[]（含配方组需求）>。
 //
 // 含原版 CreateReverseWallRecipes / CreateReversePlatformRecipes 派生的反向配方（108 条）：
-//   墙 → 块、平台 → 材料；派生规则只复制站位，不复制液体环境（与原版一致）。
+//   墙 → 块、平台 → 材料；派生规则只复制站位，不复制液体 / 场景环境（与原版一致）。
 //
-// 未做环境校验（服务端不可确定性复现，故不收录；仅记录出现次数以便如实说明覆盖范围）：
-//   needSnowBiome=1 / needGraveyardBiome=131 / needMechdusa=1 / needTorchGodsFavor=2
-//   （雪原 / 墓地的判定依赖客户端分辨率的场景度量，机械三王 / 火把神恩依赖特殊种子与玩家解锁状态）
+// 附加环境标志的全部出现次数（均落表，由 CraftingEnvironment 按原版口径判定）：
+//   needSnowBiome=1（场景扫描区雪原图格 ≥ 1500）/ needGraveyardBiome=131（墓碑数 − 向日葵数/2 ≥ 28）
+//   needMechdusa=1（世界特性 remixWorld ∧ getGoodWorld）/ needTorchGodsFavor=2（玩家已解锁火把神恩）
 //
 // 未收录（生成器静态不可解，按「不猜数值」原则整体跳过，绝不落半条配方）：
 //   - 下列产物的配方依赖反编译提升的局部量（num / stack），无法静态求值，整条作废：3918, 3965, 3972, 3970, 3962, 3969, 3961, 3959, 3960, 3966, 3973, 3971, 3964
@@ -80,7 +81,7 @@ public static partial class RecipeTable
     /// <summary>算作水源的图格（原版 TileID.Sets.CountsAsWaterForCrafting，如水槽 / 喷泉）：紧邻即可满足 needWater。</summary>
     public static readonly int[] WaterForCraftingTiles = { 172, 207 };
 
-    /// <summary>逐条提取的原版配方（产物 ID / 产物堆叠 / 合成站 / 液体环境 / 材料需求，含配方组需求）。</summary>
+    /// <summary>逐条提取的原版配方（产物 ID / 产物堆叠 / 合成站 / 环境标志 / 材料需求，含配方组需求）。</summary>
     public static readonly CraftRecipe[] All =
     {
         new CraftRecipe(8, 3, -1, CraftEnvironment.None, new[] { new CraftRequirement(23, -1, 1),new CraftRequirement(9, 25, 1) }),   // Torch
@@ -273,7 +274,7 @@ public static partial class RecipeTable
         new CraftRecipe(289, 1, 13, CraftEnvironment.None, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(313, -1, 1),new CraftRequirement(5, -1, 1) }),   // RegenerationPotion
         new CraftRecipe(290, 1, 13, CraftEnvironment.None, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(315, -1, 1),new CraftRequirement(276, -1, 1) }),   // SwiftnessPotion
         new CraftRecipe(291, 1, 13, CraftEnvironment.None, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(317, -1, 1),new CraftRequirement(275, -1, 1) }),   // GillsPotion
-        new CraftRecipe(5573, 1, 13, CraftEnvironment.None, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(8, -1, 1),new CraftRequirement(313, -1, 1),new CraftRequirement(314, -1, 1),new CraftRequirement(318, -1, 1) }),   // TorchGodPotion
+        new CraftRecipe(5573, 1, 13, CraftEnvironment.TorchGodsFavor, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(8, -1, 1),new CraftRequirement(313, -1, 1),new CraftRequirement(314, -1, 1),new CraftRequirement(318, -1, 1) }),   // TorchGodPotion
         new CraftRecipe(292, 1, 13, CraftEnvironment.None, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(313, -1, 1),new CraftRequirement(11, -1, 1) }),   // IronskinPotion
         new CraftRecipe(292, 1, 13, CraftEnvironment.None, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(313, -1, 1),new CraftRequirement(700, -1, 1) }),   // IronskinPotion
         new CraftRecipe(293, 1, 13, CraftEnvironment.None, new[] { new CraftRequirement(126, -1, 1),new CraftRequirement(314, -1, 1),new CraftRequirement(313, -1, 1),new CraftRequirement(75, -1, 1) }),   // ManaRegenerationPotion
@@ -448,10 +449,10 @@ public static partial class RecipeTable
         new CraftRecipe(6081, 2, -1, CraftEnvironment.None, new[] { new CraftRequirement(6088, -1, 1) }),   // ForbiddenPlatform
         new CraftRecipe(6103, 2, -1, CraftEnvironment.None, new[] { new CraftRequirement(6109, -1, 1) }),   // WaterPlatform
         new CraftRecipe(6125, 2, -1, CraftEnvironment.None, new[] { new CraftRequirement(6132, -1, 1) }),   // BoulderPlatform
-        new CraftRecipe(1389, 2, 300, CraftEnvironment.None, new[] { new CraftRequirement(9, -1, 1) }),   // WoodShelf
-        new CraftRecipe(1388, 2, 300, CraftEnvironment.None, new[] { new CraftRequirement(145, -1, 1) }),   // BrassShelf
-        new CraftRecipe(1418, 2, 300, CraftEnvironment.None, new[] { new CraftRequirement(9, -1, 1) }),   // DungeonShelf
-        new CraftRecipe(1387, 2, 300, CraftEnvironment.None, new[] { new CraftRequirement(717, -1, 1) }),   // MetalShelf
+        new CraftRecipe(1389, 2, 300, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(9, -1, 1) }),   // WoodShelf
+        new CraftRecipe(1388, 2, 300, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(145, -1, 1) }),   // BrassShelf
+        new CraftRecipe(1418, 2, 300, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(9, -1, 1) }),   // DungeonShelf
+        new CraftRecipe(1387, 2, 300, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(717, -1, 1) }),   // MetalShelf
         new CraftRecipe(1431, 1, -1, CraftEnvironment.None, new[] { new CraftRequirement(31, -1, 1),new CraftRequirement(75, -1, 1) }),   // StarinaBottle
         new CraftRecipe(1993, 1, -1, CraftEnvironment.None, new[] { new CraftRequirement(31, -1, 1),new CraftRequirement(1992, -1, 1) }),   // FireflyinaBottle
         new CraftRecipe(2005, 1, -1, CraftEnvironment.None, new[] { new CraftRequirement(31, -1, 1),new CraftRequirement(2004, -1, 1) }),   // LightningBuginaBottle
@@ -489,31 +490,31 @@ public static partial class RecipeTable
         new CraftRecipe(4278, 10, 125, CraftEnvironment.None, new[] { new CraftRequirement(170, -1, 10),new CraftRequirement(75, -1, 1) }),   // BlueStarryGlassBlock
         new CraftRecipe(4280, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4278, -1, 1) }),   // BlueStarryGlassWall
         new CraftRecipe(5291, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4392, -1, 1) }),   // EchoWall
-        new CraftRecipe(4490, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4640, -1, 1) }),   // AmethystEcho
-        new CraftRecipe(4491, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4641, -1, 1) }),   // TopazEcho
-        new CraftRecipe(4492, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4642, -1, 1) }),   // SapphireEcho
-        new CraftRecipe(4493, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4643, -1, 1) }),   // EmeraldEcho
-        new CraftRecipe(4494, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4644, -1, 1) }),   // RubyEcho
-        new CraftRecipe(4495, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4645, -1, 1) }),   // DiamondEcho
-        new CraftRecipe(4647, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4646, -1, 1) }),   // AmberStoneWallEcho
-        new CraftRecipe(4496, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4349, -1, 1) }),   // Cave1Echo
-        new CraftRecipe(4497, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4350, -1, 1) }),   // Cave2Echo
-        new CraftRecipe(4498, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4351, -1, 1) }),   // Cave3Echo
-        new CraftRecipe(4499, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4352, -1, 1) }),   // Cave4Echo
-        new CraftRecipe(4500, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4353, -1, 1) }),   // Cave5Echo
-        new CraftRecipe(4503, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(150, -1, 1) }),   // SpiderEcho
-        new CraftRecipe(4529, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(62, -1, 1) }),   // Jungle1Echo
-        new CraftRecipe(4531, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(62, -1, 1) }),   // Jungle3Echo
-        new CraftRecipe(4530, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(195, -1, 1) }),   // Jungle2Echo
-        new CraftRecipe(4532, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(195, -1, 1) }),   // Jungle4Echo
-        new CraftRecipe(3340, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3272, -1, 1) }),   // HardenedSandWall
-        new CraftRecipe(3341, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3274, -1, 1) }),   // CorruptHardenedSandWall
-        new CraftRecipe(3342, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3275, -1, 1) }),   // CrimsonHardenedSandWall
-        new CraftRecipe(3343, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3338, -1, 1) }),   // HallowHardenedSandWall
-        new CraftRecipe(3344, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3276, -1, 1) }),   // CorruptSandstoneWall
-        new CraftRecipe(3345, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3277, -1, 1) }),   // CrimsonSandstoneWall
-        new CraftRecipe(3346, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3339, -1, 1) }),   // HallowSandstoneWall
-        new CraftRecipe(3348, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3347, -1, 1) }),   // DesertFossilWall
+        new CraftRecipe(4490, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4640, -1, 1) }),   // AmethystEcho
+        new CraftRecipe(4491, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4641, -1, 1) }),   // TopazEcho
+        new CraftRecipe(4492, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4642, -1, 1) }),   // SapphireEcho
+        new CraftRecipe(4493, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4643, -1, 1) }),   // EmeraldEcho
+        new CraftRecipe(4494, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4644, -1, 1) }),   // RubyEcho
+        new CraftRecipe(4495, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4645, -1, 1) }),   // DiamondEcho
+        new CraftRecipe(4647, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4646, -1, 1) }),   // AmberStoneWallEcho
+        new CraftRecipe(4496, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4349, -1, 1) }),   // Cave1Echo
+        new CraftRecipe(4497, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4350, -1, 1) }),   // Cave2Echo
+        new CraftRecipe(4498, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4351, -1, 1) }),   // Cave3Echo
+        new CraftRecipe(4499, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4352, -1, 1) }),   // Cave4Echo
+        new CraftRecipe(4500, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4353, -1, 1) }),   // Cave5Echo
+        new CraftRecipe(4503, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(150, -1, 1) }),   // SpiderEcho
+        new CraftRecipe(4529, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(62, -1, 1) }),   // Jungle1Echo
+        new CraftRecipe(4531, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(62, -1, 1) }),   // Jungle3Echo
+        new CraftRecipe(4530, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(195, -1, 1) }),   // Jungle2Echo
+        new CraftRecipe(4532, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(195, -1, 1) }),   // Jungle4Echo
+        new CraftRecipe(3340, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3272, -1, 1) }),   // HardenedSandWall
+        new CraftRecipe(3341, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3274, -1, 1) }),   // CorruptHardenedSandWall
+        new CraftRecipe(3342, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3275, -1, 1) }),   // CrimsonHardenedSandWall
+        new CraftRecipe(3343, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3338, -1, 1) }),   // HallowHardenedSandWall
+        new CraftRecipe(3344, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3276, -1, 1) }),   // CorruptSandstoneWall
+        new CraftRecipe(3345, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3277, -1, 1) }),   // CrimsonSandstoneWall
+        new CraftRecipe(3346, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3339, -1, 1) }),   // HallowSandstoneWall
+        new CraftRecipe(3348, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3347, -1, 1) }),   // DesertFossilWall
         new CraftRecipe(663, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(662, -1, 1) }),   // RainbowBrickWall
         new CraftRecipe(2695, 1, 125, CraftEnvironment.None, new[] { new CraftRequirement(1345, -1, 1),new CraftRequirement(170, -1, 1) }),   // ConfettiBlock
         new CraftRecipe(2696, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2695, -1, 1) }),   // ConfettiWall
@@ -576,7 +577,7 @@ public static partial class RecipeTable
         new CraftRecipe(1380, 4, 283, CraftEnvironment.None, new[] { new CraftRequirement(139, -1, 1) }),   // PinkSlabWall
         new CraftRecipe(2119, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // StoneSlab
         new CraftRecipe(2433, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2119, -1, 1) }),   // StoneSlabWall
-        new CraftRecipe(4962, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // AccentSlab
+        new CraftRecipe(4962, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 1) }),   // AccentSlab
         new CraftRecipe(2120, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(169, -1, 1) }),   // SandstoneSlab
         new CraftRecipe(3272, 1, 220, CraftEnvironment.None, new[] { new CraftRequirement(169, -1, 1),new CraftRequirement(2, -1, 1) }),   // HardenedSand
         new CraftRecipe(3271, 1, 220, CraftEnvironment.None, new[] { new CraftRequirement(169, -1, 1),new CraftRequirement(3, -1, 1) }),   // Sandstone
@@ -609,19 +610,19 @@ public static partial class RecipeTable
         new CraftRecipe(719, 5, 17, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(702, -1, 1) }),   // PlatinumBrick
         new CraftRecipe(214, 5, 17, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(174, -1, 1) }),   // HellstoneBrick
         new CraftRecipe(3067, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(214, -1, 1) }),   // HellstoneBrickWall
-        new CraftRecipe(4533, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(174, -1, 1) }),   // Lava1Echo
-        new CraftRecipe(4534, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(174, -1, 1) }),   // Lava2Echo
-        new CraftRecipe(4535, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(174, -1, 1) }),   // Lava3Echo
-        new CraftRecipe(4536, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(174, -1, 1) }),   // Lava4Echo
+        new CraftRecipe(4533, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(174, -1, 1) }),   // Lava1Echo
+        new CraftRecipe(4534, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(174, -1, 1) }),   // Lava2Echo
+        new CraftRecipe(4535, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(174, -1, 1) }),   // Lava3Echo
+        new CraftRecipe(4536, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(174, -1, 1) }),   // Lava4Echo
         new CraftRecipe(192, 5, 17, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(173, -1, 1) }),   // ObsidianBrick
         new CraftRecipe(330, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(192, -1, 1) }),   // ObsidianBrickWall
-        new CraftRecipe(4507, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(173, -1, 1) }),   // ObsidianBackEcho
+        new CraftRecipe(4507, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(173, -1, 1) }),   // ObsidianBackEcho
         new CraftRecipe(606, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(577, -1, 1) }),   // DemoniteBrickWall
         new CraftRecipe(594, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(593, -1, 2) }),   // SnowBrick
         new CraftRecipe(595, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(594, -1, 1) }),   // SnowBrickWall
-        new CraftRecipe(4489, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(593, -1, 1) }),   // SnowWallEcho
+        new CraftRecipe(4489, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(593, -1, 1) }),   // SnowWallEcho
         new CraftRecipe(883, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(664, -1, 2) }),   // IceBrick
-        new CraftRecipe(4506, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(664, -1, 1) }),   // IceEcho
+        new CraftRecipe(4506, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(664, -1, 1) }),   // IceEcho
         new CraftRecipe(884, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(883, -1, 1) }),   // IceBrickWall
         new CraftRecipe(587, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(586, -1, 1) }),   // CandyCaneWall
         new CraftRecipe(592, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(591, -1, 1) }),   // GreenCandyCaneWall
@@ -629,32 +630,32 @@ public static partial class RecipeTable
         new CraftRecipe(608, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(607, -1, 1) }),   // SandstoneBrickWall
         new CraftRecipe(4051, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(3271, -1, 1) }),   // SmoothSandstone
         new CraftRecipe(4053, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4051, -1, 1) }),   // SmoothSandstoneWall
-        new CraftRecipe(3273, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3271, -1, 1) }),   // SandstoneWall
+        new CraftRecipe(3273, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3271, -1, 1) }),   // SandstoneWall
         new CraftRecipe(4565, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4564, -1, 1) }),   // BambooBlockWall
         new CraftRecipe(4547, 1, 106, CraftEnvironment.None, new[] { new CraftRequirement(4564, -1, 1) }),   // LargeBambooBlock
         new CraftRecipe(4564, 1, 106, CraftEnvironment.None, new[] { new CraftRequirement(4547, -1, 1) }),   // BambooBlock
         new CraftRecipe(4548, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4547, -1, 1) }),   // LargeBambooBlockWall
         new CraftRecipe(412, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(409, -1, 2) }),   // PearlstoneBrick
         new CraftRecipe(417, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(412, -1, 1) }),   // PearlstoneBrickWall
-        new CraftRecipe(4488, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(409, -1, 1) }),   // PearlstoneEcho
-        new CraftRecipe(4525, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow1Echo
-        new CraftRecipe(4526, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow2Echo
-        new CraftRecipe(4527, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow3Echo
-        new CraftRecipe(4528, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow4Echo
+        new CraftRecipe(4488, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(409, -1, 1) }),   // PearlstoneEcho
+        new CraftRecipe(4525, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow1Echo
+        new CraftRecipe(4526, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow2Echo
+        new CraftRecipe(4527, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow3Echo
+        new CraftRecipe(4528, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(409, -1, 1) }),   // Hallow4Echo
         new CraftRecipe(609, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(61, -1, 2) }),   // EbonstoneBrick
         new CraftRecipe(610, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(609, -1, 1) }),   // EbonstoneBrickWall
-        new CraftRecipe(4486, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(61, -1, 1) }),   // EbonstoneEcho
-        new CraftRecipe(4513, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption1Echo
-        new CraftRecipe(4514, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption2Echo
-        new CraftRecipe(4515, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption3Echo
-        new CraftRecipe(4516, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption4Echo
+        new CraftRecipe(4486, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(61, -1, 1) }),   // EbonstoneEcho
+        new CraftRecipe(4513, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption1Echo
+        new CraftRecipe(4514, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption2Echo
+        new CraftRecipe(4515, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption3Echo
+        new CraftRecipe(4516, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(61, -1, 1) }),   // Corruption4Echo
         new CraftRecipe(4050, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(836, -1, 2) }),   // CrimstoneBrick
         new CraftRecipe(4052, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4050, -1, 1) }),   // CrimstoneBrickWall
-        new CraftRecipe(4509, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(836, -1, 1) }),   // CrimstoneEcho
-        new CraftRecipe(4517, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson1Echo
-        new CraftRecipe(4518, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson2Echo
-        new CraftRecipe(4519, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson3Echo
-        new CraftRecipe(4520, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson4Echo
+        new CraftRecipe(4509, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(836, -1, 1) }),   // CrimstoneEcho
+        new CraftRecipe(4517, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson1Echo
+        new CraftRecipe(4518, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson2Echo
+        new CraftRecipe(4519, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson3Echo
+        new CraftRecipe(4520, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(836, -1, 1) }),   // Crimson4Echo
         new CraftRecipe(413, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1),new CraftRequirement(172, -1, 1) }),   // IridescentBrick
         new CraftRecipe(418, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(413, -1, 1) }),   // IridescentBrickWall
         new CraftRecipe(414, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1),new CraftRequirement(176, -1, 1) }),   // MudstoneBlock
@@ -671,12 +672,12 @@ public static partial class RecipeTable
         new CraftRecipe(3101, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3100, -1, 1) }),   // MeteoriteBrickWall
         new CraftRecipe(2793, 5, 17, CraftEnvironment.None, new[] { new CraftRequirement(880, -1, 1),new CraftRequirement(836, -1, 5) }),   // CrimtaneBrick
         new CraftRecipe(2790, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2793, -1, 1) }),   // CrimtaneBrickWall
-        new CraftRecipe(134, 5, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(364, -1, 1) }),   // BlueBrick
-        new CraftRecipe(137, 5, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(365, -1, 1) }),   // GreenBrick
-        new CraftRecipe(137, 5, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(1106, -1, 1) }),   // GreenBrick
-        new CraftRecipe(139, 5, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(1104, -1, 1) }),   // PinkBrick
-        new CraftRecipe(139, 5, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(1105, -1, 1) }),   // PinkBrick
-        new CraftRecipe(139, 5, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(366, -1, 1) }),   // PinkBrick
+        new CraftRecipe(134, 5, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(364, -1, 1) }),   // BlueBrick
+        new CraftRecipe(137, 5, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(365, -1, 1) }),   // GreenBrick
+        new CraftRecipe(137, 5, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(1106, -1, 1) }),   // GreenBrick
+        new CraftRecipe(139, 5, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(1104, -1, 1) }),   // PinkBrick
+        new CraftRecipe(139, 5, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(1105, -1, 1) }),   // PinkBrick
+        new CraftRecipe(139, 5, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(366, -1, 1) }),   // PinkBrick
         new CraftRecipe(415, 5, 17, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(364, -1, 1) }),   // CobaltBrick
         new CraftRecipe(420, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(415, -1, 1) }),   // CobaltBrickWall
         new CraftRecipe(416, 5, 17, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 5),new CraftRequirement(365, -1, 1) }),   // MythrilBrick
@@ -774,22 +775,22 @@ public static partial class RecipeTable
         new CraftRecipe(577, 5, 17, CraftEnvironment.None, new[] { new CraftRequirement(56, -1, 1),new CraftRequirement(61, -1, 5) }),   // DemoniteBrick
         new CraftRecipe(176, 1, -1, CraftEnvironment.Water, new[] { new CraftRequirement(2, -1, 1) }),   // MudBlock
         new CraftRecipe(5572, 1, -1, CraftEnvironment.None, new[] { new CraftRequirement(176, -1, 1) }),   // MudBallPlayer
-        new CraftRecipe(4487, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(176, -1, 1) }),   // MudWallEcho
+        new CraftRecipe(4487, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(176, -1, 1) }),   // MudWallEcho
         new CraftRecipe(30, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // DirtWall
-        new CraftRecipe(4501, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // Cave6Echo
-        new CraftRecipe(4510, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // CaveWall1Echo
-        new CraftRecipe(4511, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // CaveWall2Echo
-        new CraftRecipe(4521, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt1Echo
-        new CraftRecipe(4522, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt2Echo
-        new CraftRecipe(4523, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt3Echo
-        new CraftRecipe(4524, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt4Echo
+        new CraftRecipe(4501, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2, -1, 1) }),   // Cave6Echo
+        new CraftRecipe(4510, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2, -1, 1) }),   // CaveWall1Echo
+        new CraftRecipe(4511, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2, -1, 1) }),   // CaveWall2Echo
+        new CraftRecipe(4521, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt1Echo
+        new CraftRecipe(4522, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt2Echo
+        new CraftRecipe(4523, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt3Echo
+        new CraftRecipe(4524, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2, -1, 1) }),   // Dirt4Echo
         new CraftRecipe(26, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // StoneWall
-        new CraftRecipe(4502, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // Cave7Echo
-        new CraftRecipe(4512, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // Cave8Echo
-        new CraftRecipe(4537, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks1Echo
-        new CraftRecipe(4538, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks2Echo
-        new CraftRecipe(4539, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks3Echo
-        new CraftRecipe(4540, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks4Echo
+        new CraftRecipe(4502, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 1) }),   // Cave7Echo
+        new CraftRecipe(4512, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 1) }),   // Cave8Echo
+        new CraftRecipe(4537, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks1Echo
+        new CraftRecipe(4538, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks2Echo
+        new CraftRecipe(4539, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks3Echo
+        new CraftRecipe(4540, 4, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 1) }),   // Rocks4Echo
         new CraftRecipe(1723, 4, 304, CraftEnvironment.None, new[] { new CraftRequirement(9, -1, 1) }),   // LivingWoodWall
         new CraftRecipe(3584, 4, 304, CraftEnvironment.None, new[] { new CraftRequirement(9, -1, 1) }),   // LivingLeafWall
         new CraftRecipe(93, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(9, -1, 1) }),   // WoodWall
@@ -1083,7 +1084,7 @@ public static partial class RecipeTable
         new CraftRecipe(5687, 1, 220, CraftEnvironment.None, new[] { new CraftRequirement(23, -1, 50) }),   // SlimeSpear
         new CraftRecipe(5688, 1, 220, CraftEnvironment.None, new[] { new CraftRequirement(23, -1, 50) }),   // SlimeWhip
         new CraftRecipe(171, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(9, 25, 6) }),   // Sign
-        new CraftRecipe(4710, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(9, 25, 6) }),   // TatteredWoodSign
+        new CraftRecipe(4710, 1, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(9, 25, 6) }),   // TatteredWoodSign
         new CraftRecipe(1447, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(9, -1, 1) }),   // WoodenFence
         new CraftRecipe(2210, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(619, -1, 1) }),   // EbonwoodFence
         new CraftRecipe(2211, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(620, -1, 1) }),   // RichMahoganyFence
@@ -1094,7 +1095,7 @@ public static partial class RecipeTable
         new CraftRecipe(5217, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(5215, -1, 1) }),   // AshWoodFence
         new CraftRecipe(1448, 4, 16, CraftEnvironment.None, new[] { new CraftRequirement(704, -1, 1) }),   // LeadFence
         new CraftRecipe(2333, 4, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 1) }),   // IronFence
-        new CraftRecipe(4424, 4, 283, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 1) }),   // WroughtIronFence
+        new CraftRecipe(4424, 4, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(22, -1, 1) }),   // WroughtIronFence
         new CraftRecipe(4667, 4, 18, CraftEnvironment.None, new[] { new CraftRequirement(4564, -1, 1) }),   // BambooFence
         new CraftRecipe(3665, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(48, -1, 1),new CraftRequirement(530, -1, 10) }),   // Fake_Chest
         new CraftRecipe(3666, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(306, -1, 1),new CraftRequirement(530, -1, 10) }),   // Fake_GoldChest
@@ -1147,7 +1148,7 @@ public static partial class RecipeTable
         new CraftRecipe(2699, 1, 106, CraftEnvironment.None, new[] { new CraftRequirement(9, 25, 10) }),   // WeaponRack
         new CraftRecipe(3270, 1, 106, CraftEnvironment.None, new[] { new CraftRequirement(9, 25, 6) }),   // ItemFrame
         new CraftRecipe(5137, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(5132, -1, 1) }),   // StinkbugHousingBlocker
-        new CraftRecipe(5138, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(5132, -1, 1) }),   // StinkbugHousingBlockerEcho
+        new CraftRecipe(5138, 1, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(5132, -1, 1) }),   // StinkbugHousingBlockerEcho
         new CraftRecipe(343, 1, 106, CraftEnvironment.None, new[] { new CraftRequirement(9, 25, 9),new CraftRequirement(22, 28, 1) }),   // Barrel
         new CraftRecipe(359, 1, 106, CraftEnvironment.None, new[] { new CraftRequirement(22, 28, 3),new CraftRequirement(170, -1, 6),new CraftRequirement(9, -1, 10) }),   // GrandfatherClock
         new CraftRecipe(352, 1, 106, CraftEnvironment.None, new[] { new CraftRequirement(9, 25, 14) }),   // Keg
@@ -1324,7 +1325,7 @@ public static partial class RecipeTable
         new CraftRecipe(2631, 1, 305, CraftEnvironment.None, new[] { new CraftRequirement(824, -1, 10) }),   // SkywareWorkbench
         new CraftRecipe(4104, 1, 305, CraftEnvironment.None, new[] { new CraftRequirement(824, -1, 6) }),   // ToiletSunplate
         new CraftRecipe(765, 1, 305, CraftEnvironment.Water, new[] { new CraftRequirement(751, -1, 1) }),   // RainCloud
-        new CraftRecipe(3756, 1, 305, CraftEnvironment.None, new[] { new CraftRequirement(751, -1, 1) }),   // SnowCloudBlock
+        new CraftRecipe(3756, 1, 305, CraftEnvironment.SnowBiome, new[] { new CraftRequirement(751, -1, 1) }),   // SnowCloudBlock
         new CraftRecipe(5569, 1, 305, CraftEnvironment.Lava, new[] { new CraftRequirement(751, -1, 1) }),   // LavaCloud
         new CraftRecipe(5570, 10, 305, CraftEnvironment.None, new[] { new CraftRequirement(751, -1, 10),new CraftRequirement(75, -1, 1) }),   // StarCloud
         new CraftRecipe(5571, 10, 305, CraftEnvironment.None, new[] { new CraftRequirement(751, -1, 10),new CraftRequirement(662, -1, 1) }),   // RainbowCloud
@@ -1650,28 +1651,28 @@ public static partial class RecipeTable
         new CraftRecipe(3364, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(129, -1, 10),new CraftRequirement(9, 25, 4),new CraftRequirement(8, -1, 2) }),   // Fireplace
         new CraftRecipe(33, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, 26, 20),new CraftRequirement(9, 25, 4),new CraftRequirement(8, -1, 3) }),   // Furnace
         new CraftRecipe(360, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50) }),   // ArmorStatue
-        new CraftRecipe(444, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(261, -1, 5) }),   // FishStatue
-        new CraftRecipe(3653, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2002, -1, 5) }),   // WormStatue
-        new CraftRecipe(3651, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2018, 2, 5) }),   // SquirrelStatue
-        new CraftRecipe(3652, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(1998, 5, 5) }),   // ButterflyStatue
-        new CraftRecipe(3654, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(1992, 6, 5) }),   // FireflyStatue
-        new CraftRecipe(3655, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2157, 1, 5) }),   // ScorpionStatue
-        new CraftRecipe(3656, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2006, 7, 5) }),   // SnailStatue
-        new CraftRecipe(3658, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2003, -1, 5) }),   // MouseStatue
-        new CraftRecipe(3659, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2123, 4, 5) }),   // DuckStatue
-        new CraftRecipe(3660, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2205, -1, 5) }),   // PenguinStatue
-        new CraftRecipe(3661, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2121, -1, 5) }),   // FrogStatue
-        new CraftRecipe(3662, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(3194, 3, 5) }),   // BuggyStatue
-        new CraftRecipe(445, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2019, -1, 5) }),   // BunnyStatue
-        new CraftRecipe(464, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2015, 0, 5) }),   // BirdStatue
-        new CraftRecipe(3657, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2740, -1, 5) }),   // GrasshopperStatue
-        new CraftRecipe(4342, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4334, 8, 5) }),   // DragonflyStatue
-        new CraftRecipe(4360, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4359, -1, 5) }),   // SeagullStatue
-        new CraftRecipe(4397, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4395, -1, 5) }),   // OwlStatue
-        new CraftRecipe(4466, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4464, 9, 5) }),   // TurtleStatue
-        new CraftRecipe(5317, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(5212, 10, 5) }),   // MacawStatue
-        new CraftRecipe(5318, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(5311, -1, 5) }),   // ToucanStatue
-        new CraftRecipe(5319, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(5312, 11, 5) }),   // CockatielStatue
+        new CraftRecipe(444, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(261, -1, 5) }),   // FishStatue
+        new CraftRecipe(3653, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2002, -1, 5) }),   // WormStatue
+        new CraftRecipe(3651, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2018, 2, 5) }),   // SquirrelStatue
+        new CraftRecipe(3652, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(1998, 5, 5) }),   // ButterflyStatue
+        new CraftRecipe(3654, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(1992, 6, 5) }),   // FireflyStatue
+        new CraftRecipe(3655, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2157, 1, 5) }),   // ScorpionStatue
+        new CraftRecipe(3656, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2006, 7, 5) }),   // SnailStatue
+        new CraftRecipe(3658, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2003, -1, 5) }),   // MouseStatue
+        new CraftRecipe(3659, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2123, 4, 5) }),   // DuckStatue
+        new CraftRecipe(3660, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2205, -1, 5) }),   // PenguinStatue
+        new CraftRecipe(3661, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2121, -1, 5) }),   // FrogStatue
+        new CraftRecipe(3662, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(3194, 3, 5) }),   // BuggyStatue
+        new CraftRecipe(445, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2019, -1, 5) }),   // BunnyStatue
+        new CraftRecipe(464, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2015, 0, 5) }),   // BirdStatue
+        new CraftRecipe(3657, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(2740, -1, 5) }),   // GrasshopperStatue
+        new CraftRecipe(4342, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4334, 8, 5) }),   // DragonflyStatue
+        new CraftRecipe(4360, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4359, -1, 5) }),   // SeagullStatue
+        new CraftRecipe(4397, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4395, -1, 5) }),   // OwlStatue
+        new CraftRecipe(4466, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(4464, 9, 5) }),   // TurtleStatue
+        new CraftRecipe(5317, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(5212, 10, 5) }),   // MacawStatue
+        new CraftRecipe(5318, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(5311, -1, 5) }),   // ToucanStatue
+        new CraftRecipe(5319, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(5312, 11, 5) }),   // CockatielStatue
         new CraftRecipe(20, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(12, -1, 3) }),   // CopperBar
         new CraftRecipe(3509, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(20, -1, 8),new CraftRequirement(9, 25, 4) }),   // CopperPickaxe
         new CraftRecipe(3506, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(20, -1, 6),new CraftRequirement(9, 25, 3) }),   // CopperAxe
@@ -1704,7 +1705,7 @@ public static partial class RecipeTable
         new CraftRecipe(1, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 10),new CraftRequirement(9, 25, 3) }),   // IronPickaxe
         new CraftRecipe(10, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 8),new CraftRequirement(9, 25, 3) }),   // IronAxe
         new CraftRecipe(7, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 8),new CraftRequirement(9, 25, 3) }),   // IronHammer
-        new CraftRecipe(4711, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, 28, 12),new CraftRequirement(9, 25, 3) }),   // GravediggerShovel
+        new CraftRecipe(4711, 1, 16, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(22, 28, 12),new CraftRequirement(9, 25, 3) }),   // GravediggerShovel
         new CraftRecipe(4, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 8) }),   // IronBroadsword
         new CraftRecipe(6, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 6) }),   // IronShortsword
         new CraftRecipe(99, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, -1, 7) }),   // IronBow
@@ -1783,8 +1784,8 @@ public static partial class RecipeTable
         new CraftRecipe(105, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(19, -1, 1),new CraftRequirement(8, -1, 1) }),   // Candle
         new CraftRecipe(148, 1, 125, CraftEnvironment.Water, new[] { new CraftRequirement(105, -1, 1) }),   // WaterCandle
         new CraftRecipe(3117, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(19, -1, 2),new CraftRequirement(3114, -1, 1) }),   // PeaceCandle
-        new CraftRecipe(5322, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(57, -1, 3),new CraftRequirement(8, -1, 1) }),   // ShadowCandle
-        new CraftRecipe(5322, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(1257, -1, 3),new CraftRequirement(8, -1, 1) }),   // ShadowCandle
+        new CraftRecipe(5322, 1, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(57, -1, 3),new CraftRequirement(8, -1, 1) }),   // ShadowCandle
+        new CraftRecipe(5322, 1, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(1257, -1, 3),new CraftRequirement(8, -1, 1) }),   // ShadowCandle
         new CraftRecipe(349, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(19, -1, 5),new CraftRequirement(8, -1, 3) }),   // Candelabra
         new CraftRecipe(706, 1, 17, CraftEnvironment.None, new[] { new CraftRequirement(702, -1, 4) }),   // PlatinumBar
         new CraftRecipe(3485, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(706, -1, 10),new CraftRequirement(9, 25, 4) }),   // PlatinumPickaxe
@@ -2177,8 +2178,8 @@ public static partial class RecipeTable
         new CraftRecipe(4455, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(2343, -1, 1),new CraftRequirement(1526, -1, 1) }),   // RubyMinecart
         new CraftRecipe(4456, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(2343, -1, 1),new CraftRequirement(1527, -1, 1) }),   // DiamondMinecart
         new CraftRecipe(4467, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(2343, -1, 1),new CraftRequirement(3643, -1, 1) }),   // AmberMinecart
-        new CraftRecipe(4745, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, 28, 5),new CraftRequirement(9, 25, 10),new CraftRequirement(68, -1, 10) }),   // CoffinMinecart
-        new CraftRecipe(4745, 1, 16, CraftEnvironment.None, new[] { new CraftRequirement(22, 28, 5),new CraftRequirement(9, 25, 10),new CraftRequirement(1330, -1, 10) }),   // CoffinMinecart
+        new CraftRecipe(4745, 1, 16, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(22, 28, 5),new CraftRequirement(9, 25, 10),new CraftRequirement(68, -1, 10) }),   // CoffinMinecart
+        new CraftRecipe(4745, 1, 16, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(22, 28, 5),new CraftRequirement(9, 25, 10),new CraftRequirement(1330, -1, 10) }),   // CoffinMinecart
         new CraftRecipe(5289, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(3354, -1, 1),new CraftRequirement(3355, -1, 1),new CraftRequirement(3356, -1, 1) }),   // MinecartPowerup
         new CraftRecipe(2768, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(3467, -1, 40),new CraftRequirement(1006, -1, 40),new CraftRequirement(1552, -1, 40),new CraftRequirement(3261, -1, 40),new CraftRequirement(175, -1, 40),new CraftRequirement(117, -1, 40) }),   // DrillContainmentUnit
         new CraftRecipe(5131, 1, -1, CraftEnvironment.None, new[] { new CraftRequirement(4797, -1, 1),new CraftRequirement(4960, -1, 1) }),   // ResplendentDessert
@@ -2548,44 +2549,44 @@ public static partial class RecipeTable
         new CraftRecipe(5516, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(5395, -1, 20) }),   // Poulder
         new CraftRecipe(5520, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(540, -1, 1),new CraftRequirement(4825, -1, 1) }),   // LavaBoulder
         new CraftRecipe(5521, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(540, -1, 1),new CraftRequirement(150, -1, 200) }),   // SpiderBoulder
-        new CraftRecipe(5522, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(540, -1, 1) }),   // Ghoulder
+        new CraftRecipe(5522, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(540, -1, 1) }),   // Ghoulder
         new CraftRecipe(5514, 1, 125, CraftEnvironment.None, new[] { new CraftRequirement(540, -1, 1),new CraftRequirement(75, -1, 50) }),   // RainbowBoulder
-        new CraftRecipe(5384, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(540, -1, 1),new CraftRequirement(29, -1, 1) }),   // LifeCrystalBoulder
-        new CraftRecipe(4390, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(276, -1, 6) }),   // RollingCactus
-        new CraftRecipe(5066, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(1124, -1, 5) }),   // BeeHive
-        new CraftRecipe(5067, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3271, -1, 5),new CraftRequirement(323, -1, 1) }),   // AntlionEggs
-        new CraftRecipe(5471, 1, 86, CraftEnvironment.None, new[] { new CraftRequirement(150, -1, 1) }),   // CobwebReplica
-        new CraftRecipe(150, 1, 86, CraftEnvironment.None, new[] { new CraftRequirement(5471, -1, 1) }),   // Cobweb
-        new CraftRecipe(5467, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(61, -1, 15),new CraftRequirement(57, -1, 3),new CraftRequirement(86, -1, 3) }),   // DemonAltarReplica
-        new CraftRecipe(5468, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(836, -1, 15),new CraftRequirement(1257, -1, 3),new CraftRequirement(1329, -1, 3) }),   // CrimsonAltarReplica
+        new CraftRecipe(5384, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(540, -1, 1),new CraftRequirement(29, -1, 1) }),   // LifeCrystalBoulder
+        new CraftRecipe(4390, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(276, -1, 6) }),   // RollingCactus
+        new CraftRecipe(5066, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(1124, -1, 5) }),   // BeeHive
+        new CraftRecipe(5067, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3271, -1, 5),new CraftRequirement(323, -1, 1) }),   // AntlionEggs
+        new CraftRecipe(5471, 1, 86, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(150, -1, 1) }),   // CobwebReplica
+        new CraftRecipe(150, 1, 86, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(5471, -1, 1) }),   // Cobweb
+        new CraftRecipe(5467, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(61, -1, 15),new CraftRequirement(57, -1, 3),new CraftRequirement(86, -1, 3) }),   // DemonAltarReplica
+        new CraftRecipe(5468, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(836, -1, 15),new CraftRequirement(1257, -1, 3),new CraftRequirement(1329, -1, 3) }),   // CrimsonAltarReplica
         new CraftRecipe(5469, 1, 26, CraftEnvironment.None, new[] { new CraftRequirement(57, -1, 5),new CraftRequirement(86, -1, 5) }),   // ShadowOrbReplica
         new CraftRecipe(5470, 1, 26, CraftEnvironment.None, new[] { new CraftRequirement(1257, -1, 5),new CraftRequirement(1329, -1, 5) }),   // CrimsonHeartReplica
-        new CraftRecipe(5286, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(29, -1, 1) }),   // RepairedLifeCrystal
-        new CraftRecipe(5287, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(109, -1, 1) }),   // RepairedManaCrystal
+        new CraftRecipe(5286, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(29, -1, 1) }),   // RepairedLifeCrystal
+        new CraftRecipe(5287, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(109, -1, 1) }),   // RepairedManaCrystal
         new CraftRecipe(5320, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(28, -1, 1) }),   // PlaceableHealingPotion
         new CraftRecipe(5321, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(110, -1, 1) }),   // PlaceableManaPotion
         new CraftRecipe(5345, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(4392, -1, 20),new CraftRequirement(530, -1, 6),new CraftRequirement(129, -1, 10) }),   // EchoMonolith
-        new CraftRecipe(3393, 1, 86, CraftEnvironment.None, new[] { new CraftRequirement(3391, -1, 1),new CraftRequirement(3392, -1, 1) }),   // CrawdadBanner
-        new CraftRecipe(3391, 1, 86, CraftEnvironment.None, new[] { new CraftRequirement(3392, -1, 1),new CraftRequirement(3393, -1, 1) }),   // SalamanderBanner
-        new CraftRecipe(3392, 1, 86, CraftEnvironment.None, new[] { new CraftRequirement(3391, -1, 1),new CraftRequirement(3393, -1, 1) }),   // GiantShellyBanner
-        new CraftRecipe(4391, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(664, -1, 1) }),   // ThinIce
-        new CraftRecipe(1290, 1, 114, CraftEnvironment.None, new[] { new CraftRequirement(111, -1, 1),new CraftRequirement(29, -1, 1) }),   // PanicNecklace
-        new CraftRecipe(111, 1, 114, CraftEnvironment.None, new[] { new CraftRequirement(1290, -1, 1),new CraftRequirement(109, -1, 1) }),   // BandofStarpower
-        new CraftRecipe(2193, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(4142, -1, 1),new CraftRequirement(521, -1, 10) }),   // FleshCloningVaat
-        new CraftRecipe(4142, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(2193, -1, 1),new CraftRequirement(521, -1, 10) }),   // LesionStation
-        new CraftRecipe(4355, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(540, -1, 5) }),   // BoulderStatue
-        new CraftRecipe(4640, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(181, -1, 1),new CraftRequirement(3, -1, 1) }),   // AmethystStoneBlock
-        new CraftRecipe(4641, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(180, -1, 1),new CraftRequirement(3, -1, 1) }),   // TopazStoneBlock
-        new CraftRecipe(4642, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(177, -1, 1),new CraftRequirement(3, -1, 1) }),   // SapphireStoneBlock
-        new CraftRecipe(4643, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(179, -1, 1),new CraftRequirement(3, -1, 1) }),   // EmeraldStoneBlock
-        new CraftRecipe(4644, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(178, -1, 1),new CraftRequirement(3, -1, 1) }),   // RubyStoneBlock
-        new CraftRecipe(4645, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(182, -1, 1),new CraftRequirement(3, -1, 1) }),   // DiamondStoneBlock
-        new CraftRecipe(4646, 1, 283, CraftEnvironment.None, new[] { new CraftRequirement(999, -1, 1),new CraftRequirement(3, -1, 1) }),   // AmberStoneBlock
+        new CraftRecipe(3393, 1, 86, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3391, -1, 1),new CraftRequirement(3392, -1, 1) }),   // CrawdadBanner
+        new CraftRecipe(3391, 1, 86, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3392, -1, 1),new CraftRequirement(3393, -1, 1) }),   // SalamanderBanner
+        new CraftRecipe(3392, 1, 86, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3391, -1, 1),new CraftRequirement(3393, -1, 1) }),   // GiantShellyBanner
+        new CraftRecipe(4391, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(664, -1, 1) }),   // ThinIce
+        new CraftRecipe(1290, 1, 114, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(111, -1, 1),new CraftRequirement(29, -1, 1) }),   // PanicNecklace
+        new CraftRecipe(111, 1, 114, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(1290, -1, 1),new CraftRequirement(109, -1, 1) }),   // BandofStarpower
+        new CraftRecipe(2193, 1, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(4142, -1, 1),new CraftRequirement(521, -1, 10) }),   // FleshCloningVaat
+        new CraftRecipe(4142, 1, 18, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(2193, -1, 1),new CraftRequirement(521, -1, 10) }),   // LesionStation
+        new CraftRecipe(4355, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(3, -1, 50),new CraftRequirement(540, -1, 5) }),   // BoulderStatue
+        new CraftRecipe(4640, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(181, -1, 1),new CraftRequirement(3, -1, 1) }),   // AmethystStoneBlock
+        new CraftRecipe(4641, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(180, -1, 1),new CraftRequirement(3, -1, 1) }),   // TopazStoneBlock
+        new CraftRecipe(4642, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(177, -1, 1),new CraftRequirement(3, -1, 1) }),   // SapphireStoneBlock
+        new CraftRecipe(4643, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(179, -1, 1),new CraftRequirement(3, -1, 1) }),   // EmeraldStoneBlock
+        new CraftRecipe(4644, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(178, -1, 1),new CraftRequirement(3, -1, 1) }),   // RubyStoneBlock
+        new CraftRecipe(4645, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(182, -1, 1),new CraftRequirement(3, -1, 1) }),   // DiamondStoneBlock
+        new CraftRecipe(4646, 1, 283, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(999, -1, 1),new CraftRequirement(3, -1, 1) }),   // AmberStoneBlock
         new CraftRecipe(565, 1, 114, CraftEnvironment.None, new[] { new CraftRequirement(562, -1, 1),new CraftRequirement(563, -1, 1),new CraftRequirement(564, -1, 1),new CraftRequirement(566, -1, 1),new CraftRequirement(567, -1, 1),new CraftRequirement(568, -1, 1),new CraftRequirement(569, -1, 1),new CraftRequirement(570, -1, 1),new CraftRequirement(571, -1, 1),new CraftRequirement(572, -1, 1),new CraftRequirement(573, -1, 1),new CraftRequirement(574, -1, 1) }),   // MusicBoxTitle
         new CraftRecipe(4356, 1, 114, CraftEnvironment.None, new[] { new CraftRequirement(4078, -1, 1),new CraftRequirement(4080, -1, 1),new CraftRequirement(4081, -1, 1),new CraftRequirement(4082, -1, 1),new CraftRequirement(4357, -1, 1),new CraftRequirement(4358, -1, 1),new CraftRequirement(4421, -1, 1),new CraftRequirement(4606, -1, 1),new CraftRequirement(5006, -1, 1),new CraftRequirement(4979, -1, 1),new CraftRequirement(4985, -1, 1),new CraftRequirement(4990, -1, 1) }),   // MusicBoxTitleAlt
-        new CraftRecipe(4992, 1, 114, CraftEnvironment.None, new[] { new CraftRequirement(1603, -1, 1),new CraftRequirement(1602, -1, 1),new CraftRequirement(4079, -1, 1),new CraftRequirement(4077, -1, 1),new CraftRequirement(1607, -1, 1),new CraftRequirement(4991, -1, 1) }),   // MusicBoxConsoleTitle
+        new CraftRecipe(4992, 1, 114, CraftEnvironment.GraveyardBiome, new[] { new CraftRequirement(1603, -1, 1),new CraftRequirement(1602, -1, 1),new CraftRequirement(4079, -1, 1),new CraftRequirement(4077, -1, 1),new CraftRequirement(1607, -1, 1),new CraftRequirement(4991, -1, 1) }),   // MusicBoxConsoleTitle
         new CraftRecipe(4237, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(562, -1, 1),new CraftRequirement(2860, -1, 25) }),   // MusicBoxDayRemix
-        new CraftRecipe(5638, 1, 18, CraftEnvironment.None, new[] { new CraftRequirement(576, -1, 1),new CraftRequirement(5573, -1, 2),new CraftRequirement(8, -1, 101) }),   // MusicBoxTorchGod
+        new CraftRecipe(5638, 1, 18, CraftEnvironment.TorchGodsFavor, new[] { new CraftRequirement(576, -1, 1),new CraftRequirement(5573, -1, 2),new CraftRequirement(8, -1, 101) }),   // MusicBoxTorchGod
         new CraftRecipe(43, 1, 26, CraftEnvironment.None, new[] { new CraftRequirement(38, -1, 6) }),   // SuspiciousLookingEye
         new CraftRecipe(5120, 1, 26, CraftEnvironment.None, new[] { new CraftRequirement(5070, -1, 3),new CraftRequirement(56, -1, 5),new CraftRequirement(38, -1, 1) }),   // DeerThing
         new CraftRecipe(5120, 1, 26, CraftEnvironment.None, new[] { new CraftRequirement(5070, -1, 3),new CraftRequirement(880, -1, 5),new CraftRequirement(38, -1, 1) }),   // DeerThing
@@ -2602,7 +2603,7 @@ public static partial class RecipeTable
         new CraftRecipe(556, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(68, -1, 6),new CraftRequirement(22, 28, 5),new CraftRequirement(521, -1, 6) }),   // MechanicalWorm
         new CraftRecipe(556, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(1330, -1, 6),new CraftRequirement(22, 28, 5),new CraftRequirement(521, -1, 6) }),   // MechanicalWorm
         new CraftRecipe(557, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(154, -1, 30),new CraftRequirement(22, 28, 5),new CraftRequirement(520, -1, 3),new CraftRequirement(521, -1, 3) }),   // MechanicalSkull
-        new CraftRecipe(5334, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(544, -1, 1),new CraftRequirement(557, -1, 1),new CraftRequirement(556, -1, 1) }),   // MechdusaSummon
+        new CraftRecipe(5334, 1, 134, CraftEnvironment.Mechdusa, new[] { new CraftRequirement(544, -1, 1),new CraftRequirement(557, -1, 1),new CraftRequirement(556, -1, 1) }),   // MechdusaSummon
         new CraftRecipe(1844, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(1725, -1, 30),new CraftRequirement(1508, -1, 5),new CraftRequirement(1225, -1, 10) }),   // PumpkinMoonMedallion
         new CraftRecipe(1958, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(225, -1, 20),new CraftRequirement(1508, -1, 5),new CraftRequirement(547, -1, 5) }),   // NaughtyPresent
         new CraftRecipe(2767, 1, 134, CraftEnvironment.None, new[] { new CraftRequirement(2766, -1, 8) }),   // SolarTablet

@@ -1630,7 +1630,11 @@ public sealed class GameHost : IDisposable
                 DirectionPositive: npc.Direction >= 0,
                 // 原版 ai[0..3]：依赖 ai 的 aiStyle（如史莱姆跳跃状态）必须下发，
                 // 否则客户端会把 ai 全置 0，表现与服务端不一致。
-                Ai: npc.Ai);
+                Ai: npc.Ai,
+                // 难度覆盖 + 玩家数：客户端据此自算 lifeMax（包 23 不下发 lifeMax），
+                // 必须与 NPC 生成时的缩放口径一致（原版 NPC.difficulty / statsAreScaledForThisManyPlayers）。
+                Difficulty: CombatResolver.DifficultyValue(world.GameMode),
+                PlayerCount: npc.StatsScaledForPlayers);
 
             var baselineKey = (Index: i, Generation: npc.Generation);
             var sent = 0;

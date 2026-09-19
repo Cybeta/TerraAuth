@@ -1098,6 +1098,95 @@ public class SimulationTests
     }
 
     /// <summary>
+    /// 合成环境快照的场景度量（原版 <c>SceneMetrics.ScanTiles</c>）：以玩家所在图格为中心的固定
+    /// 169×124 图格扫描区内，雪原图格 ≥ 1500 → <c>ZoneSnow</c>；墓碑数 − 向日葵数/2 ≥ 28 → <c>ZoneGraveyard</c>。
+    /// 阈值两侧都验证（含向日葵抵消墓碑的原版口径）。
+    /// </summary>
+    [Fact]
+    public void CraftingEnvironmentSampler_Tracks_Snow_And_Graveyard_Biomes()
+    {
+        var world = new WorldState { Tiles = new TileMap(200, 200) };
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Position = new Vector2(100 * 16f, 100 * 16f),
+        };
+        var environment = player.CraftingEnvironment;
+
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.False(environment.SnowBiome);
+        Assert.False(environment.GraveyardBiome);
+
+        int centerX = ((int)(player.Position.X + NpcSizes.PlayerWidth / 2f)) >> 4;
+        int centerY = ((int)(player.Position.Y + NpcSizes.PlayerHeight / 2f)) >> 4;
+        int zoneLeft = centerX - CraftingEnvironmentSampler.ZoneScanWidth / 2;
+        int zoneTop = centerY - CraftingEnvironmentSampler.ZoneScanHeight / 2;
+
+        void FillRow(int row, int count, int tileType)
+        {
+            for (int i = 0; i < count; i++)
+                world.Tiles[zoneLeft + i, zoneTop + row] = new Tile { Active = true, Type = (ushort)tileType };
+        }
+
+        // 雪原图格（雪块 147）：1499 格 < 1500 → 不算雪原；补齐到 1500 → 算雪原。
+        FillRow(0, 169, 147);
+        FillRow(1, 169, 147);
+        FillRow(2, 169, 147);
+        FillRow(3, 169, 147);
+        FillRow(4, 169, 147);
+        FillRow(5, 169, 147);
+        FillRow(6, 169, 147);
+        FillRow(7, 169, 147);
+        FillRow(8, 147, 147);   // 8×169 + 147 = 1499
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.False(environment.SnowBiome);
+        Assert.False(environment.Satisfies(-1, CraftEnvironment.SnowBiome));
+
+        FillRow(8, 148, 147);   // 1500
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.True(environment.SnowBiome);
+        Assert.True(environment.Satisfies(-1, CraftEnvironment.SnowBiome));
+
+        // 墓地：27 墓碑 − 2 向日葵/2 = 26 < 28 → 不算墓地；29 墓碑 − 1 = 28 → 算墓地。
+        FillRow(120, 27, 85);
+        FillRow(121, 2, 27);
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.False(environment.GraveyardBiome);
+        Assert.False(environment.Satisfies(-1, CraftEnvironment.GraveyardBiome));
+
+        FillRow(120, 29, 85);
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.True(environment.GraveyardBiome);
+        Assert.True(environment.Satisfies(-1, CraftEnvironment.GraveyardBiome));
+    }
+
+    /// <summary>
+    /// 合成环境快照的另外两类前置条件：世界特性（原版 <c>SpecialSeedFeatures.Mechdusa</c>）与
+    /// 玩家解锁状态（原版 <c>Player.unlockedBiomeTorches</c>，由包 4 上报）——两者都由服务端持为状态位。
+    /// </summary>
+    [Fact]
+    public void CraftingEnvironmentSampler_Tracks_Mechdusa_And_TorchGodsFavor()
+    {
+        var world = new WorldState { Tiles = new TileMap(32, 32) };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        var environment = player.CraftingEnvironment;
+
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.False(environment.Mechdusa);
+        Assert.False(environment.TorchGodsFavor);
+        Assert.False(environment.Satisfies(-1, CraftEnvironment.Mechdusa));
+        Assert.False(environment.Satisfies(-1, CraftEnvironment.TorchGodsFavor));
+
+        world.MechdusaFeature = true;
+        player.UnlockedBiomeTorches = true;
+        CraftingEnvironmentSampler.Refresh(world, player);
+        Assert.True(environment.Mechdusa);
+        Assert.True(environment.TorchGodsFavor);
+        Assert.True(environment.Satisfies(-1, CraftEnvironment.Mechdusa | CraftEnvironment.TorchGodsFavor));
+    }
+
+    /// <summary>
     /// SSC 背包守恒事务：纯消耗（喝药水 / 投掷物 / 一次性道具）只减不增，不可能借此凭空造物
     /// → 放行；原版「丢弃物品」（包 21 生成世界掉落物 + 包 5 清空槽位）也依赖这一条才不会回滚。
     /// </summary>
@@ -1291,6 +1380,166 @@ public class SimulationTests
         Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
         Assert.Equal(0, player.Items[50]);
         Assert.Equal(2, player.Items[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：墓地配方（木架 1389 ← 木材 9，骨焊机 300 旁）——材料与站位都满足，
+    /// 但**不在墓地**时（原版 <c>needGraveyardBiome</c>）必须回滚；放下足够墓碑（≥ 28，向日葵按半抵消）
+    /// 后才提交。这是「只在材料与站位上校验」会漏掉的作弊面。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Graveyard_Recipe_Follows_Biome()
+    {
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(200, 200) };
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Position = new Vector2(100 * 16f, 100 * 16f),
+        };
+        PlaceCraftingStation(world, player, tileType: 300);   // 骨焊机
+        player.Items[50] = 9;   // 木材
+        player.ItemStacks[50] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 1389, 2).Apply(world, rng).Applied);
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(9, player.Items[50]);
+
+        // 场景扫描区内放下 28 个墓碑 → 满足墓地前置条件 → 同一操作提交
+        int centerY = ((int)(player.Position.Y + NpcSizes.PlayerHeight / 2f)) >> 4;
+        int centerX = ((int)(player.Position.X + NpcSizes.PlayerWidth / 2f)) >> 4;
+        int zoneLeft = centerX - CraftingEnvironmentSampler.ZoneScanWidth / 2;
+        int zoneTop = centerY - CraftingEnvironmentSampler.ZoneScanHeight / 2;
+        for (int i = 0; i < 28; i++)
+            world.Tiles[zoneLeft + i, zoneTop + 100] = new Tile { Active = true, Type = 85 };
+
+        Assert.True(new StageInventorySlotCommand(130, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(130, 1, 51, 1389, 2).Apply(world, rng).Applied);
+        world.Tick = 150;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[50]);
+        Assert.Equal(1389, player.Items[51]);
+        Assert.Equal(2, player.ItemStacks[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：雪原配方（雪云块 3756 ← 冰块 751，工作台 305 旁）需要身处雪原
+    /// （原版 <c>needSnowBiome</c>：场景扫描区内雪原图格 ≥ 1500）——不满足即回滚，满足才提交。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Snow_Biome_Recipe_Follows_SceneMetrics()
+    {
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(200, 200) };
+        var player = new PlayerRuntime
+        {
+            Id = 1,
+            Active = true,
+            Position = new Vector2(100 * 16f, 100 * 16f),
+        };
+        PlaceCraftingStation(world, player, tileType: 305);
+        player.Items[50] = 751;   // 冰块
+        player.ItemStacks[50] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 3756, 1).Apply(world, rng).Applied);
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(751, player.Items[50]);
+
+        int centerX = ((int)(player.Position.X + NpcSizes.PlayerWidth / 2f)) >> 4;
+        int centerY = ((int)(player.Position.Y + NpcSizes.PlayerHeight / 2f)) >> 4;
+        int zoneLeft = centerX - CraftingEnvironmentSampler.ZoneScanWidth / 2;
+        int zoneTop = centerY - CraftingEnvironmentSampler.ZoneScanHeight / 2;
+        for (int i = 0; i < 1500; i++)
+            world.Tiles[zoneLeft + i % 169, zoneTop + 20 + i / 169] = new Tile { Active = true, Type = 147 };
+
+        Assert.True(new StageInventorySlotCommand(130, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(130, 1, 51, 3756, 1).Apply(world, rng).Applied);
+        world.Tick = 150;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(3756, player.Items[51]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：火把药水（5573 ← 火把 / 瓶子系列，瓶子 13 旁）需要玩家已解锁火把神恩
+    /// （原版 <c>needTorchGodsFavor</c> → <c>Player.unlockedBiomeTorches</c>，由包 4 上报）——
+    /// 未解锁回滚，解锁后提交。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_TorchGodsFavor_Recipe_Follows_Player_Unlock()
+    {
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(64, 64) };
+        var player = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(32 * 16f, 32 * 16f) };
+        PlaceCraftingStation(world, player, tileType: 13);   // 瓶子
+        int[] materials = { 126, 8, 313, 314, 318 };
+        for (int i = 0; i < materials.Length; i++)
+        {
+            player.Items[40 + i] = materials[i];
+            player.ItemStacks[40 + i] = 1;
+        }
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        for (int i = 0; i < materials.Length; i++)
+            Assert.True(new StageInventorySlotCommand(100, 1, 40 + i, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 5573, 1).Apply(world, rng).Applied);
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(126, player.Items[40]);
+
+        player.UnlockedBiomeTorches = true;   // 包 4 的 TorchFlags bit2
+        for (int i = 0; i < materials.Length; i++)
+            Assert.True(new StageInventorySlotCommand(130, 1, 40 + i, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(130, 1, 50, 5573, 1).Apply(world, rng).Applied);
+        world.Tick = 150;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(5573, player.Items[50]);
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：机械三王召唤物（5334 ← 秘银 / 精金系列，秘银砧 134 旁）需要世界具备
+    /// 「机械三王」特性（原版 <c>needMechdusa</c> → <c>SpecialSeedFeatures.Mechdusa</c>）——
+    /// 本服务端的程序化世界不产出该特性，故默认回滚；世界特性置位后提交。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Mechdusa_Recipe_Follows_World_Feature()
+    {
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(64, 64) };
+        var player = new PlayerRuntime { Id = 1, Active = true, Position = new Vector2(32 * 16f, 32 * 16f) };
+        PlaceCraftingStation(world, player, tileType: 134);
+        player.Items[40] = 544;
+        player.ItemStacks[40] = 1;
+        player.Items[41] = 557;
+        player.ItemStacks[41] = 1;
+        player.Items[42] = 556;
+        player.ItemStacks[42] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        for (int slot = 40; slot <= 42; slot++)
+            Assert.True(new StageInventorySlotCommand(100, 1, slot, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 5334, 1).Apply(world, rng).Applied);
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(544, player.Items[40]);
+
+        world.MechdusaFeature = true;
+        for (int slot = 40; slot <= 42; slot++)
+            Assert.True(new StageInventorySlotCommand(130, 1, slot, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(130, 1, 50, 5334, 1).Apply(world, rng).Applied);
+        world.Tick = 150;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(5334, player.Items[50]);
     }
 
     /// <summary>
@@ -2872,26 +3121,51 @@ public class WorldGeneratorTests
     }
 
     /// <summary>
-    /// 原版 <c>Main.CalculateDamagePlayersTake</c> 按难度取分支（阶段 D）：
-    /// 经典 <c>dmg − def×0.5</c>、专家 <c>dmg×2 − def×0.75</c>、大师 <c>dmg×3 − def</c>，最低 1。
+    /// 原版 <c>Main.CalculateDamagePlayersTake</c> 按难度取**减防系数**（阶段 D）：
+    /// 经典 <c>dmg − def×0.5</c>、专家 <c>dmg − def×0.75</c>、大师 <c>dmg − def</c>，最低 1。
+    /// 伤害值本身不随难度变化 —— 放大发生在 NPC 生成时（见难度缩放用例）。
     /// </summary>
     [Theory]
     [InlineData(GameMode.Classic, 7, 2, 6)]     // 7 − round(2×0.5)=1 → 6
-    [InlineData(GameMode.Expert, 7, 2, 12)]     // 14 − round(2×0.75)=2 → 12
-    [InlineData(GameMode.Master, 7, 2, 19)]     // 21 − 2 → 19
+    [InlineData(GameMode.Expert, 7, 2, 5)]      // 7 − round(2×0.75)=2 → 5
+    [InlineData(GameMode.Master, 7, 2, 5)]      // 7 − 2 → 5
+    [InlineData(GameMode.Expert, 14, 0, 14)]    // 专家下史莱姆的伤害已放大到 14（生成时 ×2）
+    [InlineData(GameMode.Master, 21, 0, 21)]    // 大师下史莱姆的伤害已放大到 21（生成时 ×3）
     [InlineData(GameMode.Classic, 1, 10, 1)]    // 下限 1
-    [InlineData(GameMode.Expert, 1, 10, 1)]     // 2 − round(7.5)=8 → 下限 1
+    [InlineData(GameMode.Expert, 1, 10, 1)]     // 1 − round(7.5)=8 → 下限 1
     [InlineData(GameMode.Master, 0, 0, 1)]      // 0 → 下限 1
     public void CalculateDamagePlayersTake_Applies_Mode_Formula(GameMode mode, int damage, int defense, int expected)
         => Assert.Equal(expected, CombatResolver.CalculateDamagePlayersTake(damage, defense, mode));
 
     /// <summary>
-    /// 阶段 D：专家模式下包 117 区间上界按难度放大（原版 1.4 起难度倍率内置于
-    /// <c>CalculateDamagePlayersTake</c>，不再单独放大 <c>npc.damage</c>）。
-    /// 史莱姆接触 7、玩家防御 0 → 专家上界 = ceil(7×1.15)=9 × 2 − 0 = 18（经典为 9）。
+    /// 原版 <c>NPC.ScaleStats_ByDifficulty</c>（NPC.cs L18341）：**专家 ×2 / 大师 ×3** 的 NPC 生命上限与伤害
+    /// （<c>EnemyMaxLifeMultiplier</c> / <c>EnemyDamageMultiplier</c> 曲线在经典~大师区间即难度值本身），
+    /// 走 <c>SpawnBoss → AddNpc</c> 这条生成路径（刷怪 / 变体 / 换型共用同一入口）。
+    /// 绿史莱姆（type 1）基础：生命 25 / 伤害 7。
+    /// </summary>
+    [Theory]
+    [InlineData(0, 25, 7)]
+    [InlineData(1, 50, 14)]
+    [InlineData(2, 75, 21)]
+    public void SpawnedNpc_Scales_Life_And_Damage_By_Difficulty(int worldGameMode, int expectedLifeMax, int expectedDamage)
+    {
+        var world = new WorldState();
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        world.GameMode = worldGameMode;
+
+        var npc = sim.SpawnBoss(1, 320f, 460f);
+
+        Assert.Equal(expectedLifeMax, npc.LifeMax);
+        Assert.Equal(expectedLifeMax, npc.Life);      // 生成即满血
+        Assert.Equal(expectedDamage, npc.Damage);
+    }
+
+    /// <summary>
+    /// 难度缩放只应用一次：专家下史莱姆接触伤害 = 7×2 = 14（不是 7），
+    /// 包 117 区间上界 = ceil(14×1.15) = 17（不再乘第二次倍率）。
     /// </summary>
     [Fact]
-    public void ExpertMode_Contact_UpperBound_Scales_With_Difficulty()
+    public void ExpertMode_Contact_Damage_Is_Scaled_Once()
     {
         var world = WorldGenerator.GenerateSmall();
         world.GameMode = (int)GameMode.Expert;
@@ -2910,27 +3184,126 @@ public class WorldGeneratorTests
 
         var rng = new XoshiroRng(1);
 
+        // 未走 AddNpc 的裸实体：接触伤害按「表值 × 难度倍率」兜底，口径与生成路径一致
         var slime = new WorldNpc
         {
             Type = 1,
             NetId = 1,
             Active = true,
-            Life = 25,
-            LifeMax = 25,
+            Life = 50,
+            LifeMax = 50,
             X = player.Position.X,
             Y = player.Position.Y + 21f,
         };
         lock (world.NpcsLock) world.Npcs.Add(slime);
 
-        // 超上界（19 > 18）→ 拒绝（hurt_damage_above_limit），生命不变
-        var above = new DamagePlayerCommand(2, 1, 19).Apply(world, rng);
+        Assert.Equal(14, CombatResolver.FindContactDamage(world, player, out _, out _));
+
+        // 超上界（18 > 17）→ 拒绝；区间内（17）→ 接受并按上报值扣血：100 − 17 = 83
+        var above = new DamagePlayerCommand(2, 1, 18).Apply(world, rng);
         Assert.False(above.Applied);
         Assert.Equal(CommandFailures.HurtDamageAboveLimit, above.Reason);
         Assert.Equal(100, player.Hp);
 
-        // 区间内（专家上界 18）→ 接受并按上报值扣血：100 − 18 = 82
-        Assert.True(new DamagePlayerCommand(3, 1, 18).Apply(world, rng).Applied);
-        Assert.Equal(82, player.Hp);
+        Assert.True(new DamagePlayerCommand(3, 1, 17).Apply(world, rng).Applied);
+        Assert.Equal(83, player.Hp);
+    }
+
+    /// <summary>
+    /// 原版 <c>NPC.ScaleStats_ForExpertHardmode</c>（NPC.cs L18683，专家及以上**且**困难模式）：把强度不足的
+    /// 普通怪补到最低强度线（<c>damage + defense + lifeMax/4</c> 低于 80，击败世纪之花后 100）。
+    /// 蓝史莱姆（7 / 2 / 25）→ 强度 = 7+2+6 = 15 → factor = 80/15 = **5**（原版**整数除法**）→
+    /// 伤害 7×5×0.9 = 31、防御 2×5 = 10、生命 25×5×1.1 = 137。
+    /// </summary>
+    [Theory]
+    [InlineData(false, 31, 10, 137)]    // 目标线 80 → factor 5
+    [InlineData(true, 37, 12, 165)]     // 击败世纪之花 → 目标线 100 → factor 6
+    public void NpcHardmodeScaling_Tops_Up_Weak_Mobs(bool downedPlantBoss, int expectedDamage, int expectedDefense, int expectedLifeMax)
+    {
+        var npc = new WorldNpc { Type = 1, Damage = 7, Defense = 2, LifeMax = 25, Life = 25 };
+
+        NpcHardmodeScaling.Apply(npc, downedPlantBoss);
+
+        Assert.Equal(expectedDamage, npc.Damage);
+        Assert.Equal(expectedDefense, npc.Defense);
+        Assert.Equal(expectedLifeMax, npc.LifeMax);
+    }
+
+    /// <summary>
+    /// 困难模式补强的三类豁免：Boss / <c>lifeMax ≥ 1000</c>、<c>DontDoHardmodeScaling</c> 类型、
+    /// 以及投射物型 NPC（只放大伤害，不动防御与生命上限）。
+    /// </summary>
+    [Fact]
+    public void NpcHardmodeScaling_Skips_Bosses_Excluded_Types_And_Projectile_Npcs()
+    {
+        var boss = new WorldNpc { Type = 4, Damage = 15, Defense = 12, LifeMax = 2800, IsBoss = true };
+        NpcHardmodeScaling.Apply(boss, false);
+        Assert.Equal(15, boss.Damage);
+        Assert.Equal(2800, boss.LifeMax);
+
+        var wormHead = new WorldNpc { Type = 13, Damage = 22, Defense = 2, LifeMax = 150 };   // NPCID.Sets.DontDoHardmodeScaling
+        NpcHardmodeScaling.Apply(wormHead, false);
+        Assert.Equal(22, wormHead.Damage);
+        Assert.Equal(150, wormHead.LifeMax);
+
+        // 投射物型（25 克苏鲁之仆）：强度 5+0+2 = 7 → factor 80/7 = 11 → 伤害 5×11×0.9 = 49，防御 / 生命不动
+        var servant = new WorldNpc { Type = 25, Damage = 5, Defense = 0, LifeMax = 10 };
+        NpcHardmodeScaling.Apply(servant, false);
+        Assert.Equal(49, servant.Damage);
+        Assert.Equal(0, servant.Defense);
+        Assert.Equal(10, servant.LifeMax);
+    }
+
+    /// <summary>
+    /// 原版 <c>NPC.ScaleStats_ByPlayerCount</c> + <c>GetStatScalingFactors</c>（NPC.cs L18733/L18895）：
+    /// 专家及以上按在线人数放大**生命上限**（伤害不随人数变化）。2 人 balance = 1.35、3 人 = 1.9167…；
+    /// 未列入类型表的怪倍率为 1，但「按几人缩放」仍要记录（包 23 的玩家数段用它）。
+    /// </summary>
+    [Fact]
+    public void NpcPlayerCountScaling_Follows_Vanilla_Curve()
+    {
+        NpcPlayerCountScaling.GetStatScalingFactors(2, out double balance2, out _);
+        NpcPlayerCountScaling.GetStatScalingFactors(3, out double balance3, out _);
+        Assert.Equal(1.35, balance2, 6);
+        Assert.Equal(1.0 + 0.35 + (0.35 + (1.0 - 0.35) / 3.0), balance3, 6);
+
+        var eye = new WorldNpc { Type = 4, LifeMax = 2800 };                     // 克苏鲁之眼
+        NpcPlayerCountScaling.Apply(eye, 2);
+        Assert.Equal(3780, eye.LifeMax);                                          // 2800 × 1.35
+        Assert.Equal(2, eye.StatsScaledForPlayers);
+
+        var slime = new WorldNpc { Type = 1, LifeMax = 25 };                      // 表外类型：倍率 1
+        NpcPlayerCountScaling.Apply(slime, 3);
+        Assert.Equal(25, slime.LifeMax);
+        Assert.Equal(3, slime.StatsScaledForPlayers);
+
+        var martian = new WorldNpc { Type = 338, LifeMax = 100 };                 // 火星暴乱（入侵组 -1）
+        NpcPlayerCountScaling.Apply(martian, 3);
+        Assert.Equal(140, martian.LifeMax);                                       // 1 + (3-1)×0.2 = 1.4
+    }
+
+    /// <summary>
+    /// 生成链路整体（难度 × 人数 × 客户端口径）：专家世界 + 2 名在线玩家 →
+    /// 克苏鲁之眼生命上限 = 2800 × 2（难度）→ 5600 × 1.35（人数）= 7560，
+    /// 并把「按 2 人缩放」记进实体（包 23 玩家数段的来源）。
+    /// </summary>
+    [Fact]
+    public void SpawnedBoss_Scales_By_Difficulty_And_PlayerCount()
+    {
+        var world = WorldGenerator.GenerateSmall();
+        world.GameMode = (int)GameMode.Expert;
+        lock (world.PlayersLock)
+        {
+            world.Players[1] = new PlayerRuntime { Id = 1, Active = true };
+            world.Players[2] = new PlayerRuntime { Id = 2, Active = true };
+        }
+
+        var sim = new WorldSimulator(world, new CommandQueue(), new EventRecorder(), new SnapshotStore());
+        var boss = sim.SpawnBoss(4, 320f, 460f);
+
+        Assert.Equal(7560, boss.LifeMax);
+        Assert.Equal(7560, boss.Life);
+        Assert.Equal(2, boss.StatsScaledForPlayers);
     }
 
     /// <summary>
@@ -4543,6 +4916,39 @@ public class WorldGeneratorTests
 
         Assert.Equal(3, typed.PlayerId);
         Assert.Equal(17, typed.TalkNpc);
+    }
+
+    /// <summary>
+    /// 包 23（编码 → 解码）对称：**难度覆盖段**（bitsB.bit2 + float，原版 <c>NPC.difficulty</c>）与
+    /// **玩家数段**（bitsB.bit0 + byte，原版 <c>statsAreScaledForThisManyPlayers</c>）
+    /// 带值时往返一致，缺省（经典 1 / 单人 1）不写这两段 —— 客户端据它们自算 NPC 生命上限。
+    /// </summary>
+    [Fact]
+    public void NpcUpdate_Difficulty_Override_RoundTrips_In_Codec()
+    {
+        var encoder = new PacketEncoder(ProtocolVersion.Current);
+        var decoder = new PacketDecoder();
+
+        static NpcUpdatePacket Decode(PacketEncoder encoder, PacketDecoder decoder, NpcUpdatePacket packet)
+        {
+            var memory = new ArrayBufferWriter<byte>();
+            encoder.Encode(memory, PacketId.NpcUpdate, packet);
+            var buffer = new ReadOnlySequence<byte>(memory.WrittenMemory);
+            Assert.True(decoder.TryDecodeFrame(ref buffer, new DecodeContext(), out var decoded));
+            return Assert.IsType<NpcUpdatePacket>(decoded);
+        }
+
+        var expert = Decode(encoder, decoder, new NpcUpdatePacket(
+            3, 7, default, default, 255, 1,
+            Life: 10, LifeMax: 50, Ai: new[] { 1f, 2f, 3f, 4f }, Difficulty: 2f, PlayerCount: 3));
+        Assert.Equal(2f, expert.Difficulty);
+        Assert.Equal(3, expert.PlayerCount);
+        Assert.Equal(new[] { 1f, 2f, 3f, 4f }, expert.Ai);
+
+        var classic = Decode(encoder, decoder, new NpcUpdatePacket(
+            3, 7, default, default, 255, 1, Life: 10, LifeMax: 25));
+        Assert.Equal(1f, classic.Difficulty);
+        Assert.Equal(1, classic.PlayerCount);
     }
 
     /// <summary>包 54（编码 → 解码）对称：NpcBuffSync 载荷往返一致。</summary>

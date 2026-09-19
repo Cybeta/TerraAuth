@@ -1,7 +1,7 @@
 # TerraAuth — 优化待办（Backlog）
 
 > 记录**尚未实施**的优化 / 补全事项，供后续排期取舍。已实施项见文末「本轮回溯」。
-> 最后更新：2026-09-19（第四十一轮：反向墙 / 平台配方补齐（合成覆盖收口）；800/800 通过）
+> 最后更新：2026-09-19（第四十四轮：难度缩放收口 —— 困难模式补强 + 多人人数缩放 + 包 23 双段；818/818 通过）
 
 ---
 
@@ -113,6 +113,139 @@
 
 ## 附：本轮回溯
 
+### 第四十四轮（2026-09-19）：难度缩放收口（困难模式补强 + 多人人数缩放 + 包 23 双段）
+
+**一、根因**
+
+- 上一轮只做了难度曲线（专家 ×2 / 大师 ×3）与包 23 的难度覆盖段；原版 `NPC.ScaleStats` 链还有两步没做：
+  ①专家 + **困难模式**的弱怪补强（`ScaleStats_ForExpertHardmode`）；②专家以上按**在线人数**放大生命上限
+  （`ScaleStats_ByPlayerCount`）。缺这两步 → 困难模式里低级怪仍能一刀秒、多人世界里 Boss 血量不随人数上升。
+  更要紧的是：客户端收到包 23 后是**自己按同一条链重算** `lifeMax`（人数来自包内玩家数段、困难模式来自包 7 进度位），
+  服务端少算一步，血条上限就会与该步的差值发散。
+
+**二、原版口径（1.4.5.8 逐行核对）**
+
+- `NPC.ScaleStats(activePlayersCount, strengthOverride)`（NPC.cs L18316）顺序：
+  `[专家+困难] ScaleStats_ForExpertHardmode()` → `ScaleStats_ByDifficulty()` → `[专家] ScaleStats_ByPlayerCount(n)`
+  → `lifeMax < 6 → 6`（弹幕类除外）→ `life = lifeMax`。
+- `ScaleStats_ForExpertHardmode`（L18683）：`power = damage + defense + lifeMax/4`，低于 `80`（`downedPlantBoss` 时 `100`）
+  则补强：`damage × factor × 0.9`，非投射物型再 `defense × factor`、`lifeMax × factor × 1.1`；
+  **`factor` 是整数除法** `目标 / power`（截断）。豁免：`boss || lifeMax >= 1000`、`NPCID.Sets.DontDoHardmodeScaling`；
+  投射物型（`NPCID.Sets.ProjectileNPC`）只放大伤害。
+- `ScaleStats_ByPlayerCount`（L18733）：只放大 **lifeMax**（伤害不变），倍率来自 `GetStatScalingFactors`
+  （balance 1 / 1.35 / 1.9167…，boost 按 `+(1-boost)/3` 递增；>8 后放缓、上限 1000）。
+  类型表是显式清单（眼魔 4、世吞 13-15、脑 266/267、史莱姆王 50、骷髅王 35/36、鹿角怪 668、血肉墙 113-116、
+  史莱姆皇后 657-660、毁灭者 134-136/139、机械骷髅王 127-131、双子 125-126、世纪之花 262/264、光女 636、
+  石巨人 245-249、猪鲨 370、拜月教 / 月亮事件 439/440/454-459/523、月总 396-398、551 等）；
+  撒旦军队集合按 `Lerp(1, balance, 0.857)`；`GetNPCInvasionGroup` 返回 −1 / −2 的类型（火星暴乱 338-352、
+  旧日军团 305-315/325-330）按 `1 + (n-1)×0.2`，其中 315/325/327/344/345/346 例外不缩放。
+  并把「按几人缩放」写入 `statsAreScaledForThisManyPlayers`（包 23 的玩家数段）。
+- 客户端一致性：包 7 的进度位给客户端 `Main.hardMode`（bit4）与 `NPC.downedPlantBoss`（bit7）；
+  包 23 的难度段 / 玩家数段给难度与人数 —— 三者齐备，客户端才能算出与服务端相同的上限。
+
+**三、改动**
+
+- 新增 `Simulation/Combat/NpcDifficultyScaling.cs`：`NpcHardmodeScaling`（含两张 `NPCID.Sets` 集合与整数除法口径）、
+  `NpcPlayerCountScaling`（人数曲线 + 显式类型表 + 撒旦军队 / 入侵组分支），全部逐条镜像原版。
+- `WorldSimulator.ApplyNpcDifficultyScaling` 改为完整链路（困难模式 → 难度曲线 → 人数 → 生命下限 6 → 生命重算），
+  生成路径（刷怪 / `SpawnBoss` / 变体 / `TransformNpc`）统一生效。
+- 在线人数：`Tick()` 开头与 `SpawnBoss` 内（取 NpcsLock **之前**）快照，避免与全局锁序
+  （PlayersLock → … → NpcsLock）反序。
+- **包 23 增加玩家数段**（`NpcUpdatePacket.PlayerCount` → bitsB.bit0 + byte），与难度段并列下发，编解码对称。
+
+**四、已知边界**
+
+- 未建模：`getGoodWorld` 特殊种子分支（弱怪补强里的 `AnyNPCs` 例外）、`value`（金币数值缩放）、
+  击退抗性削弱（本服务端未模拟击退）、旅途 0.5 / 传奇 5.33 两端难度。
+
+**测试**：**818 / 818 通过**（新增 5 例：困难模式补强的三档数值与三类豁免、人数曲线 + 类型表 + 入侵组倍率、
+生成链路「专家 + 2 人」下眼魔生命 2800 × 2 × 1.35 = 7560；并把包 23 编解码用例扩到玩家数段）。
+
+### 第四十三轮（2026-09-19）：难度缩放（专家 / 大师）+ 差距盘点落为待办
+
+**一、根因**
+
+- 难度此前只进入玩家受击公式的**减防系数**，NPC 的 `lifeMax` / `damage` 仍是经典数值 → 专家 / 大师世界里
+  怪既不疼也打不死；同时包 23 **不下发 `lifeMax`**（客户端按 netID 自算上限），未缩放时客户端算出的上限
+  与服务端生命值发散（满血怪显示半格血 / 掉到某点才动）。
+- 顺带核实：上一轮实现把「专家 ×2 / 大师 ×3」写进了 `CalculateDamagePlayersTake` 的注释与实现
+  （「原版 1.4 起不再单独放大 npc.damage」）——**该判断不成立**（见下），属数值正确、结构错误的实现。
+
+**二、原版口径（1.4.5.8 逐行核对）**
+
+- 难度是一条曲线：`GameDifficultyLevel` 旅途 0.5 / 经典 1 / 专家 2 / 大师 3（`Main.Difficulty` 由包 7 的
+  `Main.GameMode` 推导，特殊种子 `getGoodWorld` 再 +1）。
+- `GameDifficultyData.EnemyMaxLifeMultiplier`（(0.5,0.5)→(4,4) 直线）与 `EnemyDamageMultiplier`
+  （(0.5,0.5)→(3,3)→(4,5.33)）在**经典~大师区间恰好等于难度值本身** → 专家 ×2、大师 ×3。
+- `NPC.ScaleStats_ByDifficulty()`（NPC.cs L18341）在**生成时**：`lifeMax *= Sample(difficulty)`、
+  `damage = GetAttackDamage_ScaledByDifficulty(damage)`、击退 × 曲线，并令 `life = lifeMax`；
+  城镇 / 友方 NPC 不参与（`!friendly && !townNPC`）。
+- `Main.CalculateDamagePlayersTake` 只改**减防系数**（经典 `−def×0.5` / 专家 `−def×0.75` / 大师 `−def`），
+  **不动伤害值** → 「公式里乘倍率」与「生成时乘倍率」只能取一。
+
+**三、改动**
+
+- `WorldSimulator.AddNpc` 新增 `ApplyNpcDifficultyScaling`（生成路径唯一入口：刷怪 / `SpawnBoss` / 变体 /
+  `TransformNpc` 共用）：`lifeMax` 与 `damage` 按倍率放大、生成即满血（换型按比例折算）、城镇 NPC 跳过。
+- `CombatResolver.CalculateDamagePlayersTake` 去掉内置倍率；新增
+  `NpcLifeMultiplier` / `NpcDamageMultiplier` / `ScaleNpcLifeMax` / `ScaleNpcDamage` / `DifficultyValue`；
+  `FindContactDamage` 改取 **NPC 实体上的权威伤害**（`npc.Damage`，裸实体按「表值 × 倍率」兜底）。
+- **包 23 增加难度覆盖段**（`NpcUpdatePacket.Difficulty` → bitsB.bit2 + float，解码对称；
+  `GameHost.BroadcastNpcUpdatesAsync` 传 `CombatResolver.DifficultyValue(world.GameMode)`）：
+  客户端用该值（缺省 1）作为难度**强覆盖**去缩放自算的 `lifeMax`，不写这一段专家 / 大师的血条就是错的。
+
+**四、已知边界 / 后续**
+
+- 未建模：多人玩家数缩放（`ScaleStats_ByPlayerCount` + `GetStatScalingFactors`，仅部分 Boss；包 23 的
+  `bitsB.bit0` + 玩家数字节）、专家 + 困难模式逐类型微调（`ScaleStats_ForExpertHardmode`）、旅途 0.5 /
+  传奇 5.33 两端与 `getGoodWorld` 的 +1。
+- 本轮同时把「距原版流畅游玩差距盘点」写入交接说明 §8（G1–G10），并把尚未登记的小项落为待办
+  **22–27**（掉落数据库完整化 / 档案周期保存 / `.wld` 段 6..10 / 液体分桶下发 / 多人玩家数缩放 /
+  专家+困难逐类型微调）。
+
+**测试**：**813 / 813 通过**（改 2 处旧断言：难度公式理论数据、专家接触上界；新增 6 例：
+生成路径的生命 / 伤害缩放（经典 / 专家 / 大师三档）、接触伤害只放大一次（含 117 上界 17）、
+包 23 难度覆盖段编解码往返、真机链路下专家 2 / 大师 3 的难度覆盖下发）。
+
+### 第四十二轮（2026-09-19）：合成环境标志补齐 —— 雪原 / 墓地 / 机械三王 / 火把神恩
+
+**一、根因**
+
+- 上一轮只校验「合成站 `requiredTile` + 液体（水 / 蜂蜜 / 岩浆）」，配方表里另外 4 类环境标志被**整体丢弃**：
+  雪原（1 条）、墓地（131 条）、机械三王（1 条）、火把神恩（2 条）。缺这一步 → 客户端凑齐材料 + 站在合成站旁，
+  就能在**任意位置**合成这些配方（典型如墓地系列的墓碑 / 骨制家具、雪云块、火把药水、机械三王召唤物）。
+- 上一轮把雪原 / 墓地归为「依赖客户端分辨率的场景度量」，**该判断不成立**：原版群系计数走
+  `SceneMetrics.ScanTiles()`，扫描区是 `Utils.CenteredRectangle(TileCenter, ZoneScanSize)` —— 而
+  `ZoneScanSize` 由**常量** `AssumedConstantScreenSize = 1920×1200` + `ZoneScanPadding = 25` 算出，
+  即 **169×124 图格**，与客户端分辨率无关（分辨率只影响 `VisualScanArea` 的屏上图格统计，那是音乐盒 / 喷泉等另一批计数）。
+  故服务端可确定性复现，本轮据此补齐。
+
+**二、配方表（`gen-recipes.ps1` → `RecipeTable.cs`）**
+
+- 生成器把此前只统计不入表的 4 个 ctx 标志落进 `CraftEnvironment`：`SnowBiome` / `GraveyardBiome` / `Mechdusa` /
+  `TorchGodsFavor`（去重键一并纳入，避免「同材料同站位、仅环境不同」的配方被误判为重复）；
+  派生的反向墙 / 平台配方仍只复制 `requiredTile`（与原版一致）。
+- 表内条目数与配方总数不变：**3301 条**，其中 135 条带这些标志（1 / 131 / 1 / 2）；文件头改为「已收录 + 判定口径」。
+
+**三、判定（`Simulation/Crafting/CraftingEnvironment.cs`）**
+
+- `CraftingEnvironmentSampler.Refresh` 在同一次区块读锁内多扫一圈场景度量区（原版
+  `SceneMetrics.ScanTiles` 口径）：可达区域（X ±5 / Y ±3）**恒被** 169×124 的区域包含，故并集就是后者；
+  - `ZoneSnow`：雪原图格（147/148/161/162/163/164/200）计数 ≥ **1500**（原版 `SnowTileNormalThreshold`）；
+  - `ZoneGraveyard`：墓碑（85）计数 − 向日葵（27）计数/2 ≥ **28**（原版 `GraveyardTileThreshold`）。
+- `needMechdusa` 取世界特性 `WorldState.MechdusaFeature`（原版 `SpecialSeedFeatures.Mechdusa` = remixWorld ∧ getGoodWorld）：
+  本服务端的程序化世界不产出该类种子 → 生产恒 false → 该配方在当前世界**不可用**（安全侧）。
+- `needTorchGodsFavor` 取玩家解锁状态：包 4 的 `TorchFlags` bit2（原版 `Player.unlockedBiomeTorches`）写入
+  `PlayerRuntime.UnlockedBiomeTorches`（跟连接建立、不落盘；原版服务端同样以客户端上报为准）。
+
+**四、已知边界**
+
+- 机械三王配方在本服务端的世界里恒不可用（世界生成不支持特殊种子）；火把神恩取决于客户端上报的解锁位。
+- 同窗口多级合成、13 条静态不可解的 Lesion 家具配方仍回滚（与上一轮一致，安全侧）。
+
+**测试**：**806 / 806 通过**（新增 6 例：雪原 / 墓地阈值的场景度量两侧边界 + 世界特性 / 玩家解锁位采集；
+墓地配方、雪原配方、火把神恩配方、机械三王配方各自「不满足回滚 → 满足提交」的端到端用例）。
+
 ### 第四十一轮（2026-09-19）：反向墙 / 平台配方补齐（合成覆盖收口）
 
 **一、根因**
@@ -176,7 +309,9 @@
 
 **四、已知边界**
 
-- 站位 / 液体已按原版判定；雪原 / 墓地 / 特殊种子 / 火把神恩仍未校验（上述 4 类标志的配方仅受材料与站位约束）。
+- 站位 / 液体已按原版判定；雪原 / 墓地 / 特殊种子 / 火把神恩仍未校验（上述 4 类标志的配方仅受材料与站位约束）
+  —— **第四十二轮已补齐**（见下），且核实「雪原 / 墓地依赖客户端分辨率」的原判断不成立：两者取原版**固定尺寸**的
+  场景扫描区（`SceneMetrics.ZoneScanSize` = 169×124 图格），与客户端分辨率无关，服务端可确定性复现。
 - 家具模板里不设站位的工作台配方（`overrideStation < 0`）与手工合成配方（`-1`）本就不需要站位。
 
 **测试**：**799 / 799 通过**（新增 4 例：材料齐备但无站位 → 回滚、站位超出可达区域 → 回滚、

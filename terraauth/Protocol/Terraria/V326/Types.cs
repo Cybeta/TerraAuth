@@ -607,7 +607,19 @@ public sealed record NpcUpdatePacket(
     /// 为 null 表示不下发 —— 原版客户端收到未置位的 ai 位会**把该 ai 显式置 0**，故两者不等价，
     /// 依赖 ai 的 aiStyle（如史莱姆的跳跃状态）必须下发。
     /// </summary>
-    float[]? Ai = null) : INetworkPacket
+    float[]? Ai = null,
+    /// <summary>
+    /// 原版 <c>NPC.difficulty</c>（难度曲线值：经典 1 / 专家 2 / 大师 3）。
+    /// <c>!= 1</c> 时包内会置 bitsB.bit2 并写出该 float，客户端据此按同一条曲线缩放自算的 <c>lifeMax</c>
+    /// （包 23 **不下发 lifeMax**，只下发当前生命）——不写这一段，专家 / 大师下血条会与服务端发散。
+    /// </summary>
+    float Difficulty = 1f,
+    /// <summary>
+    /// 原版 <c>NPC.statsAreScaledForThisManyPlayers</c>（该 NPC 的生命上限按几名在线玩家缩放）。
+    /// <c>&gt; 1</c> 时包内会置 bitsB.bit0 并写出该人数，客户端据此重算同一个 <c>lifeMax</c>
+    /// （专家及以上的多人世界里，Boss 类生命上限会随人数放大）。
+    /// </summary>
+    int PlayerCount = 1) : INetworkPacket
 {
     public PacketId Type => PacketId.NpcUpdate;
 }

@@ -152,8 +152,8 @@ public sealed class PacketDecoder : IPacketDecoder
 
         var netId = r.ReadInt16();
 
-        if ((bitsB & 0x01) != 0) r.ReadByte();      // 玩家数缩放
-        if ((bitsB & 0x04) != 0) r.ReadSingle();    // 难度覆盖
+        var playerCount = (bitsB & 0x01) != 0 ? r.ReadByte() : 1;    // 按几人缩放（缺省 1）
+        var difficulty = (bitsB & 0x04) != 0 ? r.ReadSingle() : 1f;   // 难度覆盖（缺省 1 = 经典）
         if ((bitsA & 0x80) == 0)                    // 非满血 → 有生命段
         {
             _ = r.ReadByte() switch { 2 => (int)r.ReadInt16(), 4 => r.ReadInt32(), _ => (int)r.ReadSByte() };
@@ -162,6 +162,8 @@ public sealed class PacketDecoder : IPacketDecoder
         return new NpcUpdatePacket(index, generation, position, velocity, target, netId)
         {
             Ai = hasAi ? ai : null,
+            Difficulty = difficulty,
+            PlayerCount = playerCount,
         };
     }
 

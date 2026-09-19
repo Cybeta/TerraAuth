@@ -58,6 +58,9 @@ public partial class WorldSimulator : IWorldViewProvider
     /// <summary>在指定位置生成一只 Boss（生命上限取自 <see cref="NpcStatsTable"/>，未收录按 1000 兜底）并返回该 NPC。</summary>
     public WorldNpc SpawnBoss(int npcType, float x, float y)
     {
+        // 在线人数快照：调用方**不得**已持有 NpcsLock（本方法随后自己取，锁序为 PlayersLock → NpcsLock）。
+        RefreshActivePlayerCount();
+
         int life = NpcStatsTable.Of.TryGetValue(npcType, out var stats) ? stats.LifeMax : 1000;
 
         // 调用方给的是「希望 Boss 出现的位置」→ 换算成原版口径的碰撞盒左上角（X/Y = 左上角，脚底 = Y + height）
@@ -90,12 +93,16 @@ public partial class WorldSimulator : IWorldViewProvider
     /// </summary>
     private void AddNpc(WorldNpc npc)
     {
-        // 回填权威战斗属性（伤害 / 防御）：服务端战斗结算不再依赖简化常量表
+        // 回填权威战斗属性（伤害 / 防御）：服务端战斗结算不再依赖简化常量表。
+        // 随后按世界难度放大（原版 NPC.ScaleStats → ScaleStats_ByDifficulty）——生成路径的唯一入口，
+        // 因此刷怪 / Boss / 变体 / 换型都自动带上专家 2×、大师 3×。
         if (NpcStatsTable.Of.TryGetValue(npc.Type, out var stats))
         {
             npc.Damage = stats.Damage;
             npc.Defense = stats.Defense;
         }
+
+        ApplyNpcDifficultyScaling(npc);
 
         for (int i = 0; i < _world.Npcs.Count; i++)
         {
@@ -108,6 +115,60 @@ public partial class WorldSimulator : IWorldViewProvider
         }
 
         _world.Npcs.Add(npc);
+    }
+
+    /// <summary>
+    /// 原版 <c>NPC.ScaleStats(...)</c> 的完整链路（NPC.cs L18316），生成时对**非城镇 NPC** 依次执行：
+    /// ①专家 + 困难模式的「弱怪补强」（<see cref="NpcHardmodeScaling"/>）→
+    /// ②难度曲线（<see cref="CombatResolver.ScaleNpcLifeMax"/> / <see cref="CombatResolver.ScaleNpcDamage"/>，专家 ×2 / 大师 ×3）→
+    /// ③按在线人数放大生命上限（<see cref="NpcPlayerCountScaling"/>，专家及以上）→
+    /// ④生命下限 6（弹幕类除外），并按「生成即满血 / 换型按比例」重算当前生命。
+    /// <para>
+    /// **客户端必须知道同一难度与同一人数**：包 23 的「难度覆盖段 + 玩家数段」由
+    /// <see cref="CombatResolver.DifficultyValue"/> 与 <see cref="WorldNpc.StatsScaledForPlayers"/> 下发，
+    /// 客户端据此自算 <c>lifeMax</c>（包 23 不下发上限），血条才与服务端一致。
+    /// </para>
+    /// 未建模：`getGoodWorld` 特殊种子分支、`value`（金币数值）、击退抗性削弱（本服务端未模拟击退）。
+    /// </summary>
+    private void ApplyNpcDifficultyScaling(WorldNpc npc)
+    {
+        var mode = CombatResolver.FromWorldDifficulty(_world.GameMode);
+        if (mode == GameMode.Classic || npc.IsTownNpc) return;
+
+        int oldLifeMax = Math.Max(1, npc.LifeMax);
+        bool wasFull = npc.Life >= oldLifeMax;
+
+        if (_world.Progress.HardMode)
+            NpcHardmodeScaling.Apply(npc, _world.Progress.DownedPlantBoss);
+
+        npc.LifeMax = CombatResolver.ScaleNpcLifeMax(npc.LifeMax, mode);
+        npc.Damage = CombatResolver.ScaleNpcDamage(npc.Damage, mode);
+
+        NpcPlayerCountScaling.Apply(npc, _activePlayers);
+
+        if (!NpcHardmodeScaling.IsProjectileNpc(npc.Type) && npc.LifeMax < 6)
+            npc.LifeMax = 6;
+
+        npc.Life = wasFull
+            ? npc.LifeMax                                                   // 生成即满血
+            : Math.Max(1, npc.Life * npc.LifeMax / oldLifeMax);              // 换型等按比例折算
+    }
+
+    /// <summary>
+    /// 本 tick 的在线玩家数（原版 <c>Main.ActivePlayersCount</c>）：在**取任何 NPC 锁之前**刷新一次
+    /// （全局锁序 SectionLocks → PlayersLock → … → NpcsLock，持 NpcsLock 时再取 PlayersLock 会反序）。
+    /// 供生成时的按人数缩放使用；tick 外（如运维 `/boss`）沿用上一次的计数，误差 ≤ 1 tick 的在线人数变化。
+    /// </summary>
+    private int _activePlayers = 1;
+
+    private void RefreshActivePlayerCount()
+    {
+        int count = 0;
+        lock (_world.PlayersLock)
+            foreach (var player in _world.Players.Values)
+                if (player.Active) count++;
+
+        _activePlayers = Math.Max(1, count);
     }
 
     /// <summary>
@@ -143,6 +204,9 @@ public partial class WorldSimulator : IWorldViewProvider
         npc.Damage = stats.Damage;
         npc.Defense = stats.Defense;
         npc.Life = Math.Max(1, oldLife * npc.LifeMax / oldLifeMax);
+
+        // 换型后同样按世界难度放大（原版 Transform → SetDefaults → ScaleStats），当前生命按比例保持。
+        ApplyNpcDifficultyScaling(npc);
 
         npc.AiStyle = NpcAiStyleOf(newType);
         npc.Ai[0] = ai0;
@@ -186,6 +250,10 @@ public partial class WorldSimulator : IWorldViewProvider
     {
         // tick 从 1 开始编号：先推进，再仿真，快照标记当前 tick
         _world.Tick++;
+
+        // 0. 在线人数快照：必须在任何 NPC 锁之前取（锁序 PlayersLock → NpcsLock），
+        //    供刷怪时的「按人数缩放生命上限」使用（原版 NPC.ScaleStats_ByPlayerCount）。
+        RefreshActivePlayerCount();
 
         // 1. Input：应用本 tick 的 Command
         ApplyCommandsForTick(_world.Tick);

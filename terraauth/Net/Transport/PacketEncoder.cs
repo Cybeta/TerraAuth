@@ -417,8 +417,17 @@ public sealed class PacketEncoder : IPacketEncoder
         if (sendAi) bitsA |= 0x3C;
 
         if (npc.SpriteDirectionPositive) bitsA |= 0x40;
+
+        // BitsByte B：bit0=带玩家数缩放 / bit1=雕像 / bit2=带难度覆盖 / bit3=需同步生成。
+        // 两段都是「客户端自算 lifeMax」的输入（包 23 不下发上限），必须与服务端生成时的口径一致：
+        // 难度覆盖段缺省 1 是「强覆盖为经典」而非「沿用世界难度」；玩家数段缺省 1 表示按单人缩放。
+        var sendPlayerCount = npc.PlayerCount > 1;
+        var sendDifficulty = npc.Difficulty != 1f;
+        byte bitsB = 0;
+        if (sendPlayerCount) bitsB |= 0x01;
+        if (sendDifficulty) bitsB |= 0x04;
         bw.Write(bitsA);
-        bw.Write((byte)0);              // BitsByte B：无玩家数缩放 / 非雕像 / 无难度覆盖 / 非需同步生成
+        bw.Write(bitsB);
 
         if (sendAi)
         {
@@ -429,6 +438,9 @@ public sealed class PacketEncoder : IPacketEncoder
         }
 
         bw.Write(npc.NetId);            // Int16 netID（客户端据此 SetDefaults 生成 NPC）
+
+        if (sendPlayerCount) bw.Write((byte)Math.Min(byte.MaxValue, npc.PlayerCount));   // 按几人缩放
+        if (sendDifficulty) bw.Write(npc.Difficulty);                                    // 难度覆盖（原版 NPC.difficulty）
 
         if (lifeFull) return;
 

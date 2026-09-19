@@ -295,10 +295,21 @@ public sealed class WorldState
 
     /// <summary>
     /// 世界难度（0=普通、1=专家、2=大师、3=旅途；启动时由 <c>ServerConfig.GameMode</c> 写入，见 <c>GameHost</c>）。
-    /// 玩家受击区间校验（<see cref="DamagePlayerCommand"/>）与接触兜底（<c>WorldSimulator.SimulateCombat</c>）
-    /// 经 <see cref="CombatResolver.FromWorldDifficulty"/> 取原版 <c>Main.CalculateDamagePlayersTake</c> 对应分支。
+    /// 影响两处且**互不重复**：①玩家受击公式的减防系数（<c>CombatResolver.CalculateDamagePlayersTake</c>，
+    /// 经 <see cref="CombatResolver.FromWorldDifficulty"/>）；②NPC 生成时的生命 / 伤害倍率
+    /// （专家 ×2 / 大师 ×3，<c>WorldSimulator.AddNpc</c> → <c>CombatResolver.ScaleNpcLifeMax</c> /
+    /// <c>ScaleNpcDamage</c>，对应原版 <c>NPC.ScaleStats_ByDifficulty</c>）。
     /// </summary>
     public int GameMode { get; set; }
+
+    /// <summary>
+    /// 世界是否具备「机械三王」特性（原版 <c>SpecialSeedFeatures.Mechdusa</c> = remixWorld ∧ getGoodWorld，
+    /// 即特殊种子组合）。本服务端的程序化世界生成不产出该类种子，故生产恒为 false ——
+    /// 于是需要该特性的配方（表内 1 条）在当前世界**不可用**（失败方向是安全侧）；
+    /// 若日后支持特殊种子，在生成 / 读档处按种子写入即可。合成前置条件见
+    /// <see cref="CraftingEnvironment.Mechdusa"/>。
+    /// </summary>
+    public bool MechdusaFeature { get; set; }
 
     // ---- 时间 / 天气 ----
     /// <summary>当日时间 0..54000。</summary>
@@ -2201,11 +2212,18 @@ public sealed class PlayerRuntime
     public readonly Dictionary<(int ItemId, byte Prefix), int> InventoryTransactionBaseline = new();
 
     /// <summary>
-    /// 合成环境快照（可达区域图格 + 相邻液体），由 <see cref="CraftingEnvironmentSampler.Refresh"/> 在
-    /// 事务暂存时重取；提交时据此校验配方的合成站 / 液体前置条件。
-    /// 默认（未采集）为空快照 = 任何需要合成站的配方都不可用 —— **失败方向是安全侧**（回滚）。
+    /// 合成环境快照（可达区域图格 + 相邻液体 + 雪原 / 墓地 / 世界特性 / 火把神恩），
+    /// 由 <see cref="CraftingEnvironmentSampler.Refresh"/> 在事务暂存时重取；提交时据此校验配方的
+    /// 合成站 / 环境前置条件。默认（未采集）为空快照 = 任何需要合成站的配方都不可用 —— **失败方向是安全侧**（回滚）。
     /// </summary>
     public readonly CraftingEnvironment CraftingEnvironment = new();
+
+    /// <summary>
+    /// 玩家是否已解锁「火把神恩」（原版 <c>Player.unlockedBiomeTorches</c>：使用火把神恩道具后置位）。
+    /// 由客户端包 4 的 <c>TorchFlags</c> bit2 上报（原版服务端同样以该字段为准），随连接建立写入、不落盘；
+    /// 供 needTorchGodsFavor 配方（表内 2 条）的前置条件校验。
+    /// </summary>
+    public bool UnlockedBiomeTorches;
 
     // ---- SSC 箱子守恒事务（包 32 的窗口聚合）----
 
@@ -2590,11 +2608,18 @@ public sealed class WorldNpc
     public int Life = 100;
     public int LifeMax = 100;
 
-    /// <summary>基础伤害（原版 <c>NPC.SetDefaults.damage</c>，经典难度基准；生成时由 <see cref="NpcStatsTable"/> 回填）。</summary>
+    /// <summary>基础伤害（原版 <c>NPC.SetDefaults.damage</c>；生成时由 <see cref="NpcStatsTable"/> 回填，
+    /// 并按世界难度 / 困难模式补强放大，见 <c>WorldSimulator.ApplyNpcDifficultyScaling</c>）。</summary>
     public int Damage;
 
-    /// <summary>基础防御（原版 <c>NPC.SetDefaults.defense</c>）。</summary>
+    /// <summary>基础防御（原版 <c>NPC.SetDefaults.defense</c>，可能被困难模式补强放大）。</summary>
     public int Defense;
+
+    /// <summary>
+    /// 该 NPC 的生命上限是「按几名在线玩家」缩放的（原版 <c>NPC.statsAreScaledForThisManyPlayers</c>，默认 1）。
+    /// 专家及以上按人数放大生命上限，并随包 23 的玩家数段下发给客户端（客户端据此重算同一个上限）。
+    /// </summary>
+    public int StatsScaledForPlayers = 1;
 
     public float VelocityX;
     public float VelocityY;

@@ -7,19 +7,20 @@ using TerraAuth.Simulation;
 namespace TerraAuth.Simulation;
 
 /// <summary>
-/// 游戏难度（对应原版 <c>Main.GameMode</c>）：决定玩家受击伤害公式
-/// （<see cref="CombatResolver.CalculateDamagePlayersTake"/>）与 NPC 对玩家的伤害倍率。
+/// 游戏难度（对应原版 <c>Main.GameMode</c>）：决定玩家受击公式的**减防系数**
+/// （<see cref="CombatResolver.CalculateDamagePlayersTake"/>）与 NPC 生命 / 伤害的难度倍率
+/// （<see cref="CombatResolver.ScaleNpcLifeMax"/> / <see cref="CombatResolver.ScaleNpcDamage"/>）。
 /// server.json 用字符串枚举读写（"Classic" / "Expert" / "Master"）。
 /// </summary>
 public enum GameMode
 {
-    /// <summary>经典：<c>dmg − def×0.5</c>（最低 1）。</summary>
+    /// <summary>经典：<c>dmg − def×0.5</c>（最低 1），NPC 生命 / 伤害 ×1。</summary>
     Classic = 0,
 
-    /// <summary>专家：<c>dmg×2 − def×0.75</c>（最低 1）。</summary>
+    /// <summary>专家：<c>dmg − def×0.75</c>（最低 1），NPC 生命 / 伤害 ×2。</summary>
     Expert = 1,
 
-    /// <summary>大师：<c>dmg×3 − def</c>（最低 1）。</summary>
+    /// <summary>大师：<c>dmg − def</c>（最低 1），NPC 生命 / 伤害 ×3。</summary>
     Master = 2,
 }
 
@@ -37,21 +38,22 @@ public static class CombatResolver
     }
 
     /// <summary>
-    /// 原版 <c>Main.CalculateDamagePlayersTake</c>（Main.cs L89200），按难度取分支，最低 1：
+    /// 原版 <c>Main.CalculateDamagePlayersTake</c>（Main.cs L89200），按难度取**减防系数**，最低 1：
     /// <list type="bullet">
     /// <item>经典：<c>dmg − def×0.5</c></item>
-    /// <item>专家：<c>dmg×2 − def×0.75</c></item>
-    /// <item>大师：<c>dmg×3 − def</c></item>
+    /// <item>专家：<c>dmg − def×0.75</c></item>
+    /// <item>大师：<c>dmg − def</c></item>
     /// </list>
-    /// <paramref name="damage"/> 为 NPC 基础伤害（<see cref="NpcStatsTable"/>，原版正常模式数值）——
-    /// 难度倍率内置于本公式（原版 1.4 起不再单独放大 <c>npc.damage</c>），
-    /// 服务端上界与客户端 <c>Player.Hurt</c> 显示口径完全一致。
+    /// **伤害值本身不受本公式影响** —— 专家 / 大师的 NPC 伤害放大发生在生成时
+    /// （原版 <c>NPC.ScaleStats_ByDifficulty</c> → <c>GetAttackDamage_ScaledByDifficulty</c>，
+    /// 见 <see cref="ScaleNpcDamage"/>）；本公式若再乘一次倍率就是双倍放大。
+    /// <paramref name="damage"/> 取 **NPC 实体上的权威伤害**（已含难度与防御前的原始值）。
     /// </summary>
     public static int CalculateDamagePlayersTake(int damage, int defense, GameMode mode = GameMode.Classic)
         => mode switch
         {
-            GameMode.Expert => Math.Max(1, damage * 2 - (int)Math.Round(defense * 0.75f)),
-            GameMode.Master => Math.Max(1, damage * 3 - defense),
+            GameMode.Master => Math.Max(1, damage - defense),
+            GameMode.Expert => Math.Max(1, damage - (int)Math.Round(defense * 0.75f)),
             _ => Math.Max(1, damage - (int)Math.Round(defense * 0.5f)),
         };
 
@@ -66,6 +68,43 @@ public static class CombatResolver
             2 => GameMode.Master,
             _ => GameMode.Classic,
         };
+
+    /// <summary>
+    /// 原版 <c>Main.Difficulty</c> 的难度曲线值（<c>GameDifficultyLevel</c>：经典 1 / 专家 2 / 大师 3）。
+    /// 用于包 23 的**难度覆盖段**：客户端收到该值后按同一条曲线缩放 NPC 生命 / 伤害，
+    /// 从而与本服务端自算的 <c>lifeMax</c> 一致（否则客户端会按经典缩放，血条与服务端发散）。
+    /// 旅途（0.5）未建模 → 按经典 1。
+    /// </summary>
+    public static float DifficultyValue(int worldDifficulty)
+        => worldDifficulty switch
+        {
+            1 => 2f,
+            2 => 3f,
+            _ => 1f,
+        };
+
+    /// <summary>
+    /// 原版 <c>GameDifficultyData.EnemyMaxLifeMultiplier</c>（其曲线在经典~大师区间恰好等于难度值本身）：
+    /// 专家 ×2、大师 ×3。旅途 0.5 / 传奇 5.33 未建模。
+    /// </summary>
+    public static float NpcLifeMultiplier(GameMode mode)
+        => mode switch
+        {
+            GameMode.Master => 3f,
+            GameMode.Expert => 2f,
+            _ => 1f,
+        };
+
+    /// <summary>原版 <c>GameDifficultyData.EnemyDamageMultiplier</c>（同一曲线口径）：专家 ×2、大师 ×3。</summary>
+    public static float NpcDamageMultiplier(GameMode mode) => NpcLifeMultiplier(mode);
+
+    /// <summary>原版 <c>NPC.ScaleStats_ByDifficulty</c> 的生命部分：<c>(int)(lifeMax × 倍率)</c>（截断，最低 1）。</summary>
+    public static int ScaleNpcLifeMax(int lifeMax, GameMode mode)
+        => Math.Max(1, (int)(lifeMax * NpcLifeMultiplier(mode)));
+
+    /// <summary>原版 <c>NPC.GetAttackDamage_ScaledByDifficulty</c>：<c>(int)(damage × 倍率)</c>（截断）。</summary>
+    public static int ScaleNpcDamage(int damage, GameMode mode)
+        => (int)(damage * NpcDamageMultiplier(mode));
 
     /// <summary>
     /// 原版 <c>Main.CalculateDamageNPCsTake</c>（Main.cs L89180）：<c>dmg - def×0.5</c>，最低 1。
@@ -195,6 +234,7 @@ public static class CombatResolver
     /// 查找与玩家碰撞盒重叠的敌怪伤害（取接触者中的最大值）；无接触返回 0。
     /// 判定口径与原版 <c>Player.Update_NPCCollision</c> 一致：玩家 / NPC 盒各自取整后做 AABB 求交，
     /// **不设最小重叠**（两轴各 1px 即命中），且用逐类型尺寸而非「点 + 半径」。
+    /// 伤害取 **NPC 实体上的权威值**（生成时已按世界难度放大，见 <c>WorldSimulator.AddNpc</c>）。
     /// <paramref name="contactNpc"/> 回传实际接触的 NPC（诊断输出用）。
     /// </summary>
     public static int FindContactDamage(WorldState world, PlayerRuntime player, out WorldNpc? contactNpc, out int contactIndex)
@@ -203,6 +243,8 @@ public static class CombatResolver
         int best = 0;
         contactNpc = null;
         contactIndex = -1;
+
+        var mode = FromWorldDifficulty(world.GameMode);
 
         lock (world.NpcsLock)
         {
@@ -215,7 +257,7 @@ public static class CombatResolver
                 if (!PlayerTouchesNpc(px, py, npc.X, npc.Y, width, height))
                     continue;
 
-                int damage = NpcStatsTable.Of.TryGetValue(npc.Type, out var stats) ? stats.Damage : 7;
+                int damage = ContactDamageOf(npc, mode);
                 if (damage > best)
                 {
                     best = damage;
@@ -227,6 +269,22 @@ public static class CombatResolver
 
         return best;
     }
+
+    /// <summary>
+    /// 接触伤害取值：优先用 NPC 实体上的权威伤害（生成 / 换型时已按难度缩放）；
+    /// 实体尚未回填（直接构造的 NPC）或类型未收录时，退回**同样按难度缩放**的表值 / 兜底 7 ——
+    /// 保证专家 / 大师的接触伤害不会因为走了哪条生成路径而不一致。
+    /// </summary>
+    private static int ContactDamageOf(WorldNpc npc, GameMode mode)
+    {
+        if (npc.Damage > 0) return npc.Damage;
+        int baseDamage = NpcStatsTable.Of.TryGetValue(npc.Type, out var stats) ? stats.Damage : 0;
+        if (baseDamage <= 0) baseDamage = DefaultContactDamage;
+        return ScaleNpcDamage(baseDamage, mode);
+    }
+
+    /// <summary>未收录类型的接触伤害兜底（原版语义：不认识的怪按 7 点处理）。</summary>
+    private const int DefaultContactDamage = 7;
 
     /// <summary>玩家此刻是否与任一敌怪接触（包 117 区间校验的前置条件，防伪造远程受伤）。</summary>
     public static bool IsPlayerInContact(WorldState world, PlayerRuntime player)
