@@ -1242,11 +1242,11 @@ public class SimulationTests
         Assert.True(CraftingConservation.IsConserved(authoritative, empty, allowConsumption: true));
     }
 
-    /// <summary>配方表抽取自检：关键配方（铜锭 / 天顶剑）必须与原始材料一致。</summary>
+    /// <summary>配方表抽取自检：关键配方（铜锭 / 天顶剑）与派生反向配方（墙 → 块 / 平台 → 材料）必须与原始材料一致。</summary>
     [Fact]
     public void RecipeTable_Extracts_Key_Vanilla_Recipes()
     {
-        Assert.True(RecipeTable.All.Length > 3000, "配方表条目过少，抽取可能失真");
+        Assert.True(RecipeTable.All.Length > 3300, "配方表条目过少，抽取可能失真");
         Assert.Equal(34, RecipeTable.Groups.Length);
 
         Assert.True(RecipeTable.TryGetRecipes(20, out var bar));   // 铜锭
@@ -1255,6 +1255,42 @@ public class SimulationTests
 
         Assert.True(RecipeTable.TryGetRecipes(4956, out var zenith));   // 天顶剑
         Assert.Contains(zenith, r => r.Requirements.Length == 10);
+
+        // 反向墙（CreateReverseWallRecipes 派生）：4 个土墙（30）→ 1 个土块（2），沿用工作台（18）
+        Assert.True(RecipeTable.TryGetRecipes(2, out var dirtBlock));
+        Assert.Contains(dirtBlock, r => r.RequiredTile == 18 && r.Requirements.Length == 1 &&
+            r.Requirements[0] is { ItemId: 30, GroupId: -1, Stack: 4 });
+
+        // 反向平台（CreateReversePlatformRecipes 派生）：2 个木平台（94）→ 1 个木材（9）
+        Assert.True(RecipeTable.TryGetRecipes(9, out var wood));
+        Assert.Contains(wood, r => r.Requirements.Length == 1 &&
+            r.Requirements[0] is { ItemId: 94, GroupId: -1, Stack: 2 });
+    }
+
+    /// <summary>
+    /// SSC 背包守恒事务：原版**派生反向配方**（4 土墙 → 1 土块，工作台旁）必须被提交 ——
+    /// 这类「墙拆回块 / 平台拆回材料」的配方由原版 CreateReverseWallRecipes / CreateReversePlatformRecipes 派生，
+    /// 未收录时玩家的合法拆解会被整窗回滚。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Commits_Derived_Reverse_Wall_Recipe()
+    {
+        var world = new WorldState { Tick = 100, Tiles = new TileMap(32, 32) };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        PlaceCraftingStation(world, player, tileType: 18);   // 工作台
+        player.Items[50] = 30;   // 土墙
+        player.ItemStacks[50] = 4;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 50, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 2, 1).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[50]);
+        Assert.Equal(2, player.Items[51]);
     }
 
     /// <summary>

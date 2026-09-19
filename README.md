@@ -91,7 +91,7 @@ SSC（`ServerConfig.SscEnabled`，默认开）下服务端持有背包唯一真�
 
 ### 已知边界
 
-- **合成与纯消耗已纳入守恒判据**：净增量由原版配方表（`terraauth/Simulation/Crafting/RecipeTable.cs`）解释，并按 `requiredTile` + 水 / 蜂蜜 / 岩浆**校验合成站与环境**（`CraftingEnvironmentSampler`）；「只减不增」的消耗在背包侧放行（箱子侧不放行）。**不校验**雪原 / 墓地 / 特殊种子 / 火把神恩（依赖客户端场景度量与玩家解锁状态）；同一窗口内的多级合成与未收录配方（反向墙 / 平台配方）仍会回滚（见 `terraauth/OPTIMIZATION_BACKLOG.md`）。
+- **合成与纯消耗已纳入守恒判据**：净增量由原版配方表（`terraauth/Simulation/Crafting/RecipeTable.cs`，3301 条，含派生的「墙 → 块 / 平台 → 材料」）解释，并按 `requiredTile` + 水 / 蜂蜜 / 岩浆**校验合成站与环境**（`CraftingEnvironmentSampler`）；「只减不增」的消耗在背包侧放行（箱子侧不放行）。**不校验**雪原 / 墓地 / 特殊种子 / 火把神恩（依赖客户端场景度量与玩家解锁状态）；同一窗口内的多级合成与 13 条静态不可解的 Lesion 家具配方仍会回滚（见 `terraauth/OPTIMIZATION_BACKLOG.md`）。
 - 包 85（快速堆叠到附近箱子）**已实现**：客户端上报来源槽位 + smartStack，服务端按当前打开的箱子自行规划装箱，不接受客户端最终快照。
 - 包 5 / 包 32 的跨背包-箱子操作已改为**绑定玩家会话 + 箱子索引的守恒事务**；跨玩家同箱并发、包 5/32 乱序或重放、关箱/重开边界、断线重连期间未提交槽位更新等组合仍是持续验证项。
 
