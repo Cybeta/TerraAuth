@@ -46,7 +46,7 @@
 **目标**：把召唤物的**位置、存活、索敌与伤害**从"owner 客户端自报"逐步收到服务端，
 使召唤流派也具备服务端权威（对应交接说明 §8 第 3 项 / 差距盘点 G2）。
 
-**现状（v4.3.1）**：召唤本体与本体发射的弹幕都在同一张 `Simulation/Combat/SummonProjectileTable.cs` 的
+**现状（v0.4.3.1）**：召唤本体与本体发射的弹幕都在同一张 `Simulation/Combat/SummonProjectileTable.cs` 的
 `Of` 集合里；服务端只做**归属登记 + 伤害上界校验**（包 28 走 `CombatResolver.SummonDamageBound`），
 位置与存活完全由客户端包 27 / 29 驱动，不做积分也不超时。这套设计**当前没有已知缺陷**，
 仅"权威性不足"。
