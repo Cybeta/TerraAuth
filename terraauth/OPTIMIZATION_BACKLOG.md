@@ -67,7 +67,7 @@ git stash show -p stash@{0} --stat
    831-835 / 963-970 哨兵弹幕 …），若对它们"跳过积分 + 不超时 + 拒包 29 + 服务端接管跟随与攻击"，
    会变成**永久跟随的炮台**，且包 27 会把客户端本应消失的弹幕复活。
 
-**第一步交付（只做数据，不动行为）**：三张表（建议由 `decompiled-tmp/` 的生成脚本抽取，与 `RecipeTable` /
+**第一步交付（只做数据，不动行为）**：三张表（建议由仓库外的一次性生成脚本抽取，与 `RecipeTable` /
 `ItemDamageTable` 同路，文件头写来源方法 + 条目数 + 未知项）：
 
 | 表 | 内容 | 来源 | 用途 |
@@ -428,6 +428,43 @@ server.json 用字符串枚举），组合根注入 `WorldState.SummonAuthority`
 
 ## 附：本轮回溯
 
+### 第四十五轮（2026-09-20）：真机缺陷修复 —— 掉落物幽灵（包 151）+ 宝袋两项
+
+**一、掉落物「幽灵」＝「地图上有、悬停有名字、永远捡不起来」**
+
+- 证据：真机日志只有包 21（丢弃），**没有任何包 22 / 151**（客户端从未发起拾取）→ 客户端侧拒绝拾取。
+- 根因（读原版）：服务端用「包 21 + 原 ItemId + stack=0」做移除，但包 21 **没有移除语义** ——
+  客户端 `MessageBuffer case 21` 只写 `stack`、不动 `type`，而失效判定是 `WorldItem.active => type != 0`；
+  若该槽位在客户端已是空气，该分支还会 `new WorldItem(new Item(num44))` 再 `stack = 0` → **凭空造幽灵**。
+  幽灵 `stack == 0` → `Player.PickupItem → GetItem` 拿不到任何东西 → `item.stack == stack` 提前返回 → **不发拾取包**。
+  原版移除通道是**包 151（ItemDestroy）**：`NetMessage.SendData(21, …)` 在 `IsAir` 时自动 `msgType = 151`，
+  客户端 `case 151` 做 `playerIndexTheItemIsReservedFor = 255` + `TurnToAir()`。
+- 修复：`GameHost.BroadcastWorldStateAsync` 的移除广播改用 `PacketId.ItemDestroy`（`ItemDestroyPacket(item.Slot)`）。
+- 附带确认：`Player.GrabItems` 的拾取闸门确为 `playerIndexTheItemIsReservedFor == Main.myPlayer`
+  （客户端 `GrabItems` 只挑归属自己的物品），归属仍由服务端 160px 就近搜索 + 包 22 下发。
+
+**二、宝袋（3319）两项缺陷**
+
+- 症状：①鼠标把袋子**拿在手上**（拖拽 / 换位）→ 袋子自动被打开；②右键开袋后战利品**约 1 秒后全部消失**。
+- 根因：①「清空袋槽（包 5）」被即时翻译成开袋，而鼠标拿起袋子同样清空该槽（单包粒度不可区分）；
+  ②服务端另掷一次骰（`OpenEyeOfCthulhuTreasureBagCommand`），与客户端本地掷骰（`Player.OpenBossBag` 用 `Main.rand`）
+  写入同一批槽位；数值对不上 → 守恒事务窗口判不守恒 → **整窗回滚**（战利品被权威值覆盖）。
+  另发现旧命令的奖励表本身与 vanilla 不符（漏 3097、47 被误当腐化专属、1299 概率 1/40 ≠ 1/30）。
+- 修复：**新增 `Simulation/BossBagLootTable.cs`**（21 个宝袋 ID = `ItemID.Sets.BossBag`；3319 池 8 条 + 单次上限，
+  取腐化 / 猩红并集）；删除即时开袋转换 + `OpenEyeOfCthulhuTreasureBagCommand` + ledger 开袋方法 + 内部意图包；
+  `CraftingConservation` 新增宝袋规则：**袋净减少必须有解释**（① 同窗口合法战利品 = 开袋；② 同窗口该玩家把该袋丢到世界 = 掉落），
+  否则回滚保袋（未建模的 20 个袋失败关闭）。`WorldItemEntity` 增 `SpawnedTick` 支撑「本窗口掉落」判定。
+- 诊断：`[InventoryTx]`（事务提交 / 回滚 + 暂存/权威差异）、`[ItemOwner]`（包 21/22 下发与归属搜索无结果原因）。
+
+**三、顺带发现的遗留项（未修，记入待办）**
+
+- `WorldState.Items` 只增不减（拾取只置 `Active=false`，槽位不复用），`SpawnItemCommand` 在 `Items.Count >= 400` 时
+  **静默 `NotApplied`** → 长时间运行后新掉落物会静默消失（真机曾出现「丢出来地图上没有」）。应改为
+  「回收失效条目 / 复用槽位」或至少在拒绝时给出可见日志。
+
+**测试**：**838 / 838 通过**（宝袋 6 例新增：客户端掷骰提交 / 鼠标拿起回滚 / 掉落提交 / 超上限回滚 / 溢出到地面提交 /
+未建模袋回滚；真机链路 2 例；权威层 1 例改写）。
+
 ### 第四十四轮（2026-09-19）：难度缩放收口（困难模式补强 + 多人人数缩放 + 包 23 双段）
 
 **一、根因**
@@ -582,8 +619,8 @@ server.json 用字符串枚举），组合根注入 `WorldState.SummonAuthority`
 
 **三、仍未收录（宁回滚不猜数值）**
 
-- **13 条**（产物 `3918` + `3959`–`3973`，Lesion 家具系列 / Crystal Sofa）依赖反编译提升的局部量
-  （`num` / `stack`，如 `requiredItem[0].stack = (int)((float)num * 2.5f)`）—— 反编译文本丢失了赋值，
+- **13 条**（产物 `3918` + `3959`–`3973`，Lesion 家具系列 / Crystal Sofa）依赖原版编译器临时量
+  （`num` / `stack`，如 `requiredItem[0].stack = (int)((float)num * 2.5f)`）—— 静态读取无法还原该赋值，
   猜测会给出错误材料量（偏松即成漏洞），故**整条作废**；生成文件头会列出这些产物 ID。
 
 **测试**：**800 / 800 通过**（配方表自检补「4 土墙 → 1 土块（工作台）/ 2 木平台 → 1 木材」两条派生配方断言；
@@ -644,7 +681,7 @@ server.json 用字符串枚举），组合根注入 `WorldState.SummonAuthority`
 **二、配方表（新增 `Simulation/Crafting/RecipeTable.cs`，自动生成）**
 
 - **数据源**：Terraria 1.4.5.8 原版 `Recipe.SetupRecipes` 及其家具 / 雕像辅助方法
-  （`decompiled/src/Terraria/Recipe.cs`）；生成脚本 `decompiled-tmp/gen-recipes.ps1`。
+  （原版 `Recipe.SetupRecipes`）；生成脚本为仓库外的一次性脚本（未纳入版本库）。
 - **产出**：**3193 条配方 + 34 个配方组**（产物 / 产物堆叠 / 材料需求，含配方组需求）。
 - **抽取覆盖面**：`SetupRecipes` 逐条语句（含 `for` 字面量循环、`SetIngredients`、局部变量表达式、
   `ItemID.Sets.TextureCopyLoad[i]` 与内联二维数组）；字面量家具表直接扫体；

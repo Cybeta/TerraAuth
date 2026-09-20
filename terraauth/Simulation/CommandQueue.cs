@@ -243,56 +243,6 @@ public sealed record SetInventorySlotCommand(long Tick, int? PlayerId, int Slot,
     }
 }
 
-/// <summary>SSC 眼魔宝袋开袋命令：奖励由服务端随机并原子写入权威背包。</summary>
-public sealed record OpenEyeOfCthulhuTreasureBagCommand(long Tick, int? PlayerId, int Slot)
-    : Command(Tick, PlayerId, "open_eye_of_cthulhu_treasure_bag")
-{
-    public override CommandApplyResult Apply(WorldState world, IRng rng)
-    {
-        if (PlayerId is not int playerId)
-            return new(false, CommandFailures.MissingPlayer);
-        if (world.InventoryLedger is null)
-            return new(false, CommandFailures.InventoryUnavailable);
-
-        bool crimson;
-        lock (world.PlayersLock)
-        {
-            if (!world.Players.TryGetValue(playerId, out var player) ||
-                (SessionId != 0 && player.SessionId != SessionId) || !player.Active || player.Dead)
-            {
-                return new(false, CommandFailures.PlayerNotActive);
-            }
-            crimson = world.Progress.Crimson;
-        }
-
-        var rewards = new List<InventoryReward>
-        {
-            crimson
-                ? new InventoryReward(880, 30 + rng.NextInt32(61))
-                : new InventoryReward(56, 30 + rng.NextInt32(61)),
-        };
-        if (crimson)
-            rewards.Add(new InventoryReward(2171, 1 + rng.NextInt32(3)));
-        else
-        {
-            rewards.Add(new InventoryReward(47, 20 + rng.NextInt32(31)));
-            rewards.Add(new InventoryReward(59, 1 + rng.NextInt32(3)));
-        }
-        if (rng.NextInt32(7) == 0) rewards.Add(new InventoryReward(2112, 1));
-        if (rng.NextInt32(40) == 0) rewards.Add(new InventoryReward(1299, 1));
-
-        var result = world.InventoryLedger.TryOpenEyeOfCthulhuTreasureBag(playerId, Slot, rewards);
-        // 奖励由服务端原子生成；校验失败（袋已被消费 / 背包满）不产出任何物品。
-        // 客户端随后上报的奖励快照由权威层回正（Correct），无需 pending 屏障。
-        return result switch
-        {
-            InventoryBagOpenResult.Success => new(true),
-            InventoryBagOpenResult.InventoryFull => new(false, CommandFailures.InventoryFull),
-            _ => new(false, CommandFailures.NotApplied),
-        };
-    }
-}
-
 /// <summary>玩家死亡命令：包 118（客户端声明死亡）权威通过后生成。</summary>
 public sealed record KillPlayerCommand(long Tick, int? PlayerId)
     : Command(Tick, PlayerId, "kill_player")
@@ -2099,6 +2049,7 @@ public sealed record SpawnItemCommand(
                     ? world.Tick + WorldItemEntity.DefaultGrabDelay  // 原版 100 tick ≈ 1.67s
                     : 0,
                 NewNotified = false,       // 由服务器统一广播（客户端丢弃 index=400，本地未持有，须服务端下发）
+                SpawnedTick = world.Tick,  // 结算窗口据此认定「本窗口内该玩家的掉落」（宝袋净减少的解释来源）
             });
         }
 

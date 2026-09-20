@@ -24,12 +24,6 @@ public sealed class RateLimits
 
 public sealed record PacketContext(int PlayerId, long Tick, DateTimeOffset ReceivedAt, long SessionId = 0) : IPacketContext;
 
-/// <summary>SSC 权威校验后由眼魔宝袋清空请求转换的内部意图包，不来自网络解码。</summary>
-internal sealed record OpenEyeOfCthulhuTreasureBagPacket(int Slot) : INetworkPacket
-{
-    public PacketId Type => PacketId.InventorySlot;
-}
-
 /// <summary>
 /// SSC 背包守恒事务的内部暂存意图包：包 5 与服务端权威值不一致时由库存权威层转换，不来自网络解码。
 /// 终端阶段据此生成 <see cref="Simulation.StageInventorySlotCommand"/>，把客户端意图放进事务窗口。
@@ -254,9 +248,6 @@ public sealed class TerminalStage : IPipelineStage
         ItemPickupPacket pickup => new PickupItemCommand(context.Tick, context.PlayerId, pickup.ItemSlotIndex),
         // 包 151 ItemDestroy → 物品拾取（原版 1.4.5 客户端拾取物品后的真实通知路径）
         ItemDestroyPacket destroy => new PickupItemCommand(context.Tick, context.PlayerId, destroy.ItemSlotIndex),
-        // SSC 眼魔宝袋清空意图由库存权威层转换，终端阶段只映射为权威开袋命令。
-        OpenEyeOfCthulhuTreasureBagPacket bag => new OpenEyeOfCthulhuTreasureBagCommand(
-            context.Tick, context.PlayerId, bag.Slot),
         // SSC 背包事务暂存意图 → 暂存命令（窗口到期后由守恒校验决定提交 / 回滚）
         StageInventorySlotPacket staged => new StageInventorySlotCommand(context.Tick, context.PlayerId,
             staged.Slot, staged.ItemId, staged.Stack, staged.Prefix),

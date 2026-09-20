@@ -294,32 +294,13 @@ public class AuthorityTests
         Assert.Equal(new[] { 1, 2, 3 }, order);
     }
 
+    /// <summary>
+    /// SSC 宝袋：清空袋槽**不再**被单独翻译成开袋命令。原版客户端把袋子拿在鼠标上也会把该槽上报为空，
+    /// 单包粒度无法与右键开袋区分；现在与其它槽位一致进入守恒事务窗口，
+    /// 由窗口内的战利品（客户端掷骰）决定是「开袋提交」还是「鼠标拿起回滚」。
+    /// </summary>
     [Fact]
-    public void InventoryAuthority_Ssc_MapsEyeOfCthulhuBagClearToOpenCommand()
-    {
-        var world = new WorldState();
-        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
-        lock (world.PlayersLock)
-        {
-            var player = new PlayerRuntime { Id = 1, Active = true };
-            player.Items[3] = 3319;
-            player.ItemStacks[3] = 1;
-            world.Players[1] = player;
-        }
-        var pipeline = new InboundPipeline(new IPipelineStage[]
-        {
-            new InventoryAuthorityStage(enforcers.Inventory, new NoOpAuditLogger()),
-            new TerminalStage(),
-        });
-
-        var result = pipeline.ProcessAsync(new InventorySlotPacket(3, 0, 0), 1, new CommandQueue()).Result;
-
-        Assert.Equal(AuthorityDecision.Accept, result.Decision);
-        Assert.IsType<OpenEyeOfCthulhuTreasureBagCommand>(result.Command);
-    }
-
-    [Fact]
-    public void InventoryAuthority_BagOpen_IsIdempotent_AtAuthority_AndOtherSlotsAreStaged()
+    public void InventoryAuthority_BagClear_IsStaged_LikeAnyOtherSlot()
     {
         var world = new WorldState();
         var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
@@ -332,17 +313,13 @@ public class AuthorityTests
         }
 
         var inventory = enforcers.Inventory;
-        var bag = inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!);
-        // 袋尚未被消费时，重复「清空袋槽」仍转成开袋意图；真正去重发生在命令 Apply 的终审。
-        var repeatedBagSlot = inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!);
-        // 其他槽位快照不再被 pending 屏蔽，而是进入背包守恒事务窗口（到期后判守恒）。
-        var otherSlot = inventory.Validate(new InventorySlotPacket(4, 56, 1), 1, null!);
+        var bagSlot = inventory.Validate(new InventorySlotPacket(3, 0, 0), 1, null!);
+        var lootSlot = inventory.Validate(new InventorySlotPacket(4, 56, 30), 1, null!);
 
-        Assert.Equal(AuthorityDecision.Accept, bag.Decision);
-        Assert.Equal(AuthorityDecision.Accept, repeatedBagSlot.Decision);
-        Assert.IsType<OpenEyeOfCthulhuTreasureBagPacket>(repeatedBagSlot.Packet);
-        Assert.Equal(AuthorityDecision.Accept, otherSlot.Decision);
-        Assert.IsType<StageInventorySlotPacket>(otherSlot.Packet);
+        Assert.Equal(AuthorityDecision.Accept, bagSlot.Decision);
+        Assert.IsType<StageInventorySlotPacket>(bagSlot.Packet);
+        Assert.Equal(AuthorityDecision.Accept, lootSlot.Decision);
+        Assert.IsType<StageInventorySlotPacket>(lootSlot.Packet);
     }
 
     [Fact]

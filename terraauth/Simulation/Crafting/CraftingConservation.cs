@@ -17,7 +17,7 @@
 //        （玩家一次合成产出的堆叠数是配方产出堆叠的整数倍），按配方材料从「减少」池里扣减
 //        （配方组按组内任意成员合计扣减）。解释得通 → 守恒，否则回滚。
 //
-// 数据源：原版配方表 <see cref="RecipeTable"/>（由 decompiled-tmp/gen-recipes.ps1 从
+// 数据源：原版配方表 <see cref="RecipeTable"/>（由仓库外的一次性生成脚本从
 // Terraria 1.4.5.8 的 Recipe.SetupRecipes 逐条提取，见 RecipeTable.cs）。
 //
 // 已知边界（宁回滚不放过）：
@@ -172,7 +172,8 @@ public static class CraftingConservation
         Dictionary<(int ItemId, byte Prefix), int> proposed,
         bool allowConsumption,
         IReadOnlyDictionary<int, int>? removalLimit = null,
-        CraftingEnvironment? environment = null)
+        CraftingEnvironment? environment = null,
+        IReadOnlyDictionary<int, int>? droppedToWorld = null)
     {
         if (SameTotals(authoritative, proposed)) return true;   // 快路径：逐 (物品, 前缀) 完全一致
 
@@ -205,10 +206,86 @@ public static class CraftingConservation
                 if (amount > removalLimit.GetValueOrDefault(item)) return false;
         }
 
+        // 宝袋（BossBag）专用规则：袋的净减少**不得**走通用「纯减少 = 消耗」放行。
+        // 原版客户端把袋子「拿在鼠标上」也会把该槽上报为空（包 5），那不是开袋——
+        // 通用规则会把袋子直接吞掉（此后玩家放下袋子时又被判凭空造物回滚 → 袋子凭空消失）。
+        // 只有两类解释成立：① 同窗口出现该袋战利品（= 开袋，客户端掷骰，服务端按池 + 上限校验）；
+        // ② 服务端已记录该袋被玩家丢到世界（= 掉落，见 WorldState 的窗口掉落统计）。
+        foreach (var bagId in CollectBagKeys(available))
+        {
+            var removed = available[bagId];
+            var byDrop = Math.Min(removed, droppedToWorld?.GetValueOrDefault(bagId) ?? 0);
+            var opens = removed - byDrop;
+            available.Remove(bagId);
+            if (opens == 0) continue;
+
+            // 15 tick（≈250ms）窗口内开两次袋不可能发生；出现即视为异常，回滚（安全侧）。
+            if (opens > 1) return false;
+            if (!BossBagLootTable.TryGetLoot(bagId, out var loot)) return false;   // 未建模 → 失败关闭
+            if (!TryConsumeBagOpen(bagId, loot, added, droppedToWorld)) return false;
+        }
+
         if (added.Count == 0) return allowConsumption;   // 纯减少：背包 = 消耗，箱子 = 不放行
 
         int budget = MaxSearchNodes;
         return TryExplain(available, added, requireEmptyRemovals: !allowConsumption, environment, ref budget);
+    }
+
+    /// <summary>取出净减少中的宝袋 ID 快照（后续会从 available 中移除这些键）。</summary>
+    private static List<int> CollectBagKeys(Dictionary<int, int> available)
+    {
+        var bags = new List<int>();
+        foreach (var itemId in available.Keys)
+            if (BossBagLootTable.IsBag(itemId)) bags.Add(itemId);
+        return bags;
+    }
+
+    /// <summary>
+    /// 校验一次开袋：[p&lt;paramref name="added"/&gt;] 里该袋战利品池的物品按池上限消费掉（= 由开袋解释），
+    /// 池外物品留给后续配方解释；背包满时战利品会直接掉到地上（原版 <c>GetOrDropItem</c>），
+    /// 故本窗口内该袋战利品的地面掉落同样算作开袋证据。
+    /// **无任何证据 → 不是开袋**（鼠标把袋子拿在手上 / 丢弃之外的槽位清空）→ 返回 false 触发回滚。
+    /// </summary>
+    private static bool TryConsumeBagOpen(
+        int bagItemId,
+        BossBagLootEntry[] loot,
+        Dictionary<int, int> added,
+        IReadOnlyDictionary<int, int>? droppedToWorld)
+    {
+        var consumed = new List<int>();
+        long coinCopper = 0;
+        foreach (var (itemId, amount) in added)
+        {
+            // 开袋附带的金币（原版把 Boss 的 NPC.value 换算成钱币）：按铜币总量区间校验，不按件数上限
+            if (BossBagLootTable.IsCoin(itemId))
+            {
+                if (!BossBagLootTable.CoinValueByBag.ContainsKey(bagItemId)) continue;
+                coinCopper += BossBagLootTable.CoinCopper(itemId, amount);
+                consumed.Add(itemId);
+                continue;
+            }
+
+            int maxStack = 0;
+            foreach (var entry in loot)
+                if (entry.ItemId == itemId) { maxStack = entry.MaxStack; break; }
+            if (maxStack == 0) continue;               // 非该袋战利品 → 留给配方解释
+            if (amount > maxStack) return false;       // 超出单次开袋上限 → 判造物
+            consumed.Add(itemId);
+        }
+        if (coinCopper > 0 && !BossBagLootTable.CoinRewardAllowed(bagItemId, coinCopper))
+        {
+            // 越界金币不算开袋奖励：留在 added 里交给配方判据（无法解释 → 该槽回滚），
+            // 不影响「袋 + 装备战利品」这一侧的判定（越界槽位不能把开袋一起拖下水）。
+            consumed.RemoveAll(BossBagLootTable.IsCoin);
+        }
+        foreach (var itemId in consumed) added.Remove(itemId);
+        if (consumed.Count > 0) return true;
+
+        if (droppedToWorld is not null)
+            foreach (var entry in loot)
+                if (droppedToWorld.GetValueOrDefault(entry.ItemId) > 0) return true;
+
+        return false;
     }
 
     private static bool SameTotals(

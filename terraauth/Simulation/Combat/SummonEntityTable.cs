@@ -1,6 +1,6 @@
 // TerraAuth — 召唤本体表（数据表；阶段 1：只落数据，不改行为）
 //
-// 来源（Terraria 1.4.5.8 反编译源码逐条提取；抽取脚本在仓库外 decompiled-tmp/）：
+// 来源（Terraria 1.4.5.8 原版行为逐条核对；抽取脚本在仓库外，未纳入版本库）：
 //   · **判定本体的唯一权威** = `Projectile.SetDefaults` 里赋 `minion = true` / `sentry = true` 的弹幕类型
 //     —— Projectile.cs L718..10699 的 `else if (type == N)` / `else if (type >= A && type <= B)` / `case N:` 三种形态
 //     —— extract-summon-bodies3.ps1 + extract-summon-bodies-full.ps1 → **62 条**

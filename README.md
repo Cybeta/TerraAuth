@@ -12,22 +12,25 @@ TerraAuth 的目标是在**协议层**把关键状态收回服务端，提供可
 
 <table>
 <tr>
-<td align="center" width="25%"><img src="docs/images/king-slime.png" height="72" alt="史莱姆王" /><br /><sub>史莱姆王</sub></td>
-<td align="center" width="25%"><img src="docs/images/eye-of-cthulhu.png" height="72" alt="克苏鲁之眼" /><br /><sub>克苏鲁之眼</sub></td>
-<td align="center" width="25%"><img src="docs/images/skeletron.png" height="72" alt="骷髅王" /><br /><sub>骷髅王</sub></td>
-<td align="center" width="25%"><img src="docs/images/moon-lord.png" height="72" alt="月亮领主" /><br /><sub>月亮领主</sub></td>
+<td align="center" width="20%"><img src="docs/images/king-slime.png" height="72" alt="史莱姆王" /><br /><sub>史莱姆王</sub></td>
+<td align="center" width="20%"><img src="docs/images/eye-of-cthulhu.png" height="72" alt="克苏鲁之眼" /><br /><sub>克苏鲁之眼</sub></td>
+<td align="center" width="20%"><img src="docs/images/skeletron.png" height="72" alt="骷髅王" /><br /><sub>骷髅王</sub></td>
+<td align="center" width="20%"><img src="docs/images/moon-lord.png" height="72" alt="月亮领主" /><br /><sub>月亮领主</sub></td>
+<td align="center" width="20%"><img src="docs/images/empress-of-light.png" height="72" alt="光之女皇（精灵王）" /><br /><sub>光之女皇</sub></td>
 </tr>
 <tr>
 <td align="center"><b>① 原版游戏端进服</b><br /><br /><b>✅ 已达成</b></td>
 <td align="center"><b>② 原版客户端流畅游玩</b><br /><br /><b>🔵 正在进行</b></td>
 <td align="center"><b>③ 插件功能完善</b><br /><br /><b>⚪ 待进行</b></td>
 <td align="center"><b>④ Mod 兼容</b><br /><br /><b>⚪ 待进行</b></td>
+<td align="center"><b>⑤ 监控与可观测性</b><br /><br /><b>⚪ 待进行</b></td>
 </tr>
 <tr>
 <td align="center"><sub>原版客户端（协议 326）握手 → 进入世界 → 正常断开，全链路实测通过</sub></td>
 <td align="center"><sub>位置 / 物品 / 战斗 / 世界改动全部由服务端权威结算；当前收敛 SSC 守恒事务与合成 / 开袋 / 放置回滚类问题</sub></td>
 <td align="center"><sub>Hook 扩展点 + 服务端命令子系统 + 插件事件审计</sub></td>
 <td align="center"><sub>ModPolicy 白名单与兼容层</sub></td>
+<td align="center"><sub>Prometheus 指标 + 审计查询 + 异常告警</sub></td>
 </tr>
 </table>
 
@@ -157,7 +160,7 @@ terraauth/
 ├─ Plugins/             # 插件系统（Hook / 加载器 / 管线装饰）
 ├─ ModCompat/           # 未来 MOD 兼容层（当前生产禁用）
 ├─ Concurrency/         # 并行优化（Worker 池 / 分片 / 快照并行）
-├─ Tests/               # xUnit 验收测试（818 用例，以 dotnet test 实测为准）
+├─ Tests/               # xUnit 验收测试（843 用例，以 dotnet test 实测为准）
 └─ server.json          # 阈值配置
 ```
 
@@ -179,4 +182,12 @@ if (|dx| > allowedX || |dy| > allowedY) → Reject("speed_exceeded")，拒绝时
 
 ## 许可
 
-本项目仅为学习 / 研究用途，与 Re-Logic 官方无关。Terraria 协议实现参考社区规范。
+本项目采用 **TerraAuth 非商业许可协议 v1.0**（全文见 [LICENSE](LICENSE)）——非 OSI 认证的标准开源许可，要点：
+
+- ✅ **允许**：个人学习 / 研究 / 测试；修改与制作衍生作品；**非商业**前提下的自建服务器运行与分发
+  （须完整保留本协议与署名、标注所做修改、衍生作品沿用同一许可）。
+- 🚫 **禁止任何形式的商业利用**：贩卖本项目（源码 / 编译产物 / 整合包 / 启动器 / 授权码 / 会员资格）、
+  付费开服或付费特权、付费代搭建 / 代部署 / 代运维 / 付费技术支持、改名换皮后商用、广告与流量变现、
+  搭售捆绑进收费产品，以及"免费下载 + 付费解锁"等规避行为。**需要商用请先取得著作权人的书面商业授权。**
+- **第三方素材**：`docs/images/` 下的 Boss 立绘等游戏素材版权归 **Re-Logic** 所有，不在本协议授权范围内；
+  本项目是独立的第三方服务端实现，与 Re-Logic 无隶属 / 赞助 / 背书关系，**不包含也不提供** Terraria 游戏本体。

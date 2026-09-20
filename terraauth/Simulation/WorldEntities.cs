@@ -62,6 +62,12 @@ public sealed class WorldItemEntity
 
     /// <summary>失效发生的 tick（用于延后清理）。</summary>
     public long DeadTick;
+
+    /// <summary>
+    /// 生成 tick（服务端时钟）：用于「本结算窗口内该玩家丢出了什么」的判定
+    /// （宝袋的净减少需要被同窗口的掉落解释，见 <c>WorldState.CollectWindowWorldDrops</c>）。
+    /// </summary>
+    public long SpawnedTick;
 }
 
 /// <summary>服务端权威的弹幕实体（对应原版 <c>Main.projectile[key]</c>）。</summary>

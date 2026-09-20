@@ -12,21 +12,11 @@ using TerraAuth.Protocol;
 namespace TerraAuth.Simulation;
 
 /// <summary>世界全局状态：元数据 + 图格矩阵 + 实体列表。</summary>
-public readonly record struct InventoryReward(int ItemId, int Stack);
-
-public enum InventoryBagOpenResult
-{
-    Success,
-    InvalidBag,
-    InventoryFull,
-}
-
 public interface IInventoryLedger
 {
     bool ConsumeItem(int playerId, int itemId);
     bool TryAddItem(int playerId, int itemId, int stack);
     bool TryAddItemExactly(int playerId, int itemId, int stack);
-    InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(int playerId, int slot, IReadOnlyList<InventoryReward> rewards);
 }
 
 public sealed class WorldState
@@ -1254,6 +1244,11 @@ public sealed class WorldState
             if (Tick - player.InventoryTransactionStartTick < windowTicks)
                 return InventoryTransactionOutcome.None;   // 窗口未到期，继续聚合
 
+            // 开袋（客户端掷骰）先摘出来单独结算：袋槽 + 池内战利品槽按客户端上报值直接提交，
+            // 与窗口其余槽位**解耦**。否则窗口里任何一个与开袋无关的非法 / 未同步槽位都会把整窗
+            // （含开袋）一起回滚 —— 真机表现为「右键开袋，新物品出现后全部消失、袋子回到背包」。
+            var approvedBagSlots = ApproveBagOpen(player);
+
             bool conserved = IsInventoryConserved(player);
             var slots = player.PendingInventoryChanges.Keys.ToArray();
 
@@ -1268,11 +1263,18 @@ public sealed class WorldState
                 player.RecalculateDefense();
             }
 
+            // 诊断（默认关闭）：背包守恒事务的结算结果 + 暂存 / 权威差异。
+            // 真机「物品出现约 1 秒后消失」= 窗口到期判不守恒回滚，只有这条日志能定位是哪一类操作被回滚。
+            if (DiagnosticLog.Enabled)
+                Console.WriteLine($"[InventoryTx] 玩家 #{playerId} tick={Tick} {(conserved ? "提交" : "回滚")}"
+                    + (approvedBagSlots.Count > 0 ? $"（开袋已单独提交 {approvedBagSlots.Count} 槽）" : string.Empty)
+                    + DescribeChanges(player, slots)
+                    + (conserved ? string.Empty : DescribeCraftEnv(player)));
+
             player.PendingInventoryChanges.Clear();
             player.InventoryTransactionBaseline.Clear();
             player.InventoryTransactionStartTick = -1;
             CloseInventoryTransaction(playerId);
-
             foreach (int slot in slots)
                 MarkInventoryChanged(playerId, player.SessionId, slot);
 
@@ -1283,13 +1285,138 @@ public sealed class WorldState
     }
 
     /// <summary>
+    /// 开袋的独立结算：当暂存意图里存在「某个宝袋恰好净减少 1 件」且同窗口出现该袋战利品
+    /// （池内物品、单次上限内，见 <see cref="BossBagLootTable"/>）时，把**袋槽 + 这些战利品槽**
+    /// 从暂存中摘出并按客户端上报值直接提交，返回被提交的槽位。
+    /// <para>
+    /// 为什么要单独结算：背包守恒事务是**整窗**提交或回滚，真机上背包里只要存在一件与开袋无关的
+    /// 未同步 / 非法物品，整窗就会回滚 → 宝袋永远打不开（症状：右键开袋，新物品出现后全部消失、
+    /// 袋子回到背包）。摘出这几槽后，开袋按客户端掷骰结果落地，其余槽位仍按原判据各自裁决
+    /// （非法增加照样回滚）。
+    /// </para>
+    /// 调用方需持 <see cref="PlayersLock"/>。
+    /// </summary>
+    private List<int> ApproveBagOpen(PlayerRuntime player)
+    {
+        var approved = new List<int>();
+        if (player.PendingInventoryChanges.Count == 0) return approved;
+
+        foreach (var (bagSlot, bagStaged) in player.PendingInventoryChanges)
+        {
+            int bagId = player.Items[bagSlot];
+            if (!BossBagLootTable.IsBag(bagId) || player.ItemPrefixes[bagSlot] != 0 || player.ItemStacks[bagSlot] <= 0)
+                continue;
+
+            // 该槽的暂存值必须把袋**恰好减少 1 件**（= 开一次袋）；其余情况交回通用判据
+            var kept = bagStaged.Stack > 0 && bagStaged.ItemId == bagId ? bagStaged.Stack : 0;
+            if (player.ItemStacks[bagSlot] - kept != 1) continue;
+            if (!BossBagLootTable.TryGetLoot(bagId, out _)) continue;   // 未建模的袋交回通用判据（失败关闭）
+
+            // 战利品槽：暂存物品属于该袋池（或开袋附带的金币），且净增量在允许范围内。
+            // 超出范围 / 不在池内的槽位**只是不摘出**（留给通用判据回滚），绝不让它把开袋一起拖下水。
+            var gains = new Dictionary<int, int>();
+            var lootSlots = new List<int>();
+            var coinSlots = new List<int>();
+            long coinCopper = 0;
+            foreach (var (slot, staged) in player.PendingInventoryChanges)
+            {
+                if (slot == bagSlot || staged.Stack <= 0 || staged.Prefix != 0) continue;
+                var baseStack = player.Items[slot] == staged.ItemId && player.ItemPrefixes[slot] == 0
+                    ? player.ItemStacks[slot]
+                    : 0;
+                // 槽内原有别的物品（既非「空槽填入」也非「同类堆叠合并」）→ 不摘出，交回通用判据
+                if (player.ItemStacks[slot] > 0 && baseStack == 0) continue;
+                var gain = staged.Stack - baseStack;
+
+                // 开袋附带的金币（原版把 Boss 的 NPC.value 换算成钱币）：按铜币总量区间校验
+                if (BossBagLootTable.IsCoin(staged.ItemId))
+                {
+                    if (!BossBagLootTable.CoinValueByBag.ContainsKey(bagId)) continue;
+                    coinCopper += BossBagLootTable.CoinCopper(staged.ItemId, gain);
+                    coinSlots.Add(slot);
+                    continue;
+                }
+
+                if (!BossBagLootTable.TryGetLootLimit(bagId, staged.ItemId, out var limit)) continue;
+                if (gains.GetValueOrDefault(staged.ItemId) + gain > limit) continue;   // 超单次上限 → 不摘出
+                gains[staged.ItemId] = gains.GetValueOrDefault(staged.ItemId) + gain;
+                lootSlots.Add(slot);
+            }
+
+            // 金币只有落在原版区间内才算开袋奖励（超出 → 不摘出，交给通用判据回滚）
+            if (coinCopper > 0 && BossBagLootTable.CoinRewardAllowed(bagId, coinCopper))
+                lootSlots.AddRange(coinSlots);
+
+            // 没有任何可信战利品 → 不是开袋（鼠标把袋子拿在手上 / 丢弃等），整体交回通用判据
+            if (lootSlots.Count == 0) continue;
+
+            // 提交：袋槽 + 战利品槽按客户端上报值写入权威背包，并从暂存中摘除（其余槽位仍按原判据结算）
+            foreach (int lootSlot in lootSlots) approved.Add(lootSlot);
+            approved.Add(bagSlot);
+            foreach (int slot in approved)
+            {
+                var staged = player.PendingInventoryChanges[slot];
+                player.Items[slot] = staged.Stack > 0 ? staged.ItemId : 0;
+                player.ItemStacks[slot] = staged.Stack > 0 ? staged.Stack : 0;
+                player.ItemPrefixes[slot] = staged.Stack > 0 ? staged.Prefix : (byte)0;
+                player.PendingInventoryChanges.Remove(slot);
+                MarkInventoryChanged(player.Id, player.SessionId, slot);
+            }
+            player.RecalculateDefense();
+            return approved;
+        }
+        return approved;
+    }
+
+    /// <summary>诊断用（<see cref="DiagnosticLog.Enabled"/>）：列出本次结算槽位的「暂存值 → 权威值」。</summary>
+    private static string DescribeChanges(PlayerRuntime player, int[] slots)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (int slot in slots)
+        {
+            var staged = player.PendingInventoryChanges.TryGetValue(slot, out var s) ? s : default;
+            var stagedText = staged.Stack > 0 ? $"{staged.ItemId}x{staged.Stack}" : "空";
+            var authoritative = player.ItemStacks[slot] > 0 ? $"{player.Items[slot]}x{player.ItemStacks[slot]}" : "空";
+            sb.Append($" 槽{slot}:暂存{stagedText}/权威{authoritative}");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>诊断用：箱子事务的暂存值（箱子槽 + 背包槽）。</summary>
+    private static string DescribeChestChanges(PlayerRuntime player)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var ((chest, slot), staged) in player.PendingChestChanges)
+            sb.Append($" 箱{chest}:槽{slot}→{(staged.Stack > 0 ? $"{staged.ItemId}x{staged.Stack}" : "空")}");
+        foreach (var (slot, staged) in player.PendingChestInventoryChanges)
+        {
+            var authoritative = player.ItemStacks[slot] > 0 ? $"{player.Items[slot]}x{player.ItemStacks[slot]}" : "空";
+            sb.Append($" 包槽{slot}:{(staged.Stack > 0 ? $"{staged.ItemId}x{staged.Stack}" : "空")}/权威{authoritative}");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 诊断用：合成环境快照摘要（可达区域内的图格类型 + 液体标志）。
+    /// 真机「工作台旁合不出来的东西」= 站位图格没进快照（可达区域 / 图格 ID 口径不一致），
+    /// 这条摘要能直接看出快照里到底有没有工作台（35）/ 熔炉（17）/ 铁砧（16）等站位。
+    /// </summary>
+    private static string DescribeCraftEnv(PlayerRuntime player)
+    {
+        var env = player.CraftingEnvironment;
+        var tiles = new System.Text.StringBuilder();
+        foreach (int tile in env.AdjacentTiles) tiles.Append(tiles.Length > 0 ? $",{tile}" : $"{tile}");
+        return $" [合成环境 站位=[{tiles}] 水={env.Water} 蜜={env.Honey} 岩={env.Lava}]";
+    }
+
+    /// <summary>
     /// 守恒校验：把暂存意图叠加到权威背包后，每个 (物品, 前缀) 的总数量必须与权威值一致；
     /// 此外还放行**原版配方可解释**的合成净增量与纯消耗性减少（见 <see cref="CraftingConservation"/>）。
     /// 权威侧含一切外部变更（/give、拾取、开袋、箱子转移），因此与外部变更冲突的暂存意图
     /// 会因总量对不上而自然回滚，无需额外的版本号或冲突表；消耗上限取窗口开始时的权威总量，
     /// 使「窗口期内服务端外部塞入的物品」无法被客户端的清空意图「消耗」掉。
     /// </summary>
-    private static bool IsInventoryConserved(PlayerRuntime player)
+    private bool IsInventoryConserved(PlayerRuntime player)
     {
         var authoritative = new Dictionary<(int ItemId, byte Prefix), int>();
         var proposed = new Dictionary<(int ItemId, byte Prefix), int>();
@@ -1320,8 +1447,35 @@ public sealed class WorldState
 
         return CraftingConservation.IsConserved(
             authoritative, proposed, allowConsumption: true,
-            BuildRemovalLimit(player.InventoryTransactionBaseline), player.CraftingEnvironment);
+            BuildRemovalLimit(player.InventoryTransactionBaseline), player.CraftingEnvironment,
+            CollectWindowWorldDrops(player));
     }
+
+    /// <summary>
+    /// 本结算窗口内该玩家**丢到世界**的物品计数（物品 → 堆叠数）：宝袋的净减少必须由它解释，
+    /// 否则「鼠标把袋子拿在手上」造成的槽位清空会把袋子静默吞掉（见 Conservation 的宝袋规则）。
+    /// 只统计 <c>DroppedBy == 该玩家</c> 且在本窗口（含窗口开启前 30 tick 的容差，覆盖
+    /// 客户端先发包 21、后补发槽位的顺序）内生成的掉落物。
+    /// 锁序：调用方持 <see cref="PlayersLock"/> → 这里取 <see cref="ItemsLock"/>（合法顺序）。
+    /// </summary>
+    private Dictionary<int, int>? CollectWindowWorldDrops(PlayerRuntime player)
+    {
+        var since = player.InventoryTransactionStartTick - WindowDropToleranceTicks;
+        Dictionary<int, int>? drops = null;
+        lock (ItemsLock)
+        {
+            foreach (var item in Items)
+            {
+                if (!item.Active || item.DroppedBy != player.Id || item.SpawnedTick < since) continue;
+                drops ??= new Dictionary<int, int>();
+                drops[item.ItemId] = drops.GetValueOrDefault(item.ItemId) + item.Stack;
+            }
+        }
+        return drops;
+    }
+
+    /// <summary>窗口掉落统计的时间容差（tick）：覆盖「先发包 21、后补槽位包 5」的到达顺序。</summary>
+    private const int WindowDropToleranceTicks = 30;
 
     /// <summary>
     /// 把窗口开始时的 (物品, 前缀) 基准折叠成「物品 → 允许被消耗的总量」。
@@ -1495,6 +1649,13 @@ public sealed class WorldState
                             stagedChestSlots.Add(slot);
                 }
             }
+
+            // 诊断（默认关闭）：箱子守恒事务的结算结果（提交 / 回滚 + 两侧暂存值）。
+            // 真机「从宝箱里拿出来的钱币 / 材料消失，随后合成缺料被回滚」= 箱侧与背包侧的同一转移
+            // 没进同一个窗口，或守恒判定把整窗回滚；只有这条日志能区分这两种情况。
+            if (DiagnosticLog.Enabled)
+                Console.WriteLine($"[ChestTx] 玩家 #{playerId} tick={Tick} 箱子#{chestIndex} "
+                    + $"{(conserved ? "提交" : "回滚")}{DescribeChestChanges(player)}");
 
             player.PendingChestChanges.Clear();
             player.PendingChestInventoryChanges.Clear();

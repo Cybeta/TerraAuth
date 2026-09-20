@@ -23,24 +23,32 @@ public enum ModPolicyMode
     AllowAll
 }
 
-/// <summary>Mod 策略配置（对应 config.json 的 ModPolicy 节）。</summary>
+/// <summary>Mod 策略配置（对应 server.json 的 ModPolicy 节）。</summary>
 public sealed class ModPolicy
 {
+    /// <summary>策略模式：VanillaOnly = 仅原版客户端；Whitelist = 只允许 AllowedMods 列出的 Mod；
+    /// Blacklist = 禁止 BlockedMods 列出的 Mod；AllowAll = 全部允许（仅记录日志）。</summary>
     public ModPolicyMode Mode { get; set; } = ModPolicyMode.VanillaOnly;
     /// <summary>遇到未列出的 Mod 是否阻止（Whitelist 模式下有效）。</summary>
     public bool BlockOnUnlistedMod { get; set; } = true;
     /// <summary>允许仅客户端 Mod（不影响服务端，默认可用）。</summary>
     public bool AllowClientSideMods { get; set; } = true;
+    /// <summary>白名单条目（Whitelist 模式下只有列出的 Mod 可进服）。</summary>
     public IReadOnlyList<ModEntry> AllowedMods { get; set; } = Array.Empty<ModEntry>();
+    /// <summary>黑名单条目（Blacklist 模式下列出的 Mod 一律拒绝）。</summary>
     public IReadOnlyList<ModEntry> BlockedMods { get; set; } = Array.Empty<ModEntry>();
+    /// <summary>强制要求的 Mod（客户端未安装即拒绝连接）。</summary>
     public IReadOnlyList<ModEntry> RequiredMods { get; set; } = Array.Empty<ModEntry>();
 }
 
 /// <summary>Mod 条目（版本区间 + 可选哈希校验）。</summary>
 public sealed class ModEntry
 {
+    /// <summary>Mod 名称。</summary>
     public string Name { get; set; } = "";
+    /// <summary>允许的最低版本（含）；null = 不限。</summary>
     public string? MinVersion { get; set; }
+    /// <summary>允许的最高版本（含）；null = 不限。</summary>
     public string? MaxVersion { get; set; }
     /// <summary>Mod 文件哈希（用于完整性校验，可选）。</summary>
     public string? Hash { get; set; }

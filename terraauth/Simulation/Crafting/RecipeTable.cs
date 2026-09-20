@@ -1,6 +1,6 @@
-﻿// TerraAuth — 合成配方表（自动生成，勿手改）
-// 数据源：Terraria 1.4.5.8 原版 Recipe.SetupRecipes 及其家具 / 雕像辅助方法（decompiled/src/Terraria/Recipe.cs）。
-// 生成脚本：decompiled-tmp/gen-recipes.ps1。
+// TerraAuth — 合成配方表（自动生成，勿手改）
+// 数据源：Terraria 1.4.5.8 原版 Recipe.SetupRecipes 及其家具 / 雕像辅助方法。
+// 生成脚本：仓库外的一次性生成脚本（未纳入版本库）。
 //
 // 用途：SSC 背包 / 箱子守恒事务在「总量必须严格不变」之外，额外放行**原版配方可解释**的
 // 「材料 → 产物」净增量（合成），并按 RequiredTile / Environment 校验**合成站与环境**。
@@ -18,7 +18,7 @@
 //   needMechdusa=1（世界特性 remixWorld ∧ getGoodWorld）/ needTorchGodsFavor=2（玩家已解锁火把神恩）
 //
 // 未收录（生成器静态不可解，按「不猜数值」原则整体跳过，绝不落半条配方）：
-//   - 下列产物的配方依赖反编译提升的局部量（num / stack），无法静态求值，整条作废：3918, 3965, 3972, 3970, 3962, 3969, 3961, 3959, 3960, 3966, 3973, 3971, 3964
+//   - 下列产物的配方依赖原版编译器临时量（num / stack），无法静态求值，整条作废：3918, 3965, 3972, 3970, 3962, 3969, 3961, 3959, 3960, 3966, 3973, 3971, 3964
 //   - 少量辅助方法内联数组 / 无法静态求值的表达式分支（合成站 / 环境均可静态解，已收录）
 
 namespace TerraAuth.Simulation;

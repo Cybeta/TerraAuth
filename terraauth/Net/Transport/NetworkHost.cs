@@ -393,7 +393,12 @@ public sealed class NetworkHost : IAsyncDisposable
                 // 违规：记录审计（Phase 2 IAuditLogger；PersistenceAuditLogger 不输出控制台）
                 // 诊断：限频打印拒绝原因，否则"移动包是否被权威层丢弃"在服务端完全不可见
                 var rejectNo = Interlocked.Increment(ref _rejectCount);
-                if (rejectNo <= 50 || rejectNo % 1000 == 0)
+                // 常规只打印前 50 条 + 每 1000 条（未建模包量大，早把额度占满）。
+                // 例外：箱子 / 拾取 / 丢弃这几类「玩家能直接感知到」的拒绝**始终打印**——
+                // 真机排查「从宝箱拿出来的东西消失 / 地上捡不起来」时，前 50 条早被未建模包占完了。
+                var alwaysLogged = packet is SyncChestItemPacket or ChestPacket or ItemPickupPacket
+                    or ItemDestroyPacket or ItemDropPacket or QuickStackChestsPacket;
+                if (rejectNo <= 50 || rejectNo % 1000 == 0 || alwaysLogged)
                     Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}"
                         + (result.Detail is { Length: > 0 } d ? $"（{d}）" : ""));
 

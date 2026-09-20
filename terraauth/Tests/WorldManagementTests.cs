@@ -196,6 +196,65 @@ public class WorldManagementTests
         }
     }
 
+    /// <summary>
+    /// server.json 的每个选项都必须带中文说明：渲染出的文本里，**每一个属性行**的上方必须是一行注释。
+    /// 新增 / 改名配置项却忘了在 <see cref="ConfigDocumentation"/> 补说明时，本用例会失败。
+    /// </summary>
+    [Fact]
+    public void Config_Render_Documents_Every_Option()
+    {
+        var rendered = ConfigDocumentation.Render(new ServerConfig());
+
+        string? previous = null;
+        var properties = 0;
+        foreach (var line in rendered.Split('\n'))
+        {
+            var text = line.TrimEnd('\r');
+            var trimmed = text.TrimStart();
+            var isProperty = trimmed.StartsWith('"') && trimmed.Contains("\":", StringComparison.Ordinal);
+            if (isProperty)
+            {
+                properties++;
+                Assert.True(previous is not null && previous.TrimStart().StartsWith("//", StringComparison.Ordinal),
+                    $"配置项缺少中文说明：{trimmed}");
+            }
+            previous = text;
+        }
+
+        Assert.True(properties >= 30, $"渲染结果里属性行过少（{properties}），可能渲染逻辑失效");
+    }
+
+    /// <summary>带注释的 server.json 必须能被加载器正常解析（注释被跳过），且值原样往返。</summary>
+    [Fact]
+    public void Config_WithComments_RoundTrips_Through_Loader()
+    {
+        var directory = CreateDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "server.json");
+            ConfigurationService.Write(path, new ServerConfig
+            {
+                MaxEnemies = 3,
+                GameMode = GameMode.Master,
+                SummonAuthority = SummonAuthorityMode.ServerAi,
+                VerboseDiagnostics = true,
+            });
+
+            var text = File.ReadAllText(path);
+            Assert.Contains("//", text);
+
+            var config = ReadConfig(path);
+            Assert.Equal(3, config.MaxEnemies);
+            Assert.Equal(GameMode.Master, config.GameMode);
+            Assert.Equal(SummonAuthorityMode.ServerAi, config.SummonAuthority);
+            Assert.True(config.VerboseDiagnostics);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static ServerConfig ReadConfig(string path) => JsonSerializer.Deserialize<ServerConfig>(
         File.ReadAllText(path), ConfigurationService.JsonOptions)!;
 

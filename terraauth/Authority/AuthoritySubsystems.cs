@@ -759,17 +759,12 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
                         return AuthorityResult.RejectSilent();
                     }
 
-                    // SSC 眼魔宝袋：客户端开袋时会先清空袋槽（Stack==0），随后回显本地奖励快照。
-                    // 这里把「清空袋槽」直接转成权威开袋命令，不再建立全背包静默屏障：
-                    // 奖励由服务端在命令中原子生成（TryOpenEyeOfCthulhuTreasureBag），客户端随后
-                    // 上报的奖励快照会走下面的权威回正分支收敛。命令 Apply 时会再次校验袋仍在，
-                    // 因此重复触发是幂等的（不会凭空产出奖励）。
-                    if (slot.Stack == 0 && player.Items[slot.Slot] == 3319 &&
-                        player.ItemStacks[slot.Slot] > 0 && player.ItemPrefixes[slot.Slot] == 0)
-                    {
-                        return AuthorityResult.Accept(
-                            new OpenEyeOfCthulhuTreasureBagPacket(slot.Slot));
-                    }
+                    // SSC 眼魔宝袋：**不再**把「清空袋槽」直接当作开袋。
+                    // 原版客户端把袋子拿在鼠标上（拖拽 / 换位）也会把该槽上报为空（包 5），
+                    // 与「右键开袋（袋消失 + 同窗口出现战利品）」在单包粒度上无法区分——
+                    // 旧实现在这里直接生成开袋命令，真机表现为「鼠标一拿起袋子就自动开了」。
+                    // 现在统一走下面的守恒事务窗口：窗口内含该袋合法战利品 → 判定为开袋（提交客户端掷骰结果）；
+                    // 只是槽位清空 → 判不守恒回滚（袋子留在原地）。判定见 CraftingConservation 的宝袋规则。
                 }
             }
 
@@ -788,7 +783,9 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
     private AuthorityResult Deny(int playerId, string action, string reason, object details)
     {
         _audit.Log(AuditEvent.Now(playerId, "authority", action, reason, details));
-        return AuthorityResult.Reject(reason);
+        // 把细节一并带进拒绝结果：真机排障时控制台日志要能直接看到「哪个槽位 / 哪个坐标」被拒，
+        // 否则只能去翻审计库（前 50 条之后的拒绝根本不会打印）。
+        return AuthorityResult.Reject(reason, detail: System.Text.Json.JsonSerializer.Serialize(details));
     }
 
     public bool IsValidItem(int itemId) => itemId >= 0 && itemId < MaxItemId;
@@ -812,6 +809,30 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
         }
     }
 
+    /// <summary>
+    /// 背包里是否有该物品 —— **计入本窗口尚未结算的暂存增加**。
+    /// 为什么需要：客户端「合成后立刻放到地图上」是常规操作（工作台就是这么做出来的），
+    /// 而 SSC 的合成要走 15 tick 守恒窗口，权威背包在这段时间里还没有该物品 →
+    /// 只看权威值会把放置误拒（`item_not_in_inventory`），地图上就多出一个服务端不认识的方块，
+    /// 之后在它旁边合成全部失败（站位不在服务端图格里）。
+    /// </summary>
+    public bool HasItemIncludingPending(int playerId, int itemId)
+    {
+        lock (_world.PlayersLock)
+        {
+            if (!_world.Players.TryGetValue(playerId, out var player)) return false;
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            {
+                if (player.Items[slot] == itemId && player.ItemStacks[slot] > 0) return true;
+                if (player.PendingInventoryChanges.TryGetValue(slot, out var staged) &&
+                    staged.ItemId == itemId && staged.Stack > 0) return true;
+                if (player.PendingChestInventoryChanges.TryGetValue(slot, out var chestStaged) &&
+                    chestStaged.ItemId == itemId && chestStaged.Stack > 0) return true;
+            }
+            return false;
+        }
+    }
+
     public bool ConsumeItem(int playerId, int itemId)
     {
         lock (_world.PlayersLock)
@@ -828,6 +849,30 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
                 player.RecalculateDefense();
                 _world.MarkInventoryChanged(playerId, player.SessionId, slot);
                 return true;
+            }
+
+            // 权威背包没有 → 从**本窗口尚未结算的暂存值**里扣（合成后立刻放置的情形，见 HasItemIncludingPending）。
+            // 扣暂存值而不是回滚暂存意图：物品变成了地图上的图格，窗口结算时按「已扣」的值提交即可。
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            {
+                if (player.PendingInventoryChanges.TryGetValue(slot, out var staged) &&
+                    staged.ItemId == itemId && staged.Stack > 0)
+                {
+                    var left = staged.Stack - 1;
+                    player.PendingInventoryChanges[slot] = left > 0
+                        ? (staged.ItemId, left, staged.Prefix)
+                        : (0, 0, (byte)0);
+                    return true;
+                }
+                if (player.PendingChestInventoryChanges.TryGetValue(slot, out var chestStaged) &&
+                    chestStaged.ItemId == itemId && chestStaged.Stack > 0)
+                {
+                    var left = chestStaged.Stack - 1;
+                    player.PendingChestInventoryChanges[slot] = left > 0
+                        ? (chestStaged.ItemId, left, chestStaged.Prefix)
+                        : (0, 0, (byte)0);
+                    return true;
+                }
             }
             return false;
         }
@@ -879,68 +924,6 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
             }
             player.RecalculateDefense();
             return true;
-        }
-    }
-
-    public InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(
-        int playerId, int slot, IReadOnlyList<InventoryReward> rewards)
-    {
-        if (slot < 0 || slot >= PlayerRuntime.InventorySlotCount)
-            return InventoryBagOpenResult.InvalidBag;
-
-        lock (_world.PlayersLock)
-        {
-            if (!_world.Players.TryGetValue(playerId, out var player) ||
-                player.Items[slot] != 3319 || player.ItemStacks[slot] <= 0 || player.ItemPrefixes[slot] != 0)
-            {
-                return InventoryBagOpenResult.InvalidBag;
-            }
-
-            var itemIds = (int[])player.Items.Clone();
-            var stacks = (int[])player.ItemStacks.Clone();
-            var prefixes = (byte[])player.ItemPrefixes.Clone();
-            if (--stacks[slot] == 0)
-            {
-                itemIds[slot] = 0;
-                prefixes[slot] = 0;
-            }
-
-            foreach (var reward in rewards)
-            {
-                var remaining = reward.Stack;
-                for (var target = 0; target < PlayerRuntime.InventorySlotCount && remaining > 0; target++)
-                {
-                    if (itemIds[target] != reward.ItemId || stacks[target] <= 0 || stacks[target] >= _limits.MaxStackSize)
-                        continue;
-                    var add = Math.Min(remaining, _limits.MaxStackSize - stacks[target]);
-                    stacks[target] += add;
-                    remaining -= add;
-                }
-                for (var target = 0; target < PlayerRuntime.InventorySlotCount && remaining > 0; target++)
-                {
-                    if (stacks[target] > 0) continue;
-                    var add = Math.Min(remaining, _limits.MaxStackSize);
-                    itemIds[target] = reward.ItemId;
-                    stacks[target] = add;
-                    prefixes[target] = 0;
-                    remaining -= add;
-                }
-                if (remaining > 0)
-                    return InventoryBagOpenResult.InventoryFull;
-            }
-
-            for (var target = 0; target < PlayerRuntime.InventorySlotCount; target++)
-            {
-                if (player.Items[target] == itemIds[target] && player.ItemStacks[target] == stacks[target] &&
-                    player.ItemPrefixes[target] == prefixes[target])
-                    continue;
-                player.Items[target] = itemIds[target];
-                player.ItemStacks[target] = stacks[target];
-                player.ItemPrefixes[target] = prefixes[target];
-                _world.MarkInventoryChanged(playerId, player.SessionId, target);
-            }
-            player.RecalculateDefense();
-            return InventoryBagOpenResult.Success;
         }
     }
 
@@ -1214,7 +1197,10 @@ internal sealed class WorldAuthority : IWorldAuthority
             return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y });
 
         // 背包物品校验只读；实际扣除必须随放置命令一起提交。
-        if (!_inv.HasItem(playerId, place.TileType))
+        // 计入本窗口尚未结算的暂存值：客户端「合成后立刻放下」是常规操作（工作台就是这么来的），
+        // 权威背包要等 15 tick 守恒窗口后才拿到该物品 —— 只比对权威值会误拒（item_not_in_inventory），
+        // 地图上就多出一个服务端不认识的方块，之后在它旁边合成全部失败。
+        if (!_inv.HasItemIncludingPending(playerId, place.TileType))
             return Deny(playerId, "tile_rejected", "item_not_in_inventory",
                 new { place.TileType, Reason = "backpack missing item or not synced yet" });
 

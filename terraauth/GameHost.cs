@@ -1025,6 +1025,11 @@ public sealed class GameHost : IDisposable
         {
             try
             {
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine(
+                        $"[ItemOwner] 下发包21 slot={item.Slot} id={item.ItemId} stack={item.Stack} " +
+                        $"pos=({item.Position.X:0},{item.Position.Y:0}) vel=({item.Velocity.X:0},{item.Velocity.Y:0}) droppedBy={item.DroppedBy}");
+
                 await Network.BroadcastWhereAsync(PacketId.ItemDrop,
                     new ItemDropPacket(item.ItemId, item.Stack)
                     {
@@ -1114,6 +1119,11 @@ public sealed class GameHost : IDisposable
         var remainingDelay = item.RemainingGrabDelayTicks(world.Tick);
         var grabDelayPlayer = remainingDelay > 0 && item.DroppedBy >= 0 ? item.DroppedBy : 255;
 
+        if (DiagnosticLog.Enabled)
+            Console.WriteLine(
+                $"[ItemOwner] 下发包22 slot={item.Slot} target={target} delayPlayer={grabDelayPlayer} " +
+                $"delayTime={remainingDelay} item@({item.Position.X:0},{item.Position.Y:0})");
+
         await Network.BroadcastAsync(PacketId.ItemPickup,
             new ItemOwnerPacket(target, item.Position)
             {
@@ -1185,6 +1195,22 @@ public sealed class GameHost : IDisposable
                     bestDistSq = distSq;
                     best = kv.Key;
                 }
+            }
+
+            // 诊断（默认关闭）：物品可见但不可拾取时，确认「归属搜索为何找不到玩家」。
+            // 原版客户端 Player.GrabItems 只拾取 playerIndexTheItemIsReservedFor == 自己的物品，
+            // 归属下发 255（无主）即等于「永久不可拾取」，故这里必须打印双方坐标与距离。
+            if (DiagnosticLog.Enabled && best == 255 && item.OwnerSearchAge % 20 == 0)
+            {
+                var players = new StringBuilder();
+                foreach (var kv in world.Players)
+                {
+                    var p = kv.Value;
+                    players.Append($" p{kv.Key}(active={p.Active},dead={p.Dead})@({p.Position.X:0},{p.Position.Y:0})");
+                }
+                Console.WriteLine(
+                    $"[ItemOwner] 归属搜索无结果 slot={item.Slot} item@({item.Position.X:0},{item.Position.Y:0}) " +
+                    $"droppedBy={item.DroppedBy} skipDropper={skipDropper} 半径={MathF.Sqrt(ItemOwnerSearchRangeSq):0}{players}");
             }
         }
         return best;
@@ -1509,7 +1535,11 @@ public sealed class GameHost : IDisposable
             }
         }
 
-        // 掉落物被拾取 / 失效：服务端补发包 21（stack=0）通知客户端移除
+        // 掉落物被拾取 / 失效：服务端补发包 151（ItemDestroy）通知客户端移除。
+        // 原版语义（WorldItem.active => type != 0 / NetMessage.SendData 在 IsAir 时自动把 21 改成 151）：
+        // 包 21 **没有移除语义**——客户端只写 stack、不动 type，故「21 + stack=0」会留下
+        // type != 0 && stack == 0 的幽灵（仍冒粒子、悬停仍显示名字，且永远拾取不了）；
+        // 若该槽位在客户端已是空气，客户端还会新建一个物品再设 stack=0 → 凭空造幽灵。
         WorldItemEntity[] removedItems;
         lock (world.ItemsLock)
             removedItems = world.Items.Where(i => !i.Active && !i.RemovalNotified).ToArray();
@@ -1518,13 +1548,8 @@ public sealed class GameHost : IDisposable
         {
             try
             {
-                await Network.BroadcastAsync(PacketId.ItemDrop,
-                    new ItemDropPacket(item.ItemId, 0)
-                    {
-                        ItemSlotIndex = item.Slot,
-                        Position = item.Position,
-                        Velocity = new Vector2(0, 0),
-                    }, ct).ConfigureAwait(false);
+                await Network.BroadcastAsync(PacketId.ItemDestroy,
+                    new ItemDestroyPacket(item.Slot), ct).ConfigureAwait(false);
 
                 item.RemovalNotified = true;
             }

@@ -9,10 +9,17 @@ namespace TerraAuth.Config;
 public record ServerConfig
 {
     // ---- 网络 ----
+    /// <summary>最大并发连接数；达到后新连接被拒绝。默认 64。</summary>
     public int MaxConnections { get; init; } = 64;
+
+    /// <summary>握手超时（秒）：连接建立后未在此时限内完成版本握手即断开。默认 10。</summary>
     public int HandshakeTimeoutSeconds { get; init; } = 10;
+
+    /// <summary>快照下发频率（Hz，20 = 每 50ms 一轮）。越高客户端越顺滑，带宽与 CPU 越高。默认 20。</summary>
     public int SnapshotRateHz { get; init; } = 20;
-    public float ViewportRadius { get; init; } = 2000f;   // 快照视野半径（像素）；0 = 不裁剪
+
+    /// <summary>视口裁剪半径（像素）：只向玩家下发此半径内的 NPC / 掉落物 / 液体 / 图格区块；0 = 不裁剪（全世界下发）。</summary>
+    public float ViewportRadius { get; init; } = 2000f;
 
     // ---- 世界 ----
     /// <summary>基准世界文件路径（.wld）；为空或文件不存在则按 <see cref="WorldSize"/> 程序化生成。</summary>
@@ -62,15 +69,25 @@ public record ServerConfig
     public int SessionResumeGraceSeconds { get; init; } = 60;
 
     // ---- 玩家属性权威 (Phase 2 IPlayerAuthority) ----
-    public int MaxPlayerHp { get; init; } = 500;           // 玩家生命上限（客户端不得抬高，超出即纠正）
-    public int MaxPlayerMana { get; init; } = 200;         // 玩家法力上限
+    /// <summary>玩家生命上限；客户端上报超过即被纠正回权威值。默认 500。</summary>
+    public int MaxPlayerHp { get; init; } = 500;
+
+    /// <summary>玩家法力上限；客户端上报超过即被纠正回权威值。默认 200。</summary>
+    public int MaxPlayerMana { get; init; } = 200;
 
     // ---- 移动权威 (Phase 2 IMovementAuthority) ----
     // 单一速度上限：飞行上限同时覆盖步行/冲刺以降低误判（见 GameHost.AuthorityThresholds.From）。
+    /// <summary>水平移动速度上限（像素/帧，60fps）：位置包位移超过「上限 × Δt + 容差」判超速并拒绝。默认 8。</summary>
     public float MaxFlightSpeed { get; init; } = 8.0f;
+
+    /// <summary>垂直下落速度上限（像素/帧）；原版落地终速约 20，故垂直允许位移取 max(水平上限, 本值)。默认 20。</summary>
     public float MaxFallSpeed { get; init; } = 20.0f;
-    public float TeleportTolerance { get; init; } = 4.0f;  // 单 tick 允许最大位移（防瞬移）
-    public float ShadowPredictionMaxDeviation { get; init; } = 8.0f; // 影子预测偏差阈值（px）
+
+    /// <summary>单次位置包的额外容差（像素），吸收网络抖动，避免正常移动被误判瞬移。默认 4。</summary>
+    public float TeleportTolerance { get; init; } = 4.0f;
+
+    /// <summary>影子预测偏差阈值（像素）：服务端预测位置与客户端实报位置差超过此值即回正。默认 8。</summary>
+    public float ShadowPredictionMaxDeviation { get; init; } = 8.0f;
 
     // ---- 战斗权威 (Phase 2 ICombatAuthority) ----
     /// <summary>
@@ -82,23 +99,41 @@ public record ServerConfig
     /// </summary>
     public GameMode GameMode { get; init; } = GameMode.Classic;
 
-    public int MaxSingleDamage { get; init; } = 30000;     // 单次伤害上限
-    public int MaxDpsWindowSeconds { get; init; } = 5;     // DPS 统计窗口
-    public int MaxDps { get; init; } = 50000;              // 窗口内最大 DPS
+    /// <summary>单次伤害上限（防「一击必杀」伪造）；包 28 的伤害线格式为 Int16，取值须 ≤ 32767。默认 30000。</summary>
+    public int MaxSingleDamage { get; init; } = 30000;
+
+    /// <summary>DPS 统计窗口（秒）。默认 5。</summary>
+    public int MaxDpsWindowSeconds { get; init; } = 5;
+
+    /// <summary>窗口内最大 DPS，超过即拒绝。默认 50000。</summary>
+    public int MaxDps { get; init; } = 50000;
 
     // ---- 世界/交互权威 (Phase 2 IWorldAuthority) ----
-    public int MaxTileBreakPerSecond { get; init; } = 60;  // 每秒挖砖上限
-    public int MaxTilePlacePerSecond { get; init; } = 40;  // 每秒放砖上限
+    /// <summary>单玩家每秒挖砖（破坏图格）上限。默认 60。</summary>
+    public int MaxTileBreakPerSecond { get; init; } = 60;
+
+    /// <summary>单玩家每秒放砖（放置图格 / 墙）上限。默认 40。</summary>
+    public int MaxTilePlacePerSecond { get; init; } = 40;
+
+    /// <summary>单玩家每秒新建弹幕上限。默认 30。</summary>
     public int MaxProjectilesPerSecond { get; init; } = 30;
 
     // ---- 限流权威 (Phase 2 IRateAuthority) ----
-    public int MaxPacketsPerSecond { get; init; } = 120;   // 单玩家每秒上行包总量上限
-    public int MaxChatPerMinute { get; init; } = 30;       // 单玩家每分钟聊天上限
-    public int MaxLiquidPerSecond { get; init; } = 60;     // 单玩家每秒液体编辑帧上限（包 82 模块 0）
+    /// <summary>单玩家每秒上行包总量上限。默认 120。</summary>
+    public int MaxPacketsPerSecond { get; init; } = 120;
+
+    /// <summary>单玩家每分钟聊天条数上限。默认 30。</summary>
+    public int MaxChatPerMinute { get; init; } = 30;
+
+    /// <summary>单玩家每秒液体编辑帧上限（包 82 模块 0）。默认 60。</summary>
+    public int MaxLiquidPerSecond { get; init; } = 60;
 
     // ---- 库存权威 (Phase 2 IInventoryAuthority) ----
-    public bool SscEnabled { get; init; } = true;          // Server Side Characters
-    public int MaxStackSize { get; init; } = 999;          // 单格最大堆叠
+    /// <summary>SSC（Server Side Characters）：服务端背包 / 生命 / 法力权威开关，见文件头与 <c>world.SscEnabled</c>。默认 true。</summary>
+    public bool SscEnabled { get; init; } = true;
+
+    /// <summary>单格最大堆叠（服务端权威上限，客户端上报超过即拒）。原版多为 9999，本项目默认 999。</summary>
+    public int MaxStackSize { get; init; } = 999;
 
     /// <summary>
     /// 玩家从背包移除（清空 / 换出）召唤武器后，是否立即销毁该玩家已召唤的弹幕。
@@ -117,8 +152,11 @@ public record ServerConfig
     public SummonAuthorityMode SummonAuthority { get; init; } = SummonAuthorityMode.ClientDriven;
 
     // ---- 封禁 / 违规处置 (Phase 6 IBanManager + Phase 5 连接处置) ----
-    public int MaxViolationsBeforeBan { get; init; } = 10; // 窗口内累计违规达此值 → 封禁记录 + 踢出连接
-    public int ViolationWindowMinutes { get; init; } = 60; // 违规时间窗口（滑动，分钟）
+    /// <summary>违规滑动窗口内累计达此值 → 记录封禁并踢出连接。默认 10。</summary>
+    public int MaxViolationsBeforeBan { get; init; } = 10;
+
+    /// <summary>违规统计窗口（滑动，分钟）。默认 60。</summary>
+    public int ViolationWindowMinutes { get; init; } = 60;
 
     // ---- 连接认证 (Phase 5) ----
     /// <summary>玩家名白名单（包 4 SyncPlayer）；为空表示不限制。</summary>
@@ -132,8 +170,11 @@ public record ServerConfig
     public ModPolicy ModPolicy { get; init; } = new();
 
     // ---- 监控 (Phase 6 IMetrics) ----
+    /// <summary>是否启用 Prometheus 指标端点。</summary>
     public bool MetricsEnabled { get; init; } = true;
-    public int MetricsPort { get; init; } = 9090;          // Prometheus 抓取端口
+
+    /// <summary>Prometheus 抓取端口（默认 9090）；非管理员权限下可能绑定失败（仅告警，不影响游戏）。</summary>
+    public int MetricsPort { get; init; } = 9090;
 
     // ---- 诊断 ----
     /// <summary>

@@ -677,11 +677,12 @@ public class VanillaFeatureTests
     }
 
     /// <summary>
-    /// B2：开宝藏袋不得给整包建立静默屏障。原版开袋后会继续上报其它槽位（奖励入包 / 后续整理），
-    /// 若这些包被静默丢弃，玩家会看到背包「卡住」；此处验证开袋同时另一槽位的守恒整理仍被提交。
+    /// 开袋与同窗口的其它槽位整理必须一起结算（不给整包建立静默屏障）。
+    /// 原版开袋 = 客户端掷骰：清空袋槽 + 上报战利品；服务端按宝袋战利品池校验后**提交客户端掷骰结果**
+    /// （战利品保留在客户端上报的槽位），同窗口的整理一并提交。
     /// </summary>
     [Fact]
-    public async Task Vanilla_TreasureBag_DoesNotSilenceOtherSlots()
+    public async Task Vanilla_TreasureBag_OpenCommits_WithOtherSlots()
     {
         using var server = VanillaServer.Start();
         await using var s = await server.ConnectAsync("Alice");
@@ -697,25 +698,53 @@ public class VanillaFeatureTests
         player.Items[51] = 40;
         player.ItemStacks[51] = 4;
 
-        // 客户端清空袋槽（触发权威开袋）+ 同一窗口内整理其它槽位（10/4 → 6/8，守恒）
+        // 客户端：清空袋槽 + 上报掷骰战利品（880×45 / 3097×1）+ 同一窗口内整理其它槽位（10/4 → 6/8，守恒）
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(40, 0, 0));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(41, 880, 45));
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(42, 3097, 1));
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(50, 40, 6));
         await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(51, 40, 8));
 
-        Assert.True(await TickUntilAsync(server, () => player.Items[40] == 0 && player.ItemStacks[40] == 0,
-            TimeSpan.FromSeconds(5)), "宝袋未被权威开袋");
         Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
             "背包事务未结算");
+
+        // 开袋提交：袋被消耗、战利品按客户端掷骰原样入包
+        Assert.Equal(0, player.Items[40]);
+        Assert.Equal(880, player.Items[41]);
+        Assert.Equal(45, player.ItemStacks[41]);
+        Assert.Equal(3097, player.Items[42]);
+        Assert.Equal(1, player.ItemStacks[42]);
 
         // 其它槽位的守恒整理被提交（未被开袋屏障静默丢弃）
         Assert.Equal(40, player.Items[50]);
         Assert.Equal(6, player.ItemStacks[50]);
         Assert.Equal(40, player.Items[51]);
         Assert.Equal(8, player.ItemStacks[51]);
+    }
 
-        // 奖励已由服务端生成（腐化 / 猩红世界的矿物，堆叠 30..90）
-        Assert.Contains(Enumerable.Range(0, PlayerRuntime.InventorySlotCount).Select(i => player.Items[i]),
-            id => id is 56 or 880);
+    /// <summary>
+    /// 宝袋在背包里被鼠标「拿在手上」（只清空槽位、没有战利品）必须回滚：
+    /// 袋子留在原槽，绝不被静默吞掉（否则玩家放回袋子时又被判造物回滚 → 袋子凭空消失）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_TreasureBag_CursorPickup_IsRolledBack()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        var player = world.Players[1];
+        await StandAtAsync(server, s, world.SpawnTileX * 16f + 8f, world.SpawnTileY * 16f - 8f);
+
+        player.Items[40] = 3319;
+        player.ItemStacks[40] = 1;
+
+        await s.SendAsync(PacketId.InventorySlot, new InventorySlotPacket(40, 0, 0));
+
+        Assert.True(await SettleInventoryTransactionAsync(server, player, TimeSpan.FromSeconds(5)),
+            "背包事务未结算");
+
+        Assert.Equal(3319, player.Items[40]);
+        Assert.Equal(1, player.ItemStacks[40]);
     }
 
     /// <summary>

@@ -4,7 +4,7 @@
 // 见 Simulation/Combat/SummonEntityTable.cs 的 62 条）与「本体 AI 自己发射的派生弹幕」分开。
 // 这是 backlog W-2 里 `ServerShots`（服务端生成本体派生弹幕）的前置数据。
 //
-// 来源与口径（Terraria 1.4.5.8 反编译源码，逐条人工读 AI；脚本无法可靠完成，原因见下）：
+// 来源与口径（Terraria 1.4.5.8 原版 AI 行为逐条人工核对；脚本无法可靠完成，原因见下）：
 //   · 只有**本体所走的那条 AI 分支内、且 type 条件对本本体成立**的 `Projectile.NewProjectile`
 //     才算派生。原版把几十个 type 塞进同一个巨型 AI（`AI_026` / `AI_062` / `AI_067` / `AI_133` 内联块 …），
 //     发射点的 Type 往往在**函数入口按 type 赋给局部变量**（如 `int num48 = 0; if (type == 373) num48 = 374;`），

@@ -10,12 +10,15 @@ public sealed class ConfigurationService : IConfigurationService
 {
     /// <summary>
     /// 配置序列化选项：枚举以字符串读写（如 ModPolicy.Mode = "Whitelist"），
-    /// 属性名大小写不敏感，便于运维手写配置。
+    /// 属性名大小写不敏感，便于运维手写配置；**允许 `//` 注释与尾随逗号**，
+    /// 使 server.json 能携带逐项中文说明（说明见 <see cref="ConfigDocumentation"/>）。
     /// </summary>
     public static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
         WriteIndented = true,
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
         Converters = { new JsonStringEnumConverter() },
     };
 
@@ -51,12 +54,16 @@ public sealed class ConfigurationService : IConfigurationService
         _watcher.EnableRaisingEvents = true;
     }
 
+    /// <summary>
+    /// 写配置：统一走 <see cref="ConfigDocumentation.Render"/>，保证每次重写（生成默认配置 / 切换世界 /
+    /// 重置世界改动）都带上逐项中文说明，不会把运维手工加的注释冲掉。
+    /// </summary>
     public static void Write(string path, ServerConfig config)
     {
         var fullPath = Path.GetFullPath(path);
         var directory = Path.GetDirectoryName(fullPath);
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-        File.WriteAllText(fullPath, JsonSerializer.Serialize(config, JsonOptions));
+        File.WriteAllText(fullPath, ConfigDocumentation.Render(config));
     }
 
     public void Reload()

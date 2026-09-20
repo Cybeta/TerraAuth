@@ -2570,82 +2570,251 @@ public class SimulationTests
         Assert.Equal(10000, q.Count);
     }
 
+    /// <summary>
+    /// SSC 宝袋：客户端右键开袋 = 「袋槽清空 + 同窗口上报客户端掷骰的战利品」。
+    /// 守恒判据按宝袋战利品池（<see cref="BossBagLootTable"/>）解释 → **提交**，战利品保留。
+    /// （旧实现由服务端另掷一次奖励，与客户端回显冲突 → 整窗回滚，真机表现为
+    /// 「战利品出现约 1 秒后全部消失」。）
+    /// </summary>
     [Fact]
-    public void OpenEyeOfCthulhuTreasureBag_ConsumesBagAndAddsRewards()
+    public void TreasureBag_ClientRoll_IsCommitted_AndLootKept()
     {
-        var world = new WorldState();
-        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
-        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;      // 眼魔宝袋
+        player.ItemStacks[3] = 1;
         lock (world.PlayersLock)
-        {
-            var player = new PlayerRuntime { Id = 1, SessionId = 7, Active = true };
-            player.Items[3] = 3319;
-            player.ItemStacks[3] = 1;
             world.Players[1] = player;
-        }
+        var rng = new XoshiroRng(1);
 
-        var result = new OpenEyeOfCthulhuTreasureBagCommand(1, 1, 3) { SessionId = 7 }
-            .Apply(world, new FixedRng(0, 0, 0, 0, 0));
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 5, 2171, 2).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 6, 47, 30).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 7, 3097, 1).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 8, 2112, 1).Apply(world, rng).Applied);
 
-        Assert.True(result.Applied);
-        var playerAfter = world.Players[1];
-        Assert.DoesNotContain(playerAfter.Items.Zip(playerAfter.ItemStacks), item => item.First == 3319 && item.Second > 0);
-        Assert.Contains(56, playerAfter.Items);
-        Assert.Contains(47, playerAfter.Items);
-        Assert.Contains(59, playerAfter.Items);
-        Assert.Contains(2112, playerAfter.Items);
-        Assert.Contains(1299, playerAfter.Items);
-        Assert.Contains((1, 7L, 3), world.DrainInventoryUpdates(59));
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+
+        Assert.Equal(0, player.Items[3]);            // 袋已开（消耗）
+        Assert.Equal(880, player.Items[4]);
+        Assert.Equal(52, player.ItemStacks[4]);
+        Assert.Equal(2171, player.Items[5]);
+        Assert.Equal(47, player.Items[6]);
+        Assert.Equal(3097, player.Items[7]);
+        Assert.Equal(2112, player.Items[8]);
     }
 
+    /// <summary>
+    /// SSC 宝袋：窗口里同时存在**与开袋无关的非法增加**（真机场景：客户端与服务端背包不一致的槽位，
+    /// 例如客户端手里多出一件服务端不认的物品）时，开袋仍必须成交 —— 开袋单独结算，
+    /// 无关槽位照旧回滚。这修的是「背包里只要有一件未同步物品，宝袋就永远打不开」。
+    /// </summary>
     [Fact]
-    public void OpenEyeOfCthulhuTreasureBag_FullInventory_DoesNotConsumeBag()
+    public void TreasureBag_OpenCommits_EvenWithUnrelatedForgeryInWindow()
     {
-        var world = new WorldState();
-        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
-        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true, SessionId = 7 };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
         lock (world.PlayersLock)
-        {
-            var player = new PlayerRuntime { Id = 1, Active = true };
-            for (var slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
-            {
-                player.Items[slot] = 1;
-                player.ItemStacks[slot] = 999;
-            }
-            player.Items[3] = 3319;
-            player.ItemStacks[3] = 1;
             world.Players[1] = player;
-        }
+        var rng = new XoshiroRng(1);
 
-        var result = new OpenEyeOfCthulhuTreasureBagCommand(1, 1, 3)
-            .Apply(world, new FixedRng(0, 0, 0, 1, 1));
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 5, 3097, 1).Apply(world, rng).Applied);
+        // 无关的非法增加：权威背包里该槽为空，客户端却报有 72x35（不在宝袋战利品池内）
+        Assert.True(new StageInventorySlotCommand(100, 1, 52, 72, 35).Apply(world, rng).Applied);
 
-        Assert.False(result.Applied);
-        Assert.Equal(CommandFailures.InventoryFull, result.Reason);
-        Assert.Equal(3319, world.Players[1].Items[3]);
-        Assert.Equal(1, world.Players[1].ItemStacks[3]);
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+
+        // 开袋成交：袋消耗、战利品落地
+        Assert.Equal(0, player.Items[3]);
+        Assert.Equal(880, player.Items[4]);
+        Assert.Equal(52, player.ItemStacks[4]);
+        Assert.Equal(3097, player.Items[5]);
+        // 无关槽位照旧回滚（未被开袋带进来）
+        Assert.Equal(0, player.Items[52]);
+
+        // 三个已成交槽位都要回写客户端，否则客户端本地仍是旧值
+        var updates = world.DrainInventoryUpdates(8);
+        Assert.Contains((1, 7L, 3), updates);
+        Assert.Contains((1, 7L, 4), updates);
+        Assert.Contains((1, 7L, 5), updates);
     }
 
+    /// <summary>
+    /// SSC 宝袋：开袋**除装备外还给金币** —— 原版 <c>Player.OpenBossBag</c> 结尾把 Boss 的
+    /// <c>NPC.value</c>（克苏鲁之眼 = 30000 铜币）乘随机系数后换算成钱币。原实现漏了这段，
+    /// 真机表现为「开袋后金币出现又消失」。金币按铜币总量区间（基础值 × [0.8, 2.883]）校验。
+    /// </summary>
     [Fact]
-    public void OpenEyeOfCthulhuTreasureBag_CannotBeOpenedTwice()
+    public void TreasureBag_CoinReward_IsCommitted_WhenWithinRange()
     {
-        var world = new WorldState();
-        var enforcers = new AuthorityEnforcers(new RateLimits(), new NoOpAuditLogger(), world);
-        world.InventoryLedger = enforcers.Inventory as IInventoryLedger;
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
         lock (world.PlayersLock)
-        {
-            var player = new PlayerRuntime { Id = 1, Active = true };
-            player.Items[3] = 3319;
-            player.ItemStacks[3] = 1;
             world.Players[1] = player;
-        }
+        var rng = new XoshiroRng(1);
 
-        var command = new OpenEyeOfCthulhuTreasureBagCommand(1, 1, 3);
-        Assert.True(command.Apply(world, new FixedRng(0, 0, 0, 1, 1)).Applied);
-        var repeat = command.Apply(world, new FixedRng(0, 0, 0, 1, 1));
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 5, 3097, 1).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 6, 72, 675).Apply(world, rng).Applied);   // 675 银币 = 67500 铜币
 
-        Assert.False(repeat.Applied);
-        Assert.Equal(CommandFailures.NotApplied, repeat.Reason);
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+
+        Assert.Equal(0, player.Items[3]);
+        Assert.Equal(880, player.Items[4]);
+        Assert.Equal(3097, player.Items[5]);
+        Assert.Equal(72, player.Items[6]);
+        Assert.Equal(675, player.ItemStacks[6]);
+    }
+
+    /// <summary>
+    /// SSC 宝袋：开袋金币超出原版区间（&gt; 2.883 × 30000 = 86490 铜币）→ **只有金币槽回滚**，
+    /// 开袋本身（袋消耗 + 装备战利品）照常成交 —— 越界的槽位不能把开袋一起拖下水。
+    /// </summary>
+    [Fact]
+    public void TreasureBag_CoinReward_AboveRange_OnlyCoinsRolledBack()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 6, 73, 9).Apply(world, rng).Applied);   // 9 金币 = 90000 铜币
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+
+        Assert.Equal(0, player.Items[3]);            // 袋照常消耗
+        Assert.Equal(880, player.Items[4]);          // 装备战利品照常到手
+        Assert.Equal(0, player.Items[6]);            // 越界金币不回滚进背包
+    }
+
+    /// <summary>
+    /// SSC 宝袋：**鼠标把袋子拿在手上**（拖拽 / 换位）只让客户端把该槽上报为空，没有战利品也没有掉落。
+    /// 这类清空必须回滚（袋子留在原槽）——否则通用「纯减少 = 消耗」会把袋子静默吞掉，
+    /// 玩家把袋子放回背包时又被判凭空造物回滚 → 袋子凭空消失。
+    /// </summary>
+    [Fact]
+    public void TreasureBag_CursorPickup_WithoutLoot_RollsBack_AndKeepsBag()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, new XoshiroRng(1)).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(3319, player.Items[3]);         // 袋子留在权威背包
+        Assert.Equal(1, player.ItemStacks[3]);
+    }
+
+    /// <summary>SSC 宝袋：丢弃（槽位清空 + 本窗口该玩家丢到世界的同一件袋）→ 提交；袋只存在于地面，不复制。</summary>
+    [Fact]
+    public void TreasureBag_DroppedToWorld_IsCommitted()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new SpawnItemCommand(100, 1, 3319, 1, new Vector2(100, 100), new Vector2(0, 0), 0)
+            .Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[3]);
+        Assert.Contains(world.Items, i => i.ItemId == 3319 && i.Active);   // 地面上有那件袋
+    }
+
+    /// <summary>SSC 宝袋：战利品超出单次开袋上限（880 上限 90）→ 判造物回滚，袋不被消耗。</summary>
+    [Fact]
+    public void TreasureBag_Loot_AboveTableLimit_RollsBack()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 91).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(3319, player.Items[3]);
+    }
+
+    /// <summary>
+    /// SSC 宝袋：背包已满 → 原版开袋的战利品直接掉到地上（<c>GetOrDropItem</c>）。
+    /// 此时窗口里没有背包增量，但**本窗口该玩家掉到地上的战利品**同样构成开袋证据 → 提交。
+    /// </summary>
+    [Fact]
+    public void TreasureBag_LootDroppedToWorld_IsCommitted()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        // 战利品溢出到地面：客户端发包 21（index=400）→ 服务端生成该玩家的掉落物
+        Assert.True(new SpawnItemCommand(100, 1, 3097, 1, new Vector2(100, 100), new Vector2(0, 0), 0)
+            .Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[3]);
+    }
+
+    /// <summary>
+    /// SSC 宝袋：**未建模战利品池的袋**（如史莱姆王袋 3320）失败关闭 —— 净减少得不到解释即回滚，
+    /// 袋子留在背包（宁可打不开，也不能被静默销毁或凭空造物）。
+    /// </summary>
+    [Fact]
+    public void TreasureBag_UnmodeledBag_RollsBack()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3320;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 56, 90).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(3320, player.Items[3]);
     }
 
     [Fact]
@@ -2704,8 +2873,6 @@ public class SimulationTests
         public bool ConsumeItem(int playerId, int itemId) => false;
         public bool TryAddItem(int playerId, int itemId, int stack) => false;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => false;
-        public InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(int playerId, int slot, IReadOnlyList<InventoryReward> rewards)
-            => InventoryBagOpenResult.InvalidBag;
     }
 
     /// <summary>背包一律接受（用于并发拾取等只关心原子性的用例）。</summary>
@@ -2714,8 +2881,6 @@ public class SimulationTests
         public bool ConsumeItem(int playerId, int itemId) => true;
         public bool TryAddItem(int playerId, int itemId, int stack) => true;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => true;
-        public InventoryBagOpenResult TryOpenEyeOfCthulhuTreasureBag(int playerId, int slot, IReadOnlyList<InventoryReward> rewards)
-            => InventoryBagOpenResult.Success;
     }
 }
 

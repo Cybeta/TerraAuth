@@ -1,48 +1,125 @@
 {
+  // ===== TerraAuth 服务端配置（server.json）=====
+  // 每行选项的上方注释即该项含义；改动保存后立即热重载（FileSystemWatcher）。
+  // 本文件会被服务端在「首次生成默认配置 / 切换世界 / 重置世界改动」时自动重写，注释不会丢失。
+  // 支持 // 注释与尾随逗号；枚举一律用字符串（如 "Expert"、"ServerDamage"）。
+
+  // ---- 网络 ----
+  // 最大并发连接数；达到后新连接被拒绝。默认 64。
   "MaxConnections": 64,
+  // 握手超时（秒）：连接建立后未在此时限内完成版本握手即断开。默认 10。
   "HandshakeTimeoutSeconds": 10,
+  // 快照下发频率（Hz，20 = 每 50ms 一轮）。越高越顺滑，带宽与 CPU 越高。默认 20。
   "SnapshotRateHz": 20,
+  // 视口裁剪半径（像素）：只向玩家下发此半径内的 NPC / 掉落物 / 液体 / 图格区块；0 = 不裁剪（全世界下发）。默认 2000。
   "ViewportRadius": 2000,
+
+  // ---- 世界 ----
+  // 基准世界文件路径（.wld）。留空或文件不存在 → 按 WorldSize + WorldSeed 程序化生成。
   "WorldPath": "",
+  // 程序化世界尺寸档："Small"（4200×1200）/ "Medium"（6400×1800）/ "Large"（8400×2400）。仅 WorldPath 为空或文件不存在时生效。
   "WorldSize": "Small",
+  // 程序化生成的随机种子（决定地形 / 群系 / 矿脉分布）。改种子 = 换一张新地图，重启生效；换种子后请把 ResetWorldChangesOnStart 置 true 跑一次。
   "WorldSeed": 20260916,
+  // 启动时清空持久化的世界改动（图格 + 箱子内容）：换种子 / 换 .wld 时置 true 用一次。服务端复位后会自动把它改回 false（置 true 期间每次重启都会丢弃玩家改动）。
   "ResetWorldChangesOnStart": false,
-  "MaxEnemies": 2,
-  "GameMode": "Expert",
+  // 世界导出路径（.wld）；留空 = 不导出。与 WorldPath 相同即原地保存（导出前旧文件滚动为 .bak）。
   "WorldExportPath": "",
+  // 空服导出世界的间隔（秒）；仅在 WorldExportPath 非空且无人在线时生效。默认 600。
   "WorldExportIntervalSeconds": 600,
+  // 同屏敌怪上限（达到后停止刷怪；只统计存活且非城镇的 NPC，普通情况即史莱姆）。单人测试可调小（如 2）。默认 8。
+  "MaxEnemies": 2,
+  // 会话恢复宽限期（秒）：同名玩家在此期限内重连，服务端交还原运行时（位置 / 血量 / 增益）而不是当新玩家从头进服。0 = 关闭（断线即回收）。默认 60。
   "SessionResumeGraceSeconds": 60,
+
+  // ---- 玩家属性权威 ----
+  // 玩家生命上限；客户端上报超过即被纠正回权威值。默认 500。
   "MaxPlayerHp": 500,
+  // 玩家法力上限；客户端上报超过即被纠正回权威值。默认 200。
   "MaxPlayerMana": 200,
+
+  // ---- 移动权威 ----
+  // 水平移动速度上限（像素/帧，60fps）：位置包位移超过「上限 × Δt + TeleportTolerance」判为超速并拒绝。默认 8。
   "MaxFlightSpeed": 8,
+  // 垂直下落速度上限（像素/帧）。原版落地终速约 20，故垂直允许位移取 max(MaxFlightSpeed, MaxFallSpeed)。默认 20。
   "MaxFallSpeed": 20,
+  // 单次位置包的额外容差（像素），用于吸收网络抖动，避免正常移动被误判瞬移。默认 4。
   "TeleportTolerance": 4,
+  // 影子预测偏差阈值（像素）：服务端预测位置与客户端实报位置差超过此值即回正。默认 8。
   "ShadowPredictionMaxDeviation": 8,
+
+  // ---- 战斗权威 ----
+  // 游戏难度："Classic" / "Expert" / "Master"。决定玩家受击的减防系数与 NPC 生成时的生命 / 伤害倍率（专家 ×2、大师 ×3）。
+  "GameMode": "Expert",
+  // 单次伤害上限（防「一击必杀」伪造）。注意包 28 的伤害线格式为 Int16，取值必须 ≤ 32767，否则该阈值永不触发。默认 30000。
   "MaxSingleDamage": 30000,
+  // DPS 统计窗口（秒）。默认 5。
   "MaxDpsWindowSeconds": 5,
+  // 窗口内最大 DPS，超过即拒绝。默认 50000。
   "MaxDps": 50000,
+
+  // ---- 世界 / 交互权威 ----
+  // 单玩家每秒挖砖（破坏图格）上限。默认 60。
   "MaxTileBreakPerSecond": 60,
+  // 单玩家每秒放砖（放置图格 / 墙）上限。默认 40。
   "MaxTilePlacePerSecond": 40,
+  // 单玩家每秒新建弹幕上限。默认 30。
   "MaxProjectilesPerSecond": 30,
-  "MaxLiquidPerSecond": 60,
+
+  // ---- 限流权威 ----
+  // 单玩家每秒上行包总量上限。默认 120。
   "MaxPacketsPerSecond": 120,
+  // 单玩家每分钟聊天条数上限。默认 30。
   "MaxChatPerMinute": 30,
+  // 单玩家每秒液体编辑帧上限（包 82 模块 0）。默认 60。
+  "MaxLiquidPerSecond": 60,
+
+  // ---- 库存权威（SSC 服务端背包） ----
+  // SSC（Server Side Characters）：true = 背包 / 生命 / 法力由服务端权威持有（进图全量下发 59 槽，开袋 / 拾取 / 合成走守恒事务）；false = 原版非 SSC 流程，以客户端本地背包为准（服务端背包权威功能全部停用）。
   "SscEnabled": true,
+  // 单格最大堆叠（服务端权威上限；客户端上报超过即拒绝）。原版多数物品为 9999，本项目默认 999。
   "MaxStackSize": 999,
+  // true = 玩家把召唤武器移出（清空 / 换出）背包后立即销毁其召唤弹幕（并同步移除召唤 Buff）；false（默认）= 原版行为，召唤物继续存在至自然消失 / 被替换 / 断线。
   "DestroySummonsOnWeaponRemoval": true,
+
+  // ---- 召唤权威 ----
+  // 召唤 / 哨兵的服务端权威档位："ClientDriven"（默认，位置与节奏由客户端 AI 驱动）/ "ServerDamage"（命中伤害由服务端裁定）/ "ServerAi"（位置也由服务端接管）/ "ServerShots"（服务端生成派生弹幕）。逐级开启，可热重载。
   "SummonAuthority": "ClientDriven",
+
+  // ---- 封禁 / 违规处置 ----
+  // 违规滑动窗口内累计达此值 → 记录封禁并踢出连接。默认 10。
   "MaxViolationsBeforeBan": 10,
+  // 违规统计窗口（滑动，分钟）。默认 60。
   "ViolationWindowMinutes": 60,
+
+  // ---- 连接认证 ----
+  // 玩家名白名单（取包 4 上报的玩家名）；[] = 不限制。
   "PlayerWhitelist": [],
+
+  // ---- Mod 兼容层 ----
+  // Mod 兼容策略（预留接口）。
   "ModPolicy": {
+    // 策略模式："VanillaOnly"（仅原版客户端）/ "Whitelist"（只允许 AllowedMods 列出的 Mod）/ "Blacklist"（禁止 BlockedMods 列出的 Mod）/ "AllowAll"（全部允许，仅记录日志）。
     "Mode": "VanillaOnly",
+    // Whitelist 模式下，出现未列出的 Mod 是否直接拒绝连接。
     "BlockOnUnlistedMod": true,
+    // 是否允许仅客户端 Mod（不影响服务端，默认允许）。
     "AllowClientSideMods": true,
+    // 白名单条目：[{ "Name": "Mod 名", "MinVersion": "1.0", "MaxVersion": "2.0", "Hash": "可选哈希" }]（后三项可省略）。
     "AllowedMods": [],
+    // 黑名单条目，格式同 AllowedMods。
     "BlockedMods": [],
+    // 强制要求的 Mod（缺失即拒绝连接），格式同 AllowedMods。
     "RequiredMods": []
   },
+
+  // ---- 监控 ----
+  // 是否启用 Prometheus 指标端点。
   "MetricsEnabled": true,
+  // Prometheus 抓取端口（默认 9090）。非管理员权限下可能绑定失败（仅告警，不影响游戏）。
   "MetricsPort": 9090,
+
+  // ---- 诊断 ----
+  // 热路径诊断日志开关：开启后输出逐包 / 逐次受伤 / 逐次命中 / 背包事务 [InventoryTx] / 掉落物归属 [ItemOwner] 等明细，用于真机排障。正常游玩请置 false。可热重载。
   "VerboseDiagnostics": false
 }
