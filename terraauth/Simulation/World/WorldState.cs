@@ -15,6 +15,8 @@ namespace TerraAuth.Simulation;
 public interface IInventoryLedger
 {
     bool ConsumeItem(int playerId, int itemId);
+    /// <summary>消耗集合里任意一个物品 1 个（优先手持槽）。返回 false 表示都没有。</summary>
+    bool ConsumeAnyItem(int playerId, IReadOnlyList<int> itemIds);
     bool TryAddItem(int playerId, int itemId, int stack);
     bool TryAddItemExactly(int playerId, int itemId, int stack);
 }

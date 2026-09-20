@@ -131,6 +131,12 @@ public interface IInventoryAuthority
     /// 权威背包要等 15 tick 守恒窗口结算后才有该物品，只看权威值会误拒放置。
     /// </summary>
     bool HasItemIncludingPending(int playerId, int itemId);
+    /// <summary>
+    /// 背包中是否有该集合里的任意一个物品（计入本窗口未结算的暂存值）；命中时给出命中的物品 ID。
+    /// 用于放置反查：同一图格 / 墙可由多个物品放置（工作台图格 18 对应 36/635/637… 数十个变体），
+    /// 逐个 <see cref="HasItemIncludingPending"/> 探测既慢又难回落诊断。
+    /// </summary>
+    bool HasAnyItemIncludingPending(int playerId, IReadOnlyList<int> itemIds, out int matchedItemId);
     /// <summary>消耗玩家背包中 1 个指定物品：找到第一个匹配槽位 stack-1，stack 归零则置 ItemId=0。返回 false 表示背包中无此物品。</summary>
     bool ConsumeItem(int playerId, int itemId);
     /// <summary>把物品加入服务端权威背包（优先并入同物品未满堆叠，其次占用空槽）。返回 false 表示背包已满。</summary>

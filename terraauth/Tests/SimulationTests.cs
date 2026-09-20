@@ -2871,6 +2871,7 @@ public class SimulationTests
     private sealed class RejectingInventoryLedger : IInventoryLedger
     {
         public bool ConsumeItem(int playerId, int itemId) => false;
+        public bool ConsumeAnyItem(int playerId, IReadOnlyList<int> itemIds) => false;
         public bool TryAddItem(int playerId, int itemId, int stack) => false;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => false;
     }
@@ -2879,6 +2880,7 @@ public class SimulationTests
     private sealed class AcceptingInventoryLedger : IInventoryLedger
     {
         public bool ConsumeItem(int playerId, int itemId) => true;
+        public bool ConsumeAnyItem(int playerId, IReadOnlyList<int> itemIds) => true;
         public bool TryAddItem(int playerId, int itemId, int stack) => true;
         public bool TryAddItemExactly(int playerId, int itemId, int stack) => true;
     }

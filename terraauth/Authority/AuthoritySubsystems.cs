@@ -833,6 +833,64 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
         }
     }
 
+    /// <summary>
+    /// 集合版 <see cref="HasItemIncludingPending"/>：任意一个候选物品命中即通过。
+    /// 为什么需要：放置请求携带图格 / 墙 ID，而同一图格可由数十个物品放置
+    /// （工作台图格 18 ↔ 物品 36/635/637…），必须按候选集合探测背包，否则手持非最小 ID 变体会被误拒。
+    /// 优先级与扣减一致：手持槽 → 其它权威槽 → 本窗口未结算的暂存值。
+    /// </summary>
+    public bool HasAnyItemIncludingPending(int playerId, IReadOnlyList<int> itemIds, out int matchedItemId)
+    {
+        matchedItemId = 0;
+        if (itemIds.Count == 0) return false;
+
+        lock (_world.PlayersLock)
+        {
+            if (!_world.Players.TryGetValue(playerId, out var player)) return false;
+
+            // 手持槽优先：玩家放置时扣的就是手上那件，命中它也最符合直觉
+            var selected = player.SelectedSlot;
+            if (selected >= 0 && selected < PlayerRuntime.InventorySlotCount &&
+                player.ItemStacks[selected] > 0 && ContainsItem(itemIds, player.Items[selected]))
+            {
+                matchedItemId = player.Items[selected];
+                return true;
+            }
+
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+                if (player.ItemStacks[slot] > 0 && ContainsItem(itemIds, player.Items[slot]))
+                {
+                    matchedItemId = player.Items[slot];
+                    return true;
+                }
+
+            // 暂存值：客户端「合成后立刻放置」时权威背包还没该物品（见 HasItemIncludingPending）
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            {
+                if (player.PendingInventoryChanges.TryGetValue(slot, out var staged) &&
+                    staged.Stack > 0 && ContainsItem(itemIds, staged.ItemId))
+                {
+                    matchedItemId = staged.ItemId;
+                    return true;
+                }
+                if (player.PendingChestInventoryChanges.TryGetValue(slot, out var chestStaged) &&
+                    chestStaged.Stack > 0 && ContainsItem(itemIds, chestStaged.ItemId))
+                {
+                    matchedItemId = chestStaged.ItemId;
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    private static bool ContainsItem(IReadOnlyList<int> itemIds, int itemId)
+    {
+        for (int i = 0; i < itemIds.Count; i++)
+            if (itemIds[i] == itemId) return true;
+        return false;
+    }
+
     public bool ConsumeItem(int playerId, int itemId)
     {
         lock (_world.PlayersLock)
@@ -866,6 +924,71 @@ internal sealed class InventoryAuthority : IInventoryAuthority, IInventoryLedger
                 }
                 if (player.PendingChestInventoryChanges.TryGetValue(slot, out var chestStaged) &&
                     chestStaged.ItemId == itemId && chestStaged.Stack > 0)
+                {
+                    var left = chestStaged.Stack - 1;
+                    player.PendingChestInventoryChanges[slot] = left > 0
+                        ? (chestStaged.ItemId, left, chestStaged.Prefix)
+                        : (0, 0, (byte)0);
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 集合版 <see cref="ConsumeItem"/>：消耗任意一个候选物品 1 个。
+    /// 优先级：手持槽 → 其它权威槽 → 暂存值（与 <see cref="HasAnyItemIncludingPending"/> 一致，
+    /// 保证「校验命中哪件、扣减就扣哪件」）。权威槽扣完的收尾动作与 <see cref="ConsumeItem"/> 完全相同。
+    /// </summary>
+    public bool ConsumeAnyItem(int playerId, IReadOnlyList<int> itemIds)
+    {
+        if (itemIds.Count == 0) return false;
+
+        lock (_world.PlayersLock)
+        {
+            if (!_world.Players.TryGetValue(playerId, out var player)) return false;
+
+            var selected = player.SelectedSlot;
+            if (selected >= 0 && selected < PlayerRuntime.InventorySlotCount &&
+                player.ItemStacks[selected] > 0 && ContainsItem(itemIds, player.Items[selected]))
+            {
+                if (--player.ItemStacks[selected] == 0)
+                {
+                    player.Items[selected] = 0;
+                    player.ItemPrefixes[selected] = 0;
+                }
+                player.RecalculateDefense();
+                _world.MarkInventoryChanged(playerId, player.SessionId, selected);
+                return true;
+            }
+
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            {
+                if (player.ItemStacks[slot] <= 0 || !ContainsItem(itemIds, player.Items[slot])) continue;
+                if (--player.ItemStacks[slot] == 0)
+                {
+                    player.Items[slot] = 0;
+                    player.ItemPrefixes[slot] = 0;
+                }
+                player.RecalculateDefense();
+                _world.MarkInventoryChanged(playerId, player.SessionId, slot);
+                return true;
+            }
+
+            for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            {
+                if (player.PendingInventoryChanges.TryGetValue(slot, out var staged) &&
+                    staged.Stack > 0 && ContainsItem(itemIds, staged.ItemId))
+                {
+                    var left = staged.Stack - 1;
+                    player.PendingInventoryChanges[slot] = left > 0
+                        ? (staged.ItemId, left, staged.Prefix)
+                        : (0, 0, (byte)0);
+                    return true;
+                }
+                if (player.PendingChestInventoryChanges.TryGetValue(slot, out var chestStaged) &&
+                    chestStaged.Stack > 0 && ContainsItem(itemIds, chestStaged.ItemId))
                 {
                     var left = chestStaged.Stack - 1;
                     player.PendingChestInventoryChanges[slot] = left > 0
@@ -1169,6 +1292,23 @@ internal sealed class WorldAuthority : IWorldAuthority
             return Deny(playerId, "tile_rejected", "invalid_tile_type", new { brk.TileType });
         }
 
+        // 包 17 的 action 1/3（PlaceTile / PlaceWall）与包 79 同族：服务端必须把「图格 / 墙 ID → 放置物品」
+        // 反查回来才能对账背包。客户端放置成功即已扣掉本地物品，服务端不校验也不扣减会造成背包与服务端
+        // 不一致（等于免费放砖 / 放墙）。反查 / 背包判定与 ValidatePlace 同口径。
+        if (brk.Action is 1 or 3)
+        {
+            IReadOnlyList<int> placeItemIds;
+            var known = brk.Action == 1
+                ? TileToItemTable.TryGetItemsForTile(brk.TileType, out placeItemIds)
+                : TileToItemTable.TryGetItemsForWall(brk.TileType, out placeItemIds);
+            if (!known)
+                return Deny(playerId, "tile_rejected", "tile_item_unknown",
+                    new { brk.TileType, Action = brk.Action });
+            if (!_inv.HasAnyItemIncludingPending(playerId, placeItemIds, out _))
+                return Deny(playerId, "tile_rejected", "item_not_in_inventory",
+                    new { brk.TileType, Action = brk.Action, Candidates = placeItemIds.Count });
+        }
+
         return AuthorityResult.Accept(brk);
     }
 
@@ -1199,18 +1339,20 @@ internal sealed class WorldAuthority : IWorldAuthority
         // 放置包携带的是**图格 ID**，背包里存的是**物品 ID**，两者并不相等
         // （工作台：物品 36 ↔ 图格 18；泥土：物品 2 ↔ 图格 0；木头：物品 9 ↔ 图格 30），
         // 故必须先用 TileToItemTable 反查「放置物品」，不能拿图格 ID 直接查背包。
+        // 同一图格可由多个物品放置（工作台图格 18 有数十个木材/材质变体），反查结果是**候选集合**，
+        // 命中任意一个即可 —— 只认最小物品 ID 会把手持 635 EbonwoodWorkBench 一类的合法放置误拒。
         // 反查不到（该图格不由任何物品放置，例如只靠生长 / 系统生成）→ 直接拒绝：
         // 宁可挡下这一个放置，也不允许用任意物品「换」出一个本不该由手持物放置的图格。
-        if (!TileToItemTable.TryGetItemForTile(place.TileType, out var placeItemId))
+        if (!TileToItemTable.TryGetItemsForTile(place.TileType, out var placeItemIds))
             return Deny(playerId, "tile_rejected", "tile_item_unknown", new { place.TileType });
 
         // 背包物品校验只读；实际扣除必须随放置命令一起提交。
         // 计入本窗口尚未结算的暂存值：客户端「合成后立刻放下」是常规操作（工作台就是这么来的），
         // 权威背包要等 15 tick 守恒窗口后才拿到该物品 —— 只比对权威值会误拒（item_not_in_inventory），
         // 地图上就多出一个服务端不认识的方块，之后在它旁边合成全部失败。
-        if (!_inv.HasItemIncludingPending(playerId, placeItemId))
+        if (!_inv.HasAnyItemIncludingPending(playerId, placeItemIds, out _))
             return Deny(playerId, "tile_rejected", "item_not_in_inventory",
-                new { place.TileType, Item = placeItemId, Reason = "backpack missing item or not synced yet" });
+                new { place.TileType, Candidates = placeItemIds.Count, Reason = "backpack missing item or not synced yet" });
 
         return AuthorityResult.Accept(place);
     }

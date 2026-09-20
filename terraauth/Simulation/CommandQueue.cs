@@ -874,6 +874,14 @@ return new(false, CommandFailures.NotApplied);
 
                 case 1:  // PlaceTile
                     if (TileType <= 0) break;
+                    // 包 17 的 action 1 与包 79（PlaceObject）同族：都是「把图格放到地图上」。
+                    // 服务端必须反查「图格 ID → 放置物品」并在此扣减，否则客户端已扣本地物品而服务端不扣，
+                    // 背包两边不一致（等于免费放砖）。反查不到 / 背包没有 → 不应用且**不改动图格**，
+                    // 与权威层 ValidateBreak 同口径。锁序：SectionLocks → PlayersLock，故扣减必须在写锁之内。
+                    if (world.InventoryLedger is null) return new(false, CommandFailures.NotApplied);
+                    if (!TileToItemTable.TryGetItemsForTile(TileType, out var placeTileItems) ||
+                        !world.InventoryLedger.ConsumeAnyItem(playerId, placeTileItems))
+                        return new(false, CommandFailures.NotApplied);
                     tile.Active = true;
                     tile.Type = (ushort)TileType;
                     break;
@@ -884,6 +892,11 @@ return new(false, CommandFailures.NotApplied);
 
                 case 3:  // PlaceWall
                     if (TileType <= 0) break;
+                    // 同上：墙走 action 3，反查墙 ID → 放置物品后扣减（墙表 203 项）。
+                    if (world.InventoryLedger is null) return new(false, CommandFailures.NotApplied);
+                    if (!TileToItemTable.TryGetItemsForWall(TileType, out var placeWallItems) ||
+                        !world.InventoryLedger.ConsumeAnyItem(playerId, placeWallItems))
+                        return new(false, CommandFailures.NotApplied);
                     tile.Wall = (ushort)TileType;
                     break;
 
@@ -1531,16 +1544,18 @@ return new(false, CommandFailures.NotApplied);
 
         // 扣减的是**物品 ID**，不是包里的图格 ID：两者并不相等（工作台：物品 36 ↔ 图格 18；
         // 泥土：物品 2 ↔ 图格 0；木头：物品 9 ↔ 图格 30），拿图格 ID 去扣永远扣不到。
+        // 同一图格可由多个物品放置，反查结果是候选集合，扣其中任意一件（优先手持槽）。
         // 反查不到（该图格不由任何物品放置）与权威层 ValidatePlace 同口径 → 不应用。
-        if (!TileToItemTable.TryGetItemForTile(TileType, out var itemId))
+        if (!TileToItemTable.TryGetItemsForTile(TileType, out var itemIds))
             return new(false, CommandFailures.NotApplied);
 
         // 图格和背包必须在同一提交单元中处理。先占住图格写锁，再确认目标仍为空并扣除物品。
+        // 锁序：SectionLocks → PlayersLock（ConsumeAnyItem 内部取 PlayersLock），故扣减必须在写锁之内。
         world.Sections.EnterWrite(X, Y);
         try
         {
             ref var tile = ref world.Tiles[X, Y];
-            if (tile.Active || !world.InventoryLedger.ConsumeItem(playerId, itemId))
+            if (tile.Active || !world.InventoryLedger.ConsumeAnyItem(playerId, itemIds))
                 return new(false, CommandFailures.NotApplied);
             tile.Active = true;
             tile.Type = (ushort)TileType;
