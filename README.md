@@ -6,6 +6,31 @@
 
 TerraAuth 的目标是在**协议层**把关键状态收回服务端，提供可靠的反作弊能力：客户端只能声明意图，所有状态变更必须经过服务端权威校验后才生效。
 
+## 开发路线
+
+<!-- Boss 立绘文件在 docs/images/（取自 Terraria Wiki，版权归 Re-Logic 所有，此处仅作进度标识）。 -->
+
+<table>
+<tr>
+<td align="center" width="25%"><img src="docs/images/king-slime.png" height="72" alt="史莱姆王" /><br /><sub>史莱姆王</sub></td>
+<td align="center" width="25%"><img src="docs/images/eye-of-cthulhu.png" height="72" alt="克苏鲁之眼" /><br /><sub>克苏鲁之眼</sub></td>
+<td align="center" width="25%"><img src="docs/images/skeletron.png" height="72" alt="骷髅王" /><br /><sub>骷髅王</sub></td>
+<td align="center" width="25%"><img src="docs/images/moon-lord.png" height="72" alt="月亮领主" /><br /><sub>月亮领主</sub></td>
+</tr>
+<tr>
+<td align="center"><b>① 原版游戏端进服</b><br /><br /><b>✅ 已达成</b></td>
+<td align="center"><b>② 原版客户端流畅游玩</b><br /><br /><b>🔵 正在进行</b></td>
+<td align="center"><b>③ 插件功能完善</b><br /><br /><b>⚪ 待进行</b></td>
+<td align="center"><b>④ Mod 兼容</b><br /><br /><b>⚪ 待进行</b></td>
+</tr>
+<tr>
+<td align="center"><sub>原版客户端（协议 326）握手 → 进入世界 → 正常断开，全链路实测通过</sub></td>
+<td align="center"><sub>位置 / 物品 / 战斗 / 世界改动全部由服务端权威结算；当前收敛 SSC 守恒事务与合成 / 开袋 / 放置回滚类问题</sub></td>
+<td align="center"><sub>Hook 扩展点 + 服务端命令子系统 + 插件事件审计</sub></td>
+<td align="center"><sub>ModPolicy 白名单与兼容层</sub></td>
+</tr>
+</table>
+
 ## 当前进度
 
 | 阶段 | 内容 | 状态 |
