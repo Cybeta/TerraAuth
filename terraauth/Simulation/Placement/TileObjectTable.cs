@@ -1,7 +1,6 @@
 // TerraAuth — 图格物件（家具类）几何表：图格 ID → 尺寸 / 锚点偏移 / 样式与贴图坐标参数
 // 数据源：Terraria 1.4.5.8 原版 Terraria.ObjectData.TileObjectData.Initialize()
-//   （decompiled/src/Terraria.ObjectData/TileObjectData.cs，按 addTile(N) / addBaseTile(out StyleNxM)
-//    / newTile.CopyFrom(StyleNxM) / addSubTile 的线性顺序求值得到）。
+//   （按 addTile(N) / addBaseTile(out StyleNxM) / newTile.CopyFrom(StyleNxM) / addSubTile 的线性顺序逐条核对求值）。
 // 生成脚本：仓库外的一次性生成脚本（未纳入版本库）。
 //
 // 当前条目数：389 项。
