@@ -1383,15 +1383,71 @@ internal sealed class WorldAuthority : IWorldAuthority
         // 再检查放置目标，最后检查背包。验证阶段不得产生副作用，避免目标格已占用时扣除物品。
         // 拒绝细节带上该格在**当前权威世界**里的状态：真机「服务端多出一格图格」时，
         // 只有这条日志能直接看出服务端认为那一格是什么（而不是只看到被拒的包内容）。
-        Tile tile;
-        using (_world.Sections.EnterRead(place.X, place.Y, place.X, place.Y))
-            tile = _world.Tiles[place.X, place.Y];
-        if (tile.Active)
+        //
+        // 图格物件（工作台 / 家具等，见 TileObjectTable）必须按**整个 footprint** 判占用：
+        // 原版 TileObject.Place 从锚点（= 点击格 - Origin，见 TileObject.CanPlace 第 210-211 行）起把
+        // Width × Height 逐格配上帧写满，只看点击格会让「旁边那格已被占用」的请求通过，
+        // 随后整个物件把邻居那格覆盖掉（真机：贴着已有家具再放一件，服务端世界被改坏）。
+        // 表外类型（泥土 / 石头这类普通方块）保持原来的单格检查。
+        if (TileObjectTable.TryGet(place.TileType, out var objectInfo))
         {
-            _world.MarkPlacementRejected(playerId, _world.Tick, placeItemIds);
-            return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y },
-                $"({place.X},{place.Y}) tile={place.TileType} 现存 tile={tile.Type}"
-                + $" active={(tile.Active ? "true" : "false")} wall={tile.Wall} frame={tile.FrameX},{tile.FrameY}");
+            int anchorX = place.X - objectInfo.OriginX;
+            int anchorY = place.Y - objectInfo.OriginY;
+            if (anchorX < 0 || anchorY < 0 || anchorX + objectInfo.Width > _world.MaxTilesX ||
+                anchorY + objectInfo.Height > _world.MaxTilesY)
+            {
+                _world.MarkPlacementRejected(playerId, _world.Tick, placeItemIds);
+                return Deny(playerId, "tile_rejected", "out_of_bounds",
+                    new { place.X, place.Y, AnchorX = anchorX, AnchorY = anchorY },
+                    $"({place.X},{place.Y}) tile={place.TileType} 锚点=({anchorX},{anchorY})"
+                    + $" footprint={objectInfo.Width}x{objectInfo.Height} 超出世界范围");
+            }
+
+            // 锁内只读取占用情况，拒绝 / 登记退回凭据放在锁外（与下面的单格分支同口径，避免锁内嵌套）。
+            bool occupied = false;
+            int occupiedX = 0;
+            int occupiedY = 0;
+            Tile occupiedTile = default;
+            using (_world.Sections.EnterRead(anchorX, anchorY, anchorX + objectInfo.Width - 1,
+                       anchorY + objectInfo.Height - 1))
+            {
+                for (int x = 0; x < objectInfo.Width && !occupied; x++)
+                for (int y = 0; y < objectInfo.Height && !occupied; y++)
+                {
+                    occupiedTile = _world.Tiles[anchorX + x, anchorY + y];
+                    if (!occupiedTile.Active) continue;
+                    occupied = true;
+                    occupiedX = anchorX + x;
+                    occupiedY = anchorY + y;
+                }
+            }
+
+            if (occupied)
+            {
+                _world.MarkPlacementRejected(playerId, _world.Tick, placeItemIds);
+                return Deny(playerId, "tile_rejected", "tile_already_exists",
+                    new
+                    {
+                        place.X, place.Y, AnchorX = anchorX, AnchorY = anchorY,
+                        OccupiedX = occupiedX, OccupiedY = occupiedY,
+                    },
+                    $"({place.X},{place.Y}) tile={place.TileType} 锚点=({anchorX},{anchorY})"
+                    + $" 占用格=({occupiedX},{occupiedY}) 现存 tile={occupiedTile.Type}"
+                    + $" active=true wall={occupiedTile.Wall} frame={occupiedTile.FrameX},{occupiedTile.FrameY}");
+            }
+        }
+        else
+        {
+            Tile tile;
+            using (_world.Sections.EnterRead(place.X, place.Y, place.X, place.Y))
+                tile = _world.Tiles[place.X, place.Y];
+            if (tile.Active)
+            {
+                _world.MarkPlacementRejected(playerId, _world.Tick, placeItemIds);
+                return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y },
+                    $"({place.X},{place.Y}) tile={place.TileType} 现存 tile={tile.Type}"
+                    + $" active={(tile.Active ? "true" : "false")} wall={tile.Wall} frame={tile.FrameX},{tile.FrameY}");
+            }
         }
 
         // 背包物品校验只读；实际扣除必须随放置命令一起提交。

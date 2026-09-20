@@ -836,6 +836,12 @@ return new(false, CommandFailures.NotApplied);
             return containerBroken ? new(true) : new(false, CommandFailures.NoChange);
         if (Action == 0 && TileType == 0 && TryBreakStatelessMultiTileObject(world, rng, out var objectBroken))
             return objectBroken ? new(true) : new(false, CommandFailures.NoChange);
+        // 图格物件（家具类，见 TileObjectTable）：破坏必须**整件移除**（多格物件只清一格会留下残格，
+        // 客户端已把整件家具删掉、服务端却还剩半件，两边世界观继续分叉 —— 比只写单格的现状更糟）。
+        // 只接管多格物件：1×1 物件（草药 / 花盆等）的 footprint 就是单格，走下面原有单格 + 掉落分支即可，
+        // 免得绕开「成熟草药 83/84 掉草药 + 种子」等既有掉落规则。表外类型同样不受影响。
+        if (Action is 0 or 4 && TileType == 0 && TryBreakTileObject(world, rng, Action == 0, out var tiledObjectBroken))
+            return tiledObjectBroken ? new(true) : new(false, CommandFailures.NoChange);
 
         // 区块分区锁：与包 10 编码 / 权威校验的跨线程读互斥（详见 SectionLocks）
         bool changed = false;
@@ -1357,6 +1363,148 @@ return new(false, CommandFailures.NotApplied);
         return true;
     }
 
+    /// <summary>
+    /// 多格图格物件（工作台 / 家具类）整体移除：由被拆格的 frameX/frameY 反推它在物件内的 (localX, localY)，
+    /// 清空整个 footprint、逐格 MarkTileChanged，并只在**锚点格**掉落 1 份（沿用 TileDropTable 对锚点格的判定）。
+    /// 返回 false = 未接管（非物件类型 / 单格物件 / 反推与连通块都对不上），调用方继续走原有单格破坏逻辑。
+    /// </summary>
+    /// <param name="returnsItem">action 0 = KillTile（掉落）；action 4 = KillTileNoItem（挖掉但无掉落，原版语义）。</param>
+    private bool TryBreakTileObject(WorldState world, IRng rng, bool returnsItem, out bool broken)
+    {
+        broken = false;
+        Tile hit;
+        using (world.Sections.EnterRead(X, Y, X, Y))
+            hit = world.Tiles[X, Y];
+        if (!hit.Active || !TileObjectTable.TryGet(hit.Type, out var info))
+            return false;
+        if (info.Width * info.Height <= 1)
+            return false;   // 单格物件与普通方块同构，交给原有路径（那里还有草药等专属掉落规则）
+
+        if (!TryFindObjectAnchor(world, hit, info, out int anchorX, out int anchorY))
+            return false;
+
+        int dropItem = 0;
+        int dropStack = 0;
+        using (world.Sections.EnterWrite(anchorX, anchorY, anchorX + info.Width - 1, anchorY + info.Height - 1))
+        {
+            // 掉落按**锚点格**的帧判定（原版掉落查表用的也是锚点格的 frameX/frameY）。
+            // 修复之前写入的世界里多格物件没有帧（仍是 Empty 的 -1,-1），此时按 style 0 判定，
+            // 与 TileDropTable 各分支对「负帧」的既有处理一致（frameX / 整块宽 = 0）。
+            short anchorFrameX = world.Tiles[anchorX, anchorY].FrameX;
+            short anchorFrameY = world.Tiles[anchorX, anchorY].FrameY;
+            if (anchorFrameX < 0) anchorFrameX = 0;
+            if (anchorFrameY < 0) anchorFrameY = 0;
+            TileDropTable.TryGet(hit.Type, anchorFrameX, anchorFrameY, out dropItem, out dropStack);
+
+            for (int x = 0; x < info.Width; x++)
+            for (int y = 0; y < info.Height; y++)
+            {
+                ref var cell = ref world.Tiles[anchorX + x, anchorY + y];
+                cell.Active = false;
+                cell.Type = 0;
+                cell.Wall = 0;
+            }
+        }
+
+        broken = true;
+        for (int x = 0; x < info.Width; x++)
+        for (int y = 0; y < info.Height; y++)
+            world.MarkTileChanged(anchorX + x, anchorY + y);
+
+        // 整件家具只掉 1 份：原版把多格物件当作一个整体，逐格掉物品会凭空多出材料。
+        // 掉落物在区块锁之外生成（与主路径同口径，避免与 ItemsLock 形成新的锁序）。
+        if (returnsItem && dropItem > 0)
+            world.SpawnItemDrop(dropItem, dropStack, anchorX, anchorY, rng);
+
+        return true;
+    }
+
+    /// <summary>
+    /// 求物件锚点。首选按帧精确反推（本修复之后服务端写下的帧必然可反推）：
+    /// 格内偏移 frameX = baseX + localX * (CoordinateWidth + CoordinatePadding)、
+    /// frameY = baseY + Σ_{l&lt;localY}(CoordinateHeights[l] + CoordinatePadding)（原版 TileObject.Place 第 94-109 行），
+    /// baseX/baseY 是一个样式块的整数倍，故 localX/localY 可由取模还原。
+    /// 反推不出时（本次修复之前写入的世界 / 存档，多格物件的帧仍是 Empty(-1,-1)）退化为
+    /// 「把被拆格当作 footprint 内任意一格枚举候选锚点」，取「整个 footprint 都是同类型图格」的连通块；
+    /// 候选按 (localX, localY) 升序取第一个命中的（确定性），一个都不命中则返回 false（交回单格破坏，至少不留残骸）。
+    /// </summary>
+    private bool TryFindObjectAnchor(WorldState world, in Tile hit, in TileObjectInfo info, out int anchorX, out int anchorY)
+    {
+        anchorX = 0;
+        anchorY = 0;
+
+        int stepX = info.CoordinateWidth + info.CoordinatePadding;
+        int localX = -1;
+        if (stepX > 0 && hit.FrameX >= 0 && info.CoordinateFullWidth > 0)
+        {
+            int offsetX = hit.FrameX - hit.FrameX / info.CoordinateFullWidth * info.CoordinateFullWidth;
+            if (offsetX % stepX == 0 && offsetX / stepX < info.Width)
+                localX = offsetX / stepX;
+        }
+
+        int localY = -1;
+        if (hit.FrameY >= 0 && info.CoordinateFullHeight > 0)
+        {
+            // 纵向各行可以不等高（CoordinateHeights），故逐行累加比对而不是直接除步长。
+            int offsetY = hit.FrameY - hit.FrameY / info.CoordinateFullHeight * info.CoordinateFullHeight;
+            int cursor = 0;
+            for (int l = 0; l < info.Height; l++)
+            {
+                if (cursor == offsetY)
+                {
+                    localY = l;
+                    break;
+                }
+                cursor += info.CoordinateHeights[l] + info.CoordinatePadding;
+            }
+        }
+
+        if (localX >= 0 && localY >= 0)
+        {
+            int candidateX = X - localX;
+            int candidateY = Y - localY;
+            if (FootprintMatches(world, candidateX, candidateY, info, hit.Type))
+            {
+                anchorX = candidateX;
+                anchorY = candidateY;
+                return true;
+            }
+        }
+
+        for (int lx = 0; lx < info.Width; lx++)
+        for (int ly = 0; ly < info.Height; ly++)
+        {
+            int candidateX = X - lx;
+            int candidateY = Y - ly;
+            if (!FootprintMatches(world, candidateX, candidateY, info, hit.Type)) continue;
+            anchorX = candidateX;
+            anchorY = candidateY;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>footprint 是否整块都是该类型的活动图格（越界即 false）。</summary>
+    private static bool FootprintMatches(WorldState world, int anchorX, int anchorY, in TileObjectInfo info, ushort type)
+    {
+        if (anchorX < 0 || anchorY < 0 || anchorX + info.Width > world.MaxTilesX ||
+            anchorY + info.Height > world.MaxTilesY)
+            return false;
+
+        using (world.Sections.EnterRead(anchorX, anchorY, anchorX + info.Width - 1, anchorY + info.Height - 1))
+        {
+            for (int x = 0; x < info.Width; x++)
+            for (int y = 0; y < info.Height; y++)
+            {
+                var cell = world.Tiles[anchorX + x, anchorY + y];
+                if (!cell.Active || cell.Type != type) return false;
+            }
+        }
+
+        return true;
+    }
+
     private bool TryBreakContainerObject(WorldState world, IRng rng, out bool broken)
     {
         broken = false;
@@ -1553,6 +1701,56 @@ return new(false, CommandFailures.NotApplied);
         // 反查不到（该图格不由任何物品放置）与权威层 ValidatePlace 同口径 → 不应用。
         if (!TileToItemTable.TryGetItemsForTile(TileType, out var itemIds))
             return new(false, CommandFailures.NotApplied);
+
+        // 图格物件（工作台 / 家具等，见 TileObjectTable）：原版 TileObject.Place 从锚点（= 点击格 - Origin，
+        // 见 TileObject.CanPlace 第 210-211 行）起把 Width × Height 每格都写上 active/type/**帧**。
+        // 只写点击那一格、且不写帧（帧停在 Tile.Empty 的 -1,-1）时，客户端本地已按正确帧显示整件家具，
+        // 服务端世界却只有一格无帧图格 —— 真机表现即「放下的工作台看起来碎了 / 没了」，
+        // 在相邻那格再放还会被 tile_already_exists 拒（服务端把那一格当成已占用）。
+        if (TileObjectTable.TryGet(TileType, out var objectInfo))
+        {
+            int anchorX = X - objectInfo.OriginX;
+            int anchorY = Y - objectInfo.OriginY;
+            if (anchorX < 0 || anchorY < 0 || anchorX + objectInfo.Width > world.MaxTilesX ||
+                anchorY + objectInfo.Height > world.MaxTilesY)
+                return new(false, CommandFailures.NotApplied);
+
+            int lastX = anchorX + objectInfo.Width - 1;
+            int lastY = anchorY + objectInfo.Height - 1;
+            using (world.Sections.EnterWrite(anchorX, anchorY, lastX, lastY))
+            {
+                // 权威层 ValidatePlace 已按同一 footprint 判过占用；写锁内再确认一次，防止与并发写入交错。
+                // 原版 Place 只写「本来不 active」的格子，我们要求全空才放，故这里直接写满。
+                for (int dx = 0; dx < objectInfo.Width; dx++)
+                for (int dy = 0; dy < objectInfo.Height; dy++)
+                    if (world.Tiles[anchorX + dx, anchorY + dy].Active)
+                        return new(false, CommandFailures.NotApplied);
+
+                if (!world.InventoryLedger.ConsumeAnyItem(playerId, itemIds))
+                    return new(false, CommandFailures.NotApplied);
+
+                for (int dx = 0; dx < objectInfo.Width; dx++)
+                for (int dy = 0; dy < objectInfo.Height; dy++)
+                {
+                    // 帧算法照抄原版 TileObject.Place（含 StyleWrapLimit / StyleHorizontal 的样式布局），
+                    // dx/dy 已在 footprint 内，TryGetFrame 必然成功。
+                    TileObjectTable.TryGetFrame(TileType, Style, dx, dy, out short frameX, out short frameY);
+                    ref var cell = ref world.Tiles[anchorX + dx, anchorY + dy];
+                    cell.Active = true;
+                    cell.Type = (ushort)TileType;
+                    cell.Wall = 0;
+                    cell.FrameX = frameX;
+                    cell.FrameY = frameY;
+                }
+            }
+
+            // 整个 footprint 都要下发：客户端只收到其中一格时，另一格在客户端仍是空的（家具看起来缺一半）。
+            for (int dx = 0; dx < objectInfo.Width; dx++)
+            for (int dy = 0; dy < objectInfo.Height; dy++)
+                world.MarkTileChanged(anchorX + dx, anchorY + dy);
+
+            return new(true);
+        }
 
         // 图格和背包必须在同一提交单元中处理。先占住图格写锁，再确认目标仍为空并扣除物品。
         // 锁序：SectionLocks → PlayersLock（ConsumeAnyItem 内部取 PlayersLock），故扣减必须在写锁之内。

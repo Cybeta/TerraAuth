@@ -19,6 +19,7 @@
   <ItemGroup>
     <Compile Include="AuthorityTests.cs" />
     <Compile Include="PlacementTests.cs" />
+    <Compile Include="TileObjectTests.cs" />
     <Compile Include="SimulationTests.cs" />
     <Compile Include="SnapshotTests.cs" />
     <Compile Include="NetworkTests.cs" />
