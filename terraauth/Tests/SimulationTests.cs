@@ -983,6 +983,113 @@ public class SimulationTests
     }
 
     /// <summary>
+    /// 真机缺陷回归（工作台「制作后直接放置」）：放置被权威层拒绝 = 服务端从未产出图格，
+    /// 但客户端本地放置**先成功**，已把物品从手持槽移走并上报包 5；守恒层对「只减不增」的纯消耗
+    /// 一律放行（药水 / 投掷物等未建模消耗需要），于是这次无产出凭据的减少被静默提交 → 物品凭空销毁
+    /// （玩家感知：「放下去马上被销毁」）。登记被拒放置后，该槽位不得被提交为清空。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Rescues_RejectedPlacement_Removal()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[58] = 36;      // 工作台（图格 18 ↔ 物品 36）
+        player.ItemStacks[58] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        // 权威层拒绝这次放置（该格已被占用）→ 登记退回凭据；客户端按本地成功结果清空手持槽
+        world.MarkPlacementRejected(1, world.Tick, TileToItemTable.TileToItems[18]);
+        Assert.True(new StageInventorySlotCommand(100, 1, 58, 0, 0).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(36, player.Items[58]);
+        Assert.Equal(1, player.ItemStacks[58]);
+        Assert.Empty(player.RejectedPlacements);   // 结算收尾必须清空退回凭据
+
+        // 退回的槽位同样要回写客户端（否则客户端手里仍是空的）
+        Assert.Contains((1, player.SessionId, 58), world.DrainInventoryUpdates(8));
+    }
+
+    /// <summary>
+    /// 被拒放置的退回必须放过「减少其实有凭据」的情况：玩家把该物品丢到了世界（掉落物已生成），
+    /// 槽位清空是合法的，退回会让地上与背包各有一份。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Keeps_Removal_When_Item_Was_Dropped()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[58] = 36;
+        player.ItemStacks[58] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        world.MarkPlacementRejected(1, world.Tick, TileToItemTable.TileToItems[18]);
+        world.MarkItemDroppedByPlayer(1, 36);   // 本窗口内该物品已丢到世界 → 减少有凭据
+        Assert.True(new StageInventorySlotCommand(100, 1, 58, 0, 0).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[58]);
+        Assert.Equal(0, player.ItemStacks[58]);
+    }
+
+    /// <summary>
+    /// 退回只针对被拒放置的**候选物品**：同窗口减少别种物品（木头）不受影响，
+    /// 没被减少的工作台也原样保留。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Rescue_Does_Not_Touch_Other_Items()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[57] = 36;      // 工作台：本窗口未减少，不得被误改
+        player.ItemStacks[57] = 1;
+        player.Items[58] = 9;       // 木头：本窗口被清空
+        player.ItemStacks[58] = 5;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        world.MarkPlacementRejected(1, world.Tick, TileToItemTable.TileToItems[18]);
+        Assert.True(new StageInventorySlotCommand(100, 1, 58, 0, 0).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[58]);          // 木头照常消耗
+        Assert.Equal(0, player.ItemStacks[58]);
+        Assert.Equal(36, player.Items[57]);         // 工作台未受影响
+        Assert.Equal(1, player.ItemStacks[57]);
+    }
+
+    /// <summary>
+    /// 退回凭据必须新鲜：早于本窗口的拒绝记录对应的那次上报早已结算，拿它退回会误伤之后的正常消耗。
+    /// </summary>
+    [Fact]
+    public void InventoryTransaction_Ignores_Stale_Rejected_Placement()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[58] = 36;
+        player.ItemStacks[58] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        world.MarkPlacementRejected(1, world.Tick - 100, TileToItemTable.TileToItems[18]);
+        Assert.True(new StageInventorySlotCommand(100, 1, 58, 0, 0).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+        Assert.Equal(0, player.Items[58]);          // 过期凭据不生效 → 纯消耗照常提交
+        Assert.Equal(0, player.ItemStacks[58]);
+    }
+
+    /// <summary>
     /// SSC 背包守恒事务：原版合成（3 铜矿 → 1 铜锭）改变背包总量，但净增量可由原版配方解释
     /// → 必须提交（此前判据只看「总量不变」，把合成当成凭空造物整窗回滚，表现为合成后物品被吃掉）。
     /// 铜锭需要熔炉（图格 17）→ 用例先在玩家可达区域内放一块熔炉。

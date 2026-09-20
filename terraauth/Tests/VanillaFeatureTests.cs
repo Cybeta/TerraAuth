@@ -807,6 +807,33 @@ public class VanillaFeatureTests
             "背包无该物品时放砖未被拒绝");
     }
 
+    /// <summary>
+    /// 放置被拒必须补发该格权威单格（包 20）：客户端本地放置已成功（物品已从手持槽移走并上报包 5），
+    /// 服务端却从未产生这一格 —— 不补发就会在客户端留下「幽灵方块」（本地可见、服务端不认、挖掉也不掉落）。
+    /// </summary>
+    [Fact]
+    public async Task Vanilla_TilePlace_On_Occupied_Tile_Resends_Authoritative_Tile()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Alice");
+        var world = server.Host.Simulator.State;
+        int sx = world.SpawnTileX, sy = world.SpawnTileY;
+        await StandAtAsync(server, s, sx * 16f + 8f, sy * 16f - 8f);
+
+        int tx = sx, ty = sy + 3;                                  // 地表下 3 格（180px 放置半径内）
+        while (ty < world.MaxTilesY && !world.Tiles[tx, ty].Active) ty++;
+        Assert.True(ty < world.MaxTilesY, "目标列未找到实心图格");
+        world.Tiles[tx, ty] = new Tile { Active = true, Type = 1 };  // 石块：图格 ID → 物品的反查表内
+
+        await s.SendAsync(PacketId.TilePlace, new TilePlacePacket(tx, ty, 1));
+
+        Assert.True(await WaitForRejectAsync(server, "tile_already_exists", TimeSpan.FromSeconds(5)),
+            "占用格上的放置未被拒绝");
+        // 本夹具不跑 GameHost 的 flush 循环，无需 FlushTileUpdatesAsync —— 收到的包 20 只可能来自「被拒后补发」
+        var got = await s.ReadUntilAsync(p => p.Type == PacketId.TileSquare, TimeSpan.FromSeconds(5));
+        Assert.Contains(got, p => p.Type == PacketId.TileSquare);
+    }
+
     // ========================================================================
     // 四、战斗 / 抛射物（包 28 / 27）
     // ========================================================================

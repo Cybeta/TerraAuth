@@ -1263,11 +1263,17 @@ internal sealed class WorldAuthority : IWorldAuthority
     {
         // 越界检查：坐标必须落在世界尺寸内
         if (!IsInWorld(brk.X, brk.Y))
-            return Deny(playerId, "tile_rejected", "out_of_bounds", new { brk.X, brk.Y });
+        {
+            if (brk.Action is 1 or 3) _world.MarkPlacementRejected(playerId, _world.Tick, null);
+            return Deny(playerId, "tile_rejected", "out_of_bounds", new { brk.X, brk.Y }, BreakPlaceDetail(brk));
+        }
 
         // 玩家可达距离：CE 伪造远距离坐标 → 直接拒绝
         if (!IsWithinReach(playerId, brk.X, brk.Y, DigReachPx))
-            return Deny(playerId, "tile_rejected", "out_of_reach", new { brk.X, brk.Y });
+        {
+            if (brk.Action is 1 or 3) _world.MarkPlacementRejected(playerId, _world.Tick, null);
+            return Deny(playerId, "tile_rejected", "out_of_reach", new { brk.X, brk.Y }, BreakPlaceDetail(brk));
+        }
 
         // 目标 tile 必须存在（Action=0/4 挖实心砖；2 挖墙；>=5 电线/斜坡类跳过实体检查）
         // 区块读锁内取一份图格副本：仿真线程可能正在改同一格（详见 SectionLocks）
@@ -1289,7 +1295,7 @@ internal sealed class WorldAuthority : IWorldAuthority
         }
         else if (brk.Action is 1 or 3 && (brk.TileType < 0 || brk.TileType > MaxTileType))
         {
-            return Deny(playerId, "tile_rejected", "invalid_tile_type", new { brk.TileType });
+            return Deny(playerId, "tile_rejected", "invalid_tile_type", new { brk.TileType }, BreakPlaceDetail(brk));
         }
 
         // 包 17 的 action 1/3（PlaceTile / PlaceWall）与包 79 同族：服务端必须把「图格 / 墙 ID → 放置物品」
@@ -1302,39 +1308,62 @@ internal sealed class WorldAuthority : IWorldAuthority
                 ? TileToItemTable.TryGetItemsForTile(brk.TileType, out placeItemIds)
                 : TileToItemTable.TryGetItemsForWall(brk.TileType, out placeItemIds);
             if (!known)
+            {
+                _world.MarkPlacementRejected(playerId, _world.Tick, null);
                 return Deny(playerId, "tile_rejected", "tile_item_unknown",
-                    new { brk.TileType, Action = brk.Action });
+                    new { brk.TileType, Action = brk.Action }, BreakPlaceDetail(brk));
+            }
             if (!_inv.HasAnyItemIncludingPending(playerId, placeItemIds, out _))
+            {
+                _world.MarkPlacementRejected(playerId, _world.Tick, placeItemIds);
                 return Deny(playerId, "tile_rejected", "item_not_in_inventory",
-                    new { brk.TileType, Action = brk.Action, Candidates = placeItemIds.Count });
+                    new { brk.TileType, Action = brk.Action, Candidates = placeItemIds.Count }, BreakPlaceDetail(brk));
+            }
         }
 
         return AuthorityResult.Accept(brk);
     }
+
+    /// <summary>包 17 放置类（action 1/3）拒绝的紧凑细节：坐标 + 图格 / 墙 ID；挖 / 电线 / 斜坡类返回 null。</summary>
+    private static string? BreakPlaceDetail(TileBreakPacket brk)
+        => brk.Action is 1 or 3 ? $"action={brk.Action} ({brk.X},{brk.Y}) type={brk.TileType}" : null;
 
     /// <summary>原版有效图格 / 墙类型上限（1.4.5.8：图格 0..556）。</summary>
     private const int MaxTileType = 556;
 
     private AuthorityResult ValidatePlace(TilePlacePacket place, int playerId)
     {
+        // 放置被拒必须登记「退回凭据」（见 WorldState.MarkPlacementRejected）：
+        // 客户端本地放置**先成功**（已把物品从手持槽移走并上报包 5），而服务端这次放置被拒 = 从未产出图格；
+        // 背包守恒层对「只减不增」的纯消耗一律放行（药水 / 投掷物等未建模消耗需要），不登记就会把这次减少
+        // 当纯消耗提交 → 物品凭空销毁（真机：工作台「放下去马上被销毁」）。
+        // 注意：这是校验阶段唯一的副作用，只写「本窗口退回凭据」这一小块状态，绝不改动背包数值
+        // （保持「验证阶段不产生副作用」的原则）。
+
         // 越界检查
         if (!IsInWorld(place.X, place.Y))
-            return Deny(playerId, "tile_rejected", "out_of_bounds", new { place.X, place.Y });
+        {
+            _world.MarkPlacementRejected(playerId, _world.Tick, null);
+            return Deny(playerId, "tile_rejected", "out_of_bounds", new { place.X, place.Y },
+                $"({place.X},{place.Y}) tile={place.TileType}");
+        }
 
         // 玩家可达距离
         if (!IsWithinReach(playerId, place.X, place.Y, PlaceReachPx))
-            return Deny(playerId, "tile_rejected", "out_of_reach", new { place.X, place.Y });
+        {
+            _world.MarkPlacementRejected(playerId, _world.Tick, null);
+            return Deny(playerId, "tile_rejected", "out_of_reach", new { place.X, place.Y },
+                $"({place.X},{place.Y}) tile={place.TileType}");
+        }
 
         // tile 类型合法性：Terraria 有效砖类型 0..556（1.4.5.8），负数或超上限拒
         if (place.TileType < 0 || place.TileType > MaxTileType)
-            return Deny(playerId, "tile_rejected", "invalid_tile_type", new { place.TileType });
-
-        // 先检查放置目标，再检查背包。验证阶段不得产生副作用，避免目标格已占用时扣除物品。
-        Tile tile;
-        using (_world.Sections.EnterRead(place.X, place.Y, place.X, place.Y))
-            tile = _world.Tiles[place.X, place.Y];
-        if (tile.Active)
-            return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y });
+        {
+            // 与其他拒绝一并登记：候选未知（越界 / 类型非法时反查不到物品），不参与退回，仅保证日志可追溯。
+            _world.MarkPlacementRejected(playerId, _world.Tick, null);
+            return Deny(playerId, "tile_rejected", "invalid_tile_type", new { place.TileType },
+                $"({place.X},{place.Y}) tile={place.TileType}");
+        }
 
         // 放置包携带的是**图格 ID**，背包里存的是**物品 ID**，两者并不相等
         // （工作台：物品 36 ↔ 图格 18；泥土：物品 2 ↔ 图格 0；木头：物品 9 ↔ 图格 30），
@@ -1343,24 +1372,49 @@ internal sealed class WorldAuthority : IWorldAuthority
         // 命中任意一个即可 —— 只认最小物品 ID 会把手持 635 EbonwoodWorkBench 一类的合法放置误拒。
         // 反查不到（该图格不由任何物品放置，例如只靠生长 / 系统生成）→ 直接拒绝：
         // 宁可挡下这一个放置，也不允许用任意物品「换」出一个本不该由手持物放置的图格。
+        // 反查提到占用检查之前：反查只读、无副作用，而占用检查被拒时也要登记退回凭据（需要候选集合）。
         if (!TileToItemTable.TryGetItemsForTile(place.TileType, out var placeItemIds))
-            return Deny(playerId, "tile_rejected", "tile_item_unknown", new { place.TileType });
+        {
+            _world.MarkPlacementRejected(playerId, _world.Tick, null);
+            return Deny(playerId, "tile_rejected", "tile_item_unknown", new { place.TileType },
+                $"({place.X},{place.Y}) tile={place.TileType}");
+        }
+
+        // 再检查放置目标，最后检查背包。验证阶段不得产生副作用，避免目标格已占用时扣除物品。
+        // 拒绝细节带上该格在**当前权威世界**里的状态：真机「服务端多出一格图格」时，
+        // 只有这条日志能直接看出服务端认为那一格是什么（而不是只看到被拒的包内容）。
+        Tile tile;
+        using (_world.Sections.EnterRead(place.X, place.Y, place.X, place.Y))
+            tile = _world.Tiles[place.X, place.Y];
+        if (tile.Active)
+        {
+            _world.MarkPlacementRejected(playerId, _world.Tick, placeItemIds);
+            return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y },
+                $"({place.X},{place.Y}) tile={place.TileType} 现存 tile={tile.Type}"
+                + $" active={(tile.Active ? "true" : "false")} wall={tile.Wall} frame={tile.FrameX},{tile.FrameY}");
+        }
 
         // 背包物品校验只读；实际扣除必须随放置命令一起提交。
         // 计入本窗口尚未结算的暂存值：客户端「合成后立刻放下」是常规操作（工作台就是这么来的），
         // 权威背包要等 15 tick 守恒窗口后才拿到该物品 —— 只比对权威值会误拒（item_not_in_inventory），
         // 地图上就多出一个服务端不认识的方块，之后在它旁边合成全部失败。
         if (!_inv.HasAnyItemIncludingPending(playerId, placeItemIds, out _))
+        {
+            _world.MarkPlacementRejected(playerId, _world.Tick, placeItemIds);
             return Deny(playerId, "tile_rejected", "item_not_in_inventory",
-                new { place.TileType, Candidates = placeItemIds.Count, Reason = "backpack missing item or not synced yet" });
+                new { place.TileType, Candidates = placeItemIds.Count, Reason = "backpack missing item or not synced yet" },
+                $"({place.X},{place.Y}) tile={place.TileType} 候选={placeItemIds.Count}");
+        }
 
         return AuthorityResult.Accept(place);
     }
 
-    private AuthorityResult Deny(int playerId, string action, string reason, object details)
+    private AuthorityResult Deny(int playerId, string action, string reason, object details, string? detail = null)
     {
         _audit.Log(AuditEvent.Now(playerId, "authority", action, reason, details));
-        return AuthorityResult.Reject(reason);
+        // detail 一并带进拒绝结果：控制台 [Authority] 拒绝行只看得到 reason 时，真机排查看不出是哪一格 /
+        // 哪个包被拒（前 50 条之后连 reason 都不打印，只能翻审计库）。
+        return AuthorityResult.Reject(reason, detail: detail);
     }
 
     private bool IsInWorld(int x, int y)

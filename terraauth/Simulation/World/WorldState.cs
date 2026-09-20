@@ -1209,6 +1209,40 @@ public sealed class WorldState
     }
 
     /// <summary>
+    /// 登记一次「被权威层拒绝的放置请求」（包 79 / 包 17 action 1·3；候选物品由权威层反查给出）。
+    /// <para>
+    /// 为什么要按窗口记录：客户端本地放置成功后**立刻**把物品从手持槽移走并上报包 5，而服务端这次放置被拒 =
+    /// 从未产出图格。若只在拒绝点直接改背包，会和紧随其后的客户端上报互相打架（上报值就是客户端自认为的结果）；
+    /// 故只把「候选物品 + 拒绝时刻」记进本结算窗口，由 <see cref="TryCommitInventoryTransaction"/> 在结算时
+    /// 把这次无产出凭据的减少退回（见 <see cref="RescueRejectedPlacementRemovals"/>）。
+    /// </para>
+    /// 这是权威层校验阶段的副作用，只写退回凭据，不碰背包数值。
+    /// </summary>
+    public void MarkPlacementRejected(int playerId, long tick, IReadOnlyList<int>? candidateItems)
+    {
+        lock (PlayersLock)
+        {
+            if (Players.TryGetValue(playerId, out var player))
+                player.RejectedPlacements.Add((tick, candidateItems));
+        }
+    }
+
+    /// <summary>
+    /// 登记玩家本窗口内**丢弃到世界**的物品（包 21 → 掉落物已生成）。
+    /// 为什么按窗口记录：退回被拒放置的减少时，必须放过「减少其实有凭据」的情况——
+    /// 玩家把物品丢在地上（掉落物实打实生成了），此时槽位清空是合法的，不能因为同窗口有一次放置被拒就退回，
+    /// 否则一次丢弃就能刷出一份物品（地上有一份、背包又被退回一份）。
+    /// </summary>
+    public void MarkItemDroppedByPlayer(int playerId, int itemId)
+    {
+        lock (PlayersLock)
+        {
+            if (Players.TryGetValue(playerId, out var player))
+                player.DroppedItemsInWindow.Add(itemId);
+        }
+    }
+
+    /// <summary>
     /// 结算到期的背包事务（SSC）：窗口内客户端上报的槽位意图按「守恒」整体提交或回滚。
     /// 守恒 = 对每个 (物品, 前缀)，叠加暂存值后的总数量与当前权威总量完全一致——
     /// 拖拽 / 整理 / 拆分 / 合并 / 交换都保持总量不变；凭空造物或销毁必然破坏总量。
@@ -1238,6 +1272,8 @@ public sealed class WorldState
             {
                 player.PendingInventoryChanges.Clear();
                 player.InventoryTransactionBaseline.Clear();
+                player.RejectedPlacements.Clear();
+                player.DroppedItemsInWindow.Clear();
                 player.InventoryTransactionStartTick = -1;
                 CloseInventoryTransaction(playerId);
                 return InventoryTransactionOutcome.None;
@@ -1251,8 +1287,14 @@ public sealed class WorldState
             // （含开袋）一起回滚 —— 真机表现为「右键开袋，新物品出现后全部消失、袋子回到背包」。
             var approvedBagSlots = ApproveBagOpen(player);
 
+            // 放置被拒的减少先退回，再判守恒：这些槽位的暂存变更被整条摘掉（权威值原样保留），
+            // 于是守恒判据看到的是「没有减少」，不会再把它当纯消耗放行。
+            var rescuedSlots = RescueRejectedPlacementRemovals(player, windowTicks);
+
             bool conserved = IsInventoryConserved(player);
             var slots = player.PendingInventoryChanges.Keys.ToArray();
+            // 退回的槽位已不在暂存里，但同样要回写：客户端要拿回被退回的物品（服务端权威值覆盖本地）。
+            if (rescuedSlots.Count > 0) slots = slots.Concat(rescuedSlots).ToArray();
 
             if (conserved)
             {
@@ -1270,11 +1312,14 @@ public sealed class WorldState
             if (DiagnosticLog.Enabled)
                 Console.WriteLine($"[InventoryTx] 玩家 #{playerId} tick={Tick} {(conserved ? "提交" : "回滚")}"
                     + (approvedBagSlots.Count > 0 ? $"（开袋已单独提交 {approvedBagSlots.Count} 槽）" : string.Empty)
+                    + (rescuedSlots.Count > 0 ? $"（放置被拒已退回 {rescuedSlots.Count} 槽）" : string.Empty)
                     + DescribeChanges(player, slots)
                     + (conserved ? string.Empty : DescribeCraftEnv(player)));
 
             player.PendingInventoryChanges.Clear();
             player.InventoryTransactionBaseline.Clear();
+            player.RejectedPlacements.Clear();
+            player.DroppedItemsInWindow.Clear();
             player.InventoryTransactionStartTick = -1;
             CloseInventoryTransaction(playerId);
             foreach (int slot in slots)
@@ -1409,6 +1454,63 @@ public sealed class WorldState
             return approved;
         }
         return approved;
+    }
+
+    /// <summary>
+    /// 退回「放置被权威层拒绝、但客户端已按本地成功结果移走」的物品：把对应槽位的暂存变更**整条摘掉**
+    /// （权威值原样保留 —— 不写入就等于保持权威值），返回被退回的槽位（调用方据此回写客户端）。
+    /// <para>
+    /// 为什么需要：客户端本地放置成功后会立刻把物品从手持槽拿走并上报包 5，而服务端这次放置被拒 =
+    /// 从未产出图格；守恒判据对「只减不增」的纯消耗一律放行（药水 / 投掷物等未建模消耗需要），
+    /// 于是这次无产出凭据的减少被静默提交 —— 真机表现为「方块放下去马上被销毁」（物品没了，地图上也没有新图格）。
+    /// </para>
+    /// 三条判据同时成立才退回：凭据属于本结算窗口（久置标记会误伤之后的正常消耗）、候选物品已知（反查不到就定位不了）、
+    /// 该物品本窗口内没有「丢到世界」的凭据（掉落物已生成 = 这次减少是合法的）。
+    /// 调用方需持 <see cref="PlayersLock"/>。
+    /// </summary>
+    private List<int> RescueRejectedPlacementRemovals(PlayerRuntime player, int windowTicks)
+    {
+        var rescued = new List<int>();
+        if (player.RejectedPlacements.Count == 0) return rescued;
+
+        foreach (var (rejectTick, candidates) in player.RejectedPlacements)
+        {
+            // 新鲜度以**本结算窗口的起点**为基准：客户端是先放置、再上报包 5，故拒绝时刻必然
+            // 先于（或等于）窗口起点，两者相差通常只有几个 tick。若改成从结算时刻往回推一个窗口，
+            // 任何「拒绝 → 包 5 → 窗口到期」的正常顺序都会因窗口本身已过去而被误判为陈旧、漏退回。
+            // 窗口起点前一个窗口以上的标记才视为久置（那次上报早已结算过），再退回会误伤之后的正常消耗。
+            if (rejectTick < player.InventoryTransactionStartTick - windowTicks) continue;
+            if (candidates is null) continue;   // 候选未知（越界 / 反查不到）→ 定位不到物品，不退回
+
+            foreach (int itemId in candidates)
+            {
+                // 本窗口内已把该物品丢到世界（掉落物实打实生成了）= 这次减少有凭据，退回会凭空多出一份。
+                if (player.DroppedItemsInWindow.Contains(itemId)) continue;
+
+                // 找「权威值就是该物品、而暂存值把它减少 / 清空」的槽位：这正是客户端按本地放置成功结果上报的那次减少。
+                var toRemove = new List<int>();
+                foreach (var (slot, staged) in player.PendingInventoryChanges)
+                {
+                    if (player.Items[slot] != itemId || player.ItemStacks[slot] <= 0) continue;
+                    bool reduces = staged.Stack <= 0                     // 清空
+                        || staged.ItemId != itemId                       // 换成别的物品 = 该物品被整槽拿走
+                        || staged.Stack < player.ItemStacks[slot];        // 同物品但变少
+                    if (reduces) toRemove.Add(slot);
+                }
+
+                foreach (int slot in toRemove)
+                {
+                    player.PendingInventoryChanges.Remove(slot);
+                    rescued.Add(slot);
+                    // 诊断（默认关闭）：逐槽打印退回依据 —— 真机「放下去被销毁」时确认到底退回了哪一槽 / 哪件物品。
+                    if (DiagnosticLog.Enabled)
+                        Console.WriteLine($"[InventoryTx] 退回槽{slot}: 权威 {player.Items[slot]}x{player.ItemStacks[slot]}"
+                            + $"（被拒放置 tick={rejectTick} 候选=[{string.Join(",", candidates)}]）");
+                }
+            }
+        }
+
+        return rescued;
     }
 
     /// <summary>诊断用（<see cref="DiagnosticLog.Enabled"/>）：列出本次结算槽位的「暂存值 → 权威值」。</summary>
@@ -2453,6 +2555,16 @@ public sealed class PlayerRuntime
     /// 不在基准内，故客户端「清空该槽」的暂存意图会超出上限而被判不守恒（保留与外部变更冲突回滚的语义）。
     /// </summary>
     public readonly Dictionary<(int ItemId, byte Prefix), int> InventoryTransactionBaseline = new();
+
+    /// <summary>
+    /// 本窗口内被权威层拒绝的放置请求（放置包只带图格 / 墙 ID，候选物品由 TileToItemTable 反查；
+    /// 反查不到时 CandidateItems 为 null = 候选未知，不参与退回）。窗口结算时据此把
+    /// 「客户端已按本地成功结果移走、但服务端从未放置」的物品退回，避免凭空销毁（见 TryCommitInventoryTransaction）。
+    /// </summary>
+    public readonly List<(long Tick, IReadOnlyList<int>? CandidateItems)> RejectedPlacements = new();
+
+    /// <summary>本窗口内玩家丢弃过的物品（包 21 → 掉落物已生成 = 减少有凭据，退回时跳过）。</summary>
+    public readonly HashSet<int> DroppedItemsInWindow = new();
 
     /// <summary>
     /// 合成环境快照（可达区域图格 + 相邻液体 + 雪原 / 墓地 / 世界特性 / 火把神恩），

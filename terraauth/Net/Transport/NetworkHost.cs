@@ -394,22 +394,44 @@ public sealed class NetworkHost : IAsyncDisposable
                 // 诊断：限频打印拒绝原因，否则"移动包是否被权威层丢弃"在服务端完全不可见
                 var rejectNo = Interlocked.Increment(ref _rejectCount);
                 // 常规只打印前 50 条 + 每 1000 条（未建模包量大，早把额度占满）。
-                // 例外：箱子 / 拾取 / 丢弃这几类「玩家能直接感知到」的拒绝**始终打印**——
-                // 真机排查「从宝箱拿出来的东西消失 / 地上捡不起来」时，前 50 条早被未建模包占完了。
+                // 例外：箱子 / 拾取 / 丢弃 / **放置与破坏图格**这几类「玩家能直接感知到」的拒绝**始终打印**——
+                // 真机排查「从宝箱拿出来的东西消失 / 地上捡不起来 / 方块放下去就没了」时，
+                // 前 50 条早被未建模包占完了。
                 var alwaysLogged = packet is SyncChestItemPacket or ChestPacket or ItemPickupPacket
-                    or ItemDestroyPacket or ItemDropPacket or QuickStackChestsPacket;
+                    or ItemDestroyPacket or ItemDropPacket or QuickStackChestsPacket
+                    or TilePlacePacket or TileBreakPacket;
                 if (rejectNo <= 50 || rejectNo % 1000 == 0 || alwaysLogged)
                     Console.WriteLine($"[Authority] 拒绝 #{rejectNo} 玩家 #{connection.PlayerId}: {result.Reason}"
-                        + (result.Detail is { Length: > 0 } d ? $"（{d}）" : ""));
+                        + (result.Detail is { Length: > 0 } d ? $"（{d}）" : string.Empty));
 
                 // 客户端图格缓存与服务端不一致时，拒绝修改但立即补发权威单格，
                 // 让客户端停止重试旧 TileType；该类同步差异不计入违规。
+                // 放置被拒同样要补发：客户端本地放置**已经成功**（物品已从手持槽移走并上报包 5），
+                // 服务端却从未产生这一格 —— 不补发就会在客户端留下一个「幽灵方块」
+                // （本地看得见、服务端不认、挖掉也不掉落）；补发权威单格把它覆盖回服务端真实内容。
+                // 越界坐标无从补发（拒绝原因本身就是 out_of_bounds），故先做世界边界检查。
+                int? resendTileX = null, resendTileY = null;
                 if (packet is TileBreakPacket tileBreak
-                    && result.Reason == "tile_type_mismatch")
+                    && (result.Reason == "tile_type_mismatch"
+                        || tileBreak.Action is 1 or 3 && IsPlacementRejectReason(result.Reason)))
+                {
+                    resendTileX = tileBreak.X;
+                    resendTileY = tileBreak.Y;
+                }
+                else if (packet is TilePlacePacket tilePlace && IsPlacementRejectReason(result.Reason))
+                {
+                    resendTileX = tilePlace.X;
+                    resendTileY = tilePlace.Y;
+                }
+
+                // 两个坐标分别判空：`is int rx and int ry` 会把 ry 也绑定成 X 的值，
+                // 于是 Y 的越界判断用的是 X（X 常大于世界高度）→ 补发被误判越界而静默跳过。
+                if (resendTileX is int rx && resendTileY is int ry
+                    && rx >= 0 && ry >= 0 && rx < _world.MaxTilesX && ry < _world.MaxTilesY)
                 {
                     await connection.SendEncodedAsync(
                         PacketId.TileSquare,
-                        new TileSquarePacket(_world, tileBreak.X, tileBreak.Y, 1, 1),
+                        new TileSquarePacket(_world, rx, ry, 1, 1),
                         ct).ConfigureAwait(false);
                 }
 
@@ -433,6 +455,13 @@ public sealed class NetworkHost : IAsyncDisposable
                 break;
         }
     }
+
+    /// <summary>
+    /// 放置被拒的原因集合 —— 客户端本地放置已成功、服务端却从未产生该格，故需要补发权威单格
+    /// （否则客户端留下「幽灵方块」）：图格已存在 / 图格不由任何物品放置 / 背包里没有候选物品。
+    /// </summary>
+    private static bool IsPlacementRejectReason(string? reason)
+        => reason is "tile_already_exists" or "tile_item_unknown" or "item_not_in_inventory";
 
     /// <summary>
     /// 入站关键包明细（真机排障用，由 <see cref="DiagnosticLog.Enabled"/> 守卫）：

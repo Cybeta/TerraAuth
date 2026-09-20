@@ -816,6 +816,11 @@ public sealed record TileBreakCommand(long Tick, int? PlayerId, int X, int Y, by
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
+        // 诊断（默认关闭）：挖 / 放图格在服务端完全不可见时，「挖不动 / 放下去被销毁」无从定位。
+        // 只覆盖 0..4（挖砖 / 放砖 / 挖墙 / 放墙 / 无掉落挖），电线 / 斜坡类改动不做输出以免刷屏。
+        if (DiagnosticLog.Enabled && Action is 0 or 1 or 2 or 3 or 4)
+            Console.WriteLine($"[Tile] 包17 玩家#{PlayerId} action={Action} ({X},{Y}) type={TileType}");
+
         if (PlayerId is not int playerId)
             return new(false, CommandFailures.MissingPlayer);
         if (!TryGetPlayer(world, playerId, out _, out var failure))
@@ -2078,6 +2083,12 @@ public sealed record SpawnItemCommand(
                 SpawnedTick = world.Tick,  // 结算窗口据此认定「本窗口内该玩家的掉落」（宝袋净减少的解释来源）
             });
         }
+
+        // 包 21 上行的掉落路径：登记「本窗口内该玩家丢过的物品」，供背包守恒层区分
+        // 「合法的丢弃（掉落物已生成）」与「放置被拒后客户端误以为成功的减少」（见 MarkItemDroppedByPlayer）。
+        // 必须在 ItemsLock 之外调用：锁序为 PlayersLock → ItemsLock。
+        if (PlayerId is int droppedBy)
+            world.MarkItemDroppedByPlayer(droppedBy, ItemId);
 
         return new(true);
     }
