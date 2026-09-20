@@ -1284,6 +1284,9 @@ public sealed class WorldState
         }
     }
 
+    /// <summary>钱币物品 ID（铜 / 银 / 金 / 铂金）：开袋金币按这四种的净增量折算铜币总量。</summary>
+    private static readonly int[] CoinIds = { 71, 72, 73, 74 };
+
     /// <summary>
     /// 开袋的独立结算：当暂存意图里存在「某个宝袋恰好净减少 1 件」且同窗口出现该袋战利品
     /// （池内物品、单次上限内，见 <see cref="BossBagLootTable"/>）时，把**袋槽 + 这些战利品槽**
@@ -1301,6 +1304,29 @@ public sealed class WorldState
         var approved = new List<int>();
         if (player.PendingInventoryChanges.Count == 0) return approved;
 
+        // 权威总量 / 暂存后总量（按 (物品, 前缀)）：战利品判定必须看**全背包净增量**，而不是单槽增量 ——
+        // 单槽口径会把「把已有物品挪到别的槽」当成增加（真机：背包里已有一枚克苏鲁之盾，开袋再给一枚时，
+        // 挪位那一枚先吃掉该物品的单次上限，真正新增的那一枚反被判超限回滚）。
+        var authoritative = new Dictionary<(int ItemId, byte Prefix), int>();
+        for (int slot = 0; slot < PlayerRuntime.InventorySlotCount; slot++)
+            if (player.Items[slot] != 0 && player.ItemStacks[slot] > 0)
+                AddTotals(authoritative, player.Items[slot], player.ItemStacks[slot], player.ItemPrefixes[slot]);
+        var proposed = new Dictionary<(int ItemId, byte Prefix), int>(authoritative);
+        foreach (var (slot, staged) in player.PendingInventoryChanges)
+        {
+            if (player.Items[slot] != 0 && player.ItemStacks[slot] > 0)
+            {
+                var key = (player.Items[slot], player.ItemPrefixes[slot]);
+                var left = proposed.GetValueOrDefault(key) - player.ItemStacks[slot];
+                if (left > 0) proposed[key] = left;
+                else proposed.Remove(key);
+            }
+            if (staged.Stack > 0) AddTotals(proposed, staged.ItemId, staged.Stack, staged.Prefix);
+        }
+
+        int NetGain(int itemId) => proposed.GetValueOrDefault((itemId, (byte)0))
+                                   - authoritative.GetValueOrDefault((itemId, (byte)0));
+
         foreach (var (bagSlot, bagStaged) in player.PendingInventoryChanges)
         {
             int bagId = player.Items[bagSlot];
@@ -1312,40 +1338,55 @@ public sealed class WorldState
             if (player.ItemStacks[bagSlot] - kept != 1) continue;
             if (!BossBagLootTable.TryGetLoot(bagId, out _)) continue;   // 未建模的袋交回通用判据（失败关闭）
 
-            // 战利品槽：暂存物品属于该袋池（或开袋附带的金币），且净增量在允许范围内。
+            // 战利品槽：暂存物品属于该袋池（或开袋附带的金币），且**全背包净增量**在允许范围内。
             // 超出范围 / 不在池内的槽位**只是不摘出**（留给通用判据回滚），绝不让它把开袋一起拖下水。
-            var gains = new Dictionary<int, int>();
             var lootSlots = new List<int>();
-            var coinSlots = new List<int>();
-            long coinCopper = 0;
             foreach (var (slot, staged) in player.PendingInventoryChanges)
             {
-                if (slot == bagSlot || staged.Stack <= 0 || staged.Prefix != 0) continue;
-                var baseStack = player.Items[slot] == staged.ItemId && player.ItemPrefixes[slot] == 0
-                    ? player.ItemStacks[slot]
-                    : 0;
-                // 槽内原有别的物品（既非「空槽填入」也非「同类堆叠合并」）→ 不摘出，交回通用判据
-                if (player.ItemStacks[slot] > 0 && baseStack == 0) continue;
-                var gain = staged.Stack - baseStack;
-
-                // 开袋附带的金币（原版把 Boss 的 NPC.value 换算成钱币）：按铜币总量区间校验
-                if (BossBagLootTable.IsCoin(staged.ItemId))
+                // 「暂存带前缀」不再一票否决：袋开出的物品若客户端带了前缀（真机：背包里已有一枚带前缀的
+                // 克苏鲁之盾时，袋给的第二枚被记为带前缀 → 整槽被跳过 → 1 秒后消失），只要物品在池内、
+                // 且**全背包净增量**在单次上限内，就随开袋提交（前缀只影响属性，不构成凭空造物）。
+                int limit = 0;
+                string? skip = null;
+                if (slot == bagSlot) skip = "袋槽本身";
+                else if (staged.Stack <= 0) skip = "暂存为空";
+                else if (BossBagLootTable.IsCoin(staged.ItemId)) skip = "金币（另按铜币区间判定）";
+                else if (!BossBagLootTable.TryGetLootLimit(bagId, staged.ItemId, out limit)) skip = "不在该袋战利品池";
+                else
                 {
-                    if (!BossBagLootTable.CoinValueByBag.ContainsKey(bagId)) continue;
-                    coinCopper += BossBagLootTable.CoinCopper(staged.ItemId, gain);
-                    coinSlots.Add(slot);
-                    continue;
+                    var n = NetGain(staged.ItemId);
+                    if (n < 1) skip = $"净增 {n}（只是挪位）";
+                    else if (n > limit) skip = $"净增 {n} > 单次上限 {limit}";
                 }
 
-                if (!BossBagLootTable.TryGetLootLimit(bagId, staged.ItemId, out var limit)) continue;
-                if (gains.GetValueOrDefault(staged.ItemId) + gain > limit) continue;   // 超单次上限 → 不摘出
-                gains[staged.ItemId] = gains.GetValueOrDefault(staged.ItemId) + gain;
+                // 诊断（默认关闭）：逐槽打印判定依据 —— 真机「袋开出的东西 1 秒后消失」时靠这行定位是哪一项卡住
+                if (DiagnosticLog.Enabled)
+                    Console.WriteLine($"[BagOpen] 袋#{bagId} 槽{slot}: 暂存 {staged.ItemId}x{staged.Stack} p{staged.Prefix}"
+                        + $" / 权威 {(player.ItemStacks[slot] > 0 ? $"{player.Items[slot]}x{player.ItemStacks[slot]} p{player.ItemPrefixes[slot]}" : "空")}"
+                        + $" 净增={NetGain(staged.ItemId)} 上限={limit} → {(skip is null ? "批准" : "跳过：" + skip)}");
+
+                if (skip is not null) continue;
                 lootSlots.Add(slot);
             }
 
-            // 金币只有落在原版区间内才算开袋奖励（超出 → 不摘出，交给通用判据回滚）
-            if (coinCopper > 0 && BossBagLootTable.CoinRewardAllowed(bagId, coinCopper))
-                lootSlots.AddRange(coinSlots);
+            // 开袋附带的金币（原版把 Boss 的 NPC.value 换算成钱币）：净增量的铜币总量须落在原版区间内
+            if (BossBagLootTable.CoinValueByBag.ContainsKey(bagId))
+            {
+                long coinCopper = 0;
+                var coinSlots = new List<int>();
+                foreach (int coinId in CoinIds)
+                {
+                    var net = NetGain(coinId);
+                    if (net <= 0) continue;
+                    coinCopper += BossBagLootTable.CoinCopper(coinId, net);
+                    foreach (var (cslot, cstaged) in player.PendingInventoryChanges)
+                        if (cslot != bagSlot && cstaged.Stack > 0 && cstaged.Prefix == 0 && cstaged.ItemId == coinId)
+                            coinSlots.Add(cslot);
+                }
+                // 区间外 → 不摘出，交给通用判据回滚
+                if (coinCopper > 0 && BossBagLootTable.CoinRewardAllowed(bagId, coinCopper))
+                    lootSlots.AddRange(coinSlots);
+            }
 
             // 没有任何可信战利品 → 不是开袋（鼠标把袋子拿在手上 / 丢弃等），整体交回通用判据
             if (lootSlots.Count == 0) continue;

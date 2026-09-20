@@ -1514,6 +1514,11 @@ public sealed record TilePlaceCommand(long Tick, int? PlayerId, int X, int Y, in
 {
     public override CommandApplyResult Apply(WorldState world, IRng rng)
     {
+        // 诊断（默认关闭）：放置请求落到命令层的入参 —— 真机「放下了工作台，但服务端地图没有 / 旁边合成失败」
+        // 时靠这行区分「包被权威层拒了」与「放到了别的坐标 / 别的图格 ID」。
+        if (DiagnosticLog.Enabled)
+            Console.WriteLine($"[Tile] 放置请求 玩家#{PlayerId} ({X},{Y}) tile={TileType} style={Style}");
+
         if (X < 0 || X >= world.MaxTilesX || Y < 0 || Y >= world.MaxTilesY)
 return new(false, CommandFailures.NotApplied);
 
