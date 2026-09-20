@@ -1371,8 +1371,18 @@ public sealed class WorldState
             if (staged.Stack > 0) AddTotals(proposed, staged.ItemId, staged.Stack, staged.Prefix);
         }
 
-        int NetGain(int itemId) => proposed.GetValueOrDefault((itemId, (byte)0))
-                                   - authoritative.GetValueOrDefault((itemId, (byte)0));
+        // 战利品净增量必须**跨全部前缀**求和：开袋给的装备可能带词缀（真机：克苏鲁之盾 3097 带前缀 78），
+        // 只统计前缀 0 会把「新到手的那件带词缀装备」算成净增 0（判定为「只是挪位」）而跳过它 →
+        // 玩家开袋后装备消失（本判定是「单次上限」的依据，必须看这件物品的总净增）。
+        int NetGain(int itemId)
+        {
+            int net = 0;
+            foreach (var entry in proposed)
+                if (entry.Key.ItemId == itemId) net += entry.Value;
+            foreach (var entry in authoritative)
+                if (entry.Key.ItemId == itemId) net -= entry.Value;
+            return net;
+        }
 
         foreach (var (bagSlot, bagStaged) in player.PendingInventoryChanges)
         {

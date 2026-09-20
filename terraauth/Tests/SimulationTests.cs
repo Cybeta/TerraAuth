@@ -2785,8 +2785,10 @@ public class SimulationTests
     }
 
     /// <summary>
-    /// SSC 宝袋：开袋金币超出原版区间（&gt; 2.883 × 30000 = 86490 铜币）→ **只有金币槽回滚**，
+    /// SSC 宝袋：开袋金币超出允许上界（&gt; 5 × 30000 = 150000 铜币）→ **只有金币槽回滚**，
     /// 开袋本身（袋消耗 + 装备战利品）照常成交 —— 越界的槽位不能把开袋一起拖下水。
+    /// （上界为什么是 5× 而不是原版系数链的 2.883×，见 <c>BossBagLootTable.CoinRewardAllowed</c>：
+    /// 真机同一袋实测到 4.1×，按理论值收窄会把真机金币吞掉。）
     /// </summary>
     [Fact]
     public void TreasureBag_CoinReward_AboveRange_OnlyCoinsRolledBack()
@@ -2801,7 +2803,7 @@ public class SimulationTests
 
         Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
         Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
-        Assert.True(new StageInventorySlotCommand(100, 1, 6, 73, 9).Apply(world, rng).Applied);   // 9 金币 = 90000 铜币
+        Assert.True(new StageInventorySlotCommand(100, 1, 6, 73, 20).Apply(world, rng).Applied);   // 20 金币 = 200000 铜币
 
         world.Tick = 120;
         Assert.Equal(InventoryTransactionOutcome.RolledBack, world.TryCommitInventoryTransaction(1, 15));
@@ -2809,6 +2811,96 @@ public class SimulationTests
         Assert.Equal(0, player.Items[3]);            // 袋照常消耗
         Assert.Equal(880, player.Items[4]);          // 装备战利品照常到手
         Assert.Equal(0, player.Items[6]);            // 越界金币不回滚进背包
+    }
+
+    /// <summary>
+    /// SSC 宝袋：**战利品带词缀**（真机：克苏鲁之盾 3097 带前缀 78）必须照常到手。
+    /// 单次上限判定用的是「该物品的净增」，必须**跨全部前缀**求和 —— 只统计前缀 0 时，
+    /// 这件带词缀装备会被算成「净增 0（只是挪位）」而跳过 → 真机表现为「开袋后装备又消失了」。
+    /// </summary>
+    [Fact]
+    public void TreasureBag_LootWithPrefix_IsKept()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 5, 3097, 1, 78).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+
+        Assert.Equal(0, player.Items[3]);            // 袋已开
+        Assert.Equal(3097, player.Items[5]);         // 带词缀的盾保留
+        Assert.Equal(78, player.ItemPrefixes[5]);
+    }
+
+    /// <summary>
+    /// SSC 宝袋：同件装备被上报成两个前缀（= 想借「跨前缀求和」多拿一件）仍须按**总净增**卡单次上限。
+    /// </summary>
+    [Fact]
+    public void TreasureBag_LootWithPrefix_StillRespectsStackLimit()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 5, 3097, 1).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 6, 3097, 1, 78).Apply(world, rng).Applied);
+
+        world.Tick = 120;
+        world.TryCommitInventoryTransaction(1, 15);
+
+        // 单次上限 = 1：两件（不此前缀是否不同）≥ 2 → 判超限，两槽都不落地
+        Assert.Equal(0, player.Items[5]);
+        Assert.Equal(0, player.Items[6]);
+    }
+
+    /// <summary>
+    /// SSC 宝袋：真机实测的金币掷骰必须被接受 —— 同一袋（3319，基础 30000 铜）客户端给出
+    /// 12 金 30 银 61 铜 = 123061 铜 ≈ **4.1×**，超过按原版系数链算出的 2.883× 上界。
+    /// 金币由客户端掷骰，服务端只设上界防凭空造钱（见 <c>BossBagLootTable.CoinRewardAllowed</c>），
+    /// 拿理论值当硬上限会把真机金币吞掉。
+    /// </summary>
+    [Fact]
+    public void TreasureBag_CoinReward_RealMachineRoll_IsAccepted()
+    {
+        var world = new WorldState { Tick = 100 };
+        var player = new PlayerRuntime { Id = 1, Active = true };
+        player.Items[3] = 3319;
+        player.ItemStacks[3] = 1;
+        lock (world.PlayersLock)
+            world.Players[1] = player;
+        var rng = new XoshiroRng(1);
+
+        Assert.True(new StageInventorySlotCommand(100, 1, 3, 0, 0).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 4, 880, 52).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 5, 3097, 1, 78).Apply(world, rng).Applied);
+        Assert.True(new StageInventorySlotCommand(100, 1, 51, 71, 61).Apply(world, rng).Applied);   // 铜
+        Assert.True(new StageInventorySlotCommand(100, 1, 52, 72, 30).Apply(world, rng).Applied);   // 银
+        Assert.True(new StageInventorySlotCommand(100, 1, 53, 73, 12).Apply(world, rng).Applied);   // 金
+
+        world.Tick = 120;
+        Assert.Equal(InventoryTransactionOutcome.Committed, world.TryCommitInventoryTransaction(1, 15));
+
+        Assert.Equal(71, player.Items[51]);
+        Assert.Equal(61, player.ItemStacks[51]);
+        Assert.Equal(72, player.Items[52]);
+        Assert.Equal(30, player.ItemStacks[52]);
+        Assert.Equal(73, player.Items[53]);
+        Assert.Equal(12, player.ItemStacks[53]);
     }
 
     /// <summary>

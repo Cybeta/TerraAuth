@@ -92,14 +92,19 @@ public static class BossBagLootTable
     };
 
     /// <summary>
-    /// 开袋金币是否落在原版允许区间：基础值 × [0.8, 2.883]。
-    /// 下界 0.8 = 唯一那次 <c>(1 ± 20%)</c>；上界 = 0.8 的补 1.2 再乘四层可选加成
-    /// （1.05~1.10 / 1.10~1.20 / 1.15~1.30 / 1.20~1.40 依次可能触发）≈ 2.883×。
+    /// 开袋金币是否落在允许区间：基础值 × [0.8, 5]。
+    /// <para>
+    /// 下界 0.8 = 原版唯一那次 <c>(1 ± 20%)</c>；上界**按原版系数链算出来是 1.2 × 1.10 × 1.20 × 1.30 × 1.40
+    /// ≈ 2.883×**（四层可选加成依次可能触发），但真机实测同一袋（3319，基础 30000 铜）客户端给出
+    /// 12 金 30 银 61 铜 = **4.1×** —— 客户端侧的掷骰链与我们对原版公式的理解并不完全一致。
+    /// 金币是**客户端掷骰**的结果，服务端只能设上界防止凭空造钱：取 5× 既容得下实测值，
+    /// 又挡住离谱数值（掉一次袋凭空多出几十倍基础值）。**不要按 2.883 收窄回去**，否则真机金币又被吞。
+    /// </para>
     /// </summary>
     public static bool CoinRewardAllowed(int bagItemId, long copper)
         => CoinValueByBag.TryGetValue(bagItemId, out var value)
            && copper >= (long)(value * 0.8)
-           && copper <= (long)(value * 2.883) + 1;
+           && copper <= (long)(value * 5) + 1;
 
     /// <summary>该袋是否已建模战利品池；未建模的袋一律失败关闭（净减少得不到解释 → 回滚）。</summary>
     public static bool TryGetLoot(int bagItemId, out BossBagLootEntry[] loot)
