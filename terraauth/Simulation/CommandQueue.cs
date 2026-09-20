@@ -1529,12 +1529,18 @@ return new(false, CommandFailures.NotApplied);
         if (world.InventoryLedger is null)
 return new(false, CommandFailures.NotApplied);
 
+        // 扣减的是**物品 ID**，不是包里的图格 ID：两者并不相等（工作台：物品 36 ↔ 图格 18；
+        // 泥土：物品 2 ↔ 图格 0；木头：物品 9 ↔ 图格 30），拿图格 ID 去扣永远扣不到。
+        // 反查不到（该图格不由任何物品放置）与权威层 ValidatePlace 同口径 → 不应用。
+        if (!TileToItemTable.TryGetItemForTile(TileType, out var itemId))
+            return new(false, CommandFailures.NotApplied);
+
         // 图格和背包必须在同一提交单元中处理。先占住图格写锁，再确认目标仍为空并扣除物品。
         world.Sections.EnterWrite(X, Y);
         try
         {
             ref var tile = ref world.Tiles[X, Y];
-            if (tile.Active || !world.InventoryLedger.ConsumeItem(playerId, TileType))
+            if (tile.Active || !world.InventoryLedger.ConsumeItem(playerId, itemId))
                 return new(false, CommandFailures.NotApplied);
             tile.Active = true;
             tile.Type = (ushort)TileType;

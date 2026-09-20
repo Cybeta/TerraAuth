@@ -18,6 +18,7 @@
   <!-- 本目录测试源码（显式列表） -->
   <ItemGroup>
     <Compile Include="AuthorityTests.cs" />
+    <Compile Include="PlacementTests.cs" />
     <Compile Include="SimulationTests.cs" />
     <Compile Include="SnapshotTests.cs" />
     <Compile Include="NetworkTests.cs" />

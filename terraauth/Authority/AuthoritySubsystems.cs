@@ -1196,13 +1196,21 @@ internal sealed class WorldAuthority : IWorldAuthority
         if (tile.Active)
             return Deny(playerId, "tile_rejected", "tile_already_exists", new { place.X, place.Y });
 
+        // 放置包携带的是**图格 ID**，背包里存的是**物品 ID**，两者并不相等
+        // （工作台：物品 36 ↔ 图格 18；泥土：物品 2 ↔ 图格 0；木头：物品 9 ↔ 图格 30），
+        // 故必须先用 TileToItemTable 反查「放置物品」，不能拿图格 ID 直接查背包。
+        // 反查不到（该图格不由任何物品放置，例如只靠生长 / 系统生成）→ 直接拒绝：
+        // 宁可挡下这一个放置，也不允许用任意物品「换」出一个本不该由手持物放置的图格。
+        if (!TileToItemTable.TryGetItemForTile(place.TileType, out var placeItemId))
+            return Deny(playerId, "tile_rejected", "tile_item_unknown", new { place.TileType });
+
         // 背包物品校验只读；实际扣除必须随放置命令一起提交。
         // 计入本窗口尚未结算的暂存值：客户端「合成后立刻放下」是常规操作（工作台就是这么来的），
         // 权威背包要等 15 tick 守恒窗口后才拿到该物品 —— 只比对权威值会误拒（item_not_in_inventory），
         // 地图上就多出一个服务端不认识的方块，之后在它旁边合成全部失败。
-        if (!_inv.HasItemIncludingPending(playerId, place.TileType))
+        if (!_inv.HasItemIncludingPending(playerId, placeItemId))
             return Deny(playerId, "tile_rejected", "item_not_in_inventory",
-                new { place.TileType, Reason = "backpack missing item or not synced yet" });
+                new { place.TileType, Item = placeItemId, Reason = "backpack missing item or not synced yet" });
 
         return AuthorityResult.Accept(place);
     }
