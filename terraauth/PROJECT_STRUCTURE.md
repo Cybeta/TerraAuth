@@ -88,6 +88,7 @@ terraauth/
 │   ├── Determinism.cs            #   IRng + 确定性
 │   ├── WorldEntities.cs          #   世界实体（掉落物 / 弹幕 / NPC / 箱子）
 │   ├── PlayerProfileCodec.cs     #   SSC 玩家档案编解码（背包 / 生命 / 法力落盘）
+│   ├── WorldProgressCodec.cs     #   世界进度编解码（Boss 击杀 / 困难模式等 82 位版本化位图）
 │   ├── ItemNameTable.cs          #   物品 ID → 原版标识名（拾取提示 / 调试输出）
 │   ├── ItemDisplayNameTable.cs   #   物品 ID → 玩家提示用中文显示名
 │   ├── AxePowerTable.cs          #   手持物品斧力表（树木额外木材判定）
@@ -143,7 +144,8 @@ terraauth/
 │       ├── Connection.cs         #   单连接状态机（Handshake→Playing→Disconnected）
 │       ├── ConnectionManager.cs  #   连接池 / 超时 / 并发上限
 │       ├── ISnapshotSender.cs    #   出站快照抽象
-│       ├── NetworkHost.cs        # ★ TcpListener + Accept + 管线调度
+│       ├── NetworkHost.cs        # ★ TcpListener + Accept + 管线调度 + 档案变更落盘
+│       ├── PlayerProfileSaveTracker.cs# 档案落盘基线（会话 → 上次成功落盘字节，跳过未变更）
 │       └── README.md             #   模块说明（含实测记录）
 │
 ├── Config/                       # 配置            ── namespace TerraAuth.Config
