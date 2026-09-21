@@ -50,8 +50,16 @@ public interface IWorldRepository
     /// <summary>读取全部图格实体覆盖与删除墓碑，供启动时按锚点回放。</summary>
     Task<IReadOnlyList<WorldTileEntityRecord>> LoadTileEntityChangesAsync();
     /// <summary>
-    /// 清空全部世界改动（图格 + 箱子 + 图格实体）。基准世界换掉（改 <c>WorldSeed</c> / 换 .wld）时必须调用，
-    /// 否则按旧地图坐标记录的改动会落到新地形上。
+    /// 写入世界进度（单行覆盖写：同一世界只有一条进度记录）。
+    /// 进度是「世界状态」而非「玩家数据」，故按 <see cref="WorldId"/> 落库而非按玩家名。
+    /// </summary>
+    Task SaveWorldProgressAsync(WorldProgressRecord progress);
+    /// <summary>读取世界进度（启动时回放）；从未落盘过则返回 null（按全新世界启动）。</summary>
+    Task<WorldProgressRecord?> LoadWorldProgressAsync();
+    /// <summary>
+    /// 清空全部世界改动（图格 + 箱子 + 图格实体 + 世界进度）。基准世界换掉（改 <c>WorldSeed</c> / 换 .wld）时必须调用，
+    /// 否则按旧地图坐标记录的改动会落到新地形上。进度必须一起清：否则新地图会带着旧地图的
+    /// 「已击败 Boss / 困难模式」跑起来 —— 这正是本改动前「换图即重置进度」行为的等价保留。
     /// </summary>
     Task ClearWorldChangesAsync();
 }
@@ -70,6 +78,13 @@ public record WorldChestRecord(int Index, int X, int Y, byte[] Data, string Worl
 /// 防止同锚点的基准世界实体在重启回放时复活。
 /// </summary>
 public record WorldTileEntityRecord(int RuntimeId, int FileId, byte Type, short X, short Y, byte[]? Data, bool IsDeleted, string WorldId = "default");
+
+/// <summary>
+/// 世界进度存档：<see cref="Data"/> 是 <c>WorldProgressCodec</c> 产出的版本化字节串
+/// （当前为 1 字节版本 + 11 字节进度位图）。存字节而不再拆列：进度位会随原版版本增删，
+/// 拆成 82 个列会每加一位就要改表结构，而版本化字节串只需升 codec 版本。
+/// </summary>
+public record WorldProgressRecord(byte[] Data, string WorldId = "default");
 
 public record PlayerData(Guid Id, string Name, byte[] InventoryBlob, int MaxHp, int MaxMp);
 public record AuditEntry(DateTime Timestamp, Guid PlayerId, string EventType, string Detail, string? IpAddress);

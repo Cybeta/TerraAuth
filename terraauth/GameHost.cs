@@ -66,6 +66,9 @@ public sealed class GameHost : IDisposable
     private readonly IAsyncDisposable? _pipelineDisposable;
     private readonly WorldState _world; // 供热重载同步全局开关（SSC 等）
 
+    /// <summary>上次**成功**落盘的世界进度字节（比对新旧以跳过无变化写入）。仅在 1Hz 世界同步循环与停机路径读写。</summary>
+    private byte[]? _lastPersistedProgress;
+
     /// <summary>权威子系统聚合：配置热重载时用于推送新阈值。</summary>
     private readonly AuthorityEnforcers _enforcers;
 
@@ -160,7 +163,7 @@ public sealed class GameHost : IDisposable
             var resetConfig = config.Current with { ResetWorldChangesOnStart = false };
             ConfigurationService.Write(configPath, resetConfig);
             config.Reload();
-            Console.WriteLine("[World] 已清空旧世界改动，本次启动后自动恢复增量持久化");
+            Console.WriteLine("[World] 已清空旧世界改动（含世界进度），本次启动后自动恢复增量持久化");
         }
 
         var world = LoadBaseWorld(config.Current.WorldPath, config.Current.WorldSize, config.Current.WorldSeed);
@@ -173,6 +176,9 @@ public sealed class GameHost : IDisposable
         // 世界改动回放：基准世界是确定性的（程序化生成 / .wld 解析），只需叠加上次运行落盘的增量，
         // 否则玩家挖 / 放 / 箱内物品在服务端重启后会全部丢失。
         ApplyPersistedWorldChanges(world, db);
+        // 进度（Boss 击杀 / 困难模式 / 事件开关）单独一条记录回放：基准世界与图格增量都不带它，
+        // 不回放就会出现「重启后已击败的 Boss 复活、困难模式退回」。
+        ApplyPersistedWorldProgress(world, db);
         var commands = new CommandQueue(maxCount: CommandQueueCapacity);
         var recorder = new EventRecorder();
         var snapshots = new SnapshotStore();
@@ -430,6 +436,10 @@ public sealed class GameHost : IDisposable
                 int rounds = 0;
                 while (world.HasPendingPersist && rounds++ < maxRounds)
                     await FlushWorldChangesAsync(CancellationToken.None).ConfigureAwait(false);
+
+                // 进度必须在排空之后**单独**再落一次：没有图格待落盘时上面那个 while 一次都不跑，
+                // 而「最后一次进度变化」往往就发生在停机前不久（例如刚打完 Boss 就关服）。
+                await FlushWorldProgressAsync(CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -563,6 +573,58 @@ public sealed class GameHost : IDisposable
     }
 
     /// <summary>
+    /// 回放落盘的世界进度：Boss 击杀 / 困难模式 / 事件与种子开关。
+    /// 基准世界（程序化生成 / .wld 解析）本身不带进度，图格增量也不带，故进度必须单独回放 ——
+    /// 否则每次重启都是「已击败的 Boss 复活 + 困难模式退回经典」，这正是差距 G8「重启即回档」。
+    /// 无记录（首次开图）或数据损坏 → 按全新世界启动，绝不阻断启动。
+    /// </summary>
+    private static void ApplyPersistedWorldProgress(WorldState world, IWorldRepository repo)
+    {
+        WorldProgressRecord? record;
+        try
+        {
+            record = repo.LoadWorldProgressAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[World] 世界进度回放失败（按全新世界启动）：{ex.Message}");
+            return;
+        }
+
+        if (record is null) return;   // 全新世界：没有进度可回放
+
+        try
+        {
+            // 就地解码进 world.Progress（它是 get-only 属性但对象可变，且已被其它子系统持有引用），
+            // 解码后包 7 打包 / 困难模式地形转换判定等看到的是同一份进度。
+            WorldProgressCodec.Decode(record.Data, world.Progress);
+        }
+        catch (Exception ex) // InvalidDataException（长度 / 版本不符）与任何后端异常
+        {
+            Console.WriteLine($"[World] 世界进度回放失败（按全新世界启动）：{ex.Message}");
+            return;
+        }
+
+        var p = world.Progress;
+        // 核对计数：WorldProgress 上没有现成计数（不为日志给它加字段），就地数一遍 Downed* 位。
+        var downedFlags = new[]
+        {
+            p.DownedBoss1, p.DownedBoss2, p.DownedBoss3, p.DownedClown, p.DownedPlantBoss,
+            p.DownedMechBoss1, p.DownedMechBoss2, p.DownedMechBoss3, p.DownedMechBossAny,
+            p.DownedSlimeKing, p.DownedQueenBee, p.DownedFishron, p.DownedMartians, p.DownedAncientCultist,
+            p.DownedMoonlord, p.DownedHalloweenKing, p.DownedHalloweenTree, p.DownedChristmasIceQueen,
+            p.DownedChristmasSantank, p.DownedChristmasTree, p.DownedGolemBoss,
+            p.DownedPirates, p.DownedFrost, p.DownedGoblins,
+            p.Dd2DownedInvasionT1, p.Dd2DownedInvasionT2, p.Dd2DownedInvasionT3,
+            p.DownedTowerSolar, p.DownedTowerVortex, p.DownedTowerNebula, p.DownedTowerStardust,
+            p.DownedEmpressOfLight, p.DownedQueenSlime, p.DownedDeerclops,
+        };
+        Console.WriteLine(
+            $"[World] 已回放上次运行的世界进度：困难模式 = {(p.HardMode ? "是" : "否")}，" +
+            $"已击败 Boss（Downed* 置位）{downedFlags.Count(static v => v)} 项");
+    }
+
+    /// <summary>
     /// 回放落盘的箱子内容：按索引定位并校验坐标（基准世界被替换时坐标不符则跳过，避免错位套用）。
     /// </summary>
     private static void ApplyPersistedChests(WorldState world, IWorldRepository repo)
@@ -632,6 +694,33 @@ public sealed class GameHost : IDisposable
 
         await FlushChestChangesAsync(world).ConfigureAwait(false);
         await FlushTileEntityChangesAsync(world).ConfigureAwait(false);
+        await FlushWorldProgressAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 把世界进度（Boss 击杀 / 困难模式 / 事件与种子开关）落盘。1Hz 世界同步循环与停机各调一次。
+    /// 判据**不是** <see cref="WorldState.ProgressDirty"/>：那个标志是「包 7 该重发了」的广播信号，
+    /// 由 <c>BroadcastWorldStateAsync</c> 读取并清位（1Hz 循环里先广播后落盘），拿它当落盘判据会漏批；
+    /// 改为与上次成功落盘的字节比对，无变化直接跳过（12 字节比对，成本可忽略）。
+    /// </summary>
+    public async Task FlushWorldProgressAsync(CancellationToken ct = default)
+    {
+        if (WorldRepo is null) return;
+
+        var world = Simulator.State;
+        var bytes = WorldProgressCodec.Encode(world.Progress);
+        if (_lastPersistedProgress is not null && bytes.AsSpan().SequenceEqual(_lastPersistedProgress))
+            return;   // 与上次落盘一致，无需写库
+
+        try
+        {
+            await WorldRepo.SaveWorldProgressAsync(new WorldProgressRecord(bytes)).ConfigureAwait(false);
+            _lastPersistedProgress = bytes;   // 只在写成功后才记账，失败留给下一次 1Hz 重试
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[World] 世界进度落盘失败：{ex.Message}");
+        }
     }
 
     private async Task FlushTileEntityChangesAsync(WorldState world)

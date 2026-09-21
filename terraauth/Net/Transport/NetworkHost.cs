@@ -80,6 +80,15 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>会话恢复宽限期（tick）；0 = 断线即回收。</summary>
     private readonly long _sessionResumeGraceTicks;
 
+    /// <summary>
+    /// 玩家档案周期落盘间隔。固定常量、不做配置项：这是一个「崩溃最多丢多少」的安全边界，
+    /// 调小只是把写放大抬高（每玩家 1 次 SQLite 覆盖写），30 秒对「背包 / 生命」这种低频状态足够。
+    /// </summary>
+    private static readonly TimeSpan ProfileSaveInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary>周期落盘循环（随 <see cref="_cts"/> 取消退出）。</summary>
+    private Task? _profileSaveLoop;
+
     /// <summary>进程内违规窗口：PlayerId → 窗口起点 + 窗口内拒绝计数。</summary>
     private readonly ConcurrentDictionary<int, ViolationWindow> _violations = new();
 
@@ -149,11 +158,12 @@ public sealed class NetworkHost : IAsyncDisposable
         SnapshotSender = new ConnectionSnapshotSender(connections, encoder);
     }
 
-    /// <summary>启动监听 + Accept 循环。</summary>
+    /// <summary>启动监听 + Accept 循环 + 玩家档案周期落盘循环。</summary>
     public void Start()
     {
         _listener.Start();
         _acceptLoop = AcceptLoopAsync(_cts.Token);
+        _profileSaveLoop = ProfileSaveLoopAsync(_cts.Token);
     }
 
     /// <summary>优雅关闭。</summary>
@@ -161,6 +171,18 @@ public sealed class NetworkHost : IAsyncDisposable
     {
         _cts.Cancel();
         _listener.Stop();
+
+        // 停机前先全量落一次档案：周期保存最长有 ProfileSaveInterval 的空窗，
+        // 正常关闭必须把这最后一次补上（必须在 Dispose 连接之前 —— 档案要读玩家运行时，
+        // 连接一关就只剩余 OnConnectionClosed 那条路径，而它同样依赖运行时还在）。
+        SaveAllPlayerProfiles();
+
+        if (_profileSaveLoop is not null)
+        {
+            // Cancel 已发出：循环会从 Task.Delay 抛出取消异常退出，属正常停机路径。
+            try { await _profileSaveLoop.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
 
         if (_acceptLoop is not null)
             await _acceptLoop.ConfigureAwait(false);
@@ -275,6 +297,56 @@ public sealed class NetworkHost : IAsyncDisposable
             Reason = "Disconnected",
             SessionDuration = duration,
         });
+    }
+
+    /// <summary>
+    /// SSC 玩家档案周期落盘循环。
+    /// ① 为什么需要：档案原本只在断线（<see cref="OnConnectionClosed"/>）时落盘，而崩溃 / 被强杀
+    ///    （kill、OOM、断电）走不到那条路径 —— 玩家这一局的背包 / 生命会整体回档；
+    ///    周期保存把最坏损失压到 ≤ <see cref="ProfileSaveInterval"/>（停机再补一次全量，正常关闭不丢）。
+    /// ② 为什么放在网络层而不是 GameHost：档案身份是「按玩家名」（见 <see cref="SavePlayerProfile"/>），
+    ///    而玩家名只存在于本类的 <c>_playerAppearances</c>（包 4 外观缓存）——<c>PlayerRuntime</c> 没有名字字段，
+    ///    组合根侧拿不到名字，只能由持有外观缓存的这里驱动。
+    /// </summary>
+    private async Task ProfileSaveLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(ProfileSaveInterval, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { break; }
+
+            SaveAllPlayerProfiles();
+        }
+    }
+
+    /// <summary>
+    /// 把所有在线玩家的档案落盘一次（周期保存与停机保存共用）。
+    /// 逐个玩家独立 try/catch：某个玩家写库失败不能连累其他玩家（其余人是本局唯一存档）。
+    /// </summary>
+    private void SaveAllPlayerProfiles()
+    {
+        if (_playerProfiles is null) return;   // 未开持久化：整条路径不做事
+
+        foreach (var connection in _connections.All())
+        {
+            try
+            {
+                // 取名字的方式与 OnConnectionClosed 完全一致（外观缓存 + 会话号校验）：
+                // 玩家槽位按「最小可用 ID」复用，不校验会话号就会把上一会话的名字套到新连接上，
+                // 写进错的档案（污染别人的背包）。
+                if (!_playerAppearances.TryGetValue(connection.PlayerId, out var appearance)
+                    || appearance.SessionId != connection.SessionId)
+                    continue;
+
+                // SavePlayerProfile 内部还会校验运行时存在 + 会话一致，并按名字写档案；
+                // 未进服（无外观）的连接在此已被跳过。
+                SavePlayerProfile(connection, appearance.Packet.Name ?? "");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SSC] 周期档案落盘异常：{ex.Message}");
+            }
+        }
     }
 
     /// <summary>

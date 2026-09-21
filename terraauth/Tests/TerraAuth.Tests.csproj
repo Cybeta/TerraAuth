@@ -29,6 +29,7 @@
     <Compile Include="VanillaFeatureTests.cs" />
     <Compile Include="WorldFileTests.cs" />
     <Compile Include="WorldManagementTests.cs" />
+    <Compile Include="WorldProgressPersistenceTests.cs" />
   </ItemGroup>
 
   <!-- 被测项目引用：全部分层已合并为根目录单一工程 -->

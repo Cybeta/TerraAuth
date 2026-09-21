@@ -46,7 +46,11 @@ internal interface IDbExecutor
     void DeleteWorldChests(string worldId, IReadOnlyList<int> chestIndices);
     void SaveWorldTileEntities(IReadOnlyList<WorldTileEntityRecord> entities);
     IReadOnlyList<WorldTileEntityRecord> LoadWorldTileEntities();
-    /// <summary>清空全部世界改动（图格 + 箱子 + 图格实体）——换种子重开地图时使用（见 <c>ServerConfig.ResetWorldChangesOnStart</c>）。</summary>
+    /// <summary>写入世界进度（单行覆盖写；<paramref name="progress"/>.WorldId 指定世界）。</summary>
+    void SaveWorldProgress(WorldProgressRecord progress);
+    /// <summary>读取世界进度（按世界）；无记录返回 null。</summary>
+    WorldProgressRecord? LoadWorldProgress(string worldId);
+    /// <summary>清空全部世界改动（图格 + 箱子 + 图格实体 + 世界进度）——换种子重开地图时使用（见 <c>ServerConfig.ResetWorldChangesOnStart</c>）。</summary>
     void ClearWorldChanges(string worldId);
 }
 
@@ -149,6 +153,21 @@ public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IWo
     public Task<IReadOnlyList<WorldTileEntityRecord>> LoadTileEntityChangesAsync()
         => Task.Run<IReadOnlyList<WorldTileEntityRecord>>(() => _db.LoadWorldTileEntities().Where(e => e.WorldId == WorldId).ToArray());
 
+    /// <summary>
+    /// 写入世界进度。进度是**单条**记录（不像图格那样是空批次常态），故不做「空批次直接返回」的判断：
+    /// 每次调用都必须真写，否则进度永远停在首次落盘的状态。
+    /// </summary>
+    public Task SaveWorldProgressAsync(WorldProgressRecord progress)
+        => Task.Run(() => _db.SaveWorldProgress(progress with { WorldId = WorldId }));
+
+    /// <summary>读取本世界的进度；再校验一次世界归属（记录里带 WorldId，防止后端实现串到别的世界）。</summary>
+    public Task<WorldProgressRecord?> LoadWorldProgressAsync()
+        => Task.Run(() =>
+        {
+            var record = _db.LoadWorldProgress(WorldId);
+            return record is null || record.WorldId != WorldId ? null : record;
+        });
+
     public Task ClearWorldChangesAsync()
         => Task.Run(() => _db.ClearWorldChanges(WorldId));
 
@@ -208,6 +227,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
     private readonly ConcurrentDictionary<(string WorldId, int X, int Y), WorldTileRecord> _worldTiles = new();
     private readonly ConcurrentDictionary<(string WorldId, int Index), WorldChestRecord> _worldChests = new();
     private readonly ConcurrentDictionary<(string WorldId, short X, short Y), WorldTileEntityRecord> _worldTileEntities = new();
+    private readonly ConcurrentDictionary<string, WorldProgressRecord> _worldProgress = new();
 
     public LiteDbPersistence(string dbPath, bool runMigrations)
     {
@@ -311,11 +331,21 @@ internal sealed class LiteDbPersistence : IDbExecutor
     public IReadOnlyList<WorldTileEntityRecord> LoadWorldTileEntities()
         => _worldTileEntities.Values.OrderBy(static entity => entity.X).ThenBy(static entity => entity.Y).ToList();
 
+    public void SaveWorldProgress(WorldProgressRecord progress)
+    {
+        _worldProgress[progress.WorldId] = progress;   // 单条覆盖写：同世界只留最新进度
+        SaveToDisk();
+    }
+
+    public WorldProgressRecord? LoadWorldProgress(string worldId)
+        => _worldProgress.TryGetValue(worldId, out var record) ? record : null;
+
     public void ClearWorldChanges(string worldId)
     {
         foreach (var key in _worldTiles.Keys.Where(k => k.WorldId == worldId).ToArray()) _worldTiles.TryRemove(key, out _);
         foreach (var key in _worldChests.Keys.Where(k => k.WorldId == worldId).ToArray()) _worldChests.TryRemove(key, out _);
         foreach (var key in _worldTileEntities.Keys.Where(k => k.WorldId == worldId).ToArray()) _worldTileEntities.TryRemove(key, out _);
+        _worldProgress.TryRemove(worldId, out _);
         SaveToDisk();
     }
 
@@ -340,6 +370,8 @@ internal sealed class LiteDbPersistence : IDbExecutor
                 foreach (var c in dto.WorldChests) _worldChests[(c.WorldId, c.Index)] = c;
             if (dto.WorldTileEntities is not null)
                 foreach (var entity in dto.WorldTileEntities) _worldTileEntities[(entity.WorldId, entity.X, entity.Y)] = entity;
+            if (dto.WorldProgress is not null)
+                foreach (var progress in dto.WorldProgress) _worldProgress[progress.WorldId] = progress;
         }
         catch { /* 首次启动无文件 / 解析失败，忽略 */ }
     }
@@ -359,6 +391,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
             WorldTiles = _worldTiles.Values.ToList(),
             WorldChests = _worldChests.Values.ToList(),
             WorldTileEntities = _worldTileEntities.Values.ToList(),
+            WorldProgress = _worldProgress.Values.ToList(),
         };
         var tmp = _dbPath + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(dump));
@@ -373,6 +406,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
         public List<WorldTileRecord>? WorldTiles { get; set; }
         public List<WorldChestRecord>? WorldChests { get; set; }
         public List<WorldTileEntityRecord>? WorldTileEntities { get; set; }
+        public List<WorldProgressRecord>? WorldProgress { get; set; }
     }
 }
 
@@ -435,6 +469,9 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
             RuntimeId INTEGER NOT NULL, FileId INTEGER NOT NULL, Type INTEGER NOT NULL, Data BLOB,
             IsDeleted INTEGER NOT NULL, PRIMARY KEY(WorldId, X, Y));
             """, "WorldId, X, Y, RuntimeId, FileId, Type, Data, IsDeleted", "X, Y, RuntimeId, FileId, Type, Data, IsDeleted");
+
+        // 世界进度：单行（每个世界一条）。新表，不需要上面那套「老表补 WorldId」的迁移逻辑。
+        Exec(conn, "CREATE TABLE IF NOT EXISTS WorldProgress (WorldId TEXT PRIMARY KEY, Data BLOB NOT NULL);");
     }
 
     private static void MigrateWorldTable(SqliteConnection conn, string table, string createSql, string columns, string legacyColumns)
@@ -824,10 +861,33 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         return list;
     }
 
+    public void SaveWorldProgress(WorldProgressRecord progress)
+    {
+        using var conn = Open();
+        Exec(conn, "INSERT INTO WorldProgress(WorldId, Data) VALUES($w,$d) ON CONFLICT(WorldId) DO UPDATE SET Data=$d;",
+            cmd =>
+            {
+                cmd.Parameters.AddWithValue("$w", progress.WorldId);
+                cmd.Parameters.AddWithValue("$d", progress.Data);
+            });
+    }
+
+    public WorldProgressRecord? LoadWorldProgress(string worldId)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT Data FROM WorldProgress WHERE WorldId = $w;";
+        cmd.Parameters.AddWithValue("$w", worldId);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        return new WorldProgressRecord((byte[])reader[0], worldId);
+    }
+
     public void ClearWorldChanges(string worldId)
     {
         using var conn = Open();
-        Exec(conn, "DELETE FROM WorldTiles WHERE WorldId = $worldId; DELETE FROM WorldChests WHERE WorldId = $worldId; DELETE FROM WorldTileEntities WHERE WorldId = $worldId;",
+        Exec(conn, "DELETE FROM WorldTiles WHERE WorldId = $worldId; DELETE FROM WorldChests WHERE WorldId = $worldId; " +
+                   "DELETE FROM WorldTileEntities WHERE WorldId = $worldId; DELETE FROM WorldProgress WHERE WorldId = $worldId;",
             cmd => cmd.Parameters.AddWithValue("$worldId", worldId));
     }
 
