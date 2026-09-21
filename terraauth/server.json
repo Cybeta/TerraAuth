@@ -121,5 +121,5 @@
 
   // ---- 诊断 ----
   // 热路径诊断日志开关：开启后输出逐包 / 逐次受伤 / 逐次命中 / 背包事务 [InventoryTx] / 掉落物归属 [ItemOwner] 等明细，用于真机排障。正常游玩请置 false。可热重载。
-  "VerboseDiagnostics": true
+  "VerboseDiagnostics": false
 }
