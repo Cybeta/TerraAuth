@@ -3977,4 +3977,139 @@ public class VanillaFeatureTests
         Assert.Equal(0, world.Tiles[x, y].Liquid);
         Assert.Equal(0, world.Tiles[x, y + 1].Liquid);
     }
+
+    // ========================================================================
+    // 二十五、SSC 玩家档案落盘：变更才写（崩服 / 被强杀少丢存档）
+    // ========================================================================
+
+    /// <summary>哨兵档案长度：与真实档案同长（430 字节），但内容（全 0xAB）不可能与真实档案相等。</summary>
+    private const int ProfileSentinelLength = 430;
+
+    /// <summary>等登录链处理完（包 4 建好运行时）后取该玩家的权威运行时。</summary>
+    private static async Task<PlayerRuntime> WaitForPlayerAsync(VanillaServer server)
+    {
+        var world = server.Host.Simulator.State;
+        PlayerRuntime? player = null;
+        await TickUntilAsync(server, () =>
+        {
+            lock (world.PlayersLock)
+                player = world.Players.Values.FirstOrDefault();
+            return player is not null;
+        }, TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(player);
+        return player!;
+    }
+
+    /// <summary>
+    /// 在线改背包 → <c>FlushPlayerProfiles</c>（周期循环 / 停机走同一入口）必须落盘，**不依赖断线路径** ——
+    /// 崩服 / 被强杀时正是靠这条路径少丢存档（此前只有断线才写）。
+    /// </summary>
+    [Fact]
+    public async Task PlayerProfile_InventoryChange_IsFlushed_AndReadBack()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Tester");
+        var world = server.Host.Simulator.State;
+        var player = await WaitForPlayerAsync(server);
+
+        // 档案身份取外观缓存里的玩家名（PlayerRuntime 没有名字字段）
+        Assert.True(server.Host.Network.TryGetPlayerName(player.Id, out var name));
+        Assert.Equal("Tester", name);
+
+        // 不断线：直接改权威背包（等价于 /give / 开袋 / 拾取 / 守恒事务提交之后的状态）→ 只驱动一次落盘
+        lock (world.PlayersLock)
+        {
+            player.Items[10] = 71;
+            player.ItemStacks[10] = 5;
+            player.ItemPrefixes[10] = 0;
+        }
+
+        server.Host.Network.FlushPlayerProfiles();
+
+        var saved = await server.Host.Players.GetAsync(TerraAuth.Security.PlayerIdentity.FromName("Tester"));
+        Assert.NotNull(saved);
+
+        // 回读：把落盘字节回填到全新运行时，槽 10 必须是 (71, 5)
+        var fresh = new PlayerRuntime();
+        Assert.True(PlayerProfileCodec.TryApply(saved!.InventoryBlob, fresh));
+        Assert.Equal(71, fresh.Items[10]);
+        Assert.Equal(5, fresh.ItemStacks[10]);
+    }
+
+    /// <summary>
+    /// 未变更不写：先落一次建立基线 → 直接篡改 DB（哨兵）→ 玩家状态没变，再落一次必须**一个字节都不写**
+    /// （DB 仍是哨兵）；随后改一处背包 → 落盘必须真实覆盖哨兵。
+    /// 没有这个比对，每 500ms 就会把全部在线玩家（含挂机者）各重写一次。
+    /// </summary>
+    [Fact]
+    public async Task PlayerProfile_Unchanged_Flush_DoesNotRewrite()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Tester");
+        var world = server.Host.Simulator.State;
+        var player = await WaitForPlayerAsync(server);
+        var identity = TerraAuth.Security.PlayerIdentity.FromName("Tester");
+
+        // ① 基线：首次无基线 → 必须真实写库
+        server.Host.Network.FlushPlayerProfiles();
+
+        // ② 篡改 DB 成哨兵（直接写仓储，绕过 NetworkHost）
+        var sentinel = new byte[ProfileSentinelLength];
+        Array.Fill(sentinel, (byte)0xAB);
+        await server.Host.Players.SaveAsync(
+            new TerraAuth.Persistence.PlayerData(identity, "Tester", sentinel, 999, 999));
+
+        // ③ 玩家状态未变 → 再落一次必须跳过写库，哨兵原样保留（证明「未变更不写」）
+        server.Host.Network.FlushPlayerProfiles();
+        var unchanged = await server.Host.Players.GetAsync(identity);
+        Assert.NotNull(unchanged);
+        Assert.Equal(ProfileSentinelLength, unchanged!.InventoryBlob.Length);
+        Assert.Equal(sentinel, unchanged.InventoryBlob);
+        Assert.Equal(999, unchanged.MaxHp);   // 哨兵元数据也未被真实档案覆盖
+
+        // ④ 改一处背包 → 这一次必须写：哨兵被真实档案覆盖
+        lock (world.PlayersLock)
+        {
+            player.Items[11] = 72;
+            player.ItemStacks[11] = 3;
+        }
+        server.Host.Network.FlushPlayerProfiles();
+
+        var changed = await server.Host.Players.GetAsync(identity);
+        Assert.NotNull(changed);
+        Assert.NotEqual(sentinel, changed!.InventoryBlob);
+        var fresh = new PlayerRuntime();
+        Assert.True(PlayerProfileCodec.TryApply(changed.InventoryBlob, fresh));
+        Assert.Equal(72, fresh.Items[11]);
+        Assert.Equal(3, fresh.ItemStacks[11]);
+    }
+
+    /// <summary>
+    /// 停机补一次：改背包后不显式落盘，直接 <c>StopAsync</c> —— 正常关闭也不能丢这一局的变更
+    /// （停机路径与周期路径共用同一入口，且走的是「已变更才写」的同一判据）。
+    /// </summary>
+    [Fact]
+    public async Task PlayerProfile_StopAsync_FlushesChangedProfile()
+    {
+        using var server = VanillaServer.Start();
+        await using var s = await server.ConnectAsync("Tester");
+        var world = server.Host.Simulator.State;
+        var player = await WaitForPlayerAsync(server);
+
+        lock (world.PlayersLock)
+        {
+            player.Items[12] = 73;
+            player.ItemStacks[12] = 4;
+        }
+
+        await server.Host.Network.StopAsync();
+
+        var saved = await server.Host.Players.GetAsync(TerraAuth.Security.PlayerIdentity.FromName("Tester"));
+        Assert.NotNull(saved);
+        var fresh = new PlayerRuntime();
+        Assert.True(PlayerProfileCodec.TryApply(saved!.InventoryBlob, fresh));
+        Assert.Equal(73, fresh.Items[12]);
+        Assert.Equal(4, fresh.ItemStacks[12]);
+    }
 }

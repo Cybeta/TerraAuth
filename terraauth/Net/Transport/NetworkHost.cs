@@ -81,10 +81,15 @@ public sealed class NetworkHost : IAsyncDisposable
     private readonly long _sessionResumeGraceTicks;
 
     /// <summary>
-    /// 玩家档案周期落盘间隔。固定常量、不做配置项：这是一个「崩溃最多丢多少」的安全边界，
-    /// 调小只是把写放大抬高（每玩家 1 次 SQLite 覆盖写），30 秒对「背包 / 生命」这种低频状态足够。
+    /// 玩家档案**比对**间隔。固定常量、不做配置项：这是「崩溃最多丢多少」的安全边界。
+    /// 每 500ms 只把在线玩家的档案编码出来与上次成功落盘的字节比一次（<see cref="_profileSaveTracker"/>），
+    /// **变了才写库** —— 实际写库频率由玩家的真实变更决定（挂机玩家 0 次），
+    /// 所以间隔取到 500ms 也不会抬高写放大，崩服 / 被强杀最多丢 ~0.5 秒。
     /// </summary>
-    private static readonly TimeSpan ProfileSaveInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ProfileSaveInterval = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>档案落盘基线（会话 → 上次成功落盘的字节）。见 <see cref="PlayerProfileSaveTracker"/> 文件头。</summary>
+    private readonly PlayerProfileSaveTracker _profileSaveTracker = new();
 
     /// <summary>周期落盘循环（随 <see cref="_cts"/> 取消退出）。</summary>
     private Task? _profileSaveLoop;
@@ -158,7 +163,7 @@ public sealed class NetworkHost : IAsyncDisposable
         SnapshotSender = new ConnectionSnapshotSender(connections, encoder);
     }
 
-    /// <summary>启动监听 + Accept 循环 + 玩家档案周期落盘循环。</summary>
+    /// <summary>启动监听 + Accept 循环 + 玩家档案变更落盘循环（每 <see cref="ProfileSaveInterval"/> 把**已变更**的落一次）。</summary>
     public void Start()
     {
         _listener.Start();
@@ -172,10 +177,10 @@ public sealed class NetworkHost : IAsyncDisposable
         _cts.Cancel();
         _listener.Stop();
 
-        // 停机前先全量落一次档案：周期保存最长有 ProfileSaveInterval 的空窗，
-        // 正常关闭必须把这最后一次补上（必须在 Dispose 连接之前 —— 档案要读玩家运行时，
+        // 停机前把**已变更**的档案落一次（未变更的由字节比对跳过）：周期保存最长有 ProfileSaveInterval
+        // 的空窗，正常关闭必须把这最后一次补上（必须在 Dispose 连接之前 —— 档案要读玩家运行时，
         // 连接一关就只剩余 OnConnectionClosed 那条路径，而它同样依赖运行时还在）。
-        SaveAllPlayerProfiles();
+        FlushPlayerProfiles();
 
         if (_profileSaveLoop is not null)
         {
@@ -300,11 +305,14 @@ public sealed class NetworkHost : IAsyncDisposable
     }
 
     /// <summary>
-    /// SSC 玩家档案周期落盘循环。
+    /// SSC 玩家档案周期落盘循环：每 <see cref="ProfileSaveInterval"/> 把**已变更**的在线玩家档案落一次。
     /// ① 为什么需要：档案原本只在断线（<see cref="OnConnectionClosed"/>）时落盘，而崩溃 / 被强杀
     ///    （kill、OOM、断电）走不到那条路径 —— 玩家这一局的背包 / 生命会整体回档；
-    ///    周期保存把最坏损失压到 ≤ <see cref="ProfileSaveInterval"/>（停机再补一次全量，正常关闭不丢）。
-    /// ② 为什么放在网络层而不是 GameHost：档案身份是「按玩家名」（见 <see cref="SavePlayerProfile"/>），
+    ///    周期比对把最坏损失压到 ≤ <see cref="ProfileSaveInterval"/>（停机再补一次，正常关闭不丢）。
+    /// ② 为什么不必知道「哪里会改背包」：比对的是**状态本身**（编码后的档案字节），
+    ///    所以守恒事务提交 / `/give` / 开袋 / 拾取 / 箱子转移 / 进服下发……任何改动都会在下一轮被发现，
+    ///    无需逐处埋点（漏点风险为零）；代价只是每 500ms 把在线玩家的档案编码一次（纯内存操作）。
+    /// ③ 为什么放在网络层而不是 GameHost：档案身份是「按玩家名」（见 <see cref="SavePlayerProfile"/>），
     ///    而玩家名只存在于本类的 <c>_playerAppearances</c>（包 4 外观缓存）——<c>PlayerRuntime</c> 没有名字字段，
     ///    组合根侧拿不到名字，只能由持有外观缓存的这里驱动。
     /// </summary>
@@ -315,17 +323,21 @@ public sealed class NetworkHost : IAsyncDisposable
             try { await Task.Delay(ProfileSaveInterval, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { break; }
 
-            SaveAllPlayerProfiles();
+            FlushPlayerProfiles();
         }
     }
 
     /// <summary>
-    /// 把所有在线玩家的档案落盘一次（周期保存与停机保存共用）。
+    /// 把所有**已变更**的在线玩家档案落盘一次（周期循环 / 停机 / 测试共用；公开的理由与
+    /// <c>GameHost.FlushWorldChangesAsync</c> 一致：让周期路径与停机路径之外也能显式驱动同一条管线）。
     /// 逐个玩家独立 try/catch：某个玩家写库失败不能连累其他玩家（其余人是本局唯一存档）。
+    /// 未变更的玩家在 <see cref="SavePlayerProfile"/> 里被字节比对挡掉（挂机玩家一次都不写）。
     /// </summary>
-    private void SaveAllPlayerProfiles()
+    public void FlushPlayerProfiles()
     {
         if (_playerProfiles is null) return;   // 未开持久化：整条路径不做事
+
+        var liveKeys = new List<(int PlayerId, long SessionId)>();
 
         foreach (var connection in _connections.All())
         {
@@ -338,6 +350,10 @@ public sealed class NetworkHost : IAsyncDisposable
                     || appearance.SessionId != connection.SessionId)
                     continue;
 
+                // 本轮仍需保留基线的会话：只收集「确实会尝试落盘」的连接，
+                // 未进服 / 已被替换的连接不该拖着一条永不使用的基线。
+                liveKeys.Add((connection.PlayerId, connection.SessionId));
+
                 // SavePlayerProfile 内部还会校验运行时存在 + 会话一致，并按名字写档案；
                 // 未进服（无外观）的连接在此已被跳过。
                 SavePlayerProfile(connection, appearance.Packet.Name ?? "");
@@ -347,11 +363,16 @@ public sealed class NetworkHost : IAsyncDisposable
                 Console.WriteLine($"[SSC] 周期档案落盘异常：{ex.Message}");
             }
         }
+
+        // 丢弃已结束会话的基线：否则字典会随「历史会话数」无界增长（每会话 430 字节）。
+        _profileSaveTracker.Prune(liveKeys);
     }
 
     /// <summary>
     /// SSC 玩家档案落盘（背包 + 生命 / 法力），按玩家名作为档案身份。
     /// 同步等待写入完成：断线清理紧随其后，异步写会让「立刻重进」读到旧档案。
+    /// 这是**唯一**的档案写入口（断线 + 周期 / 停机共用），故「与上次成功落盘的字节比对」就放在这里：
+    /// 一处生效，断线路径也顺带跳过未变更写入。只有写库成功才记账（失败不记账 → 下一轮自动重试）。
     /// </summary>
     private void SavePlayerProfile(Connection connection, string name)
     {
@@ -362,14 +383,20 @@ public sealed class NetworkHost : IAsyncDisposable
             _world.Players.TryGetValue(connection.PlayerId, out runtime);
         if (runtime is null || runtime.SessionId != connection.SessionId) return;
 
+        // 键必须带 SessionId（槽位按「最小可用 ID」复用，见 PlayerProfileSaveTracker 文件头 ②）
+        var key = (connection.PlayerId, connection.SessionId);
+        var blob = PlayerProfileCodec.Encode(runtime);
+        if (!_profileSaveTracker.NeedsSave(key, blob)) return;   // 与上次成功落盘一致 → 不写
+
         try
         {
             _playerProfiles.SaveAsync(new TerraAuth.Persistence.PlayerData(
                 TerraAuth.Security.PlayerIdentity.FromName(name),
                 name,
-                PlayerProfileCodec.Encode(runtime),
+                blob,
                 runtime.HpMax,
                 runtime.MpMax)).GetAwaiter().GetResult();
+            _profileSaveTracker.MarkSaved(key, blob);
         }
         catch (Exception ex)
         {

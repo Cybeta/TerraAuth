@@ -27,6 +27,7 @@
     <Compile Include="PluginModTests.cs" />
     <Compile Include="ConcurrencyTests.cs" />
     <Compile Include="VanillaFeatureTests.cs" />
+    <Compile Include="PlayerProfileSaveTrackerTests.cs" />
     <Compile Include="WorldFileTests.cs" />
     <Compile Include="WorldManagementTests.cs" />
     <Compile Include="WorldProgressPersistenceTests.cs" />

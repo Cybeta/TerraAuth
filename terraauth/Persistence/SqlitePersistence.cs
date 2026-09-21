@@ -434,8 +434,13 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
     {
         var conn = new SqliteConnection(_connectionString);
         conn.Open();
-        // synchronous / busy_timeout 为连接级设置，每次连接都需施加
-        Exec(conn, "PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;");
+        // synchronous / busy_timeout 为连接级设置，每次连接都需施加。
+        // synchronous=FULL 是**有意**选择（别当性能缺陷改回 NORMAL）：WAL 模式下 NORMAL 的提交不刷盘
+        // （只在 checkpoint 刷），进程崩溃尚可恢复，但断电 / 系统崩会丢最近若干次提交；
+        // FULL 让每次提交都 fsync WAL，把「崩服少丢存档」落到磁盘层面。
+        // 代价可接受：本服务端写入很稀疏（玩家档案只在变更时写、图格类 1Hz 批量），
+        // 单次 fsync 在 SSD 上约 0.1~1ms。
+        Exec(conn, "PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;");
         return conn;
     }
 
