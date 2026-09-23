@@ -56,7 +56,7 @@ public sealed class PluginLoader
         }
 
         // 拓扑排序：被依赖的插件先初始化
-        foreach (var (assembly, type) in TopologicalSort(pluginTypes))
+        foreach (var (assembly, type) in TopologicalSort(pluginTypes, message => _logger.Warn(message)))
         {
             try
             {
@@ -124,7 +124,17 @@ public sealed class PluginLoader
     }
 
     // ---- 拓扑排序（Kahn 算法）----
-    private IEnumerable<(Assembly, Type)> TopologicalSort(List<(Assembly Assembly, Type Type)> items)
+
+    /// <summary>
+    /// 依赖拓扑排序：**被依赖的插件先出队**（<c>A</c> 依赖 <c>B</c> → 结果里 <c>B</c> 在 <c>A</c> 之前）。
+    /// 入度记在**依赖方**头上（<c>indegree[P]</c> = 已加载插件里 <c>P</c> 依赖了几个），因此减边时必须减
+    /// 「依赖当前节点的那些节点」—— 两者必须同向。入度若累加到**被依赖方**，顺序会整个反过来
+    /// （依赖方先初始化），而减边仍按依赖方减，于是依赖关系被误判成环、被依赖的插件永远入不了队。
+    /// 依赖的插件未加载时按「无此依赖」处理（与 <see cref="LoadAllAsync"/> 的容错一致）。
+    /// </summary>
+    internal static List<(Assembly Assembly, Type Type)> TopologicalSort(
+        IReadOnlyList<(Assembly Assembly, Type Type)> items,
+        Action<string>? onCycleDetected = null)
     {
         var byId = new Dictionary<string, (Assembly, Type)>();
         foreach (var it in items)
@@ -139,9 +149,13 @@ public sealed class PluginLoader
         {
             var inst = (IPlugin?)Activator.CreateInstance(type);
             if (inst == null) continue;
+
+            // 同一依赖声明多次只计一次：否则减边只减一次，入度永远归不了零 → 误报环
+            var counted = new HashSet<string>(StringComparer.Ordinal);
             foreach (var dep in inst.Dependencies)
             {
-                if (byId.ContainsKey(dep)) indegree[dep] = indegree.GetValueOrDefault(dep, 0) + 1;
+                if (byId.ContainsKey(dep) && counted.Add(dep))
+                    indegree[id] = indegree.GetValueOrDefault(id, 0) + 1;
             }
         }
 
@@ -161,7 +175,8 @@ public sealed class PluginLoader
                 }
             }
         }
-        if (result.Count != byId.Count) _logger.Warn("Plugin dependency cycle detected! Some plugins may not load.");
+        if (result.Count != byId.Count)
+            onCycleDetected?.Invoke("Plugin dependency cycle detected! Some plugins may not load.");
         return result;
     }
 }

@@ -91,6 +91,9 @@ public sealed class NetworkHost : IAsyncDisposable
     /// <summary>档案落盘基线（会话 → 上次成功落盘的字节）。见 <see cref="PlayerProfileSaveTracker"/> 文件头。</summary>
     private readonly PlayerProfileSaveTracker _profileSaveTracker = new();
 
+    /// <summary>串行化周期、停机和断线档案保存，避免旧写入覆盖新快照。</summary>
+    private readonly Lock _profileSaveGate = new();
+
     /// <summary>周期落盘循环（随 <see cref="_cts"/> 取消退出）。</summary>
     private Task? _profileSaveLoop;
 
@@ -98,6 +101,14 @@ public sealed class NetworkHost : IAsyncDisposable
     private readonly ConcurrentDictionary<int, ViolationWindow> _violations = new();
 
     private Task? _acceptLoop;
+
+    /// <summary>
+    /// 在跑的连接读写任务（Task → 占位）。停机时必须等它们**全部收尾**：槽位释放、断线档案落盘、
+    /// PlayerLeft Hook 都在 <see cref="RunConnectionAsync"/> 的 finally 里 —— 不等就会出现
+    /// 「StopAsync 已返回但连接清理还在跑」，而插件与持久化随后就被释放。
+    /// 用 Task 而非 Connection 做键：后者可能重写相等语义，且槽位会按「最小可用 ID」复用。
+    /// </summary>
+    private readonly ConcurrentDictionary<Task, byte> _connectionTasks = new();
 
     public ISnapshotSender SnapshotSender { get; }
 
@@ -192,8 +203,17 @@ public sealed class NetworkHost : IAsyncDisposable
         if (_acceptLoop is not null)
             await _acceptLoop.ConfigureAwait(false);
 
+        // Accept 已停 → 之后不会再登记新的连接任务，此处快照才是完整的
+        // （否则可能漏等「刚被接受、还没登记」的那条连接）。
+        var connectionTasks = _connectionTasks.Keys.ToArray();
+
         foreach (var conn in _connections.All())
             await conn.DisposeAsync().ConfigureAwait(false);
+
+        // 等连接任务真正收尾：槽位释放、断线档案落盘、PlayerLeft Hook 都在其 finally 里。
+        // 不等的话 StopAsync 会在这些清理还在跑时就返回，插件 / 持久化随后被释放 → 断线存档丢失或未观察异常。
+        if (connectionTasks.Length > 0)
+            await Task.WhenAll(connectionTasks).ConfigureAwait(false);
 
         // 真机测试收尾：把「客户端实际发了哪些未建模包」打出来（决定中继 / 建模优先级）
         LogUnmodeledPacketSummary();
@@ -226,8 +246,9 @@ public sealed class NetworkHost : IAsyncDisposable
 
                 Console.WriteLine($"[Net] 新连接 {remote} → 玩家 #{playerId}");
 
-                // 启动该连接的读写循环（不 await，后台运行）；结束后触发 PlayerLeft Hook
-                _ = RunConnectionAsync(connection, ct);
+                // 启动该连接的读写循环（不 await，后台运行）；结束后触发 PlayerLeft Hook。
+                // 任务登记进 _connectionTasks：停机要等它收尾，否则断线存档 / Hook 会跑到释放之后。
+                TrackConnection(connection, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -240,18 +261,56 @@ public sealed class NetworkHost : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 启动连接的读写循环并登记其任务，供 <see cref="StopAsync"/> 统一等待。
+    /// 任务结束（正常 / 取消 / 异常）后自动从登记表移除，避免长时间运行的服务器里登记表随历史连接无界增长。
+    /// </summary>
+    private void TrackConnection(Connection connection, CancellationToken ct)
+    {
+        var task = RunConnectionAsync(connection, ct);
+        _connectionTasks[task] = 0;
+        _ = task.ContinueWith(static (completed, state) =>
+        {
+            ((NetworkHost)state!)._connectionTasks.TryRemove(completed, out _);
+        }, this, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
     private async Task RunConnectionAsync(Connection connection, CancellationToken ct)
     {
         try
         {
             await connection.RunAsync(OnPacketAsync, ct).ConfigureAwait(false);
         }
+        catch (OperationCanceledException)
+        {
+            // 停机取消：读写循环的正常退出路径（不向 Task 抛，避免 Task.WhenAll 停机时抛出取消异常）
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[NetworkHost] 连接 #{connection.PlayerId} 读写循环异常：{ex.Message}");
+        }
         finally
         {
             // 先释放槽位再走退出清理：槽位按「最小可用 ID」复用（与原版一致），
             // 会话恢复依赖「旧槽位已释放」后重连才能拿到同一 ID；顺序颠倒会让重连拿到新 ID。
-            await _connections.RemoveAsync(connection.PlayerId, connection).ConfigureAwait(false);
-            OnConnectionClosed(connection);
+            try
+            {
+                await _connections.RemoveAsync(connection.PlayerId, connection).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[NetworkHost] 连接 #{connection.PlayerId} 槽位释放失败：{ex.Message}");
+            }
+
+            // 退出清理单独兜底：上面的异常不能把断线档案落盘 / PlayerLeft Hook 一起跳过。
+            try
+            {
+                OnConnectionClosed(connection);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[NetworkHost] 连接 #{connection.PlayerId} 退出清理失败：{ex.Message}");
+            }
         }
     }
 
@@ -337,6 +396,14 @@ public sealed class NetworkHost : IAsyncDisposable
     {
         if (_playerProfiles is null) return;   // 未开持久化：整条路径不做事
 
+        lock (_profileSaveGate)
+        {
+            FlushPlayerProfilesCore();
+        }
+    }
+
+    private void FlushPlayerProfilesCore()
+    {
         var liveKeys = new List<(int PlayerId, long SessionId)>();
 
         foreach (var connection in _connections.All())
@@ -378,29 +445,41 @@ public sealed class NetworkHost : IAsyncDisposable
     {
         if (_playerProfiles is null || string.IsNullOrEmpty(name)) return;
 
-        PlayerRuntime? runtime;
-        lock (_world.PlayersLock)
-            _world.Players.TryGetValue(connection.PlayerId, out runtime);
-        if (runtime is null || runtime.SessionId != connection.SessionId) return;
-
-        // 键必须带 SessionId（槽位按「最小可用 ID」复用，见 PlayerProfileSaveTracker 文件头 ②）
-        var key = (connection.PlayerId, connection.SessionId);
-        var blob = PlayerProfileCodec.Encode(runtime);
-        if (!_profileSaveTracker.NeedsSave(key, blob)) return;   // 与上次成功落盘一致 → 不写
-
-        try
+        lock (_profileSaveGate)
         {
-            _playerProfiles.SaveAsync(new TerraAuth.Persistence.PlayerData(
-                TerraAuth.Security.PlayerIdentity.FromName(name),
-                name,
-                blob,
-                runtime.HpMax,
-                runtime.MpMax)).GetAwaiter().GetResult();
-            _profileSaveTracker.MarkSaved(key, blob);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[SSC] 玩家档案写入失败（{name}）：{ex.Message}");
+            PlayerRuntime? runtime;
+            byte[] blob;
+            int hpMax;
+            int mpMax;
+            lock (_world.PlayersLock)
+            {
+                if (!_world.Players.TryGetValue(connection.PlayerId, out runtime)
+                    || runtime.SessionId != connection.SessionId)
+                    return;
+
+                blob = PlayerProfileCodec.Encode(runtime);
+                hpMax = runtime.HpMax;
+                mpMax = runtime.MpMax;
+            }
+
+            // 键必须带 SessionId（槽位按「最小可用 ID」复用，见 PlayerProfileSaveTracker 文件头 ②）
+            var key = (connection.PlayerId, connection.SessionId);
+            if (!_profileSaveTracker.NeedsSave(key, blob)) return;   // 与上次成功落盘一致 → 不写
+
+            try
+            {
+                _playerProfiles.SaveAsync(new TerraAuth.Persistence.PlayerData(
+                    TerraAuth.Security.PlayerIdentity.FromName(name),
+                    name,
+                    blob,
+                    hpMax,
+                    mpMax)).GetAwaiter().GetResult();
+                _profileSaveTracker.MarkSaved(key, blob);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SSC] 玩家档案写入失败（{name}）：{ex.Message}");
+            }
         }
     }
 
@@ -545,14 +624,34 @@ public sealed class NetworkHost : IAsyncDisposable
                     Console.WriteLine(
                         $"[Authority] 玩家 #{connection.PlayerId} 违规累计达 " +
                         $"{_violationKick.MaxViolations}/{_violationKick.WindowSeconds}s，踢出：{result.Reason}");
-                    await _connections.KickAsync(
-                        connection.PlayerId,
-                        $"Too many violations: {result.Reason}",
-                        CancellationToken.None,
-                        connection).ConfigureAwait(false);
+                    // **不能 await**：包处理跑在读循环的调用链上（Connection.ReadLoopAsync 逐包 await worker），
+                    // 而 KickAsync 收尾会 await 连接销毁（Connection.DisposeAsync 等 _runCompleted），
+                    // 那要等读循环退出、读循环又在等当前处理器返回 → 自锁：连接清理永不完成、停机等待永久挂起。
+                    // 丢到线程池后读循环立刻返回并退出，连接清理随之完成（PlayerLeft / 断线档案落盘照常触发）。
+                    KickDetached(connection, $"Too many violations: {result.Reason}");
                 }
                 break;
         }
+    }
+
+    /// <summary>
+    /// 从**包处理路径**发起踢出（不阻塞读循环）。见调用点注释：包处理在读循环调用链上，
+    /// 而踢出收尾要等读循环退出 —— 直接 await 会自锁。异常自行兜底，不产生未观察任务。
+    /// </summary>
+    private void KickDetached(Connection connection, string reason)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _connections.KickAsync(
+                    connection.PlayerId, reason, CancellationToken.None, connection).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Net] 踢出玩家 #{connection.PlayerId} 失败：{ex.Message}");
+            }
+        });
     }
 
     /// <summary>

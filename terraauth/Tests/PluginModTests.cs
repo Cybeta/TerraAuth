@@ -601,6 +601,106 @@ public class PluginModTests
         public override IReadOnlyList<string> Dependencies => Array.Empty<string>();
     }
 
+    // ========================================================================
+    // 3. PluginLoader：依赖拓扑排序（被依赖的插件必须先初始化）
+    // ========================================================================
+    [Fact]
+    public void PluginLoader_TopologicalSort_InitializesDependenciesFirst()
+    {
+        var items = new List<(System.Reflection.Assembly, Type)>
+        {
+            (typeof(DependentPlugin).Assembly, typeof(DependentPlugin)), // 依赖 base
+            (typeof(BasePlugin).Assembly, typeof(BasePlugin)),
+        };
+
+        var order = PluginLoader.TopologicalSort(items)
+            .Select(static item => item.Type).ToArray();
+
+        // 顺序写反时这里会变成 [dependent, base]，且 dependent 会在依赖未初始化时启动
+        Assert.Equal(new[] { typeof(BasePlugin), typeof(DependentPlugin) }, order);
+    }
+
+    [Fact]
+    public void PluginLoader_TopologicalSort_ChainOrder_WithoutFalseCycle()
+    {
+        var warnings = new List<string>();
+        var items = new List<(System.Reflection.Assembly, Type)>
+        {
+            (typeof(ThirdPlugin).Assembly, typeof(ThirdPlugin)),   // 依赖 middle
+            (typeof(MiddlePlugin).Assembly, typeof(MiddlePlugin)), // 依赖 base
+            (typeof(BasePlugin).Assembly, typeof(BasePlugin)),
+        };
+
+        var order = PluginLoader.TopologicalSort(items, warnings.Add)
+            .Select(static item => item.Type).ToArray();
+
+        Assert.Equal(new[] { typeof(BasePlugin), typeof(MiddlePlugin), typeof(ThirdPlugin) }, order);
+        Assert.Empty(warnings); // 依赖正常时必须无「环」告警（旧实现会把正常依赖误报成环）
+    }
+
+    [Fact]
+    public void PluginLoader_TopologicalSort_ReportsRealCycle()
+    {
+        var warnings = new List<string>();
+        var items = new List<(System.Reflection.Assembly, Type)>
+        {
+            (typeof(CycleAPlugin).Assembly, typeof(CycleAPlugin)),
+            (typeof(CycleBPlugin).Assembly, typeof(CycleBPlugin)),
+        };
+
+        var order = PluginLoader.TopologicalSort(items, warnings.Add);
+
+        Assert.Empty(order);          // 环内插件全部不加载
+        Assert.Single(warnings);      // 真环仍然要告警
+    }
+
+    private sealed class BasePlugin : PluginBase
+    {
+        public override string Id => "base";
+        public override string Name => "Base";
+        public override Version Version => new(1, 0, 0);
+    }
+
+    private sealed class DependentPlugin : PluginBase
+    {
+        public override string Id => "dependent";
+        public override string Name => "Dependent";
+        public override Version Version => new(1, 0, 0);
+        public override IReadOnlyList<string> Dependencies => new[] { "base" };
+    }
+
+    private sealed class MiddlePlugin : PluginBase
+    {
+        public override string Id => "middle";
+        public override string Name => "Middle";
+        public override Version Version => new(1, 0, 0);
+        public override IReadOnlyList<string> Dependencies => new[] { "base" };
+    }
+
+    private sealed class ThirdPlugin : PluginBase
+    {
+        public override string Id => "third";
+        public override string Name => "Third";
+        public override Version Version => new(1, 0, 0);
+        public override IReadOnlyList<string> Dependencies => new[] { "middle" };
+    }
+
+    private sealed class CycleAPlugin : PluginBase
+    {
+        public override string Id => "cycle-a";
+        public override string Name => "CycleA";
+        public override Version Version => new(1, 0, 0);
+        public override IReadOnlyList<string> Dependencies => new[] { "cycle-b" };
+    }
+
+    private sealed class CycleBPlugin : PluginBase
+    {
+        public override string Id => "cycle-b";
+        public override string Name => "CycleB";
+        public override Version Version => new(1, 0, 0);
+        public override IReadOnlyList<string> Dependencies => new[] { "cycle-a" };
+    }
+
     /// <summary>暴露 ModDetector 的私有比较方法用于测试。</summary>
     private static class ModDetectorTestHelper
     {

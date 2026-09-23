@@ -279,7 +279,7 @@ dotnet build TerraAuth.csproj -p:NoSqlite=true
 # 运行
 dotnet run --project TerraAuth.csproj -- --config server.json --port 7777
 
-# 测试（818 用例，当前全量通过；以 dotnet test 实测为准）
+# 测试（当前用例数与通过状态以发布构建的 dotnet test 实测为准）
 dotnet test Tests/TerraAuth.Tests.csproj
 
 # 无 SDK 环境静态校验（大括号平衡 / ProjectReference 路径 / 接口实现 / TODO 统计）

@@ -803,6 +803,88 @@ public class EndToEndTests
         }
     }
 
+    [Theory]
+    [InlineData("{\"SnapshotRateHz\":1}")]
+    [InlineData("{\"SnapshotRateHz\":1000}")]
+    [InlineData("{\"HandshakeTimeoutSeconds\":0,\"WorldExportIntervalSeconds\":0,\"SessionResumeGraceSeconds\":0,\"MaxPlayerHp\":0,\"MaxPlayerMana\":0,\"MaxDpsWindowSeconds\":0,\"MaxDps\":0,\"MaxTileBreakPerSecond\":0,\"MaxTilePlacePerSecond\":0,\"MaxProjectilesPerSecond\":0,\"MaxPacketsPerSecond\":0,\"MaxChatPerMinute\":0,\"MaxLiquidPerSecond\":0,\"MaxStackSize\":0,\"ViolationWindowMinutes\":0,\"ViewportRadius\":0,\"MaxFlightSpeed\":0,\"MaxFallSpeed\":0,\"TeleportTolerance\":0,\"ShadowPredictionMaxDeviation\":0,\"MaxEnemies\":-1,\"MetricsEnabled\":false,\"MetricsPort\":0}")]
+    [InlineData("{\"MetricsPort\":1}")]
+    [InlineData("{\"MetricsPort\":65535}")]
+    public void ConfigurationValidation_AcceptsBoundaryValues(string json)
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"terraauth-config-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(configPath, json);
+            var service = new TerraAuth.Config.ConfigurationService();
+            typeof(TerraAuth.Config.ConfigurationService)
+                .GetField("_path", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .SetValue(service, configPath);
+            service.Reload();
+            Assert.NotNull(service.Current);
+        }
+        finally
+        {
+            if (File.Exists(configPath)) File.Delete(configPath);
+        }
+    }
+
+    [Theory]
+    [InlineData("{\"MaxConnections\":0}")]
+    [InlineData("{\"MaxSingleDamage\":-1}")]
+    [InlineData("{\"MaxSingleDamage\":32768}")]
+    [InlineData("{\"MaxViolationsBeforeBan\":0}")]
+    [InlineData("{\"SnapshotRateHz\":0}")]
+    [InlineData("{\"SnapshotRateHz\":1001}")]
+    [InlineData("{\"HandshakeTimeoutSeconds\":-1}")]
+    [InlineData("{\"WorldExportIntervalSeconds\":-1}")]
+    [InlineData("{\"SessionResumeGraceSeconds\":-1}")]
+    [InlineData("{\"MaxPlayerHp\":-1}")]
+    [InlineData("{\"MaxPlayerMana\":-1}")]
+    [InlineData("{\"MaxDpsWindowSeconds\":-1}")]
+    [InlineData("{\"MaxDps\":-1}")]
+    [InlineData("{\"MaxTileBreakPerSecond\":-1}")]
+    [InlineData("{\"MaxTilePlacePerSecond\":-1}")]
+    [InlineData("{\"MaxProjectilesPerSecond\":-1}")]
+    [InlineData("{\"MaxPacketsPerSecond\":-1}")]
+    [InlineData("{\"MaxChatPerMinute\":-1}")]
+    [InlineData("{\"MaxLiquidPerSecond\":-1}")]
+    [InlineData("{\"MaxStackSize\":-1}")]
+    [InlineData("{\"ViolationWindowMinutes\":-1}")]
+    [InlineData("{\"ViewportRadius\":-1}")]
+    [InlineData("{\"MaxFlightSpeed\":-1}")]
+    [InlineData("{\"MaxFlightSpeed\":1e1000}")]
+    [InlineData("{\"MaxFallSpeed\":-1}")]
+    [InlineData("{\"TeleportTolerance\":-1}")]
+    [InlineData("{\"ShadowPredictionMaxDeviation\":-1}")]
+    [InlineData("{\"GameMode\":99}")]
+    [InlineData("{\"WorldSize\":99}")]
+    [InlineData("{\"SummonAuthority\":99}")]
+    [InlineData("{\"ModPolicy\":{\"Mode\":99}}")]
+    [InlineData("{\"MetricsPort\":0}")]
+    [InlineData("{\"MetricsPort\":65536}")]
+    public void ConfigurationValidation_RejectsInvalidHotReload_AndPreservesCurrent(string json)
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"terraauth-config-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(configPath, "{}");
+            var service = new TerraAuth.Config.ConfigurationService();
+            typeof(TerraAuth.Config.ConfigurationService)
+                .GetField("_path", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .SetValue(service, configPath);
+            service.Reload();
+            var current = service.Current;
+
+            File.WriteAllText(configPath, json);
+            Assert.ThrowsAny<Exception>(() => service.Reload());
+            Assert.Same(current, service.Current);
+        }
+        finally
+        {
+            if (File.Exists(configPath)) File.Delete(configPath);
+        }
+    }
+
     [Fact]
     public async Task ConfigHotReload_UpdatesThresholds_WithoutRestart()
     {
@@ -1100,6 +1182,96 @@ public class EndToEndTests
         {
             CleanupDb(dbPath);
         }
+    }
+
+    [Fact]
+    public async Task Persistence_OutOfOrderWorldBatches_NeverRegressOrResurrect()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"terraauth-world-order-{Guid.NewGuid():N}.db");
+        try
+        {
+            using var db = new SqlitePersistence(dbPath);
+            await db.SaveTileChangesAsync(new[] { new WorldTileRecord(1, 2, new byte[] { 2 }, Version: 2) });
+            await db.SaveTileChangesAsync(new[] { new WorldTileRecord(1, 2, new byte[] { 1 }, Version: 1) });
+            Assert.Equal(new byte[] { 2 }, Assert.Single(await db.LoadTileChangesAsync()).Data);
+
+            await db.SaveChestChangesAsync(new[] { new WorldChestRecord(3, 4, 5, new byte[] { 2 }, Version: 2) });
+            await db.DeleteChestChangesAsync(new[] { (3, 3L) });
+            await db.SaveChestChangesAsync(new[] { new WorldChestRecord(3, 4, 5, new byte[] { 1 }, Version: 1) });
+            Assert.Empty(await db.LoadChestChangesAsync());
+
+            await db.SaveTileEntityChangesAsync(new[] { new WorldTileEntityRecord(8, 9, 1, 6, 7, new byte[] { 2 }, false, Version: 2) });
+            await db.SaveTileEntityChangesAsync(new[] { new WorldTileEntityRecord(8, 9, 1, 6, 7, null, true, Version: 3) });
+            await db.SaveTileEntityChangesAsync(new[] { new WorldTileEntityRecord(8, 9, 1, 6, 7, new byte[] { 1 }, false, Version: 1) });
+            var entity = Assert.Single(await db.LoadTileEntityChangesAsync());
+            Assert.True(entity.IsDeleted);
+            Assert.Equal(3, entity.Version);
+        }
+        finally
+        {
+            CleanupDb(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task NetworkHost_StopAsync_WaitsForConnectionCleanup()
+    {
+        // 停机必须等连接任务收尾（槽位释放 + 断线落盘 + PlayerLeft Hook 都在其 finally 里），
+        // 否则 StopAsync 会在清理还在跑时返回，插件 / 持久化随后被释放。
+        var world = new WorldState();
+        var connections = new ConnectionManager();
+        using var workers = new WorkerPool(2);
+
+        var hooks = new HookRegistry(new SilentLogger());
+        var left = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        hooks.Register<PlayerLeftArgs>(new StubPlugin(), _ =>
+        {
+            left.TrySetResult();
+            return HookResult.Allow();
+        });
+
+        await using var host = new NetworkHost(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new PacketDecoder(),
+            new PacketEncoder(ProtocolVersion.Current),
+            new TerrariaProtocol(),
+            connections,
+            new InboundPipeline(new IPipelineStage[] { new FrameStage(), new TerminalStage() }),
+            new CommandQueue(),
+            workers,
+            world,
+            hooks: hooks);
+        host.Start();
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, host.BoundPort);
+        // Accept 循环是后台任务，等它登记该连接
+        Assert.True(await WaitUntilAsync(() => connections.ActiveCount > 0, TimeSpan.FromSeconds(5)),
+            "连接未被 Accept 循环登记");
+
+        // Act
+        await host.StopAsync().WaitAsync(TimeSpan.FromSeconds(10)); // 有界等待：停机不得死锁
+
+        // Assert：StopAsync 返回时连接已彻底收尾
+        Assert.True(left.Task.IsCompleted);
+        Assert.Equal(0, connections.ActiveCount);
+    }
+
+    /// <summary>静默日志：只满足 HookRegistry 的构造依赖。</summary>
+    private sealed class SilentLogger : ILogger
+    {
+        public void Debug(string message, params object[] args) { }
+        public void Info(string message, params object[] args) { }
+        public void Warn(string message, params object[] args) { }
+        public void Error(Exception? ex, string message, params object[] args) { }
+    }
+
+    /// <summary>占位插件（注册 Hook 需要一个 IPlugin 实例）。</summary>
+    private sealed class StubPlugin : PluginBase
+    {
+        public override string Id => "stub";
+        public override string Name => "Stub";
+        public override Version Version => new(1, 0, 0);
     }
 
     /// <summary>清理 DB 及其附属文件（SQLite 的 -wal/-shm、内嵌 LiteDb 的 .tmp）。</summary>

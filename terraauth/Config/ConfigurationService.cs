@@ -87,6 +87,41 @@ public sealed class ConfigurationService : IConfigurationService
             throw new InvalidDataException(
                 $"MaxSingleDamage({c.MaxSingleDamage}) 超过 Int16 上限 {short.MaxValue}，该阈值永不触发；请设为 ≤ {short.MaxValue}");
         if (c.MaxViolationsBeforeBan < 1) throw new InvalidDataException("封禁阈值至少为 1");
-        // 注：完整实现应校验所有阈值，此处仅示例
+        if (c.SnapshotRateHz is < 1 or > 1000)
+            throw new InvalidDataException("SnapshotRateHz 必须在 1..1000 范围内");
+
+        if (c.HandshakeTimeoutSeconds < 0) throw new InvalidDataException("HandshakeTimeoutSeconds 不能为负");
+        if (c.WorldExportIntervalSeconds < 0) throw new InvalidDataException("WorldExportIntervalSeconds 不能为负");
+        if (c.SessionResumeGraceSeconds < 0) throw new InvalidDataException("SessionResumeGraceSeconds 不能为负");
+        if (c.MaxPlayerHp < 0) throw new InvalidDataException("MaxPlayerHp 不能为负");
+        if (c.MaxPlayerMana < 0) throw new InvalidDataException("MaxPlayerMana 不能为负");
+        if (c.MaxDpsWindowSeconds < 0) throw new InvalidDataException("MaxDpsWindowSeconds 不能为负");
+        if (c.MaxDps < 0) throw new InvalidDataException("MaxDps 不能为负");
+        if (c.MaxTileBreakPerSecond < 0) throw new InvalidDataException("MaxTileBreakPerSecond 不能为负");
+        if (c.MaxTilePlacePerSecond < 0) throw new InvalidDataException("MaxTilePlacePerSecond 不能为负");
+        if (c.MaxProjectilesPerSecond < 0) throw new InvalidDataException("MaxProjectilesPerSecond 不能为负");
+        if (c.MaxPacketsPerSecond < 0) throw new InvalidDataException("MaxPacketsPerSecond 不能为负");
+        if (c.MaxChatPerMinute < 0) throw new InvalidDataException("MaxChatPerMinute 不能为负");
+        if (c.MaxLiquidPerSecond < 0) throw new InvalidDataException("MaxLiquidPerSecond 不能为负");
+        if (c.MaxStackSize < 0) throw new InvalidDataException("MaxStackSize 不能为负");
+        if (c.ViolationWindowMinutes < 0) throw new InvalidDataException("ViolationWindowMinutes 不能为负");
+
+        if (!float.IsFinite(c.ViewportRadius) || c.ViewportRadius < 0)
+            throw new InvalidDataException("ViewportRadius 必须是有限的非负数");
+        if (!float.IsFinite(c.MaxFlightSpeed) || c.MaxFlightSpeed < 0)
+            throw new InvalidDataException("MaxFlightSpeed 必须是有限的非负数");
+        if (!float.IsFinite(c.MaxFallSpeed) || c.MaxFallSpeed < 0)
+            throw new InvalidDataException("MaxFallSpeed 必须是有限的非负数");
+        if (!float.IsFinite(c.TeleportTolerance) || c.TeleportTolerance < 0)
+            throw new InvalidDataException("TeleportTolerance 必须是有限的非负数");
+        if (!float.IsFinite(c.ShadowPredictionMaxDeviation) || c.ShadowPredictionMaxDeviation < 0)
+            throw new InvalidDataException("ShadowPredictionMaxDeviation 必须是有限的非负数");
+
+        if (!Enum.IsDefined(c.GameMode)) throw new InvalidDataException("GameMode 无效");
+        if (!Enum.IsDefined(c.WorldSize)) throw new InvalidDataException("WorldSize 无效");
+        if (!Enum.IsDefined(c.SummonAuthority)) throw new InvalidDataException("SummonAuthority 无效");
+        if (!Enum.IsDefined(c.ModPolicy.Mode)) throw new InvalidDataException("ModPolicy.Mode 无效");
+        if (c.MetricsEnabled && c.MetricsPort is < 1 or > 65535)
+            throw new InvalidDataException("MetricsPort 必须在 1..65535 范围内");
     }
 }

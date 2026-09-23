@@ -43,8 +43,9 @@ internal interface IDbExecutor
     IReadOnlyList<WorldTileRecord> LoadWorldTiles();
     void SaveWorldChests(IReadOnlyList<WorldChestRecord> chests);
     IReadOnlyList<WorldChestRecord> LoadWorldChests();
-    void DeleteWorldChests(string worldId, IReadOnlyList<int> chestIndices);
+    void DeleteWorldChests(string worldId, IReadOnlyList<(int Index, long Version)> chestIndices);
     void SaveWorldTileEntities(IReadOnlyList<WorldTileEntityRecord> entities);
+    long GetMaxWorldVersion();
     IReadOnlyList<WorldTileEntityRecord> LoadWorldTileEntities();
     /// <summary>写入世界进度（单行覆盖写；<paramref name="progress"/>.WorldId 指定世界）。</summary>
     void SaveWorldProgress(WorldProgressRecord progress);
@@ -142,13 +143,19 @@ public sealed class SqlitePersistence : IPlayerRepository, IAuditRepository, IWo
         => Task.Run<IReadOnlyList<WorldChestRecord>>(() => _db.LoadWorldChests().Where(c => c.WorldId == WorldId).ToArray());
 
     public Task DeleteChestChangesAsync(IReadOnlyList<int> chestIndices)
-        => chestIndices.Count == 0 ? Task.CompletedTask : Task.Run(() => _db.DeleteWorldChests(WorldId, chestIndices));
+        => DeleteChestChangesAsync(chestIndices.Select(index => (index, 0L)).ToArray());
+
+    public Task DeleteChestChangesAsync(IReadOnlyList<(int Index, long Version)> chests)
+        => chests.Count == 0 ? Task.CompletedTask : Task.Run(() => _db.DeleteWorldChests(WorldId, chests));
 
     public Task SaveTileEntityChangesAsync(IReadOnlyList<WorldTileEntityRecord> entities)
     {
         var scoped = entities.Select(e => e with { WorldId = WorldId }).ToArray();
         return scoped.Length == 0 ? Task.CompletedTask : Task.Run(() => _db.SaveWorldTileEntities(scoped));
     }
+
+    public Task<long> GetMaxWorldPersistVersionAsync()
+        => Task.Run(() => _db.GetMaxWorldVersion());
 
     public Task<IReadOnlyList<WorldTileEntityRecord>> LoadTileEntityChangesAsync()
         => Task.Run<IReadOnlyList<WorldTileEntityRecord>>(() => _db.LoadWorldTileEntities().Where(e => e.WorldId == WorldId).ToArray());
@@ -226,8 +233,10 @@ internal sealed class LiteDbPersistence : IDbExecutor
     private readonly ConcurrentDictionary<Guid, BanRecord> _bans = new();
     private readonly ConcurrentDictionary<(string WorldId, int X, int Y), WorldTileRecord> _worldTiles = new();
     private readonly ConcurrentDictionary<(string WorldId, int Index), WorldChestRecord> _worldChests = new();
+    private readonly ConcurrentDictionary<(string WorldId, int Index), long> _deletedWorldChests = new();
     private readonly ConcurrentDictionary<(string WorldId, short X, short Y), WorldTileEntityRecord> _worldTileEntities = new();
     private readonly ConcurrentDictionary<string, WorldProgressRecord> _worldProgress = new();
+    private readonly object _diskWriteLock = new();
 
     public LiteDbPersistence(string dbPath, bool runMigrations)
     {
@@ -299,32 +308,62 @@ internal sealed class LiteDbPersistence : IDbExecutor
     public void SaveWorldTiles(IReadOnlyList<WorldTileRecord> tiles)
     {
         if (tiles.Count == 0) return;
-        foreach (var t in tiles) _worldTiles[(t.WorldId, t.X, t.Y)] = t;
+        foreach (var t in tiles)
+        {
+            var key = (t.WorldId, t.X, t.Y);
+            _worldTiles.AddOrUpdate(key, t, (_, old) => t.Version >= old.Version ? t : old);
+        }
         SaveToDisk();
     }
 
     public IReadOnlyList<WorldTileRecord> LoadWorldTiles() => _worldTiles.Values.ToList();
 
+    public long GetMaxWorldVersion()
+    {
+        var max = 0L;
+        foreach (var tile in _worldTiles.Values) max = Math.Max(max, tile.Version);
+        foreach (var chest in _worldChests.Values) max = Math.Max(max, chest.Version);
+        foreach (var version in _deletedWorldChests.Values) max = Math.Max(max, version);
+        foreach (var entity in _worldTileEntities.Values) max = Math.Max(max, entity.Version);
+        return max;
+    }
+
     public void SaveWorldChests(IReadOnlyList<WorldChestRecord> chests)
     {
         if (chests.Count == 0) return;
-        foreach (var c in chests) _worldChests[(c.WorldId, c.Index)] = c;
+        foreach (var c in chests)
+        {
+            var key = (c.WorldId, c.Index);
+            if (_deletedWorldChests.TryGetValue(key, out var deleted) && c.Version <= deleted) continue;
+            _worldChests.AddOrUpdate(key, c, (_, old) => c.Version >= old.Version ? c : old);
+        }
         SaveToDisk();
     }
 
     public IReadOnlyList<WorldChestRecord> LoadWorldChests() => _worldChests.Values.ToList();
 
-    public void DeleteWorldChests(string worldId, IReadOnlyList<int> chestIndices)
+    public void DeleteWorldChests(string worldId, IReadOnlyList<(int Index, long Version)> chestIndices)
     {
         if (chestIndices.Count == 0) return;
-        foreach (var index in chestIndices) _worldChests.TryRemove((worldId, index), out _);
+        foreach (var (index, version) in chestIndices)
+        {
+            var key = (worldId, index);
+            if (_worldChests.TryGetValue(key, out var current) && current.Version > version) continue;
+            if (_deletedWorldChests.TryGetValue(key, out var deleted) && deleted > version) continue;
+            _worldChests.TryRemove(key, out _);
+            _deletedWorldChests.AddOrUpdate(key, version, (_, old) => Math.Max(old, version));
+        }
         SaveToDisk();
     }
 
     public void SaveWorldTileEntities(IReadOnlyList<WorldTileEntityRecord> entities)
     {
         if (entities.Count == 0) return;
-        foreach (var entity in entities) _worldTileEntities[(entity.WorldId, entity.X, entity.Y)] = entity;
+        foreach (var entity in entities)
+        {
+            var key = (entity.WorldId, entity.X, entity.Y);
+            _worldTileEntities.AddOrUpdate(key, entity, (_, old) => entity.Version >= old.Version ? entity : old);
+        }
         SaveToDisk();
     }
 
@@ -344,6 +383,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
     {
         foreach (var key in _worldTiles.Keys.Where(k => k.WorldId == worldId).ToArray()) _worldTiles.TryRemove(key, out _);
         foreach (var key in _worldChests.Keys.Where(k => k.WorldId == worldId).ToArray()) _worldChests.TryRemove(key, out _);
+        foreach (var key in _deletedWorldChests.Keys.Where(k => k.WorldId == worldId).ToArray()) _deletedWorldChests.TryRemove(key, out _);
         foreach (var key in _worldTileEntities.Keys.Where(k => k.WorldId == worldId).ToArray()) _worldTileEntities.TryRemove(key, out _);
         _worldProgress.TryRemove(worldId, out _);
         SaveToDisk();
@@ -366,8 +406,13 @@ internal sealed class LiteDbPersistence : IDbExecutor
                 foreach (var b in dto.Bans) _bans[b.PlayerId] = b;
             if (dto.WorldTiles is not null)
                 foreach (var t in dto.WorldTiles) _worldTiles[(t.WorldId, t.X, t.Y)] = t;
+            if (dto.DeletedWorldChests is not null)
+                foreach (var tombstone in dto.DeletedWorldChests)
+                    _deletedWorldChests[(tombstone.WorldId, tombstone.Index)] = tombstone.Version;
             if (dto.WorldChests is not null)
-                foreach (var c in dto.WorldChests) _worldChests[(c.WorldId, c.Index)] = c;
+                foreach (var c in dto.WorldChests)
+                    if (c.Version > (_deletedWorldChests.TryGetValue((c.WorldId, c.Index), out var deleted) ? deleted : -1))
+                        _worldChests[(c.WorldId, c.Index)] = c;
             if (dto.WorldTileEntities is not null)
                 foreach (var entity in dto.WorldTileEntities) _worldTileEntities[(entity.WorldId, entity.X, entity.Y)] = entity;
             if (dto.WorldProgress is not null)
@@ -379,24 +424,30 @@ internal sealed class LiteDbPersistence : IDbExecutor
     private void SaveToDisk()
     {
         if (string.IsNullOrEmpty(_dbPath)) return;
-        var audit = new List<AuditEntry>();
-        foreach (var list in _audit.Values)
-            lock (list) audit.AddRange(list);
-
-        var dump = new LiteDump
+        lock (_diskWriteLock)
         {
-            Players = _players.Values.ToList(),
-            Audit = audit,
-            Bans = _bans.Values.ToList(),
-            WorldTiles = _worldTiles.Values.ToList(),
-            WorldChests = _worldChests.Values.ToList(),
-            WorldTileEntities = _worldTileEntities.Values.ToList(),
-            WorldProgress = _worldProgress.Values.ToList(),
-        };
-        var tmp = _dbPath + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(dump));
-        File.Move(tmp, _dbPath, overwrite: true);
+            var audit = new List<AuditEntry>();
+            foreach (var list in _audit.Values)
+                lock (list) audit.AddRange(list);
+
+            var dump = new LiteDump
+            {
+                Players = _players.Values.ToList(),
+                Audit = audit,
+                Bans = _bans.Values.ToList(),
+                WorldTiles = _worldTiles.Values.ToList(),
+                WorldChests = _worldChests.Values.ToList(),
+                DeletedWorldChests = _deletedWorldChests.Select(static pair => new ChestTombstone(pair.Key.WorldId, pair.Key.Index, pair.Value)).ToList(),
+                WorldTileEntities = _worldTileEntities.Values.ToList(),
+                WorldProgress = _worldProgress.Values.ToList(),
+            };
+            var tmp = _dbPath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(dump));
+            File.Move(tmp, _dbPath, overwrite: true);
+        }
     }
+
+    private sealed record ChestTombstone(string WorldId, int Index, long Version);
 
     private sealed class LiteDump
     {
@@ -405,6 +456,7 @@ internal sealed class LiteDbPersistence : IDbExecutor
         public List<BanRecord>? Bans { get; set; }
         public List<WorldTileRecord>? WorldTiles { get; set; }
         public List<WorldChestRecord>? WorldChests { get; set; }
+        public List<ChestTombstone>? DeletedWorldChests { get; set; }
         public List<WorldTileEntityRecord>? WorldTileEntities { get; set; }
         public List<WorldProgressRecord>? WorldProgress { get; set; }
     }
@@ -463,20 +515,34 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
     {
         MigrateWorldTable(conn, "WorldTiles", """
             CREATE TABLE WorldTiles (WorldId TEXT NOT NULL, X INTEGER NOT NULL, Y INTEGER NOT NULL,
-            Data BLOB NOT NULL, PRIMARY KEY(WorldId, X, Y));
-            """, "WorldId, X, Y, Data", "X, Y, Data");
+            Data BLOB NOT NULL, Version INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(WorldId, X, Y));
+            """, "WorldId, X, Y, Data, Version", "X, Y, Data, 0");
         MigrateWorldTable(conn, "WorldChests", """
             CREATE TABLE WorldChests (WorldId TEXT NOT NULL, ChestIndex INTEGER NOT NULL,
-            X INTEGER NOT NULL, Y INTEGER NOT NULL, Data BLOB NOT NULL, PRIMARY KEY(WorldId, ChestIndex));
-            """, "WorldId, ChestIndex, X, Y, Data", "ChestIndex, X, Y, Data");
+            X INTEGER NOT NULL, Y INTEGER NOT NULL, Data BLOB NOT NULL, Version INTEGER NOT NULL DEFAULT 0, IsDeleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(WorldId, ChestIndex));
+            """, "WorldId, ChestIndex, X, Y, Data, Version, IsDeleted", "ChestIndex, X, Y, Data, 0, 0");
         MigrateWorldTable(conn, "WorldTileEntities", """
             CREATE TABLE WorldTileEntities (WorldId TEXT NOT NULL, X INTEGER NOT NULL, Y INTEGER NOT NULL,
             RuntimeId INTEGER NOT NULL, FileId INTEGER NOT NULL, Type INTEGER NOT NULL, Data BLOB,
-            IsDeleted INTEGER NOT NULL, PRIMARY KEY(WorldId, X, Y));
-            """, "WorldId, X, Y, RuntimeId, FileId, Type, Data, IsDeleted", "X, Y, RuntimeId, FileId, Type, Data, IsDeleted");
+            IsDeleted INTEGER NOT NULL, Version INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(WorldId, X, Y));
+            """, "WorldId, X, Y, RuntimeId, FileId, Type, Data, IsDeleted, Version", "X, Y, RuntimeId, FileId, Type, Data, IsDeleted, 0");
+        EnsureColumn(conn, "WorldTiles", "Version", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn(conn, "WorldChests", "Version", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn(conn, "WorldChests", "IsDeleted", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn(conn, "WorldTileEntities", "Version", "INTEGER NOT NULL DEFAULT 0");
 
         // 世界进度：单行（每个世界一条）。新表，不需要上面那套「老表补 WorldId」的迁移逻辑。
         Exec(conn, "CREATE TABLE IF NOT EXISTS WorldProgress (WorldId TEXT PRIMARY KEY, Data BLOB NOT NULL);");
+    }
+
+    private static void EnsureColumn(SqliteConnection conn, string table, string column, string definition)
+    {
+        using var probe = conn.CreateCommand();
+        probe.CommandText = $"PRAGMA table_info({table});";
+        using var reader = probe.ExecuteReader();
+        while (reader.Read())
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase)) return;
+        Exec(conn, $"ALTER TABLE {table} ADD COLUMN {column} {definition};");
     }
 
     private static void MigrateWorldTable(SqliteConnection conn, string table, string createSql, string columns, string legacyColumns)
@@ -491,7 +557,12 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
             exists = true;
             hasWorldId |= string.Equals(reader.GetString(1), "WorldId", StringComparison.OrdinalIgnoreCase);
         }
-        if (!exists || hasWorldId) return;
+        if (!exists)
+        {
+            Exec(conn, createSql);
+            return;
+        }
+        if (hasWorldId) return;
 
         string legacy = table + "_LegacyWorldScope";
         Exec(conn, $"DROP TABLE IF EXISTS {legacy}; ALTER TABLE {table} RENAME TO {legacy};");
@@ -532,6 +603,7 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
                 X INTEGER NOT NULL,
                 Y INTEGER NOT NULL,
                 Data BLOB NOT NULL,
+                Version INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(WorldId, X, Y));
             CREATE TABLE IF NOT EXISTS WorldChests (
                 WorldId TEXT NOT NULL DEFAULT 'default',
@@ -539,6 +611,8 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
                 X INTEGER NOT NULL,
                 Y INTEGER NOT NULL,
                 Data BLOB NOT NULL,
+                Version INTEGER NOT NULL DEFAULT 0,
+                IsDeleted INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(WorldId, ChestIndex));
             CREATE TABLE IF NOT EXISTS WorldTileEntities (
                 WorldId TEXT NOT NULL DEFAULT 'default',
@@ -549,6 +623,7 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
                 Type INTEGER NOT NULL,
                 Data BLOB,
                 IsDeleted INTEGER NOT NULL,
+                Version INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(WorldId, X, Y));
             """);
     }
@@ -732,19 +807,22 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
-            INSERT INTO WorldTiles (WorldId, X, Y, Data) VALUES ($worldId, $x, $y, $data)
-            ON CONFLICT(WorldId, X, Y) DO UPDATE SET Data = excluded.Data;
+            INSERT INTO WorldTiles (WorldId, X, Y, Data, Version) VALUES ($worldId, $x, $y, $data, $version)
+            ON CONFLICT(WorldId, X, Y) DO UPDATE SET Data = excluded.Data, Version = excluded.Version
+            WHERE excluded.Version >= WorldTiles.Version;
             """;
         var pworld = cmd.Parameters.Add("$worldId", SqliteType.Text);
         var px = cmd.Parameters.Add("$x", SqliteType.Integer);
         var py = cmd.Parameters.Add("$y", SqliteType.Integer);
         var pd = cmd.Parameters.Add("$data", SqliteType.Blob);
+        var pv = cmd.Parameters.Add("$version", SqliteType.Integer);
         foreach (var t in tiles)
         {
             pworld.Value = t.WorldId;
             px.Value = t.X;
             py.Value = t.Y;
             pd.Value = t.Data;
+            pv.Value = t.Version;
             cmd.ExecuteNonQuery();
         }
         tx.Commit();
@@ -754,10 +832,10 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
     {
         using var conn = Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT WorldId, X, Y, Data FROM WorldTiles;";
+        cmd.CommandText = "SELECT WorldId, X, Y, Data, Version FROM WorldTiles;";
         var list = new List<WorldTileRecord>();
         using var r = cmd.ExecuteReader();
-        while (r.Read()) list.Add(new WorldTileRecord(r.GetInt32(1), r.GetInt32(2), (byte[])r[3], r.GetString(0)));
+        while (r.Read()) list.Add(new WorldTileRecord(r.GetInt32(1), r.GetInt32(2), (byte[])r[3], r.GetString(0), r.GetInt64(4)));
         return list;
     }
 
@@ -770,14 +848,16 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
-            INSERT INTO WorldChests (WorldId, ChestIndex, X, Y, Data) VALUES ($worldId, $i, $x, $y, $data)
-            ON CONFLICT(WorldId, ChestIndex) DO UPDATE SET X = excluded.X, Y = excluded.Y, Data = excluded.Data;
+            INSERT INTO WorldChests (WorldId, ChestIndex, X, Y, Data, Version, IsDeleted) VALUES ($worldId, $i, $x, $y, $data, $version, 0)
+            ON CONFLICT(WorldId, ChestIndex) DO UPDATE SET X = excluded.X, Y = excluded.Y, Data = excluded.Data, Version = excluded.Version, IsDeleted = 0
+            WHERE excluded.Version > WorldChests.Version OR (excluded.Version = WorldChests.Version AND WorldChests.IsDeleted = 0);
             """;
         var pworld = cmd.Parameters.Add("$worldId", SqliteType.Text);
         var pi = cmd.Parameters.Add("$i", SqliteType.Integer);
         var px = cmd.Parameters.Add("$x", SqliteType.Integer);
         var py = cmd.Parameters.Add("$y", SqliteType.Integer);
         var pd = cmd.Parameters.Add("$data", SqliteType.Blob);
+        var pv = cmd.Parameters.Add("$version", SqliteType.Integer);
         foreach (var c in chests)
         {
             pworld.Value = c.WorldId;
@@ -785,6 +865,7 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
             px.Value = c.X;
             py.Value = c.Y;
             pd.Value = c.Data;
+            pv.Value = c.Version;
             cmd.ExecuteNonQuery();
         }
         tx.Commit();
@@ -794,28 +875,30 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
     {
         using var conn = Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT WorldId, ChestIndex, X, Y, Data FROM WorldChests;";
+        cmd.CommandText = "SELECT WorldId, ChestIndex, X, Y, Data, Version, IsDeleted FROM WorldChests WHERE IsDeleted = 0;";
         var list = new List<WorldChestRecord>();
         using var r = cmd.ExecuteReader();
         while (r.Read())
-            list.Add(new WorldChestRecord(r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), (byte[])r[4], r.GetString(0)));
+            list.Add(new WorldChestRecord(r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), (byte[])r[4], r.GetString(0), r.GetInt64(5)));
         return list;
     }
 
-    public void DeleteWorldChests(string worldId, IReadOnlyList<int> chestIndices)
+    public void DeleteWorldChests(string worldId, IReadOnlyList<(int Index, long Version)> chestIndices)
     {
         if (chestIndices.Count == 0) return;
         using var conn = Open();
         using var tx = conn.BeginTransaction();
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "DELETE FROM WorldChests WHERE WorldId = $worldId AND ChestIndex = $i;";
+        cmd.CommandText = "INSERT INTO WorldChests (WorldId, ChestIndex, X, Y, Data, Version, IsDeleted) VALUES ($worldId, $i, 0, 0, X'', $version, 1) ON CONFLICT(WorldId, ChestIndex) DO UPDATE SET Version = excluded.Version, IsDeleted = 1, Data = X'' WHERE excluded.Version >= WorldChests.Version;";
         var pworld = cmd.Parameters.Add("$worldId", SqliteType.Text);
         var pi = cmd.Parameters.Add("$i", SqliteType.Integer);
+        var pv = cmd.Parameters.Add("$version", SqliteType.Integer);
         pworld.Value = worldId;
-        foreach (var index in chestIndices)
+        foreach (var (index, version) in chestIndices)
         {
             pi.Value = index;
+            pv.Value = version;
             cmd.ExecuteNonQuery();
         }
         tx.Commit();
@@ -829,11 +912,12 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
-            INSERT INTO WorldTileEntities (WorldId, X, Y, RuntimeId, FileId, Type, Data, IsDeleted)
-            VALUES ($worldId, $x, $y, $runtimeId, $fileId, $type, $data, $isDeleted)
+            INSERT INTO WorldTileEntities (WorldId, X, Y, RuntimeId, FileId, Type, Data, IsDeleted, Version)
+            VALUES ($worldId, $x, $y, $runtimeId, $fileId, $type, $data, $isDeleted, $version)
             ON CONFLICT(WorldId, X, Y) DO UPDATE SET
                 RuntimeId = excluded.RuntimeId, FileId = excluded.FileId, Type = excluded.Type,
-                Data = excluded.Data, IsDeleted = excluded.IsDeleted;
+                Data = excluded.Data, IsDeleted = excluded.IsDeleted, Version = excluded.Version
+            WHERE excluded.Version >= WorldTileEntities.Version;
             """;
         var pworld = cmd.Parameters.Add("$worldId", SqliteType.Text);
         var px = cmd.Parameters.Add("$x", SqliteType.Integer);
@@ -843,26 +927,36 @@ internal sealed class SqliteImpl : IDbExecutor, IDisposable
         var pt = cmd.Parameters.Add("$type", SqliteType.Integer);
         var pd = cmd.Parameters.Add("$data", SqliteType.Blob);
         var deleted = cmd.Parameters.Add("$isDeleted", SqliteType.Integer);
+        var pv = cmd.Parameters.Add("$version", SqliteType.Integer);
         foreach (var entity in entities)
         {
             pworld.Value = entity.WorldId;
             px.Value = entity.X; py.Value = entity.Y; pr.Value = entity.RuntimeId; pf.Value = entity.FileId;
-            pt.Value = entity.Type; pd.Value = (object?)entity.Data ?? DBNull.Value; deleted.Value = entity.IsDeleted ? 1 : 0;
+            pt.Value = entity.Type; pd.Value = (object?)entity.Data ?? DBNull.Value; deleted.Value = entity.IsDeleted ? 1 : 0; pv.Value = entity.Version;
             cmd.ExecuteNonQuery();
         }
         tx.Commit();
+    }
+
+    public long GetMaxWorldVersion()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT MAX(Version) FROM (SELECT Version FROM WorldTiles UNION ALL SELECT Version FROM WorldChests UNION ALL SELECT Version FROM WorldTileEntities);";
+        var value = cmd.ExecuteScalar();
+        return value is null or DBNull ? 0L : Convert.ToInt64(value, CultureInfo.InvariantCulture);
     }
 
     public IReadOnlyList<WorldTileEntityRecord> LoadWorldTileEntities()
     {
         using var conn = Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT WorldId, RuntimeId, FileId, Type, X, Y, Data, IsDeleted FROM WorldTileEntities ORDER BY X, Y;";
+        cmd.CommandText = "SELECT WorldId, RuntimeId, FileId, Type, X, Y, Data, IsDeleted, Version FROM WorldTileEntities ORDER BY X, Y;";
         var list = new List<WorldTileEntityRecord>();
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
             list.Add(new WorldTileEntityRecord(reader.GetInt32(1), reader.GetInt32(2), (byte)reader.GetInt32(3),
-                (short)reader.GetInt32(4), (short)reader.GetInt32(5), reader.IsDBNull(6) ? null : (byte[])reader[6], reader.GetInt32(7) != 0, reader.GetString(0)));
+                (short)reader.GetInt32(4), (short)reader.GetInt32(5), reader.IsDBNull(6) ? null : (byte[])reader[6], reader.GetInt32(7) != 0, reader.GetString(0), reader.GetInt64(8)));
         return list;
     }
 

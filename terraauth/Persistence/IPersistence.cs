@@ -45,8 +45,11 @@ public interface IWorldRepository
     Task<IReadOnlyList<WorldChestRecord>> LoadChestChangesAsync();
     /// <summary>删除已销毁箱子的内容覆盖记录，避免重启时基准世界容器复活。</summary>
     Task DeleteChestChangesAsync(IReadOnlyList<int> chestIndices);
+    Task DeleteChestChangesAsync(IReadOnlyList<(int Index, long Version)> chests);
     /// <summary>按锚点写入图格实体覆盖或删除墓碑。</summary>
     Task SaveTileEntityChangesAsync(IReadOnlyList<WorldTileEntityRecord> entities);
+    /// <summary>读取已持久化世界版本，用于重启后继续生成单调版本。</summary>
+    Task<long> GetMaxWorldPersistVersionAsync();
     /// <summary>读取全部图格实体覆盖与删除墓碑，供启动时按锚点回放。</summary>
     Task<IReadOnlyList<WorldTileEntityRecord>> LoadTileEntityChangesAsync();
     /// <summary>
@@ -65,19 +68,19 @@ public interface IWorldRepository
 }
 
 /// <summary>单格图格改动：坐标 + 定长序列化图格（见 <c>Tile.Serialize</c>）。</summary>
-public record WorldTileRecord(int X, int Y, byte[] Data, string WorldId = "default");
+public record WorldTileRecord(int X, int Y, byte[] Data, string WorldId = "default", long Version = 0);
 
 /// <summary>
 /// 单个箱子的内容改动：索引 + 坐标 + 物品格序列化字节（见 <c>Chest.SerializeItems</c>）。
 /// 回放时按索引定位并校验坐标，避免基准世界被替换后错位套用。
 /// </summary>
-public record WorldChestRecord(int Index, int X, int Y, byte[] Data, string WorldId = "default");
+public record WorldChestRecord(int Index, int X, int Y, byte[] Data, string WorldId = "default", long Version = 0);
 
 /// <summary>
 /// 图格实体覆盖：以锚点为稳定键，保存完整 section-5 单实体文件负载；删除时保留墓碑，
 /// 防止同锚点的基准世界实体在重启回放时复活。
 /// </summary>
-public record WorldTileEntityRecord(int RuntimeId, int FileId, byte Type, short X, short Y, byte[]? Data, bool IsDeleted, string WorldId = "default");
+public record WorldTileEntityRecord(int RuntimeId, int FileId, byte Type, short X, short Y, byte[]? Data, bool IsDeleted, string WorldId = "default", long Version = 0);
 
 /// <summary>
 /// 世界进度存档：<see cref="Data"/> 是 <c>WorldProgressCodec</c> 产出的版本化字节串

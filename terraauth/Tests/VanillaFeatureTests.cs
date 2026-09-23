@@ -4085,6 +4085,36 @@ public class VanillaFeatureTests
         Assert.Equal(3, fresh.ItemStacks[11]);
     }
 
+    [Fact]
+    public async Task PlayerProfile_ConcurrentFlushes_PersistLatestSnapshot()
+    {
+        using var server = VanillaServer.Start();
+        await using var session = await server.ConnectAsync("Tester");
+        var world = server.Host.Simulator.State;
+        var player = await WaitForPlayerAsync(server);
+
+        var flushes = Enumerable.Range(0, 8)
+            .Select(_ => Task.Run(server.Host.Network.FlushPlayerProfiles))
+            .ToArray();
+        await Task.WhenAll(flushes);
+
+        lock (world.PlayersLock)
+        {
+            player.Items[13] = 74;
+            player.ItemStacks[13] = 6;
+        }
+
+        await Task.WhenAll(Enumerable.Range(0, 8)
+            .Select(_ => Task.Run(server.Host.Network.FlushPlayerProfiles)));
+
+        var saved = await server.Host.Players.GetAsync(TerraAuth.Security.PlayerIdentity.FromName("Tester"));
+        Assert.NotNull(saved);
+        var restored = new PlayerRuntime();
+        Assert.True(PlayerProfileCodec.TryApply(saved!.InventoryBlob, restored));
+        Assert.Equal(74, restored.Items[13]);
+        Assert.Equal(6, restored.ItemStacks[13]);
+    }
+
     /// <summary>
     /// 停机补一次：改背包后不显式落盘，直接 <c>StopAsync</c> —— 正常关闭也不能丢这一局的变更
     /// （停机路径与周期路径共用同一入口，且走的是「已变更才写」的同一判据）。

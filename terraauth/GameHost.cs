@@ -119,6 +119,8 @@ public sealed class GameHost : IDisposable
         Workers = workers;
         _enforcers = enforcers;
         _world = simulator.State; // 供热重载同步全局开关（SSC 等）
+        if (worldRepo is not null)
+            EnsureWorldPersistVersion(worldRepo);
         _pipelineDisposable = pipelineDisposable;
 
         // 配置热更新 → 动态调整阈值（如 MaxFlightSpeed / MaxSingleDamage）
@@ -661,6 +663,22 @@ public sealed class GameHost : IDisposable
     /// 把服务端的图格改动落盘。由 1Hz 世界同步循环与停机时调用。
     /// 落盘失败会把本批改动**重新排队**，避免「取出即丢」造成建筑丢失。
     /// </summary>
+    private static long _worldPersistVersion;
+
+    private static void EnsureWorldPersistVersion(IWorldRepository repo)
+    {
+        var persisted = repo.GetMaxWorldPersistVersionAsync().GetAwaiter().GetResult();
+        while (true)
+        {
+            var current = Volatile.Read(ref _worldPersistVersion);
+            if (current >= persisted) return;
+            if (Interlocked.CompareExchange(ref _worldPersistVersion, persisted, current) == current) return;
+        }
+    }
+
+    private static long NextWorldPersistVersion()
+        => Interlocked.Increment(ref _worldPersistVersion);
+
     public async Task FlushWorldChangesAsync(CancellationToken ct = default)
     {
         if (WorldRepo is null) return;
@@ -676,7 +694,7 @@ public sealed class GameHost : IDisposable
                 Tile tile;
                 using (world.Sections.EnterRead(x, y, x, y))
                     tile = world.Tiles[x, y];
-                records.Add(new WorldTileRecord(x, y, Tile.Serialize(in tile)));
+                records.Add(new WorldTileRecord(x, y, Tile.Serialize(in tile), Version: NextWorldPersistVersion()));
             }
 
             try
@@ -735,12 +753,12 @@ public sealed class GameHost : IDisposable
         {
             var records = new List<WorldTileEntityRecord>(deleted.Count + ids.Count);
             records.AddRange(deleted.Select(static entity => new WorldTileEntityRecord(
-                entity.RuntimeId, entity.FileId, entity.Type, entity.X, entity.Y, null, IsDeleted: true)));
+                entity.RuntimeId, entity.FileId, entity.Type, entity.X, entity.Y, null, IsDeleted: true, Version: NextWorldPersistVersion())));
             foreach (var id in ids)
             {
                 if (!world.TryGetTileEntity(id, out var entity) || entity is null) continue;
                 records.Add(new WorldTileEntityRecord(entity.Id, entity.FileId, entity.Type, entity.X, entity.Y,
-                    entity.SerializeFilePayload(), IsDeleted: false));
+                    entity.SerializeFilePayload(), IsDeleted: false, Version: NextWorldPersistVersion()));
             }
 
             if (records.Count > 0)
@@ -766,7 +784,7 @@ public sealed class GameHost : IDisposable
         {
             try
             {
-                await WorldRepo.DeleteChestChangesAsync(deletedIndices).ConfigureAwait(false);
+                await WorldRepo.DeleteChestChangesAsync(deletedIndices.Select(index => (index, NextWorldPersistVersion())).ToArray()).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -787,7 +805,7 @@ public sealed class GameHost : IDisposable
             {
                 var chest = world.FindChestByIndex(index);
                 if (chest is null) continue;
-                records.Add(new WorldChestRecord(index, chest.X, chest.Y, Chest.SerializeItems(chest.Items)));
+                records.Add(new WorldChestRecord(index, chest.X, chest.Y, Chest.SerializeItems(chest.Items), Version: NextWorldPersistVersion()));
             }
         }
 
